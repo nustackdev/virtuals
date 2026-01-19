@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from everyshape.container.marker import (
+from pv.container.marker import (
     MARKER_SENTINEL,
     create_marker,
     extract_marker,
     is_marker,
     validate_marker_compatibility,
 )
-from everyshape.container.types import ContainerProtocol, ContainerStructure
+from pv.container.types import ContainerProtocol, ContainerStructure
 
 
 # ========================================================================

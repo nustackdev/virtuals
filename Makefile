@@ -16,7 +16,7 @@ NC := \033[0m
 # ============================================================================
 
 help:
-	@echo "$(BLUE)EveryShape Development Commands$(NC)"
+	@echo "$(BLUE)PV - Polymorphic Views Development Commands$(NC)"
 	@echo ""
 	@echo "$(GREEN)Setup:$(NC)"
 	@echo "  make install-uv      - Install uv package manager"
@@ -53,18 +53,18 @@ help:
 
 check-uv:
 	@command -v uv >/dev/null 2>&1 || { \
-		echo "$(YELLOW)⚠️  uv is not installed$(NC)"; \
+		echo "$(YELLOW)uv is not installed$(NC)"; \
 		echo "Run: make install-uv"; \
 		exit 1; \
 	}
 
 install-uv:
 	@if command -v uv >/dev/null 2>&1; then \
-		echo "$(GREEN)✓ uv is already installed$(NC)"; \
+		echo "$(GREEN)uv is already installed$(NC)"; \
 	else \
 		echo "$(BLUE)Installing uv...$(NC)"; \
 		curl -LsSf https://astral.sh/uv/install.sh | sh; \
-		echo "$(GREEN)✓ uv installed successfully$(NC)"; \
+		echo "$(GREEN)uv installed successfully$(NC)"; \
 	fi
 
 install: check-uv
@@ -72,13 +72,13 @@ install: check-uv
 	uv venv
 	@echo "$(BLUE)Installing dependencies...$(NC)"
 	uv pip install -e ".[dev,test]"
-	@echo "$(GREEN)✓ Installation complete$(NC)"
+	@echo "$(GREEN)Installation complete$(NC)"
 	@echo ""
 	@echo "Activate with: source .venv/bin/activate"
 
-dev: install build test
+dev: install test
 	@echo ""
-	@echo "$(GREEN)✓ Development environment ready!$(NC)"
+	@echo "$(GREEN)Development environment ready!$(NC)"
 	@echo ""
 	@echo "Next steps:"
 	@echo "  1. source .venv/bin/activate"
@@ -106,8 +106,8 @@ test-verbose:
 
 test-cov:
 	@echo "$(BLUE)Running tests with coverage...$(NC)"
-	pytest $(TEST_DIR) --cov=everyshape --cov-report=html:tests/reports/coverage --cov-report=term-missing --cov-branch
-	@echo "$(GREEN)✓ Coverage report: tests/reports/coverage/index.html$(NC)"
+	pytest $(TEST_DIR) --cov=pv --cov-report=html:tests/reports/coverage --cov-report=term-missing --cov-branch
+	@echo "$(GREEN)Coverage report: tests/reports/coverage/index.html$(NC)"
 
 test-watch:
 	@echo "$(BLUE)Running tests in watch mode...$(NC)"
@@ -119,22 +119,22 @@ test-watch:
 
 lint:
 	@echo "$(BLUE)Running linters...$(NC)"
-	ruff check $(SRC_DIR)/everyshape $(TEST_DIR)
+	ruff check $(SRC_DIR)/pv $(TEST_DIR)
 
 format:
 	@echo "$(BLUE)Formatting code...$(NC)"
-	ruff format $(SRC_DIR)/everyshape $(TEST_DIR)
-	ruff check --fix $(SRC_DIR)/everyshape $(TEST_DIR)
-	@echo "$(GREEN)✓ Code formatted$(NC)"
+	ruff format $(SRC_DIR)/pv $(TEST_DIR)
+	ruff check --fix $(SRC_DIR)/pv $(TEST_DIR)
+	@echo "$(GREEN)Code formatted$(NC)"
 
 format-check:
 	@echo "$(BLUE)Checking code format...$(NC)"
-	ruff format --check $(SRC_DIR)/everyshape $(TEST_DIR)
-	ruff check $(SRC_DIR)/everyshape $(TEST_DIR)
+	ruff format --check $(SRC_DIR)/pv $(TEST_DIR)
+	ruff check $(SRC_DIR)/pv $(TEST_DIR)
 
 pre-commit: format lint test-fast
 	@echo ""
-	@echo "$(GREEN)✓ Pre-commit checks passed!$(NC)"
+	@echo "$(GREEN)Pre-commit checks passed!$(NC)"
 
 # ============================================================================
 # Dependency Management
@@ -143,19 +143,19 @@ pre-commit: format lint test-fast
 lock: check-uv
 	@echo "$(BLUE)Locking dependencies...$(NC)"
 	uv pip compile pyproject.toml -o requirements.lock
-	@echo "$(GREEN)✓ Dependencies locked to requirements.lock$(NC)"
+	@echo "$(GREEN)Dependencies locked to requirements.lock$(NC)"
 
 sync: check-uv
 	@echo "$(BLUE)Installing from lock file...$(NC)"
 	uv venv
 	uv pip sync requirements.lock
-	@echo "$(GREEN)✓ Installed exact versions from lock$(NC)"
+	@echo "$(GREEN)Installed exact versions from lock$(NC)"
 
 update: check-uv
 	@echo "$(BLUE)Updating dependencies...$(NC)"
 	uv pip install --upgrade -e ".[dev,test]"
 	@$(MAKE) lock
-	@echo "$(GREEN)✓ Dependencies updated and locked$(NC)"
+	@echo "$(GREEN)Dependencies updated and locked$(NC)"
 
 add: check-uv
 	@if [ -z "$(PKG)" ]; then \
@@ -164,7 +164,7 @@ add: check-uv
 	fi
 	@echo "$(BLUE)Adding $(PKG)...$(NC)"
 	uv pip install $(PKG)
-	@echo "$(YELLOW)⚠️  Don't forget to add '$(PKG)' to pyproject.toml!$(NC)"
+	@echo "$(YELLOW)Don't forget to add '$(PKG)' to pyproject.toml!$(NC)"
 
 # ============================================================================
 # Distribution & Publishing
@@ -174,7 +174,7 @@ dist: clean-dist
 	@echo "$(BLUE)Building distribution packages...$(NC)"
 	$(PYTHON) -m pip install --upgrade build twine
 	$(PYTHON) -m build
-	@echo "$(GREEN)✓ Distribution built in dist/$(NC)"
+	@echo "$(GREEN)Distribution built in dist/$(NC)"
 	@echo ""
 	@echo "Contents:"
 	@ls -lh dist/
@@ -182,27 +182,27 @@ dist: clean-dist
 check-dist: dist
 	@echo "$(BLUE)Checking distribution...$(NC)"
 	twine check dist/*
-	@echo "$(GREEN)✓ Distribution is valid$(NC)"
+	@echo "$(GREEN)Distribution is valid$(NC)"
 
 publish-test: check-dist
 	@echo "$(BLUE)Publishing to TestPyPI...$(NC)"
 	twine upload --repository testpypi dist/*
-	@echo "$(GREEN)✓ Published to TestPyPI$(NC)"
+	@echo "$(GREEN)Published to TestPyPI$(NC)"
 	@echo ""
 	@echo "Test installation:"
-	@echo "  pip install --index-url https://test.pypi.org/simple/ everyshape"
+	@echo "  pip install --index-url https://test.pypi.org/simple/ pv"
 
 publish: check-dist
-	@echo "$(YELLOW)⚠️  Publishing to PyPI (are you sure?)$(NC)"
-	@echo "Package: everyshape"
+	@echo "$(YELLOW)Publishing to PyPI (are you sure?)$(NC)"
+	@echo "Package: pv"
 	@echo "Version: $(shell grep '^version = ' pyproject.toml | cut -d'"' -f2)"
 	@echo ""
 	@read -p "Press Enter to continue or Ctrl+C to cancel..."
 	@echo "$(BLUE)Publishing to PyPI...$(NC)"
 	twine upload dist/*
-	@echo "$(GREEN)✓ Published to PyPI!$(NC)"
+	@echo "$(GREEN)Published to PyPI!$(NC)"
 	@echo ""
-	@echo "Install with: pip install everyshape"
+	@echo "Install with: pip install pv"
 
 # ============================================================================
 # Cleanup
@@ -211,29 +211,27 @@ publish: check-dist
 clean:
 	@echo "$(BLUE)Cleaning build artifacts...$(NC)"
 	rm -rf build/ dist/ *.egg-info/
-	find . -type d -name __pycache__ -exec rm -rf {} +
-	find . -type f -name "*.pyc" -delete
-	find . -type f -name "*.pyo" -delete
-	find . -type f -name "*.so" -delete
-	find $(SRC_DIR) -name "*.c" -delete
-	@echo "$(GREEN)✓ Clean complete$(NC)"
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	find . -type f -name "*.pyc" -delete 2>/dev/null || true
+	find . -type f -name "*.pyo" -delete 2>/dev/null || true
+	@echo "$(GREEN)Clean complete$(NC)"
 
 clean-dist:
 	@echo "$(BLUE)Cleaning distribution artifacts...$(NC)"
 	rm -rf dist/ build/ *.egg-info/
-	@echo "$(GREEN)✓ Distribution cleaned$(NC)"
+	@echo "$(GREEN)Distribution cleaned$(NC)"
 
 clean-test:
 	@echo "$(BLUE)Cleaning test artifacts...$(NC)"
 	rm -rf .pytest_cache/
 	rm -rf .coverage htmlcov/
 	rm -rf tests/reports/
-	@echo "$(GREEN)✓ Test artifacts cleaned$(NC)"
+	@echo "$(GREEN)Test artifacts cleaned$(NC)"
 
 clean-all: clean clean-test
 	@echo "$(BLUE)Removing virtual environment...$(NC)"
 	rm -rf .venv/
-	@echo "$(GREEN)✓ Deep clean complete$(NC)"
+	@echo "$(GREEN)Deep clean complete$(NC)"
 
 # ============================================================================
 # CI/CD Targets
@@ -241,7 +239,7 @@ clean-all: clean clean-test
 
 ci: format-check lint test-cov
 	@echo ""
-	@echo "$(GREEN)✓ CI checks passed!$(NC)"
+	@echo "$(GREEN)CI checks passed!$(NC)"
 
 # ============================================================================
 # Information
@@ -249,7 +247,7 @@ ci: format-check lint test-cov
 
 info:
 	@echo "$(BLUE)Environment Information:$(NC)"
-	@echo "────────────────────────────────────"
+	@echo "----------------------------------------"
 	@echo "Python:  $(shell $(PYTHON) --version 2>&1)"
 	@echo "uv:      $(shell uv --version 2>/dev/null || echo 'Not installed')"
 	@echo "Venv:    $(shell [ -d .venv ] && echo 'Present' || echo 'Not created')"

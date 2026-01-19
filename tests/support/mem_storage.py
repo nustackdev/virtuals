@@ -1,7 +1,7 @@
 """Minimal in-memory storage for testing.
 
 This is a lightweight storage implementation used exclusively for testing
-everyshape's container and view operations. It implements the StorageProtocol
+pv's container and view operations. It implements the StorageProtocol
 and ObserverProtocol with just enough functionality to verify behavior.
 
 NOT intended for production use - use everybase adapters for real storage.
@@ -13,29 +13,29 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from everyshape.storage import (
+from pv.storage import (
     StorageClosedError,
     StorageScanOptions,
     StorageTransactionAbortedError,
 )
-from everyshape.storage.observer.registry import SubscriptionRegistry
-from everyshape.storage.storage.exceptions import StorageInterfaceError
-from everyshape.typing import EMPTY, Empty
+from pv.storage.observer.registry import SubscriptionRegistry
+from pv.storage.storage.exceptions import StorageInterfaceError
+from pv.typing import EMPTY, Empty
 
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterator
 
-    from everyshape.loc import key
-    from everyshape.storage import (
+    from pv.loc import key
+    from pv.storage import (
         SnapshotProtocol,
         TransactionProtocol,
         WriteBatchProtocol,
     )
-    from everyshape.storage.observer.options import SubscriptionOptions
-    from everyshape.storage.observer.types import SubscriptionCallback
-    from everyshape.storage.storage.scan import ScanProtocol
-    from everyshape.typing import Value
+    from pv.storage.observer.options import SubscriptionOptions
+    from pv.storage.observer.types import SubscriptionCallback
+    from pv.storage.storage.scan import ScanProtocol
+    from pv.typing import Value
 
 
 class MemoryScan:

@@ -9,7 +9,7 @@ Tests container creation, deletion, and descendant operations:
 
 import pytest
 
-from everyshape.container import (
+from pv.container import (
     ContainerExistsError,
     ContainerProtocol,
     ContainerStructure,
@@ -23,8 +23,8 @@ from everyshape.container import (
     node_exists,
     put_child_primitive,
 )
-from everyshape.container.types import NodeType
-from everyshape.storage import TransactionProtocol
+from pv.container.types import NodeType
+from pv.storage import TransactionProtocol
 
 
 # ============================================================================

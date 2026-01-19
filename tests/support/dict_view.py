@@ -8,14 +8,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
 
-from everyshape.container import (
+from pv.container import (
     ContainerNotFoundError,
     ContainerProtocol,
     ContainerStructure,
     NodeType,
 )
-from everyshape.typing import EMPTY, Empty, is_empty
-from everyshape.view import (
+from pv.typing import EMPTY, Empty, is_empty
+from pv.view import (
     ChildNavigationBase,
     ChildNestedGetBase,
     ChildNestedSetBase,
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from collections.abc import Mapping as PyMapping
 
-    from everyshape.view import View
+    from pv.view import View
 
 __all__ = [
     "DictView",

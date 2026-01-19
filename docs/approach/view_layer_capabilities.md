@@ -54,7 +54,7 @@ These enable bidirectional serialization. A view might support one, both, or nei
 Every protocol has a type guard function:
 
 ```python
-from everyshape.view import is_subscriptable, is_clearable, is_convertible
+from pv.view import is_subscriptable, is_clearable, is_convertible
 
 def process(view: View) -> dict | None:
     if is_convertible(view):

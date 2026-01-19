@@ -2,8 +2,8 @@
 
 import pytest
 
-from everyshape._exception import EveryShapeError
-from everyshape.container.exceptions import (
+from pv._exception import PVError
+from pv.container.exceptions import (
     ContainerCollisionError,
     ContainerError,
     ContainerExistsError,
@@ -39,12 +39,12 @@ class TestContainerErrorBase:
         exc = ContainerError(message)
         assert str(exc) == message
 
-    def test_container_error_inherits_from_everyshape_error(self):
-        """Test that ContainerError inherits from EveryShapeError."""
+    def test_container_error_inherits_from_pv_error(self):
+        """Test that ContainerError inherits from PVError."""
         exc = ContainerError("test")
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
         assert isinstance(exc, Exception)
-        assert issubclass(ContainerError, EveryShapeError)
+        assert issubclass(ContainerError, PVError)
 
 
 class TestContainerNotFoundError:
@@ -80,7 +80,7 @@ class TestContainerNotFoundError:
         exc = ContainerNotFoundError("test")
         assert isinstance(exc, ContainerNotFoundError)
         assert isinstance(exc, ContainerError)
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
         assert issubclass(ContainerNotFoundError, ContainerError)
 
 
@@ -117,7 +117,7 @@ class TestContainerExistsError:
         exc = ContainerExistsError("test")
         assert isinstance(exc, ContainerExistsError)
         assert isinstance(exc, ContainerError)
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
         assert issubclass(ContainerExistsError, ContainerError)
 
 
@@ -154,7 +154,7 @@ class TestContainerInvalidSiteError:
         exc = ContainerInvalidSiteError("test")
         assert isinstance(exc, ContainerInvalidSiteError)
         assert isinstance(exc, ContainerError)
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
         assert issubclass(ContainerInvalidSiteError, ContainerError)
 
 
@@ -191,7 +191,7 @@ class TestContainerTypeError:
         exc = ContainerTypeError("test")
         assert isinstance(exc, ContainerTypeError)
         assert isinstance(exc, ContainerError)
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
         assert issubclass(ContainerTypeError, ContainerError)
 
 
@@ -241,7 +241,7 @@ class TestContainerCollisionError:
         assert isinstance(exc, ContainerCollisionError)
         assert isinstance(exc, ContainerTypeError)
         assert isinstance(exc, ContainerError)
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
 
 
 class TestContainerParentNotFoundError:
@@ -290,7 +290,7 @@ class TestContainerParentNotFoundError:
         assert isinstance(exc, ContainerParentNotFoundError)
         assert isinstance(exc, ContainerNotFoundError)
         assert isinstance(exc, ContainerError)
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
 
 
 class TestContainerParentMalformedError:
@@ -339,7 +339,7 @@ class TestContainerParentMalformedError:
         assert isinstance(exc, ContainerParentMalformedError)
         assert isinstance(exc, ContainerTypeError)
         assert isinstance(exc, ContainerError)
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
 
 
 class TestContainerInvalidDepthError:
@@ -375,7 +375,7 @@ class TestContainerInvalidDepthError:
         exc = ContainerInvalidDepthError("test")
         assert isinstance(exc, ContainerInvalidDepthError)
         assert isinstance(exc, ContainerError)
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
         assert issubclass(ContainerInvalidDepthError, ContainerError)
 
 
@@ -399,8 +399,8 @@ class TestExceptionHierarchy:
                 f"{exc_class.__name__} should inherit from ContainerError"
             )
 
-    def test_all_exceptions_inherit_from_everyshape_error(self):
-        """Test that all container exceptions inherit from EveryShapeError."""
+    def test_all_exceptions_inherit_from_pv_error(self):
+        """Test that all container exceptions inherit from PVError."""
         exceptions = [
             ContainerError,
             ContainerNotFoundError,
@@ -413,8 +413,8 @@ class TestExceptionHierarchy:
             ContainerInvalidDepthError,
         ]
         for exc_class in exceptions:
-            assert issubclass(exc_class, EveryShapeError), (
-                f"{exc_class.__name__} should inherit from EveryShapeError"
+            assert issubclass(exc_class, PVError), (
+                f"{exc_class.__name__} should inherit from PVError"
             )
 
     def test_container_collision_error_hierarchy(self):

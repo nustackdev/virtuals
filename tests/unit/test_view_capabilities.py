@@ -8,9 +8,9 @@ Tests:
 
 from typing import ClassVar
 
-from everyshape.container import ContainerProtocol, ContainerStructure
-from everyshape.typing import EMPTY, Empty
-from everyshape.typing.view import (
+from pv.container import ContainerProtocol, ContainerStructure
+from pv.typing import EMPTY, Empty
+from pv.typing.view import (
     is_addable,
     is_appendable,
     is_assignable,
@@ -30,7 +30,7 @@ from everyshape.typing.view import (
     is_sizeable,
     is_subscriptable,
 )
-from everyshape.view import ViewBase
+from pv.view import ViewBase
 
 
 # =============================================================================

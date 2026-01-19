@@ -9,8 +9,8 @@ Tests:
 
 import pytest
 
-from everyshape._exception import EveryShapeError
-from everyshape.view import ViewError, ViewOperationError, ViewRegistryError
+from pv._exception import PVError
+from pv.view import ViewError, ViewOperationError, ViewRegistryError
 
 
 # =============================================================================
@@ -46,18 +46,18 @@ class TestViewError:
         exc = ViewError()
         assert str(exc) == ""
 
-    def test_inherits_from_everyshape_error(self) -> None:
-        """Test that ViewError inherits from EveryShapeError."""
+    def test_inherits_from_pv_error(self) -> None:
+        """Test that ViewError inherits from PVError."""
         exc = ViewError()
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
         assert isinstance(exc, Exception)
-        assert issubclass(ViewError, EveryShapeError)
+        assert issubclass(ViewError, PVError)
 
-    def test_caught_as_everyshape_error(self) -> None:
-        """Test ViewError can be caught as EveryShapeError."""
+    def test_caught_as_pv_error(self) -> None:
+        """Test ViewError can be caught as PVError."""
         try:
             raise ViewError("view error")
-        except EveryShapeError as e:
+        except PVError as e:
             assert str(e) == "view error"
 
 
@@ -93,7 +93,7 @@ class TestViewRegistryError:
         """Test that ViewRegistryError inherits from ViewError."""
         exc = ViewRegistryError()
         assert isinstance(exc, ViewError)
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
         assert issubclass(ViewRegistryError, ViewError)
 
     def test_caught_as_view_error(self) -> None:
@@ -136,7 +136,7 @@ class TestViewOperationError:
         """Test that ViewOperationError inherits from ViewError."""
         exc = ViewOperationError()
         assert isinstance(exc, ViewError)
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
         assert issubclass(ViewOperationError, ViewError)
 
     def test_caught_as_view_error(self) -> None:
@@ -160,11 +160,11 @@ class TestViewExceptionHierarchy:
         assert issubclass(ViewRegistryError, ViewError)
         assert issubclass(ViewOperationError, ViewError)
 
-    def test_all_view_exceptions_inherit_from_everyshape_error(self) -> None:
-        """Test all view exceptions inherit from EveryShapeError."""
-        assert issubclass(ViewError, EveryShapeError)
-        assert issubclass(ViewRegistryError, EveryShapeError)
-        assert issubclass(ViewOperationError, EveryShapeError)
+    def test_all_view_exceptions_inherit_from_pv_error(self) -> None:
+        """Test all view exceptions inherit from PVError."""
+        assert issubclass(ViewError, PVError)
+        assert issubclass(ViewRegistryError, PVError)
+        assert issubclass(ViewOperationError, PVError)
 
     def test_catching_view_error_catches_all_subclasses(self) -> None:
         """Test catching ViewError catches all view exceptions."""

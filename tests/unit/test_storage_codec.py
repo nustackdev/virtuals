@@ -5,12 +5,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock
 
-from everyshape.loc.key_nav import create_key
-from everyshape.storage.codec import Codec
+from pv.loc.key_nav import create_key
+from pv.storage.codec import Codec
 
 
 if TYPE_CHECKING:
-    from everyshape.typing import Value
+    from pv.typing import Value
 
 
 # Test constants
