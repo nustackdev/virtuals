@@ -4,7 +4,7 @@ from collections.abc import Generator
 
 import pytest
 
-from everykv.storage import SnapshotProtocol, TransactionProtocol
+from pv.storage import SnapshotProtocol, TransactionProtocol
 from tests.support.mem_storage import MemoryStorage
 
 

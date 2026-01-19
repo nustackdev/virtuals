@@ -252,8 +252,8 @@ Build these on top using Tree's iteration primitives.
 ## Usage Example
 
 ```python
-from everyshape.storage import create_lmdb_storage
-from everyshape.tree import Tree
+from pv.storage import create_lmdb_storage
+from pv.tree import Tree
 
 # Create storage and tree
 storage = create_lmdb_storage("data.db")

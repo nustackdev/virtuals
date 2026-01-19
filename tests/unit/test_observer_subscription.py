@@ -1,4 +1,4 @@
-"""Tests for everyshape.storage.observer.subscription module."""
+"""Tests for pv.storage.observer.subscription module."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from everykv.storage import PrefixFilter, SubscriptionOptions
-from everykv.storage.observer.subscription import Subscription, _SubscriptionContext
+from pv.storage import PrefixFilter, SubscriptionOptions
+from pv.storage.observer.subscription import Subscription, _SubscriptionContext
 
 
 class TestSubscriptionInitialization:

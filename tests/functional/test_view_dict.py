@@ -14,8 +14,8 @@ from typing import cast
 
 import pytest
 
-from everykv.storage import TransactionProtocol
-from everykv.typing.view import (
+from pv.storage import TransactionProtocol
+from pv.typing.view import (
     is_assignable,
     is_child_observable,
     is_clearable,
@@ -251,7 +251,7 @@ class TestDictViewGetPop:
 
     def test_get_missing_no_default(self, view: DictView) -> None:
         """Test get() returns EMPTY for missing key without default."""
-        from everykv.typing import EMPTY
+        from pv.typing import EMPTY
 
         result = view.get("missing")
         assert result is EMPTY

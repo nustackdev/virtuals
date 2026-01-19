@@ -2,8 +2,8 @@
 
 import pytest
 
-from everykv._exception import EveryShapeError
-from everykv.storage.observer.exceptions import (
+from pv._exception import PVError
+from pv.storage.observer.exceptions import (
     ObserverConnectionError,
     ObserverError,
     ObserverSubscriptionError,
@@ -34,12 +34,12 @@ class TestObserverErrorBase:
         exc = ObserverError(message)
         assert str(exc) == message
 
-    def test_observer_error_inherits_from_everyshape_error(self):
-        """Test that ObserverError inherits from EveryShapeError."""
+    def test_observer_error_inherits_from_pv_error(self):
+        """Test that ObserverError inherits from PVError."""
         exc = ObserverError("test")
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
         assert isinstance(exc, Exception)
-        assert issubclass(ObserverError, EveryShapeError)
+        assert issubclass(ObserverError, PVError)
 
 
 class TestObserverConnectionError:
@@ -165,8 +165,8 @@ class TestObserverExceptionHierarchy:
                 f"{exc_class.__name__} should inherit from ObserverError"
             )
 
-    def test_all_exceptions_inherit_from_everyshape_error(self):
-        """Test that all observer exceptions inherit from EveryShapeError."""
+    def test_all_exceptions_inherit_from_pv_error(self):
+        """Test that all observer exceptions inherit from PVError."""
         exceptions = [
             ObserverError,
             ObserverConnectionError,
@@ -174,8 +174,8 @@ class TestObserverExceptionHierarchy:
             ObserverValidationError,
         ]
         for exc_class in exceptions:
-            assert issubclass(exc_class, EveryShapeError), (
-                f"{exc_class.__name__} should inherit from EveryShapeError"
+            assert issubclass(exc_class, PVError), (
+                f"{exc_class.__name__} should inherit from PVError"
             )
 
     def test_catch_multiple_exception_types(self):
@@ -197,17 +197,17 @@ class TestObserverExceptionHierarchy:
         # ObserverConnectionError MRO should include ObserverError
         mro = ObserverConnectionError.__mro__
         assert ObserverError in mro
-        assert EveryShapeError in mro
+        assert PVError in mro
         assert Exception in mro
 
         # ObserverSubscriptionError MRO should include ObserverError
         mro = ObserverSubscriptionError.__mro__
         assert ObserverError in mro
-        assert EveryShapeError in mro
+        assert PVError in mro
         assert Exception in mro
 
         # ObserverValidationError MRO should include ObserverError
         mro = ObserverValidationError.__mro__
         assert ObserverError in mro
-        assert EveryShapeError in mro
+        assert PVError in mro
         assert Exception in mro

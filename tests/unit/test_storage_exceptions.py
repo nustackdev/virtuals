@@ -2,8 +2,8 @@
 
 import pytest
 
-from everykv._exception import EveryShapeError
-from everykv.storage.storage.exceptions import (
+from pv._exception import PVError
+from pv.storage.storage.exceptions import (
     StorageClosedError,
     StorageDeleteError,
     StorageError,
@@ -42,12 +42,12 @@ class TestStorageErrorBase:
         exc = StorageError(message)
         assert str(exc) == message
 
-    def test_storage_error_inherits_from_everyshape_error(self):
-        """Test that StorageError inherits from EveryShapeError."""
+    def test_storage_error_inherits_from_pv_error(self):
+        """Test that StorageError inherits from PVError."""
         exc = StorageError("test")
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
         assert isinstance(exc, Exception)
-        assert issubclass(StorageError, EveryShapeError)
+        assert issubclass(StorageError, PVError)
 
 
 class TestStorageInterfaceError:

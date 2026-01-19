@@ -1,47 +1,47 @@
-"""Tests for everyshape._exception module."""
+"""Tests for pv._exception module."""
 
 import pytest
 
-from everykv._exception import EveryShapeError
+from pv._exception import PVError
 
 
-class TestEveryShapeError:
-    """Test cases for EveryShapeError exception class."""
+class TestPVError:
+    """Test cases for PVError exception class."""
 
     def test_exception_can_be_raised(self):
-        """Test that EveryShapeError can be raised."""
-        with pytest.raises(EveryShapeError):
-            raise EveryShapeError()
+        """Test that PVError can be raised."""
+        with pytest.raises(PVError):
+            raise PVError()
 
     def test_exception_can_be_caught(self):
-        """Test that EveryShapeError can be caught."""
+        """Test that PVError can be caught."""
         try:
-            raise EveryShapeError("test error")
-        except EveryShapeError:
+            raise PVError("test error")
+        except PVError:
             # Exception was caught successfully
             pass
         else:
-            pytest.fail("EveryShapeError was not caught")
+            pytest.fail("PVError was not caught")
 
     def test_exception_message_handling(self):
         """Test that exception message is stored and retrieved correctly."""
         error_message = "This is a test error message"
-        exc = EveryShapeError(error_message)
+        exc = PVError(error_message)
         assert str(exc) == error_message
 
     def test_exception_with_empty_message(self):
         """Test exception with empty message."""
-        exc = EveryShapeError()
+        exc = PVError()
         assert str(exc) == ""
 
     def test_exception_is_instance_of_exception(self):
-        """Test that EveryShapeError is an instance of Exception."""
-        exc = EveryShapeError()
+        """Test that PVError is an instance of Exception."""
+        exc = PVError()
         assert isinstance(exc, Exception)
-        assert isinstance(exc, EveryShapeError)
+        assert isinstance(exc, PVError)
 
     def test_exception_inheritance_chain(self):
-        """Test the inheritance chain of EveryShapeError."""
-        exc = EveryShapeError("test")
-        assert issubclass(EveryShapeError, Exception)
+        """Test the inheritance chain of PVError."""
+        exc = PVError("test")
+        assert issubclass(PVError, Exception)
         assert isinstance(exc, BaseException)

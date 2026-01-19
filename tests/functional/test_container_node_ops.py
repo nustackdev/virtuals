@@ -7,7 +7,7 @@ Tests node identification and information gathering operations:
 - gather_parent_info() - parent chain analysis
 """
 
-from everykv.container import (
+from pv.container import (
     ContainerProtocol,
     ContainerStructure,
     create_container,
@@ -17,8 +17,8 @@ from everykv.container import (
     node_exists,
     put_child_primitive,
 )
-from everykv.container.types import NodeType
-from everykv.storage import TransactionProtocol
+from pv.container.types import NodeType
+from pv.storage import TransactionProtocol
 
 
 # ============================================================================

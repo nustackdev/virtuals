@@ -1,10 +1,10 @@
-"""Unit tests for storage filters in everyshape.storage.filter."""
+"""Unit tests for storage filters in pv.storage.filter."""
 
 from __future__ import annotations
 
 import pytest
 
-from everykv.storage.filter import (
+from pv.storage.filter import (
     WILDCARD,
     And,
     Filter,

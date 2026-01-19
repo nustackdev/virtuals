@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from everykv.container import (
+from pv.container import (
     DEFAULT_PARENT_PROTOCOL,
     DEFAULT_PARENT_STRUCTURE,
     ContainerProtocol,
@@ -22,7 +22,7 @@ from everykv.container import (
     require_write_batch,
     require_write_context,
 )
-from everykv.storage import (
+from pv.storage import (
     ReadAccessProtocol,
     ReadWriteAccessProtocol,
     SnapshotProtocol,
@@ -31,7 +31,7 @@ from everykv.storage import (
     WriteAccessProtocol,
     WriteBatchProtocol,
 )
-from everykv.typing import NOT_SET
+from pv.typing import NOT_SET
 
 
 # ========================================================

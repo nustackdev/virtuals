@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from everykv.testing import (
+from pv.testing import (
     ObserverCompliance,
     RegistryCompliance,
     StorageProtocolCompliance,

@@ -9,7 +9,7 @@ Tests container creation, deletion, and descendant operations:
 
 import pytest
 
-from everykv.container import (
+from pv.container import (
     ContainerExistsError,
     ContainerProtocol,
     ContainerStructure,
@@ -23,8 +23,8 @@ from everykv.container import (
     node_exists,
     put_child_primitive,
 )
-from everykv.container.types import NodeType
-from everykv.storage import TransactionProtocol
+from pv.container.types import NodeType
+from pv.storage import TransactionProtocol
 
 
 # ============================================================================

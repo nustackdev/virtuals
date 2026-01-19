@@ -2,16 +2,16 @@
 # Build System
 # ============================================================================
 [build-system]
-requires = ["setuptools>=68.0", "wheel", "Cython>=3.0"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 # ============================================================================
 # Project Metadata (PEP 621)
 # ============================================================================
 [project]
-name = "everyshape"
-version = "1.1.0"
-description = "Persistent reactive trees for Python with multiple storage backends"
+name = "pv"
+version = "0.1.0"
+description = "Polymorphic Views for Key-Value stores. KV stores it. PV shapes it."
 readme = "README.md"
 license = "MIT"
 authors = [
@@ -21,28 +21,28 @@ maintainers = [
     {name = "Gor Arakelyan", email = "gorarkln@gmail.com"}
 ]
 keywords = [
+    "key-value",
+    "kv",
     "storage",
-    "sqlite",
-    "rocksdb",
+    "views",
+    "polymorphic",
+    "data-structures",
+    "dict",
+    "list",
+    "set",
     "database",
     "persistence",
-    "reactive",
-    "reactivity",
-    "tree",
-    "cython"
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Cython",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Database",
 ]
@@ -52,11 +52,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/everyabc/everyshape"
-Documentation = "https://github.com/everyabc/everyshape#readme"
-Repository = "https://github.com/everyabc/everyshape"
-Issues = "https://github.com/everyabc/everyshape/issues"
-Changelog = "https://github.com/everyabc/everyshape/releases"
+Homepage = "https://github.com/everyabc/pv"
+Documentation = "https://github.com/everyabc/pv#readme"
+Repository = "https://github.com/everyabc/pv"
+Issues = "https://github.com/everyabc/pv/issues"
+Changelog = "https://github.com/everyabc/pv/releases"
 
 [project.optional-dependencies]
 
@@ -78,7 +78,7 @@ test = [
 
 # All development dependencies
 all = [
-    "everyshape[dev,test]",
+    "pv[dev,test]",
 ]
 
 # ============================================================================
@@ -86,7 +86,7 @@ all = [
 # ============================================================================
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["every*"]
+include = ["pv*"]
 namespaces = false
 
 # =============================================================
@@ -133,9 +133,6 @@ extend-exclude = [
     "build",
     "dist",
     "*.egg-info",
-    "*.c",
-    "*.cpp",
-    "*.so",
 ]
 
 [tool.ruff.lint]
@@ -173,7 +170,7 @@ convention = "google"  # Use Google style format
     "E711",
     "E712",
     "ANN",    # type annotations not required in tests
-    "N806",   # disable variable name checks like `User = collection_shapes["User"]`
+    "N806",   # disable variable name checks
 ]
 "src/**/testing/**/*.py" = [
     "S101",   # assert allowed in tests
@@ -182,7 +179,7 @@ convention = "google"  # Use Google style format
     "E711",
     "E712",
     "ANN",    # type annotations not required in tests
-    "N806",   # disable variable name checks like `User = collection_shapes["User"]`
+    "N806",   # disable variable name checks
     "B017",   # FIXME: blind exception pass; fix, remove this later
 ]
 "examples/**/*.py" = [
@@ -197,7 +194,7 @@ convention = "google"  # Use Google style format
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["everyshape"]
+known-first-party = ["pv"]
 force-single-line = false
 lines-after-imports = 2
 
@@ -222,7 +219,6 @@ exclude = [
     "build/",
     "dist/",
     ".venv/",
-    ".*\\.pyx$",  # Ignore Cython files
 ]
 
 # ============================================================================
