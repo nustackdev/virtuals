@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 from pv.loc import site as site_
-from pv.typing import NOT_SET, Empty, NotSet, is_notset
+from pv.types import NOT_SET, Empty, NotSet, is_notset
 
 from .context import require_read_context
 from .marker import extract_marker
@@ -22,8 +22,9 @@ from .types import NodeInfo, NodeType, ParentChainInfo, ParentInfo
 
 
 if TYPE_CHECKING:
-    from pv.storage import StorageContextType
-    from pv.typing import Value
+    from tkv.tkv.storage import StorageContextType
+
+    from pv.types import Value
 
 __all__ = [
     "gather_parent_info",

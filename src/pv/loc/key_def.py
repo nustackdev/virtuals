@@ -8,11 +8,10 @@ Keys are primarily used storage and tree layers.
 
 from __future__ import annotations
 
+from tkv.tkv.types import Key, KeySegment
+
 
 __all__ = [
     "Key",
     "KeySegment",
 ]
-
-type KeySegment = str | int
-type Key = tuple[KeySegment, ...]

@@ -29,9 +29,11 @@ from .types import DEFAULT_PARENT_PROTOCOL, DEFAULT_PARENT_STRUCTURE
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    from tkv.tkv.observer import Subscription, SubscriptionOptions
+    from tkv.tkv.storage import StorageContextType
+
     from pv.loc import site as site_
-    from pv.storage import StorageContextType, Subscription, SubscriptionOptions
-    from pv.typing import Empty, Value
+    from pv.types import Empty, Value
 
     from .types import ContainerProtocol, ContainerStructure, NodeInfo, NodeType, ParentChainInfo
 

@@ -9,7 +9,6 @@ Tests:
 
 import pytest
 
-from pv._exception import PVError
 from pv.view import ViewError, ViewOperationError, ViewRegistryError
 
 
@@ -49,16 +48,7 @@ class TestViewError:
     def test_inherits_from_pv_error(self) -> None:
         """Test that ViewError inherits from PVError."""
         exc = ViewError()
-        assert isinstance(exc, PVError)
         assert isinstance(exc, Exception)
-        assert issubclass(ViewError, PVError)
-
-    def test_caught_as_pv_error(self) -> None:
-        """Test ViewError can be caught as PVError."""
-        try:
-            raise ViewError("view error")
-        except PVError as e:
-            assert str(e) == "view error"
 
 
 # =============================================================================
@@ -93,7 +83,6 @@ class TestViewRegistryError:
         """Test that ViewRegistryError inherits from ViewError."""
         exc = ViewRegistryError()
         assert isinstance(exc, ViewError)
-        assert isinstance(exc, PVError)
         assert issubclass(ViewRegistryError, ViewError)
 
     def test_caught_as_view_error(self) -> None:
@@ -136,7 +125,6 @@ class TestViewOperationError:
         """Test that ViewOperationError inherits from ViewError."""
         exc = ViewOperationError()
         assert isinstance(exc, ViewError)
-        assert isinstance(exc, PVError)
         assert issubclass(ViewOperationError, ViewError)
 
     def test_caught_as_view_error(self) -> None:
@@ -159,12 +147,6 @@ class TestViewExceptionHierarchy:
         """Test all view exceptions inherit from ViewError."""
         assert issubclass(ViewRegistryError, ViewError)
         assert issubclass(ViewOperationError, ViewError)
-
-    def test_all_view_exceptions_inherit_from_pv_error(self) -> None:
-        """Test all view exceptions inherit from PVError."""
-        assert issubclass(ViewError, PVError)
-        assert issubclass(ViewRegistryError, PVError)
-        assert issubclass(ViewOperationError, PVError)
 
     def test_catching_view_error_catches_all_subclasses(self) -> None:
         """Test catching ViewError catches all view exceptions."""

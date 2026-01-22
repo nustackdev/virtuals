@@ -6,8 +6,6 @@ that reflects the different error categories in container operations.
 
 from __future__ import annotations
 
-from pv._exception import PVError
-
 
 __all__ = [
     "ContainerCollisionError",
@@ -22,7 +20,7 @@ __all__ = [
 ]
 
 
-class ContainerError(PVError):
+class ContainerError(Exception):
     """Base exception for all container layer errors.
 
     All container-specific exceptions inherit from this base class,

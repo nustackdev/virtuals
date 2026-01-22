@@ -11,16 +11,18 @@ Core components:
 
 from __future__ import annotations
 
+from .base import ViewBase
 from .bases import (
     ChildNavigationBase,
     ChildNestedGetBase,
     ChildNestedSetBase,
-    ChildObservableBase,
-    DescendantsObservableBase,
     LiveChildrenCountBase,
     MetadataBasedChildrenCountBase,
+)
+from .bases_observable import (
+    ChildObservableBase,
+    DescendantsObservableBase,
     ObservableBase,
-    ViewBase,
 )
 from .exceptions import ViewError, ViewOperationError, ViewRegistryError
 from .registry import ViewRegistry

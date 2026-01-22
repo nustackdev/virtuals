@@ -14,7 +14,7 @@ from logging import getLogger
 from typing import TYPE_CHECKING, cast
 
 from pv.container import Container, ContainerStructure, NodeType, node_ops
-from pv.typing import Empty, Value, is_empty
+from pv.types import Empty, Value, is_empty
 
 
 if TYPE_CHECKING:
@@ -259,7 +259,7 @@ class ChildNestedGetBase:
             ValueError: If child has no structure ID
             TypeError: If child view doesn't support extraction
         """
-        from pv.typing.view import Convertible
+        from pv.traits import Convertible
 
         # Get child container
         child_site = (*self.container.site, address)
@@ -352,7 +352,7 @@ class ChildNestedSetBase:
         Raises:
             TypeError: If child view doesn't support initialization
         """
-        from pv.typing.view import Initializable
+        from pv.traits import Initializable
 
         # Get view class and structure for this value type
         value_type = type(value)

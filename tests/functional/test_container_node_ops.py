@@ -7,6 +7,8 @@ Tests node identification and information gathering operations:
 - gather_parent_info() - parent chain analysis
 """
 
+from tkv.tkv.storage import TransactionProtocol
+
 from pv.container import (
     ContainerProtocol,
     ContainerStructure,
@@ -18,7 +20,6 @@ from pv.container import (
     put_child_primitive,
 )
 from pv.container.types import NodeType
-from pv.storage import TransactionProtocol
 
 
 # ============================================================================

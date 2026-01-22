@@ -17,8 +17,9 @@ from .types import ContainerProtocol, ContainerStructure, NodeInfo, NodeType, Pa
 
 
 if TYPE_CHECKING:
+    from tkv.tkv.storage import StorageContextType
+
     from pv.loc import site as site_
-    from pv.storage import StorageContextType
 
 __all__ = [
     "validate_compatible",

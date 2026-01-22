@@ -3,27 +3,34 @@
 from collections.abc import Generator
 
 import pytest
-
-from pv.storage import SnapshotProtocol, TransactionProtocol
-from tests.support.mem_storage import MemoryStorage
+from tkv.codecs import NoOpCodec
+from tkv.observers.mem import InMemoryObserver
+from tkv.storages.mem import InMemoryStorage
+from tkv.tkv.storage import SnapshotProtocol, TransactionProtocol
 
 
 @pytest.fixture
-def storage() -> Generator[MemoryStorage, None, None]:
+def storage() -> Generator[InMemoryStorage, None, None]:
     """Memory storage instance for functional tests.
 
     Provides a clean storage instance for each test with automatic cleanup.
     """
-    storage = MemoryStorage()
+    observer = InMemoryObserver(codec=NoOpCodec())
+    storage = InMemoryStorage(
+        codec=NoOpCodec(),
+        observer=observer,
+    )
+    observer.connect()
     storage.open()
     try:
         yield storage
     finally:
         storage.close()
+        observer.disconnect()
 
 
 @pytest.fixture
-def tx(storage: MemoryStorage) -> Generator[TransactionProtocol, None, None]:
+def tx(storage: InMemoryStorage) -> Generator[TransactionProtocol, None, None]:
     """Read-write transaction context.
 
     Auto-commits on successful completion, rolls back on exception.
@@ -33,7 +40,7 @@ def tx(storage: MemoryStorage) -> Generator[TransactionProtocol, None, None]:
 
 
 @pytest.fixture
-def snapshot(storage: MemoryStorage) -> Generator[SnapshotProtocol, None, None]:
+def snapshot(storage: InMemoryStorage) -> Generator[SnapshotProtocol, None, None]:
     """Read-only snapshot context.
 
     Useful for testing isolation and concurrent read scenarios.

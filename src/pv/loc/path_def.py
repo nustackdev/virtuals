@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from pv.typing import Value
+    from pv.types import Value
     from pv.view import View
 
 __all__ = [

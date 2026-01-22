@@ -15,7 +15,7 @@ from collections.abc import Mapping as PyMapping
 from collections.abc import Set as PySet
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from .capabilities import (
+from pv.traits import (
     Appendable,
     Assignable,
     ChildObservable,
@@ -31,7 +31,7 @@ from .capabilities import (
 
 
 if TYPE_CHECKING:
-    from pv.typing import Empty
+    from pv.types import Empty
 
 
 __all__ = [

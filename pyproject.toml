@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 # ============================================================================
 [project]
 name = "pv"
-version = "0.1.0"
+version = "2.0.0"
 description = "Polymorphic Views for Key-Value stores. KV stores it. PV shapes it."
 readme = "README.md"
 license = "MIT"
@@ -49,7 +49,11 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "attrs",
+    "tkv>=0.2.0",
 ]
+
+[tool.uv.sources]
+tkv = { git = "https://github.com/everyabc/tkv" }
 
 [project.urls]
 Homepage = "https://github.com/everyabc/pv"

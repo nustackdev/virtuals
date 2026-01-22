@@ -11,22 +11,17 @@ from __future__ import annotations
 from logging import getLogger
 from typing import TYPE_CHECKING
 
-from pv.storage import (
-    LengthFilter,
-    PrefixFilter,
-    SubscriptionOptions,
-    WildcardFilter,
-)
+from tkv.tkv.filter import LengthFilter, PrefixFilter, WildcardFilter
+from tkv.tkv.observer import SubscriptionOptions
 
 from .bases import AddressMappingBase
 
 
 if TYPE_CHECKING:
+    from tkv.tkv.observer import Subscription
+
     from pv.container import Container
     from pv.loc import site as site_
-    from pv.storage import (
-        Subscription,
-    )
 
 
 __all__ = [

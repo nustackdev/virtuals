@@ -14,7 +14,7 @@ from pv.container import (
     ContainerStructure,
     NodeType,
 )
-from pv.typing import EMPTY, Empty, is_empty
+from pv.types import EMPTY, Empty, is_empty
 from pv.view import (
     ChildNavigationBase,
     ChildNestedGetBase,

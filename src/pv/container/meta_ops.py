@@ -11,8 +11,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from tkv.tkv.filter import LengthFilter, PrefixFilter
+from tkv.tkv.storage import StorageScanOptions
+
 from pv.loc.constants import METADATA_ROOT
-from pv.typing import EMPTY
+from pv.types import EMPTY
 
 from .context import require_read_context, require_write_context
 
@@ -20,9 +23,10 @@ from .context import require_read_context, require_write_context
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    from tkv.tkv.storage import StorageContextType
+
     from pv.loc import site as site_
-    from pv.storage import StorageContextType
-    from pv.typing import Empty, Value
+    from pv.types import Empty, Value
 
 __all__ = [
     "delete_metadata",
@@ -130,8 +134,6 @@ def iter_metadata_keys(
     Raises:
         StorageInterfaceError: If context doesn't support reads
     """
-    from pv.storage import LengthFilter, PrefixFilter, StorageScanOptions
-
     meta_site = (METADATA_ROOT, *site[1:])
     # Scan immediate children of metadata site only (length = meta_site + 1)
     prefix = PrefixFilter(prefix=meta_site)

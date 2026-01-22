@@ -9,12 +9,12 @@ from __future__ import annotations
 from enum import Enum, IntFlag, auto
 from typing import TYPE_CHECKING, NamedTuple, NewType
 
-from pv.typing import NOT_SET, NotSet
+from pv.types import NOT_SET, NotSet
 
 
 if TYPE_CHECKING:
     from pv.loc import site as site_
-    from pv.typing import Value
+    from pv.types import Value
 
 
 __all__ = [

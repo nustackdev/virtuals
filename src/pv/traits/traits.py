@@ -10,9 +10,10 @@ from typing import TYPE_CHECKING, Protocol, TypeGuard, runtime_checkable
 
 
 if TYPE_CHECKING:
+    from tkv.tkv.observer import Subscription
+
     from pv.loc import key
-    from pv.storage import Subscription
-    from pv.typing import Empty
+    from pv.types import Empty
     from pv.view import View
 
 

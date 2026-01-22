@@ -15,13 +15,13 @@ from pv.loc import DATA_ROOT
 from pv.loc import path as path_
 from pv.loc import site as site_
 
-from ..registry import ViewRegistry
+from .registry import ViewRegistry
 
 
 if TYPE_CHECKING:
-    from pv.storage import StorageContextType
+    from tkv.tkv.storage import StorageContextType
 
-    from ..view import View
+    from .view import View
 
 __all__ = [
     "ViewBase",

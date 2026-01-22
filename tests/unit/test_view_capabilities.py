@@ -9,8 +9,7 @@ Tests:
 from typing import ClassVar
 
 from pv.container import ContainerProtocol, ContainerStructure
-from pv.typing import EMPTY, Empty
-from pv.typing.view import (
+from pv.traits import (
     is_addable,
     is_appendable,
     is_assignable,
@@ -30,6 +29,7 @@ from pv.typing.view import (
     is_sizeable,
     is_subscriptable,
 )
+from pv.types import EMPTY, Empty
 from pv.view import ViewBase
 
 

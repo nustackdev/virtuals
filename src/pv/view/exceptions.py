@@ -5,8 +5,6 @@ This module defines all view-specific exceptions.
 
 from __future__ import annotations
 
-from pv._exception import PVError
-
 
 __all__ = [
     "ViewError",
@@ -15,7 +13,7 @@ __all__ = [
 ]
 
 
-class ViewError(PVError):
+class ViewError(Exception):
     """Base exception for view-related errors."""
 
 
