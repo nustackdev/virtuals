@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, ClassVar, Self, cast
 import attrs
 
 from pv.container import Container, ContainerProtocol, ContainerStructure
+from pv.container.types import DEFAULT_PARENT_PROTOCOL, DEFAULT_PARENT_STRUCTURE
 from pv.loc import DATA_ROOT
 from pv.loc import path as path_
 from pv.loc import site as site_
@@ -116,24 +117,12 @@ class ViewBase(ABC):
         views: tuple[type[View], ...] = (),
         default_parent_view: type[View] | None = None,
     ) -> Self:
-        """Create a new View instance of this type on a root path."""
-        if default_parent_view is None:
-            default_parent_view = cls.get_default_parent_view()
+        """Open a View at the root path.
 
-        if default_parent_view is None:
-            raise ValueError(
-                "default_parent_view is None, either provide default_parent_view or override get_default_parent_view method."
-            )
-
-        container = Container.create(
-            site=(DATA_ROOT,),
-            ctx=ctx,
-            structure=cls.get_structure(),
-            protocol=cls.get_protocol(),
-            default_parent_structure=default_parent_view.get_structure(),
-            default_parent_protocol=default_parent_view.get_protocol(),
-            ensure_healthy_parents=True,
-        )
+        Pure navigation — does not write to storage. Container markers
+        are created lazily by write operations via _ensure_created().
+        """
+        container = Container(ctx=ctx, site=(DATA_ROOT,))
 
         registry = ViewRegistry()
         for view in cls.get_available_views() + views:
@@ -201,10 +190,10 @@ class ViewBase(ABC):
         views: tuple[type[View], ...] = (),
         default_parent_view: type[View] | None = None,
     ) -> Self:
-        """Create a View at the specified container site.
+        """Open a View at the specified container site.
 
-        Creates all necessary intermediate containers along the site path and
-        returns the View instance at the final container location.
+        Pure navigation — does not write to storage. Container markers
+        are created lazily by write operations via _ensure_created().
 
         Args:
             ctx: Storage context (transaction, snapshot or write batch)
@@ -216,12 +205,11 @@ class ViewBase(ABC):
             View instance at the final container location
 
         Raises:
-            ValueError: If site is empty or only root
-            TypeError: If default_parent_view cannot provide structure/protocol
+            ValueError: If site is empty or doesn't start with DATA_ROOT
 
         Example:
             >>> site = ("/", "users", "alice")
-            >>> alice_view = DictView.create_at_site(tx, site, DictView)
+            >>> alice_view = DictView.open_at_site(site, tx)
         """
         if not site:
             raise ValueError("Site is empty, provide a complete location")
@@ -229,31 +217,38 @@ class ViewBase(ABC):
         if site[0] != DATA_ROOT:
             raise ValueError("Site must start with DATA_ROOT ('/')")
 
-        if default_parent_view is None:
-            default_parent_view = cls.get_default_parent_view()
+        container = Container(ctx=ctx, site=site)
 
-        if default_parent_view is None:
-            raise ValueError(
-                "default_parent_view is None, either provide default_parent_view or override get_default_parent_view method."
-            )
-
-        # Create the target container with proper structure and protocol
-        container = Container.create(
-            site=site,
-            ctx=ctx,
-            structure=cls.get_structure(),
-            protocol=cls.get_protocol(),
-            default_parent_structure=default_parent_view.get_structure(),
-            default_parent_protocol=default_parent_view.get_protocol(),
-            ensure_healthy_parents=True,
-        )
-
-        # Build registry from default_parent_view
         registry = ViewRegistry()
         for view in cls.get_available_views() + views:
             registry.register(view)
 
         return cls(container, registry)
+
+    # =========================================================================
+    # WRITE SUPPORT
+    # =========================================================================
+
+    def ensure_created(self) -> None:
+        """Ensure this view's container marker exists in storage.
+
+        Call before any write operation. Idempotent — safe to call
+        multiple times (Container.create short-circuits when the marker
+        already exists).
+
+        Creates the full parent chain via ensure_healthy_parents=True,
+        so even deeply navigated containers get materialized on first write.
+        """
+        dpv = self.get_default_parent_view()
+        Container.create(
+            self.container.site,
+            self.container.ctx,
+            self.get_structure(),
+            self.get_protocol(),
+            default_parent_structure=dpv.get_structure() if dpv else DEFAULT_PARENT_STRUCTURE,
+            default_parent_protocol=dpv.get_protocol() if dpv else DEFAULT_PARENT_PROTOCOL,
+            ensure_healthy_parents=True,
+        )
 
     # =========================================================================
     # NAVIGATION HELPERS

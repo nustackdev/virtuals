@@ -133,6 +133,7 @@ class DictView(
         Raises:
             KeyError: If key not found
         """
+        self.ensure_created()
         if not self.container.exists_child(address):
             raise KeyError(address)
         self.container.delete_child(address)
@@ -221,6 +222,7 @@ class DictView(
 
     def clear(self) -> None:
         """Remove all items."""
+        self.ensure_created()
         self.container.clear_children()
         # Reset length metadata
         self._set_length(0)

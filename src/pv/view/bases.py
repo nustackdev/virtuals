@@ -163,6 +163,9 @@ class ChildNavigationBase[A](AddressMappingBase[A]):
     def open_child[ViewT: View](self, address: A, view: type[ViewT]) -> ViewT:
         """Open child view at address.
 
+        Pure navigation — does not write to storage. Container markers
+        are created lazily by write operations via _ensure_created().
+
         Args:
             address: Child container address (will be normalized)
             view: View class for child
@@ -174,12 +177,8 @@ class ChildNavigationBase[A](AddressMappingBase[A]):
             IndexError, KeyError: If address invalid after normalization
         """
         normalized_address = self.normalize_address(address)
-        child_container = Container.create(
-            (*self.container.site, normalized_address),
-            self.container.ctx,
-            view.get_structure(),
-            view.get_protocol(),
-        )
+        child_site = (*self.container.site, normalized_address)
+        child_container = Container(ctx=self.container.ctx, site=child_site)
         return view(child_container, self.registry)
 
 
@@ -331,10 +330,14 @@ class ChildNestedSetBase:
         Helper for subclasses implementing dict-like or list-like mutation.
         Automatically populates nested containers using registry.
 
+        Calls ensure_created() to lazily materialize the container marker
+        before any write operation.
+
         Args:
             address: Child address
             value: Value to store (primitive or container)
         """
+        self.ensure_created()  # type: ignore[attr-defined]
         if self.registry.is_container_type(value):
             # Value is a container type - populate it
             self._populate_child_container(address, value)
