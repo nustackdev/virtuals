@@ -77,6 +77,7 @@ class ViewBase(ABC):
     STRUCTURE: ClassVar[ContainerStructure]
     PROTOCOL: ClassVar[ContainerProtocol] = ContainerProtocol.NONE
     CONTAINER_CLS: ClassVar[type | None] = None
+    _default_registry: ClassVar[ViewRegistry | None] = None
 
     @classmethod
     def get_default_parent_view(cls) -> type[View] | None:
@@ -110,6 +111,21 @@ class ViewBase(ABC):
     # =========================================================================
 
     @classmethod
+    def _get_registry(cls, views: tuple[type[View], ...] = ()) -> ViewRegistry:
+        """Get or build the view registry, caching the default case."""
+        if not views:
+            if cls._default_registry is None:
+                registry = ViewRegistry()
+                for view in cls.get_available_views():
+                    registry.register(view)
+                cls._default_registry = registry
+            return cls._default_registry
+        registry = ViewRegistry()
+        for view in cls.get_available_views() + views:
+            registry.register(view)
+        return registry
+
+    @classmethod
     def open_root(
         cls,
         ctx: StorageContextType,
@@ -123,12 +139,7 @@ class ViewBase(ABC):
         are created lazily by write operations via _ensure_created().
         """
         container = Container(ctx=ctx, site=(DATA_ROOT,))
-
-        registry = ViewRegistry()
-        for view in cls.get_available_views() + views:
-            registry.register(view)
-
-        return cls(container, registry)
+        return cls(container, cls._get_registry(views))
 
     @classmethod
     def open_at(
@@ -218,12 +229,7 @@ class ViewBase(ABC):
             raise ValueError("Site must start with DATA_ROOT ('/')")
 
         container = Container(ctx=ctx, site=site)
-
-        registry = ViewRegistry()
-        for view in cls.get_available_views() + views:
-            registry.register(view)
-
-        return cls(container, registry)
+        return cls(container, cls._get_registry(views))
 
     # =========================================================================
     # WRITE SUPPORT
