@@ -140,6 +140,12 @@ def last_segment(path: Path) -> PathSegment:
 # =============================================================================
 
 
+def _is_address_static(view_type: type, address: object) -> bool:
+    """Check if a view type considers an address static (no normalization needed)."""
+    checker = getattr(view_type, "is_address_static", None)
+    return checker(address) if checker is not None else False
+
+
 def open_child_view(
     parent_view: View,
     address: PathAddress,
@@ -179,6 +185,10 @@ def navigate_view(
 ) -> View:
     """Navigate ViewPath to reach target View.
 
+    When all segments have static addresses (``is_address_static`` returns
+    True), skips intermediate View/Container allocation and builds the final
+    site tuple directly.
+
     Args:
         start_view: Starting view
         path: ViewPath to navigate
@@ -191,9 +201,27 @@ def navigate_view(
         >>> path = (("users", DictView), ("alice", DictView))
         >>> alice = navigate_view(root, path)
     """
-    current_view = start_view
+    if not path:
+        return start_view
 
-    for address, expected_type in path:
+    # Find longest static prefix — segments that can skip normalize_address
+    static_end = 0
+    for address, view_type in path:
+        if not _is_address_static(view_type, address):
+            break
+        static_end += 1
+
+    # Fast-path the static prefix: build site directly, one View at the end
+    current_view = start_view
+    if static_end > 0:
+        site = start_view.container.site
+        for address, _ in path[:static_end]:
+            site = (*site, address)
+        pivot_type = path[static_end - 1][1]
+        current_view = pivot_type.open_at_site(site, start_view.container.ctx)
+
+    # Slow-path the remaining dynamic segments
+    for address, expected_type in path[static_end:]:
         current_view = open_child_view(current_view, address, expected_type)
 
     return current_view
