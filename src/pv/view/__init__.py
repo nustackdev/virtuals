@@ -16,6 +16,8 @@ from .bases import (
     ChildNavigationBase,
     ChildNestedGetBase,
     ChildNestedSetBase,
+    ChildPrimitiveSetBase,
+    ChildPrimitiveUnsafeSetBase,
     LiveChildrenCountBase,
     MetadataBasedChildrenCountBase,
 )
@@ -33,6 +35,8 @@ __all__ = [  # noqa: RUF022
     "ChildNavigationBase",
     "ChildNestedGetBase",
     "ChildNestedSetBase",
+    "ChildPrimitiveSetBase",
+    "ChildPrimitiveUnsafeSetBase",
     "ChildObservableBase",
     "DescendantsObservableBase",
     "LiveChildrenCountBase",

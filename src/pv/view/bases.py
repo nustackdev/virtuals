@@ -27,6 +27,8 @@ __all__ = [
     "ChildNavigationBase",
     "ChildNestedGetBase",
     "ChildNestedSetBase",
+    "ChildPrimitiveSetBase",
+    "ChildPrimitiveUnsafeSetBase",
     "LiveChildrenCountBase",
     "MetadataBasedChildrenCountBase",
 ]
@@ -397,3 +399,51 @@ class ChildNestedSetBase:
             raise TypeError(f"Child view {view_class.__name__} does not support initialization")
 
         child_view.store(value)
+
+
+class ChildPrimitiveSetBase:
+    """Base for setting primitive child values with validation.
+
+    Provides _set_primitive() which materializes the container chain
+    and writes a primitive value with full validation.
+    """
+
+    container: Container
+
+    def _set_primitive(self, address: site_.SiteSegment, value: object) -> None:
+        """Set primitive child value with validation.
+
+        Materializes the container chain via ensure_created(), then writes
+        the primitive value with standard validation reads.
+
+        Args:
+            address: Child address
+            value: Primitive value to store
+        """
+        self.ensure_created()  # type: ignore[attr-defined]
+        self.container.put_child_primitive(address, cast("Value", value))
+
+
+class ChildPrimitiveUnsafeSetBase:
+    """Base for setting primitive child values without validation reads.
+
+    Provides _set_primitive_unsafe() which materializes the container chain
+    but skips the 2 validation storage reads (validate_is_container on parent
+    and get_node_info on child).
+    """
+
+    container: Container
+
+    def _set_primitive_unsafe(self, address: site_.SiteSegment, value: object) -> None:
+        """Set primitive child value without validation or container checks.
+
+        Directly writes the primitive value skipping both ensure_created()
+        and validation reads. The caller must guarantee the container chain
+        already exists (e.g. via fetch_parent() which triggers
+        ensure_created() during navigation).
+
+        Args:
+            address: Child address
+            value: Primitive value to store
+        """
+        self.container.put_child_primitive(address, cast("Value", value), validate=False)

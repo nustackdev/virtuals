@@ -347,6 +347,8 @@ class Container:
         self,
         key: site_.SiteSegment,
         value: Value,
+        *,
+        validate: bool = True,
     ) -> None:
         """Put primitive child value.
 
@@ -358,13 +360,17 @@ class Container:
         Args:
             key: Child key
             value: Primitive value to store
+            validate: If True, validate parent is a container and child
+                is not a container (default True). Set to False to skip
+                validation reads when the caller has already ensured
+                container existence (e.g. after init()).
 
         Raises:
-            ContainerNotFoundError: If this container doesn't exist
-            ContainerTypeError: If this is not a container, or if child exists as a container
+            ContainerNotFoundError: If this container doesn't exist (when validate=True)
+            ContainerTypeError: If this is not a container, or if child exists as a container (when validate=True)
             StorageInterfaceError: If context doesn't support writes
         """
-        container_ops.put_child_primitive(self.site, key, value, self.ctx)
+        container_ops.put_child_primitive(self.site, key, value, self.ctx, validate=validate)
 
     def get_child_primitive(self, key: site_.SiteSegment) -> Value | Empty:
         """Get primitive child value.
