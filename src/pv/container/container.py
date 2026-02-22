@@ -349,6 +349,7 @@ class Container:
         value: Value,
         *,
         validate: bool = True,
+        validate_parent: bool = True,
     ) -> None:
         """Put primitive child value.
 
@@ -360,41 +361,75 @@ class Container:
         Args:
             key: Child key
             value: Primitive value to store
-            validate: If True, validate parent is a container and child
-                is not a container (default True). Set to False to skip
-                validation reads when the caller has already ensured
-                container existence (e.g. after init()).
+            validate: If True, check child isn't already a container
+                (default True).
+            validate_parent: If True, validate parent is a container
+                (default True). Set to False when the caller has already
+                ensured container existence (e.g. via ensure_created()).
 
         Raises:
-            ContainerNotFoundError: If this container doesn't exist (when validate=True)
-            ContainerTypeError: If this is not a container, or if child exists as a container (when validate=True)
+            ContainerNotFoundError: If this container doesn't exist (when validate_parent=True)
+            ContainerTypeError: If this is not a container (when validate_parent=True),
+                or if child exists as a container (when validate=True)
             StorageInterfaceError: If context doesn't support writes
         """
-        container_ops.put_child_primitive(self.site, key, value, self.ctx, validate=validate)
+        container_ops.put_child_primitive(
+            self.site, key, value, self.ctx, validate=validate, validate_parent=validate_parent
+        )
+
+    def put_child_primitive_unsafe(
+        self,
+        key: site_.SiteSegment,
+        value: Value,
+    ) -> None:
+        """Put primitive child value — raw ctx.put(), no validation.
+
+        The caller must guarantee container chain exists and child is
+        a primitive.
+
+        Args:
+            key: Child key
+            value: Primitive value to store
+        """
+        container_ops.put_child_primitive_unsafe(self.site, key, value, self.ctx)
 
     def get_child_primitive(
         self,
         key: site_.SiteSegment,
-        *,
-        validate: bool = True,
     ) -> Value | Empty:
-        """Get primitive child value.
+        """Get primitive child value with validation.
+
+        Parses markers and asserts child is a primitive. No parent
+        validation — reads don't affect container integrity.
 
         Args:
             key: Child key
-            validate: If True, parse marker and validate node type
-                (default True). Set to False for a raw storage read
-                when the caller knows the child is a primitive.
 
         Returns:
             Primitive value or EMPTY if doesn't exist
 
         Raises:
-            ContainerNotFoundError: If this container doesn't exist (when validate=True)
-            ContainerTypeError: If this is not a container, or if child is a container (when validate=True)
+            ContainerTypeError: If child is a container
             StorageInterfaceError: If context doesn't support reads
         """
-        return container_ops.get_child_primitive(self.site, key, self.ctx, validate=validate)
+        return container_ops.get_child_primitive(self.site, key, self.ctx)
+
+    def get_child_primitive_unsafe(
+        self,
+        key: site_.SiteSegment,
+    ) -> Value | Empty:
+        """Get primitive child value — raw ctx.get(), no validation.
+
+        No marker parsing, no type checks. The caller must know the
+        child is a primitive.
+
+        Args:
+            key: Child key
+
+        Returns:
+            Raw value or EMPTY if doesn't exist
+        """
+        return container_ops.get_child_primitive_unsafe(self.site, key, self.ctx)
 
     # ========================================================================
     # CHILDREN: DELETE (Write operations)
@@ -418,6 +453,23 @@ class Container:
         """
         container_ops.delete_child(self.site, key, self.ctx)
 
+    def delete_child_primitive_unsafe(
+        self,
+        key: site_.SiteSegment,
+    ) -> None:
+        """Delete primitive child value — raw ctx.delete(), no validation.
+
+        Single ctx.delete() — no parent validation, no get_node_info,
+        no descendant cleanup. The caller must know the child is a primitive.
+
+        For validated deletes that handle both primitives and containers
+        (including subtree cleanup), use delete_child() instead.
+
+        Args:
+            key: Child key
+        """
+        container_ops.delete_child_primitive_unsafe(self.site, key, self.ctx)
+
     def clear_children(self, *, validate: bool = True) -> None:
         """Delete all direct children.
 
@@ -435,6 +487,27 @@ class Container:
             StorageInterfaceError: If context doesn't support writes
         """
         container_ops.clear_children(self.site, self.ctx, validate=validate)
+
+    def clear_children_primitives_unsafe(self) -> None:
+        """Delete all direct primitive children.
+
+        Raw scan + delete — no validation, no descendant cleanup.
+        The caller must know all children are primitives.
+        """
+        container_ops.clear_children_primitives_unsafe(self.site, self.ctx)
+
+    def iter_child_primitive_values(
+        self,
+    ) -> Generator[object, None, None]:
+        """Iterate over direct primitive child values.
+
+        Raw storage scan — no marker parsing, no type checks.
+        The caller must know all children are primitives.
+
+        Yields:
+            Raw primitive values
+        """
+        yield from container_ops.iter_child_primitive_values(self.site, self.ctx)
 
     # ========================================================================
     # DESCENDANTS: RECURSIVE READ-ONLY OPERATIONS

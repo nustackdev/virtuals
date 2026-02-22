@@ -6,7 +6,22 @@ delegate validation to the validation module.
 
 All mutations are silent (return None) and idempotent.
 
-Validation is by default enabled for mutation commands and disabled for reads.
+Three-layer architecture for child operations:
+
+- **General** (e.g. delete_child, iter_children): handles any child
+  (primitive or container). Uses get_node_info + marker parsing.
+  Container reads return NodeInfo — caller creates child containers
+  imperatively. Container can't do nested reads or writes.
+
+- **Primitive validated** (e.g. get_child_primitive, put_child_primitive):
+  only handles primitives. Validates parent and/or asserts child is
+  primitive. put_child_primitive has separate validate/validate_parent
+  flags since writes are what ensure container chain integrity.
+
+- **Unsafe primitive** (e.g. get_child_primitive_unsafe,
+  put_child_primitive_unsafe, delete_child_primitive_unsafe): raw ctx.*
+  calls. Caller guarantees container chain exists and children are
+  primitives. Maximum performance, zero validation overhead.
 """
 
 from __future__ import annotations
@@ -53,21 +68,26 @@ if TYPE_CHECKING:
 
 __all__ = [
     "clear_children",
+    "clear_children_primitives_unsafe",
     "count_children",
     "create_child_container",
     "create_container",
     "create_parents",
     "delete_child",
+    "delete_child_primitive_unsafe",
     "delete_container",
     "delete_descendants",
     "exists_child",
     "get_child_primitive",
+    "get_child_primitive_unsafe",
     "get_child_type",
     "iter_child_keys",
+    "iter_child_primitive_values",
     "iter_child_values",
     "iter_children",
     "iter_descendants",
     "put_child_primitive",
+    "put_child_primitive_unsafe",
     "walk_descendants",
 ]
 
@@ -284,6 +304,21 @@ def get_child_type(site: site_.Site, key: site_.SiteSegment, ctx: StorageContext
     return get_node_type(child_site, ctx)
 
 
+def _child_scan_options(site: site_.Site) -> StorageScanOptions:
+    """Build scan options for iterating direct children of a site.
+
+    Returns StorageScanOptions with PrefixFilter (break on prefix mismatch)
+    and LengthFilter (only direct children, not deeper descendants).
+    """
+    prefix = PrefixFilter(prefix=site)
+    child_len = LengthFilter(length=len(site) + 1)
+    return StorageScanOptions(
+        start=site,
+        break_filter=prefix,
+        filter=prefix & child_len,
+    )
+
+
 def iter_child_keys(
     site: site_.Site,
     ctx: StorageContextType,
@@ -311,16 +346,7 @@ def iter_child_keys(
     if validate:
         validate_is_container(site, ctx)
 
-    # Direct children: prefix match + length = parent + 1
-    prefix = PrefixFilter(prefix=site)
-    child_len = LengthFilter(length=len(site) + 1)
-    scan_opts = StorageScanOptions(
-        start=site,
-        break_filter=prefix,
-        filter=prefix & child_len,
-    )
-
-    for key in require_read_context(ctx).scan(scan_opts).keys():
+    for key in require_read_context(ctx).scan(_child_scan_options(site)).keys():
         yield key[-1]
 
 
@@ -347,16 +373,7 @@ def iter_child_values(
     if validate:
         validate_is_container(site, ctx)
 
-    # Direct children: prefix match + length = parent + 1
-    prefix = PrefixFilter(prefix=site)
-    child_len = LengthFilter(length=len(site) + 1)
-    scan_opts = StorageScanOptions(
-        start=site,
-        break_filter=prefix,
-        filter=prefix & child_len,
-    )
-
-    for key, value in require_read_context(ctx).scan(scan_opts).items():
+    for key, value in require_read_context(ctx).scan(_child_scan_options(site)).items():
         yield get_node_info(key, ctx, raw_value=value)
 
 
@@ -383,16 +400,7 @@ def iter_children(
     if validate:
         validate_is_container(site, ctx)
 
-    # Direct children: prefix match + length = parent + 1
-    prefix = PrefixFilter(prefix=site)
-    child_len = LengthFilter(length=len(site) + 1)
-    scan_opts = StorageScanOptions(
-        start=site,
-        break_filter=prefix,
-        filter=prefix & child_len,
-    )
-
-    for key, value in require_read_context(ctx).scan(scan_opts).items():
+    for key, value in require_read_context(ctx).scan(_child_scan_options(site)).items():
         yield (key[-1], get_node_info(key, ctx, raw_value=value))
 
 
@@ -419,16 +427,8 @@ def count_children(
     if validate:
         validate_is_container(site, ctx)
 
-    # Direct children: prefix match + length = parent + 1
-    prefix = PrefixFilter(prefix=site)
-    child_len = LengthFilter(length=len(site) + 1)
-    scan_opts = StorageScanOptions(
-        start=site,
-        break_filter=prefix,
-        filter=prefix & child_len,
-    )
     counter = 0
-    for _ in require_read_context(ctx).scan(scan_opts).keys():
+    for _ in require_read_context(ctx).scan(_child_scan_options(site)).keys():
         counter += 1
     return counter
 
@@ -476,6 +476,7 @@ def put_child_primitive(
     value: Value,
     ctx: StorageContextType,
     validate: bool = True,
+    validate_parent: bool = True,
 ) -> None:
     """Put primitive child value.
 
@@ -486,11 +487,15 @@ def put_child_primitive(
         key: Child key
         value: Primitive value
         ctx: Storage context (transaction)
-        validate: If True, validate parent is a container (default True)
+        validate: If True, check child isn't already a container (default True)
+        validate_parent: If True, validate parent is a container (default True).
+            Set to False when the caller has already ensured the parent exists
+            (e.g. via ensure_created()).
 
     Raises:
-        ContainerNotFoundError: If parent doesn't exist
-        ContainerTypeError: If parent is not a container or child is a container
+        ContainerNotFoundError: If parent doesn't exist (when validate_parent=True)
+        ContainerTypeError: If parent is not a container (when validate_parent=True)
+            or child is a container (when validate=True)
         StorageInterfaceError: If context doesn't support required operations
 
     Example:
@@ -498,16 +503,16 @@ def put_child_primitive(
         >>> get_child_primitive(("users",), "alice", tx)
         {"name": "Alice", "age": 30}
     """
-    if validate:
+    if validate_parent:
         validate_is_container(parent_site, ctx)
 
-        child_site = (*parent_site, key)
-        child_node_info = get_node_info(child_site, ctx)
+    child_site = (*parent_site, key)
 
+    if validate:
+        child_node_info = get_node_info(child_site, ctx)
         if child_node_info.exists:
             validate_is_primitive(child_site, ctx, node_type=child_node_info.node_type)
 
-    child_site = (*parent_site, key)
     require_write_context(ctx).put(child_site, value)
 
     logger.debug(
@@ -520,40 +525,51 @@ def put_child_primitive(
     )
 
 
+def put_child_primitive_unsafe(
+    parent_site: site_.Site,
+    key: site_.SiteSegment,
+    value: Value,
+    ctx: StorageContextType,
+) -> None:
+    """Put primitive child value — raw ctx.put(), no validation.
+
+    The caller must guarantee:
+    - Parent container chain exists
+    - Child is a primitive (not a container)
+
+    Args:
+        parent_site: Parent container site
+        key: Child key
+        value: Primitive value
+        ctx: Storage context (transaction)
+    """
+    child_site = (*parent_site, key)
+    require_write_context(ctx).put(child_site, value)
+
+
 def get_child_primitive(
     parent_site: site_.Site,
     key: site_.SiteSegment,
     ctx: StorageContextType,
-    validate: bool = False,
 ) -> Value | Empty:
-    """Get primitive child value.
+    """Get primitive child value with validation.
+
+    Parses markers and asserts child is a primitive (not a container).
+    No parent validation — reads don't affect container integrity.
 
     Args:
         parent_site: Parent container site
         key: Child key
         ctx: Storage context (transaction, snapshot or write batch)
-        validate: If True, validate parent is a container and child is
-            a primitive via get_node_info + marker parsing (default False).
-            When False, performs a raw storage read — no marker parsing,
-            no type checks. Safe when the caller knows the child is a
-            primitive (e.g. typed Shape refs).
 
     Returns:
         Primitive value or EMPTY if child doesn't exist
 
     Raises:
-        ContainerNotFoundError: If parent doesn't exist (when validate=True)
-        ContainerTypeError: If parent is not a container or child is a container (when validate=True)
+        ContainerTypeError: If child is a container
         StorageInterfaceError: If context doesn't support read access
     """
     child_site = (*parent_site, key)
-
-    if not validate:
-        # Raw read — skip get_node_info and marker parsing
-        return cast("Value", require_read_context(ctx).get(child_site))
-
-    validate_is_container(parent_site, ctx)
-
     child_node_info = get_node_info(child_site, ctx)
 
     if not child_node_info.exists:
@@ -562,6 +578,28 @@ def get_child_primitive(
     validate_is_primitive(child_site, ctx, node_type=child_node_info.node_type)
 
     return cast("Value", child_node_info.primitive_value)
+
+
+def get_child_primitive_unsafe(
+    parent_site: site_.Site,
+    key: site_.SiteSegment,
+    ctx: StorageContextType,
+) -> Value | Empty:
+    """Get primitive child value — raw ctx.get(), no validation.
+
+    No marker parsing, no type checks. The caller must know the child
+    is a primitive.
+
+    Args:
+        parent_site: Parent container site
+        key: Child key
+        ctx: Storage context (transaction, snapshot or write batch)
+
+    Returns:
+        Raw value or EMPTY if child doesn't exist
+    """
+    child_site = (*parent_site, key)
+    return cast("Value", require_read_context(ctx).get(child_site))
 
 
 def delete_child(
@@ -611,6 +649,47 @@ def delete_child(
     )
 
 
+def delete_child_primitive_unsafe(
+    parent_site: site_.Site,
+    key: site_.SiteSegment,
+    ctx: StorageContextType,
+) -> None:
+    """Delete primitive child value — raw ctx.delete(), no validation.
+
+    Single ctx.delete() — no parent validation, no get_node_info,
+    no descendant cleanup. The caller must know the child is a primitive.
+
+    For validated deletes that handle both primitives and containers
+    (including subtree cleanup), use delete_child() instead.
+
+    Args:
+        parent_site: Parent container site
+        key: Child key
+        ctx: Storage context (transaction)
+    """
+    child_site = (*parent_site, key)
+    require_write_context(ctx).delete(child_site)
+
+
+def iter_child_primitive_values(
+    site: site_.Site,
+    ctx: StorageContextType,
+) -> Generator[object, None, None]:
+    """Iterate over direct primitive child values.
+
+    Raw storage scan — no marker parsing, no type checks.
+    The caller must know all children are primitives.
+
+    Args:
+        site: Container site
+        ctx: Storage context (transaction, snapshot or write batch)
+
+    Yields:
+        Raw primitive values
+    """
+    yield from require_read_context(ctx).scan(_child_scan_options(site)).values()
+
+
 def clear_children(
     site: site_.Site,
     ctx: StorageContextType,
@@ -638,6 +717,24 @@ def clear_children(
         delete_child(site, key, ctx)
 
     logger.debug("Children cleared", extra={"site": site})
+
+
+def clear_children_primitives_unsafe(
+    site: site_.Site,
+    ctx: StorageContextType,
+) -> None:
+    """Delete all direct primitive children.
+
+    Raw scan + ctx.delete() each — no validation, no descendant cleanup.
+    The caller must know all children are primitives.
+
+    Args:
+        site: Container site
+        ctx: Storage context (transaction)
+    """
+    wctx = require_write_context(ctx)
+    for key in require_read_context(ctx).scan(_child_scan_options(site)).keys():
+        wctx.delete(key)
 
 
 # ============================================================================

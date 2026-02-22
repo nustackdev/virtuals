@@ -18,6 +18,8 @@ from pv.types import Empty, Value, is_empty
 
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from pv.container.types import NodeInfo
     from pv.loc import site as site_
     from pv.view import View, ViewRegistry
@@ -27,11 +29,10 @@ __all__ = [
     "ChildNavigationBase",
     "ChildNestedGetBase",
     "ChildNestedSetBase",
-    "ChildPrimitiveGetBase",
     "ChildPrimitiveSetBase",
-    "ChildPrimitiveUnsafeSetBase",
     "LiveChildrenCountBase",
     "MetadataBasedChildrenCountBase",
+    "UnsafePrimitiveOpsBase",
 ]
 
 logger = getLogger(__name__)
@@ -402,35 +403,6 @@ class ChildNestedSetBase:
         child_view.store(value)
 
 
-class ChildPrimitiveGetBase:
-    """Base for reading primitive child values without marker parsing.
-
-    Provides _get_primitive() which performs a raw storage read —
-    no get_node_info, no marker parsing, no type checks, no Empty check.
-    Returns whatever the storage returns directly.
-
-    Safe when the caller knows the child is a primitive
-    (e.g. typed Shape refs where the schema guarantees field types).
-    """
-
-    container: Container
-
-    def _get_primitive(self, address: site_.SiteSegment) -> object:
-        """Get primitive child value via raw storage read.
-
-        Skips all overhead — single ctx.get() call. The caller must
-        know the child is a primitive and exists.
-
-        Args:
-            address: Child address
-
-        Returns:
-            Primitive value
-        """
-        child_site = (*self.container.site, address)
-        return self.container.ctx.get(child_site)  # type: ignore
-
-
 class ChildPrimitiveSetBase:
     """Base for setting primitive child values with validation.
 
@@ -444,37 +416,81 @@ class ChildPrimitiveSetBase:
         """Set primitive child value with validation.
 
         Materializes the container chain via ensure_created(), then writes
-        the primitive value with standard validation reads.
+        the primitive value. Parent validation is skipped (already ensured),
+        but child type is still checked.
 
         Args:
             address: Child address
             value: Primitive value to store
         """
         self.ensure_created()  # type: ignore[attr-defined]
-        self.container.put_child_primitive(address, cast("Value", value))
+        self.container.put_child_primitive(address, cast("Value", value), validate_parent=False)
 
 
-class ChildPrimitiveUnsafeSetBase:
-    """Base for setting primitive child values without validation reads.
+class UnsafePrimitiveOpsBase:
+    """Unsafe primitive operations — Layer 3 of the three-layer architecture.
 
-    Provides _set_primitive_unsafe() which materializes the container chain
-    but skips the 2 validation storage reads (validate_is_container on parent
-    and get_node_info on child).
+    Provides raw storage access bypassing all validation. This is the
+    "unsafe primitive" layer, complementing:
+    - Layer 1 (General): handles any child type via get_node_info
+    - Layer 2 (Primitive validated): validates parent + asserts primitive
+
+    Read/write/delete go directly to ctx (single get/put/delete call),
+    duplicating the logic from container_ops unsafe variants. This
+    intentional duplication avoids function call overhead on hot paths.
+
+    Scan/clear delegate to container methods which hold the scan filter
+    logic (PrefixFilter + LengthFilter setup).
+
+    The caller must guarantee:
+    - The container chain exists (e.g. via InitCmd / ensure_created)
+    - Children are primitives (no nested containers)
+
+    Methods:
+        _unsafe_primitive_read(address)                        — ctx.get()
+        _unsafe_primitive_write(address, ensure_exists=False)  — ctx.put()
+        _unsafe_primitive_delete(address)                      — ctx.delete()
+        _unsafe_primitive_scan_values()                        — container.iter_child_primitive_values()
+        _unsafe_primitive_clear()                              — container.clear_children_primitives_unsafe()
     """
 
     container: Container
 
-    def _set_primitive_unsafe(self, address: site_.SiteSegment, value: object) -> None:
-        """Set primitive child value without validation or container checks.
+    def _unsafe_primitive_read(self, address: site_.SiteSegment) -> object:
+        """Read primitive child — single ctx.get() call."""
+        child_site = (*self.container.site, address)
+        return self.container.ctx.get(child_site)  # type: ignore
 
-        Single ctx.put() call — no ensure_created, no validation reads,
-        no function call chain. The caller must guarantee the container
-        chain already exists (e.g. via fetch_parent() which triggers
-        ensure_created() during navigation).
+    def _unsafe_primitive_write(
+        self, address: site_.SiteSegment, value: object, *, ensure_exists: bool = False
+    ) -> None:
+        """Write primitive child — single ctx.put() call.
 
         Args:
             address: Child address
             value: Primitive value to store
+            ensure_exists: If True, calls ensure_created() before writing
+                to guarantee the container chain exists. Dangerous but less
+                dangerous than the default (which skips even that).
         """
+        if ensure_exists:
+            self.ensure_created()  # type: ignore[attr-defined]
         child_site = (*self.container.site, address)
         self.container.ctx.put(child_site, value)  # type: ignore
+
+    def _unsafe_primitive_delete(self, address: site_.SiteSegment) -> None:
+        """Delete primitive child — single ctx.delete() call."""
+        child_site = (*self.container.site, address)
+        self.container.ctx.delete(child_site)  # type: ignore
+
+    def _unsafe_primitive_scan_values(self) -> Generator[object, None, None]:
+        """Scan all direct primitive child values — raw storage scan.
+
+        Yields:
+            Raw primitive values
+        """
+        yield from self.container.iter_child_primitive_values()
+
+    def _unsafe_primitive_clear(self) -> None:
+        """Delete all direct primitive children — scan + delete each."""
+        self.container.clear_children_primitives_unsafe()
