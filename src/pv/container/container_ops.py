@@ -532,20 +532,28 @@ def get_child_primitive(
         parent_site: Parent container site
         key: Child key
         ctx: Storage context (transaction, snapshot or write batch)
-        validate: If True, validate parent is a container (default False)
+        validate: If True, validate parent is a container and child is
+            a primitive via get_node_info + marker parsing (default False).
+            When False, performs a raw storage read — no marker parsing,
+            no type checks. Safe when the caller knows the child is a
+            primitive (e.g. typed Shape refs).
 
     Returns:
         Primitive value or EMPTY if child doesn't exist
 
     Raises:
-        ContainerNotFoundError: If parent doesn't exist
-        ContainerTypeError: If parent is not a container or child is a container
+        ContainerNotFoundError: If parent doesn't exist (when validate=True)
+        ContainerTypeError: If parent is not a container or child is a container (when validate=True)
         StorageInterfaceError: If context doesn't support read access
     """
-    if validate:
-        validate_is_container(parent_site, ctx)
-
     child_site = (*parent_site, key)
+
+    if not validate:
+        # Raw read — skip get_node_info and marker parsing
+        return cast("Value", require_read_context(ctx).get(child_site))
+
+    validate_is_container(parent_site, ctx)
+
     child_node_info = get_node_info(child_site, ctx)
 
     if not child_node_info.exists:

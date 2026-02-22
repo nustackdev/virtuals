@@ -27,6 +27,7 @@ __all__ = [
     "ChildNavigationBase",
     "ChildNestedGetBase",
     "ChildNestedSetBase",
+    "ChildPrimitiveGetBase",
     "ChildPrimitiveSetBase",
     "ChildPrimitiveUnsafeSetBase",
     "LiveChildrenCountBase",
@@ -401,6 +402,35 @@ class ChildNestedSetBase:
         child_view.store(value)
 
 
+class ChildPrimitiveGetBase:
+    """Base for reading primitive child values without marker parsing.
+
+    Provides _get_primitive() which performs a raw storage read —
+    no get_node_info, no marker parsing, no type checks, no Empty check.
+    Returns whatever the storage returns directly.
+
+    Safe when the caller knows the child is a primitive
+    (e.g. typed Shape refs where the schema guarantees field types).
+    """
+
+    container: Container
+
+    def _get_primitive(self, address: site_.SiteSegment) -> object:
+        """Get primitive child value via raw storage read.
+
+        Skips all overhead — single ctx.get() call. The caller must
+        know the child is a primitive and exists.
+
+        Args:
+            address: Child address
+
+        Returns:
+            Primitive value
+        """
+        child_site = (*self.container.site, address)
+        return self.container.ctx.get(child_site)  # type: ignore
+
+
 class ChildPrimitiveSetBase:
     """Base for setting primitive child values with validation.
 
@@ -437,13 +467,14 @@ class ChildPrimitiveUnsafeSetBase:
     def _set_primitive_unsafe(self, address: site_.SiteSegment, value: object) -> None:
         """Set primitive child value without validation or container checks.
 
-        Directly writes the primitive value skipping both ensure_created()
-        and validation reads. The caller must guarantee the container chain
-        already exists (e.g. via fetch_parent() which triggers
+        Single ctx.put() call — no ensure_created, no validation reads,
+        no function call chain. The caller must guarantee the container
+        chain already exists (e.g. via fetch_parent() which triggers
         ensure_created() during navigation).
 
         Args:
             address: Child address
             value: Primitive value to store
         """
-        self.container.put_child_primitive(address, cast("Value", value), validate=False)
+        child_site = (*self.container.site, address)
+        self.container.ctx.put(child_site, value)  # type: ignore

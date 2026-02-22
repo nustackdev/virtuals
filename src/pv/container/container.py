@@ -372,21 +372,29 @@ class Container:
         """
         container_ops.put_child_primitive(self.site, key, value, self.ctx, validate=validate)
 
-    def get_child_primitive(self, key: site_.SiteSegment) -> Value | Empty:
+    def get_child_primitive(
+        self,
+        key: site_.SiteSegment,
+        *,
+        validate: bool = True,
+    ) -> Value | Empty:
         """Get primitive child value.
 
         Args:
             key: Child key
+            validate: If True, parse marker and validate node type
+                (default True). Set to False for a raw storage read
+                when the caller knows the child is a primitive.
 
         Returns:
             Primitive value or EMPTY if doesn't exist
 
         Raises:
-            ContainerNotFoundError: If this container doesn't exist
-            ContainerTypeError: If this is not a container, or if child is a container
+            ContainerNotFoundError: If this container doesn't exist (when validate=True)
+            ContainerTypeError: If this is not a container, or if child is a container (when validate=True)
             StorageInterfaceError: If context doesn't support reads
         """
-        return container_ops.get_child_primitive(self.site, key, self.ctx)
+        return container_ops.get_child_primitive(self.site, key, self.ctx, validate=validate)
 
     # ========================================================================
     # CHILDREN: DELETE (Write operations)
