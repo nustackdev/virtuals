@@ -10,7 +10,7 @@ Tests container creation, deletion, and descendant operations:
 import pytest
 from tkv.tkv.storage import TransactionProtocol
 
-from pv.container import (
+from virtuals.container import (
     ContainerExistsError,
     ContainerProtocol,
     ContainerStructure,
@@ -24,7 +24,7 @@ from pv.container import (
     node_exists,
     put_child_primitive,
 )
-from pv.container.types import NodeType
+from virtuals.container.types import NodeType
 
 
 # ============================================================================

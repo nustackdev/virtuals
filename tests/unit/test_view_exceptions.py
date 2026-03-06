@@ -9,7 +9,7 @@ Tests:
 
 import pytest
 
-from pv.view import ViewError, ViewOperationError, ViewRegistryError
+from virtuals.view import ViewError, ViewOperationError, ViewRegistryError
 
 
 # =============================================================================

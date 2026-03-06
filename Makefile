@@ -106,7 +106,7 @@ test-verbose:
 
 test-cov:
 	@echo "$(BLUE)Running tests with coverage...$(NC)"
-	pytest $(TEST_DIR) --cov=pv --cov-report=html:tests/reports/coverage --cov-report=term-missing --cov-branch
+	pytest $(TEST_DIR) --cov=virtuals --cov-report=html:tests/reports/coverage --cov-report=term-missing --cov-branch
 	@echo "$(GREEN)Coverage report: tests/reports/coverage/index.html$(NC)"
 
 test-watch:
@@ -119,18 +119,18 @@ test-watch:
 
 lint:
 	@echo "$(BLUE)Running linters...$(NC)"
-	ruff check $(SRC_DIR)/pv $(TEST_DIR)
+	ruff check $(SRC_DIR)/virtuals $(TEST_DIR)
 
 format:
 	@echo "$(BLUE)Formatting code...$(NC)"
-	ruff format $(SRC_DIR)/pv $(TEST_DIR)
-	ruff check --fix $(SRC_DIR)/pv $(TEST_DIR)
+	ruff format $(SRC_DIR)/virtuals $(TEST_DIR)
+	ruff check --fix $(SRC_DIR)/virtuals $(TEST_DIR)
 	@echo "$(GREEN)Code formatted$(NC)"
 
 format-check:
 	@echo "$(BLUE)Checking code format...$(NC)"
-	ruff format --check $(SRC_DIR)/pv $(TEST_DIR)
-	ruff check $(SRC_DIR)/pv $(TEST_DIR)
+	ruff format --check $(SRC_DIR)/virtuals $(TEST_DIR)
+	ruff check $(SRC_DIR)/virtuals $(TEST_DIR)
 
 pre-commit: format lint test-fast
 	@echo ""
@@ -190,11 +190,11 @@ publish-test: check-dist
 	@echo "$(GREEN)Published to TestPyPI$(NC)"
 	@echo ""
 	@echo "Test installation:"
-	@echo "  pip install --index-url https://test.pypi.org/simple/ pv"
+	@echo "  pip install --index-url https://test.pypi.org/simple/ virtuals-py"
 
 publish: check-dist
 	@echo "$(YELLOW)Publishing to PyPI (are you sure?)$(NC)"
-	@echo "Package: pv"
+	@echo "Package: virtuals-py"
 	@echo "Version: $(shell grep '^version = ' pyproject.toml | cut -d'"' -f2)"
 	@echo ""
 	@read -p "Press Enter to continue or Ctrl+C to cancel..."
@@ -202,7 +202,7 @@ publish: check-dist
 	twine upload dist/*
 	@echo "$(GREEN)Published to PyPI!$(NC)"
 	@echo ""
-	@echo "Install with: pip install pv"
+	@echo "Install with: pip install virtuals-py"
 
 # ============================================================================
 # Cleanup

@@ -1,6 +1,6 @@
 """Unit tests for the _types module."""
 
-from pv.types import NOT_SET, NotSet, is_notset
+from virtuals.types import NOT_SET, NotSet, is_notset
 
 
 class TestNotSet:

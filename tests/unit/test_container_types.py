@@ -15,7 +15,7 @@ from tkv.tkv.storage import (
     WriteBatchProtocol,
 )
 
-from pv.container import (
+from virtuals.container import (
     DEFAULT_PARENT_PROTOCOL,
     DEFAULT_PARENT_STRUCTURE,
     ContainerProtocol,
@@ -31,7 +31,7 @@ from pv.container import (
     require_write_batch,
     require_write_context,
 )
-from pv.types import NOT_SET
+from virtuals.types import NOT_SET
 
 
 # ========================================================

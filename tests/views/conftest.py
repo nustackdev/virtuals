@@ -6,16 +6,16 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from pv._views import DictView
-from pv.codecs import NoOpCodec
-from pv.storages.mem import InMemoryStorage
+from virtuals._views import DictView
+from virtuals.codecs import NoOpCodec
+from virtuals.storages.mem import InMemoryStorage
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
-    from pv.tkv.storage import SnapshotProtocol, StorageProtocol, TransactionProtocol
-    from pv.view import View
+    from virtuals.tkv.storage import SnapshotProtocol, StorageProtocol, TransactionProtocol
+    from virtuals.view import View
 
 
 # =============================================================================
@@ -82,7 +82,7 @@ def dict_factory(root_view: DictView) -> Callable[[str, dict[str, Any] | None], 
     """
 
     def _create(address: str, data: dict | None = None) -> View:
-        from pv._views import DictView
+        from virtuals._views import DictView
 
         view = root_view.open_child(address, DictView)
         if data is not None:
@@ -105,7 +105,7 @@ def list_factory(root_view: DictView) -> Callable[[str, list[Any] | None], View]
     """
 
     def _create(address: str, data: list | None = None) -> View:
-        from pv._views import ListView
+        from virtuals._views import ListView
 
         view = root_view.open_child(address, ListView)
         if data is not None:
@@ -128,7 +128,7 @@ def set_factory(root_view: DictView) -> Callable[[str, set[Any] | None], View]:
     """
 
     def _create(address: str, data: set | None = None) -> View:
-        from pv._views import SetView
+        from virtuals._views import SetView
 
         view = root_view.open_child(address, SetView)
         if data is not None:
@@ -151,7 +151,7 @@ def tuple_factory(root_view: DictView) -> Callable[[str, tuple[Any, ...] | None]
     """
 
     def _create(address: str, data: tuple | None = None) -> View:
-        from pv._views import TupleView
+        from virtuals._views import TupleView
 
         view = root_view.open_child(address, TupleView)
         if data is not None:

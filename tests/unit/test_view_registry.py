@@ -11,8 +11,8 @@ from typing import ClassVar
 
 import pytest
 
-from pv.container import ContainerProtocol, ContainerStructure
-from pv.view import ViewBase, ViewRegistry, ViewRegistryError
+from virtuals.container import ContainerProtocol, ContainerStructure
+from virtuals.view import ViewBase, ViewRegistry, ViewRegistryError
 
 
 # =============================================================================
