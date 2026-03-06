@@ -1,10 +1,10 @@
-# pv
+# Virtuals
 
 ## Data Topology
 
 Here is a location, here is another location, here is the path between them. The locations can hold anything. The paths can traverse anything. The topology itself is the invariant.
 
-pv encodes data topology.
+Virtuals encodes data topology.
 
 ## Three Separations
 

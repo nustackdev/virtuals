@@ -3,10 +3,11 @@
 from collections.abc import Generator
 
 import pytest
-from tkv.codecs import NoOpCodec
-from tkv.observers.mem import InMemoryObserver
-from tkv.storages.mem import InMemoryStorage
-from tkv.tkv.storage import SnapshotProtocol, TransactionProtocol
+
+from virtuals.codecs import NoOpCodec
+from virtuals.observers.mem import InMemoryObserver
+from virtuals.storages.mem import InMemoryStorage
+from virtuals.tkv.storage import SnapshotProtocol, TransactionProtocol
 
 
 @pytest.fixture

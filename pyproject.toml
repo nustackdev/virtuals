@@ -9,9 +9,9 @@ build-backend = "setuptools.build_meta"
 # Project Metadata (PEP 621)
 # ============================================================================
 [project]
-name = "pv"
+name = "virtuals-py"
 version = "0.1.0"
-description = "Polymorphic Views for Key-Value stores. KV stores it. PV shapes it."
+description = "Virtual Python collections over any storage."
 readme = "README.md"
 license = "MIT"
 authors = [
@@ -49,20 +49,18 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "attrs",
-    "tkv>=0.2.0",
 ]
 
-[tool.uv.sources]
-tkv = { path = "../tkv", editable = true }
-
 [project.urls]
-Homepage = "https://github.com/everyabc/pv"
-Documentation = "https://github.com/everyabc/pv#readme"
-Repository = "https://github.com/everyabc/pv"
-Issues = "https://github.com/everyabc/pv/issues"
-Changelog = "https://github.com/everyabc/pv/releases"
+Homepage = "https://github.com/everyabc/virtuals"
+Documentation = "https://github.com/everyabc/virtuals#readme"
+Repository = "https://github.com/everyabc/virtuals"
+Issues = "https://github.com/everyabc/virtuals/issues"
+Changelog = "https://github.com/everyabc/virtuals/releases"
 
 [project.optional-dependencies]
+rocksdb = ["rdbpython"]
+lmdb = ["lmdb"]
 
 # Development tools
 dev = [
@@ -82,7 +80,7 @@ test = [
 
 # All development dependencies
 all = [
-    "pv[dev,test]",
+    "virtuals-py[dev,test]",
 ]
 
 # ============================================================================
@@ -90,7 +88,7 @@ all = [
 # ============================================================================
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["pv*"]
+include = ["virtuals*"]
 namespaces = false
 
 # =============================================================
@@ -198,7 +196,7 @@ convention = "google"  # Use Google style format
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["pv"]
+known-first-party = ["virtuals"]
 force-single-line = false
 lines-after-imports = 2
 

@@ -2,7 +2,7 @@
 
 import pytest
 
-from pv.container.exceptions import (
+from virtuals.container.exceptions import (
     ContainerCollisionError,
     ContainerError,
     ContainerExistsError,

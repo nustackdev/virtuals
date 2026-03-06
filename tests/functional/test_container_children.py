@@ -8,9 +8,8 @@ Tests container child manipulation operations:
 """
 
 import pytest
-from tkv.tkv.storage import TransactionProtocol
 
-from pv.container import (
+from virtuals.container import (
     ContainerNotFoundError,
     ContainerProtocol,
     ContainerStructure,
@@ -27,9 +26,10 @@ from pv.container import (
     node_exists,
     put_child_primitive,
 )
-from pv.container.container_ops import get_child_primitive
-from pv.container.types import NodeType
-from pv.types import EMPTY
+from virtuals.container.container_ops import get_child_primitive
+from virtuals.container.types import NodeType
+from virtuals.tkv.storage import TransactionProtocol
+from virtuals.types import EMPTY
 
 
 # ============================================================================

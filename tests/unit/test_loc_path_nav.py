@@ -9,7 +9,7 @@ Tests the core path manipulation functions without requiring View objects:
 - last_segment: gets last segment
 """
 
-from pv.loc.path import (
+from virtuals.loc.path import (
     build_value_path,
     build_view_path,
     last_segment,
