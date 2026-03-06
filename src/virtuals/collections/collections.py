@@ -1,7 +1,7 @@
 """Collection protocol hierarchy.
 
 This module defines collection protocols composed from atomic capabilities.
-Follows Python's collections.abc hierarchy while using PV's capability system.
+Follows Python's collections.abc hierarchy while using Virtuals' capability system.
 
 Protocol Hierarchy:
     Container → Collection → Sequence/Mapping/Set

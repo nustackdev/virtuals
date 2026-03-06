@@ -1,7 +1,4 @@
-"""PV - Polymorphic Views for Key-Value stores.
-
-KV stores it. PV shapes it.
-"""
+"""Virtuals - Virtual Python collections over any storage."""
 
 from __future__ import annotations
 

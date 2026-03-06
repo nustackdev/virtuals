@@ -1,7 +1,4 @@
-"""PV types module.
-
-This module defines the primitive types and special values.
-"""
+"""Virtuals TKV types module."""
 
 from __future__ import annotations
 
