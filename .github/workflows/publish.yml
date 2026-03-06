@@ -1,0 +1,111 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - 'codec-v*'  # e.g. codec-v0.1.0
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (skip actual upload)'
+        required: false
+        default: false
+        type: boolean
+
+defaults:
+  run:
+    working-directory: lib/binary-codec
+
+jobs:
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cibw_archs: "x86_64"
+          - os: macos-15-intel
+            cibw_archs: "x86_64"
+          - os: macos-15
+            cibw_archs: "arm64"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22
+        with:
+          package-dir: lib/binary-codec
+        env:
+          CIBW_ARCHS: ${{ matrix.cibw_archs }}
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.cibw_archs }}
+          path: ./wheelhouse/*.whl
+          retention-days: 1
+
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --sdist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: lib/binary-codec/dist/*.tar.gz
+          retention-days: 1
+
+  publish:
+    name: Publish to PyPI
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/virtuals-binary-codec/
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List distributions
+        run: |
+          ls -lh dist/
+          echo "Wheels: $(ls -1 dist/*.whl 2>/dev/null | wc -l)"
+          echo "Sdist: $(ls -1 dist/*.tar.gz 2>/dev/null | wc -l)"
+
+      - name: Publish to PyPI
+        if: ${{ !inputs.dry_run }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+          verbose: true
+
+      - name: Dry run
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "DRY RUN - Skipping PyPI upload"
+          echo "Would upload:"
+          ls -lh dist/

@@ -1,1 +1,6 @@
-"""Optimized binary codec for key encoding/decoding."""
+"""Cython-optimized binary key codec."""
+
+from virtuals_binary_codec import BinaryKeyCodec
+
+
+__all__ = ["BinaryKeyCodec"]

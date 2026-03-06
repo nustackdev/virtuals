@@ -21,9 +21,10 @@ help:
 	@echo "$(GREEN)Setup:$(NC)"
 	@echo "  make install-uv      - Install uv package manager"
 	@echo "  make install         - Create venv + install dependencies"
-	@echo "  make dev             - Full dev setup (install + test)"
+	@echo "  make dev             - Full dev setup (install + build + test)"
 	@echo ""
 	@echo "$(GREEN)Development:$(NC)"
+	@echo "  make build-codecs    - Build Cython binary codec extension"
 	@echo "  make test            - Run all tests"
 	@echo "  make test-cov        - Run tests with coverage report"
 	@echo ""
@@ -76,7 +77,7 @@ install: check-uv
 	@echo ""
 	@echo "Activate with: source .venv/bin/activate"
 
-dev: install test
+dev: install build-codecs test
 	@echo ""
 	@echo "$(GREEN)Development environment ready!$(NC)"
 	@echo ""
@@ -84,6 +85,15 @@ dev: install test
 	@echo "  1. source .venv/bin/activate"
 	@echo "  2. pre-commit install"
 	@echo "  3. make lock"
+
+# ============================================================================
+# Build
+# ============================================================================
+
+build-codecs:
+	@echo "$(BLUE)Building Cython binary codec...$(NC)"
+	cd lib/binary-codec && pip install -e ".[dev]" && $(PYTHON) setup.py build_ext --inplace
+	@echo "$(GREEN)Binary codec built$(NC)"
 
 # ============================================================================
 # Testing

@@ -33,7 +33,7 @@ Example usage:
 
 from __future__ import annotations
 
-from .binary.binary_codec import BinaryKeyCodec
+from .binary import BinaryKeyCodec
 from .binary_py.binary_codec import PyBinaryKeyCodec
 from .exceptions import (
     DecodeError,

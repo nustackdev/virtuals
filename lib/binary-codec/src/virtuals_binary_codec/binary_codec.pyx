@@ -12,7 +12,7 @@ from libc.string cimport memcpy
 from cpython.bytes cimport PyBytes_FromStringAndSize, PyBytes_AS_STRING, PyBytes_GET_SIZE
 from cpython.unicode cimport PyUnicode_AsUTF8String, PyUnicode_DecodeUTF8
 
-from ..exceptions import (
+from .exceptions import (
     IntegerOverflowError,
     EncodeError,
     DecodeError,
@@ -94,7 +94,7 @@ cdef inline Py_ssize_t count_null_bytes(const unsigned char* data, Py_ssize_t le
 
 
 cdef inline Py_ssize_t copy_with_escape(unsigned char* dest, const unsigned char* src, Py_ssize_t length) noexcept nogil:
-    """Copy source to dest, escaping null bytes (\x00 -> \x00\xff).
+    r"""Copy source to dest, escaping null bytes (\x00 -> \x00\xff).
 
     Returns the number of bytes written to dest.
     """

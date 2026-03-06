@@ -59,6 +59,7 @@ Issues = "https://github.com/everyabc/virtuals/issues"
 Changelog = "https://github.com/everyabc/virtuals/releases"
 
 [project.optional-dependencies]
+binary = ["virtuals-binary-codec"]
 rocksdb = ["rdbpython"]
 lmdb = ["lmdb"]
 

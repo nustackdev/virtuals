@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import pytest
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
+from virtuals_binary_codec import exceptions as _cython_exc
 
 from virtuals._backends.key_codecs import BinaryKeyCodec, PyBinaryKeyCodec, StringKeyCodec
 from virtuals._backends.key_codecs.exceptions import (
@@ -18,6 +19,13 @@ from virtuals._backends.key_codecs.exceptions import (
     EncodeError,
     IntegerOverflowError,
 )
+
+
+# Cython binary codec has its own exception hierarchy.
+# Combine both so pytest.raises catches either.
+AnyEncodeError = (EncodeError, _cython_exc.EncodeError)
+AnyDecodeError = (DecodeError, _cython_exc.DecodeError)
+AnyIntegerOverflowError = (IntegerOverflowError, _cython_exc.IntegerOverflowError)
 
 
 if TYPE_CHECKING:
@@ -313,42 +321,42 @@ class TestEncodeErrors:
 
     def test_empty_tuple_rejected(self, codec: KeyCodecProtocol) -> None:
         """Empty tuple is rejected."""
-        with pytest.raises(EncodeError):
+        with pytest.raises(AnyEncodeError):
             codec.encode(())
 
     def test_none_rejected(self, codec: KeyCodecProtocol) -> None:
         """None as key is rejected."""
-        with pytest.raises((EncodeError, TypeError, AttributeError)):
+        with pytest.raises((*AnyEncodeError, TypeError, AttributeError)):
             codec.encode(None)  # type: ignore
 
     def test_list_rejected(self, codec: KeyCodecProtocol) -> None:
         """List instead of tuple is rejected."""
-        with pytest.raises((EncodeError, TypeError, AttributeError)):
+        with pytest.raises((*AnyEncodeError, TypeError, AttributeError)):
             codec.encode(["a", "b"])  # type: ignore
 
     def test_float_component_rejected(self, codec: KeyCodecProtocol) -> None:
         """Float component is rejected."""
-        with pytest.raises(EncodeError):
+        with pytest.raises(AnyEncodeError):
             codec.encode((3.14,))  # type: ignore
 
     def test_none_component_rejected(self, codec: KeyCodecProtocol) -> None:
         """None component is rejected."""
-        with pytest.raises(EncodeError):
+        with pytest.raises(AnyEncodeError):
             codec.encode((None,))  # type: ignore
 
     def test_nested_tuple_rejected(self, codec: KeyCodecProtocol) -> None:
         """Nested tuple component is rejected."""
-        with pytest.raises(EncodeError):
+        with pytest.raises(AnyEncodeError):
             codec.encode((("nested",),))  # type: ignore
 
     def test_dict_component_rejected(self, codec: KeyCodecProtocol) -> None:
         """Dict component is rejected."""
-        with pytest.raises(EncodeError):
+        with pytest.raises(AnyEncodeError):
             codec.encode(({"key": "value"},))  # type: ignore
 
     def test_bytes_component_rejected(self, codec: KeyCodecProtocol) -> None:
         """Bytes component is rejected (strings only, not bytes)."""
-        with pytest.raises(EncodeError):
+        with pytest.raises(AnyEncodeError):
             codec.encode((b"bytes",))  # type: ignore
 
 
@@ -406,9 +414,9 @@ class TestBinaryCodecIntegerBoundaries:
 
     def test_int64_overflow_rejected(self, binary_codec) -> None:
         """Values outside int64 range are rejected."""
-        with pytest.raises(IntegerOverflowError):
+        with pytest.raises(AnyIntegerOverflowError):
             binary_codec.encode((2**63,))  # max + 1
-        with pytest.raises(IntegerOverflowError):
+        with pytest.raises(AnyIntegerOverflowError):
             binary_codec.encode((-(2**63) - 1,))  # min - 1
 
     def test_int64_ordering_at_boundaries(self, binary_codec) -> None:
@@ -445,25 +453,25 @@ class TestDecodeErrors:
 
     def test_empty_bytes_rejected(self, binary_codec) -> None:
         """Empty bytes is rejected."""
-        with pytest.raises(DecodeError):
+        with pytest.raises(AnyDecodeError):
             binary_codec.decode(b"")
 
     def test_invalid_type_marker_rejected(self, binary_codec) -> None:
         """Invalid type marker is rejected."""
         # 0x03 is not a valid type marker (only 0x01 and 0x02 are)
-        with pytest.raises(DecodeError):
+        with pytest.raises(AnyDecodeError):
             binary_codec.decode(b"\x03test\x00")
 
     def test_truncated_integer_rejected(self, binary_codec) -> None:
         """Truncated integer (less than 8 bytes) is rejected."""
         # Type marker for int (0x01) followed by only 4 bytes
-        with pytest.raises(DecodeError):
+        with pytest.raises(AnyDecodeError):
             binary_codec.decode(b"\x01\x00\x00\x00\x00")
 
     def test_missing_terminator_rejected(self, binary_codec) -> None:
         """Missing terminator is rejected."""
         # Valid string but no terminator
-        with pytest.raises(DecodeError):
+        with pytest.raises(AnyDecodeError):
             binary_codec.decode(b"\x02test")
 
     def test_random_bytes_rejected(self, binary_codec) -> None:
@@ -485,7 +493,7 @@ class TestDecodeErrors:
             # Garbage should either fail to decode or produce some output (no crashes)
             try:
                 binary_codec.decode(garbage)
-            except DecodeError:
+            except AnyDecodeError:
                 pass  # Expected - invalid data rejected
 
 

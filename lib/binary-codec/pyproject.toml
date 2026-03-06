@@ -1,0 +1,94 @@
+# ============================================================================
+# Build System
+# ============================================================================
+[build-system]
+requires = ["setuptools>=68.0", "wheel", "Cython>=3.0"]
+build-backend = "setuptools.build_meta"
+
+# ============================================================================
+# Project Metadata (PEP 621)
+# ============================================================================
+[project]
+name = "virtuals-binary-codec"
+version = "0.1.0"
+description = "Cython-optimized binary key codec for Virtuals."
+readme = "README.md"
+license = "MIT"
+authors = [
+    {name = "Gor Arakelyan", email = "gorarkln@gmail.com"}
+]
+keywords = [
+    "virtuals",
+    "codec",
+    "binary",
+    "cython",
+    "key-value",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Cython",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/everyabc/virtuals"
+Repository = "https://github.com/everyabc/virtuals"
+Issues = "https://github.com/everyabc/virtuals/issues"
+
+[project.optional-dependencies]
+dev = [
+    "Cython>=3.0.0",
+    "setuptools>=68.0",
+]
+test = [
+    "pytest>=7.0.0",
+]
+
+# ============================================================================
+# Package Discovery
+# ============================================================================
+[tool.setuptools]
+zip-safe = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["virtuals_binary_codec*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+virtuals_binary_codec = [
+    "*.pyx",
+    "*.pxd",
+    "*.pyi",
+    "py.typed",
+]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["*.c", "*.cpp"]
+
+# ============================================================================
+# cibuildwheel
+# ============================================================================
+[tool.cibuildwheel]
+build = ["cp310-*", "cp311-*", "cp312-*", "cp313-*"]
+
+skip = [
+    "*-musllinux_*",
+    "*-win32",
+    "*-manylinux_i686",
+]
+
+build-verbosity = 1
+
+test-command = "python -c \"from virtuals_binary_codec import BinaryKeyCodec; c = BinaryKeyCodec(); assert c.decode(c.encode(('test', 42))) == ('test', 42); print('ok')\""
+test-requires = ["pytest"]
