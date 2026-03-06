@@ -45,8 +45,8 @@ class TestViewError:
         exc = ViewError()
         assert str(exc) == ""
 
-    def test_inherits_from_pv_error(self) -> None:
-        """Test that ViewError inherits from PVError."""
+    def test_inherits_from_error(self) -> None:
+        """Test that ViewError inherits from Exception."""
         exc = ViewError()
         assert isinstance(exc, Exception)
 

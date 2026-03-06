@@ -19,7 +19,6 @@ __all__ = [
     "Container",
     "Empty",
     "NotSet",
-    "PVError",
     "Value",
     "View",
     "is_empty",

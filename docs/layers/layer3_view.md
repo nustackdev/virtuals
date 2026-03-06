@@ -266,8 +266,8 @@ storage.put(("tasks", 0), "Task 1")
 ### Registering Views
 
 ```python
-from pv.view import ViewRegistry
-from pv.view.views import DictView, ListView
+from virtuals.view import ViewRegistry
+from virtuals.view.views import DictView, ListView
 
 registry = ViewRegistry()
 
@@ -348,7 +348,7 @@ perms = alice["permissions"]  # set
 ## Custom Views
 
 ```python
-from pv.view import View, ContainerStructure, ContainerProtocol
+from virtuals.view import View, ContainerStructure, ContainerProtocol
 
 class DocumentView(View):
     """Custom view for documents."""
