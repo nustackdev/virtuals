@@ -30,9 +30,9 @@ except ImportError as e:
 if TYPE_CHECKING:
     from logging import Logger
 
-    from tkv.tkv.codec import CodecProtocol
-    from tkv.tkv.observer import ObserverProtocol
-    from tkv.tkv.types import Key
+    from virtuals.tkv.codec import CodecProtocol
+    from virtuals.tkv.observer import ObserverProtocol
+    from virtuals.tkv.types import Key
 
 
 __all__ = [
@@ -61,7 +61,7 @@ class RedisObserver(BaseObserver[str]):
             handled locally before publishing.
 
     Examples:
-        >>> from tkv.tkv.storage.observer.subscription import (
+        >>> from virtuals.tkv.storage.observer.subscription import (
         ...     PrefixFilter,
         ...     SubscriptionOptions,
         ... )

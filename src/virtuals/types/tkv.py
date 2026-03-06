@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tkv.tkv.types import CallbackFn, CompositeValue, PrimitiveValue, Value
+from virtuals.tkv.types import CallbackFn, CompositeValue, PrimitiveValue, Value
 
 
 __all__ = [

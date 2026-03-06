@@ -5,7 +5,7 @@ from __future__ import annotations
 from logging import getLogger
 from typing import TYPE_CHECKING, cast
 
-from tkv.tkv.storage import (
+from virtuals.tkv.storage import (
     StorageClosedError,
     StorageTransactionError,
     TransactionProtocol,
@@ -17,7 +17,7 @@ from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin
 if TYPE_CHECKING:
     from types import TracebackType
 
-    from tkv.tkv.types import Key
+    from virtuals.tkv.types import Key
 
     from .state import TransactionState
     from .storage import InMemoryStorage

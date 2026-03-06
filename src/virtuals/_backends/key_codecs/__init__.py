@@ -14,7 +14,7 @@ Key features:
 - Configurable constraints and validation
 
 Example usage:
-    >>> from tkv.tkv.codec.key_codec import BinaryKeyCodec, StringKeyCodec
+    >>> from virtuals.tkv.codec.key_codec import BinaryKeyCodec, StringKeyCodec
     >>>
     >>> # Binary codec for production use
     >>> binary_codec = BinaryKeyCodec()

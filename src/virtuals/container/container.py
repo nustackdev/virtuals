@@ -29,10 +29,9 @@ from .types import DEFAULT_PARENT_PROTOCOL, DEFAULT_PARENT_STRUCTURE
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-    from tkv.tkv.observer import Subscription, SubscriptionOptions
-    from tkv.tkv.storage import StorageContextType
-
     from virtuals.loc import site as site_
+    from virtuals.tkv.observer import Subscription, SubscriptionOptions
+    from virtuals.tkv.storage import StorageContextType
     from virtuals.types import Empty, Value
 
     from .types import ContainerProtocol, ContainerStructure, NodeInfo, NodeType, ParentChainInfo

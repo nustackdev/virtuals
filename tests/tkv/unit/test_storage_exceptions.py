@@ -1,7 +1,8 @@
 """Tests for storage exception hierarchy."""
 
 import pytest
-from tkv.tkv.storage.exceptions import (
+
+from virtuals.tkv.storage.exceptions import (
     StorageClosedError,
     StorageDeleteError,
     StorageError,

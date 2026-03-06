@@ -1,22 +1,22 @@
 """Codec adapters.
 
 Individual codecs can be imported from their respective modules:
-    from tkv.codecs.json import JSONCodec
-    from tkv.codecs.msgpack import MessagePackCodec
-    from tkv.codecs.micropack import MicroPackCodec
-    from tkv.codecs.pickle import PickleCodec
-    from tkv.codecs.passthrough import PassthroughCodec
+    from virtuals.codecs.json import JSONCodec
+    from virtuals.codecs.msgpack import MessagePackCodec
+    from virtuals.codecs.micropack import MicroPackCodec
+    from virtuals.codecs.pickle import PickleCodec
+    from virtuals.codecs.passthrough import PassthroughCodec
 
 Composite codecs (BinaryCodec, TextCodec, NoOpCodec) are available from this module:
-    from tkv.codecs import BinaryCodec, TextCodec, NoOpCodec
+    from virtuals.codecs import BinaryCodec, TextCodec, NoOpCodec
 """
 
 from __future__ import annotations
 
 from functools import partial
 
-from tkv._key_codecs import BinaryKeyCodec, StringKeyCodec
-from tkv.tkv.codec import Codec
+from virtuals._backends.key_codecs import BinaryKeyCodec, StringKeyCodec
+from virtuals.tkv.codec import Codec
 
 from .json import JSONCodec
 from .passthrough import PassthroughCodec

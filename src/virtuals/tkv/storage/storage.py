@@ -12,7 +12,7 @@ from .context import TransactionalStorageProtocol
 
 
 if TYPE_CHECKING:
-    from tkv.tkv.observer import Subscription, SubscriptionOptions
+    from virtuals.tkv.observer import Subscription, SubscriptionOptions
 
 
 @runtime_checkable
@@ -76,7 +76,7 @@ class StorageProtocol(TransactionalStorageProtocol, Protocol):
             StorageOperationError: If subscription fails.
 
         Examples:
-            >>> from tkv.tkv.storage.observer.subscription import (
+            >>> from virtuals.tkv.storage.observer.subscription import (
             ...     PrefixFilter,
             ...     SubscriptionOptions,
             ... )

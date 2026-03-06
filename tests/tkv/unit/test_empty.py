@@ -1,6 +1,6 @@
 """Unit tests for empty sentinel module."""
 
-from tkv.tkv.types import EMPTY, Empty, is_empty
+from virtuals.tkv.types import EMPTY, Empty, is_empty
 
 
 # ============================================================================

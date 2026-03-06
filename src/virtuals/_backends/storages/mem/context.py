@@ -4,19 +4,19 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from tkv.tkv.storage import (
+from virtuals.tkv.storage import (
     ScanProtocol,
     StorageClosedError,
     StorageOperationError,
     StorageScanOptions,
 )
-from tkv.tkv.types import EMPTY, Empty
+from virtuals.tkv.types import EMPTY, Empty
 
 from .state import TransactionState
 
 
 if TYPE_CHECKING:
-    from tkv.tkv.types import Key, Value
+    from virtuals.tkv.types import Key, Value
 
     from .storage import InMemoryStorage
 

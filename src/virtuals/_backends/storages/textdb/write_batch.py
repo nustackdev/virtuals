@@ -5,7 +5,7 @@ from __future__ import annotations
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
 
-from tkv.tkv.storage import (
+from virtuals.tkv.storage import (
     StorageClosedError,
     StorageTransactionError,
     WriteBatchProtocol,
@@ -17,7 +17,7 @@ from .context import ContextBase, WriteOperationsMixin
 if TYPE_CHECKING:
     from types import TracebackType
 
-    from tkv.tkv.types import Key
+    from virtuals.tkv.types import Key
 
     from .storage import TextStorage
 

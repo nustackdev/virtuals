@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from tkv.tkv.storage import (
+from virtuals.tkv.storage import (
     ReadAccessProtocol,
     ReadWriteAccessProtocol,
     SnapshotProtocol,

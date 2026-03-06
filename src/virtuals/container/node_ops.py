@@ -22,8 +22,7 @@ from .types import NodeInfo, NodeType, ParentChainInfo, ParentInfo
 
 
 if TYPE_CHECKING:
-    from tkv.tkv.storage import StorageContextType
-
+    from virtuals.tkv.storage import StorageContextType
     from virtuals.types import Value
 
 __all__ = [

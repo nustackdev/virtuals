@@ -5,15 +5,6 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 import pytest
-from tkv.tkv.storage import (
-    ReadAccessProtocol,
-    ReadWriteAccessProtocol,
-    SnapshotProtocol,
-    StorageInterfaceError,
-    TransactionProtocol,
-    WriteAccessProtocol,
-    WriteBatchProtocol,
-)
 
 from virtuals.container import (
     DEFAULT_PARENT_PROTOCOL,
@@ -30,6 +21,15 @@ from virtuals.container import (
     require_transaction,
     require_write_batch,
     require_write_context,
+)
+from virtuals.tkv.storage import (
+    ReadAccessProtocol,
+    ReadWriteAccessProtocol,
+    SnapshotProtocol,
+    StorageInterfaceError,
+    TransactionProtocol,
+    WriteAccessProtocol,
+    WriteBatchProtocol,
 )
 from virtuals.types import NOT_SET
 

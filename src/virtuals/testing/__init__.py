@@ -5,7 +5,7 @@ tkv protocols. Import compliance test suites to verify your implementations.
 
 Example:
     ```python
-    from tkv.testing import (
+    from virtuals.testing import (
         StorageProtocolCompliance,
         ObserverCompliance,
         KeyCodecCompliance,

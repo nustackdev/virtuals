@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tkv.tkv.types import EMPTY, Empty, is_empty
+from virtuals.tkv.types import EMPTY, Empty, is_empty
 
 
 __all__ = [

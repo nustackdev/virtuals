@@ -7,8 +7,6 @@ Tests node identification and information gathering operations:
 - gather_parent_info() - parent chain analysis
 """
 
-from tkv.tkv.storage import TransactionProtocol
-
 from virtuals.container import (
     ContainerProtocol,
     ContainerStructure,
@@ -20,6 +18,7 @@ from virtuals.container import (
     put_child_primitive,
 )
 from virtuals.container.types import NodeType
+from virtuals.tkv.storage import TransactionProtocol
 
 
 # ============================================================================

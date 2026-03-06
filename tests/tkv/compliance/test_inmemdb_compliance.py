@@ -7,9 +7,10 @@ to verify that InMemoryStorage correctly implements the StorageProtocol interfac
 from __future__ import annotations
 
 import pytest
-from tkv._storages.mem import InMemoryStorage
-from tkv.codecs import NoOpCodec
-from tkv.testing import StorageProtocolCompliance
+
+from virtuals._backends.storages.mem import InMemoryStorage
+from virtuals.codecs import NoOpCodec
+from virtuals.testing import StorageProtocolCompliance
 
 
 class TestInMemDBCompliance(StorageProtocolCompliance):

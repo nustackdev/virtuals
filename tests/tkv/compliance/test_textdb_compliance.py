@@ -10,9 +10,10 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from tkv._storages.textdb import TextStorage
-from tkv.codecs import TextCodec
-from tkv.testing import StorageProtocolCompliance
+
+from virtuals._backends.storages.textdb import TextStorage
+from virtuals.codecs import TextCodec
+from virtuals.testing import StorageProtocolCompliance
 
 
 class TestTextDBCompliance(StorageProtocolCompliance):

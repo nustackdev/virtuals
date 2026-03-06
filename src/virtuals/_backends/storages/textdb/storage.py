@@ -38,7 +38,7 @@ from logging import getLogger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
-from tkv.tkv.storage import (
+from virtuals.tkv.storage import (
     SnapshotProtocol,
     StorageClosedError,
     StorageError,
@@ -56,9 +56,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from types import TracebackType
 
-    from tkv.tkv.codec import CodecProtocol
-    from tkv.tkv.observer import ObserverProtocol, Subscription, SubscriptionOptions
-    from tkv.tkv.types import Key, Value
+    from virtuals.tkv.codec import CodecProtocol
+    from virtuals.tkv.observer import ObserverProtocol, Subscription, SubscriptionOptions
+    from virtuals.tkv.types import Key, Value
 
 
 __all__ = ["TextStorage"]

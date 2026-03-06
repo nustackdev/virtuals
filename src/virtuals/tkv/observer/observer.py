@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 
 if TYPE_CHECKING:
-    from tkv.tkv.codec import CodecProtocol
+    from virtuals.tkv.codec import CodecProtocol
 
     from ..types import Key
     from .subscription import Subscription

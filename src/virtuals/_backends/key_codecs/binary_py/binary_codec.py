@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Final
 
-from tkv.tkv.codec import KeyCodecProtocol
+from virtuals.tkv.codec import KeyCodecProtocol
 
 from ..exceptions import DecodeError, EncodeError, IntegerOverflowError, StringConstraintError
 from ..types import EncodedBinaryKey, Key, KeySegment

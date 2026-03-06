@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tkv._storages.rocksdb import RocksDBStorage
+from virtuals._backends.storages.rocksdb import RocksDBStorage
 
 
 __all__ = [

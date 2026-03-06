@@ -8,10 +8,11 @@ ObserverProtocol interface.
 from __future__ import annotations
 
 import pytest
-from tkv._observers.mem import InMemoryObserver
-from tkv._storages.mem import InMemoryStorage
-from tkv.codecs import NoOpCodec
-from tkv.testing import ObserverCompliance, RegistryCompliance
+
+from virtuals._backends.observers.mem import InMemoryObserver
+from virtuals._backends.storages.mem import InMemoryStorage
+from virtuals.codecs import NoOpCodec
+from virtuals.testing import ObserverCompliance, RegistryCompliance
 
 
 class TestInMemoryObserverRegistryCompliance(RegistryCompliance):

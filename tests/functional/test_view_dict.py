@@ -13,9 +13,9 @@ Covers:
 from typing import cast
 
 import pytest
-from tkv.tkv.storage import TransactionProtocol
 
 from tests.support.dict_view import DictView
+from virtuals.tkv.storage import TransactionProtocol
 from virtuals.traits import (
     is_assignable,
     is_child_observable,

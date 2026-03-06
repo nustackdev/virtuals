@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TypeVar
 
-from tkv.tkv.types import Key, KeySegment
+from virtuals.tkv.types import Key, KeySegment
 
 
 __all__ = [

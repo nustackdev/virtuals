@@ -18,7 +18,7 @@ Limitations:
 
 from __future__ import annotations
 
-from tkv._storages.mem import InMemoryStorage
+from virtuals._backends.storages.mem import InMemoryStorage
 
 
 __all__ = [

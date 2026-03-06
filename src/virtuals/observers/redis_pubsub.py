@@ -13,7 +13,7 @@ Features:
 
 from __future__ import annotations
 
-from tkv._observers.redis_pubsub import RedisObserver
+from virtuals._backends.observers.redis_pubsub import RedisObserver
 
 
 __all__ = [

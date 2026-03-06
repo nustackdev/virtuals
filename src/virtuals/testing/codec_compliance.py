@@ -9,7 +9,7 @@ Usage:
     Inherit from KeyCodecCompliance and override the codec fixture:
 
     ```python
-    from tkv.testing import KeyCodecCompliance
+    from virtuals.testing import KeyCodecCompliance
 
 
     class TestMyCodec(KeyCodecCompliance):
@@ -33,7 +33,7 @@ import pytest
 
 
 if TYPE_CHECKING:
-    from tkv.tkv.types import Key
+    from virtuals.tkv.types import Key
 
 
 class KeyCodecProtocolForTest(Protocol):

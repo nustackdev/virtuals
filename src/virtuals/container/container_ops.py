@@ -29,9 +29,8 @@ from __future__ import annotations
 from logging import getLogger
 from typing import TYPE_CHECKING, cast
 
-from tkv.tkv.filter import LengthFilter, PrefixFilter
-from tkv.tkv.storage import StorageScanOptions
-
+from virtuals.tkv.filter import LengthFilter, PrefixFilter
+from virtuals.tkv.storage import StorageScanOptions
 from virtuals.types import EMPTY, Empty, Value
 
 from .context import (
@@ -62,9 +61,8 @@ from .validation_ops import (
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-    from tkv.tkv.storage import StorageContextType
-
     from virtuals.loc import site as site_
+    from virtuals.tkv.storage import StorageContextType
 
 __all__ = [
     "clear_children",

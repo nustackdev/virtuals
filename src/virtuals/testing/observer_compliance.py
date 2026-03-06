@@ -8,7 +8,7 @@ Usage:
     Inherit from compliance classes and override the required fixtures:
 
     ```python
-    from tkv.testing import (
+    from virtuals.testing import (
         RegistryCompliance,
         ObserverCompliance,
     )
@@ -51,7 +51,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import pytest
-from tkv.tkv.filter import (
+
+from virtuals.tkv.filter import (
     WILDCARD,
     And,
     Filter,
@@ -61,11 +62,11 @@ from tkv.tkv.filter import (
     SuffixFilter,
     WildcardFilter,
 )
-from tkv.tkv.observer import SubscriptionOptions, SubscriptionRegistry
+from virtuals.tkv.observer import SubscriptionOptions, SubscriptionRegistry
 
 
 if TYPE_CHECKING:
-    from tkv.tkv.types import Key
+    from virtuals.tkv.types import Key
 
 
 # =============================================================================

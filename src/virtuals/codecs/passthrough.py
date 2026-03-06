@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from tkv.tkv.codec import ValueCodecProtocol
-    from tkv.tkv.types import Value
+    from virtuals.tkv.codec import ValueCodecProtocol
+    from virtuals.tkv.types import Value
 
 __all__ = ["PassthroughCodec"]
 

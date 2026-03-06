@@ -8,7 +8,7 @@ Keys are primarily used storage and tree layers.
 
 from __future__ import annotations
 
-from tkv.tkv.types import Key, KeySegment
+from virtuals.tkv.types import Key, KeySegment
 
 
 __all__ = [

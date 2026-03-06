@@ -10,9 +10,8 @@ from typing import TYPE_CHECKING, Protocol, TypeGuard, runtime_checkable
 
 
 if TYPE_CHECKING:
-    from tkv.tkv.observer import Subscription
-
     from virtuals.loc import key
+    from virtuals.tkv.observer import Subscription
     from virtuals.types import Empty
     from virtuals.view import View
 

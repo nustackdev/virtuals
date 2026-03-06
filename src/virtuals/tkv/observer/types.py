@@ -34,7 +34,7 @@ class SubscriptionOptions:
         filter: Filter that determines which keys trigger notifications.
 
     Examples:
-        >>> from tkv.tkv.storage.filter import (
+        >>> from virtuals.tkv.storage.filter import (
         ...     PrefixFilter,
         ...     LengthFilter,
         ...     WildcardFilter,

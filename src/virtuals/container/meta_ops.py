@@ -11,10 +11,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tkv.tkv.filter import LengthFilter, PrefixFilter
-from tkv.tkv.storage import StorageScanOptions
-
 from virtuals.loc.constants import METADATA_ROOT
+from virtuals.tkv.filter import LengthFilter, PrefixFilter
+from virtuals.tkv.storage import StorageScanOptions
 from virtuals.types import EMPTY
 
 from .context import require_read_context, require_write_context
@@ -23,9 +22,8 @@ from .context import require_read_context, require_write_context
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-    from tkv.tkv.storage import StorageContextType
-
     from virtuals.loc import site as site_
+    from virtuals.tkv.storage import StorageContextType
     from virtuals.types import Empty, Value
 
 __all__ = [

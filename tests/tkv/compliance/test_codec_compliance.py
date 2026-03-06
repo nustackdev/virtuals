@@ -7,11 +7,12 @@ all tkv codecs to verify they correctly implement the codec protocols.
 from __future__ import annotations
 
 import pytest
-from tkv._key_codecs import BinaryKeyCodec, PyBinaryKeyCodec, StringKeyCodec
-from tkv.codecs.json import JSONCodec
-from tkv.codecs.passthrough import PassthroughCodec
-from tkv.codecs.pickle import PickleCodec
-from tkv.testing import KeyCodecCompliance, ValueCodecCompliance
+
+from virtuals._backends.key_codecs import BinaryKeyCodec, PyBinaryKeyCodec, StringKeyCodec
+from virtuals.codecs.json import JSONCodec
+from virtuals.codecs.passthrough import PassthroughCodec
+from virtuals.codecs.pickle import PickleCodec
+from virtuals.testing import KeyCodecCompliance, ValueCodecCompliance
 
 
 # =============================================================================
@@ -84,7 +85,7 @@ class TestPassthroughCodecCompliance(ValueCodecCompliance):
 
 
 try:
-    from tkv.codecs.msgpack import MessagePackCodec
+    from virtuals.codecs.msgpack import MessagePackCodec
 
     class TestMessagePackCodecCompliance(ValueCodecCompliance):
         """Compliance tests for MessagePackCodec."""

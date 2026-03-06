@@ -5,9 +5,10 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 import pytest
-from tkv.tkv.filter import PrefixFilter
-from tkv.tkv.observer import SubscriptionOptions
-from tkv.tkv.observer.subscription import Subscription, _SubscriptionContext
+
+from virtuals.tkv.filter import PrefixFilter
+from virtuals.tkv.observer import SubscriptionOptions
+from virtuals.tkv.observer.subscription import Subscription, _SubscriptionContext
 
 
 class TestSubscriptionInitialization:

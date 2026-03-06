@@ -20,7 +20,7 @@ from .registry import ViewRegistry
 
 
 if TYPE_CHECKING:
-    from tkv.tkv.storage import StorageContextType
+    from virtuals.tkv.storage import StorageContextType
 
     from .view import View
 

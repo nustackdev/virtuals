@@ -9,11 +9,10 @@ from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 
 if TYPE_CHECKING:
-    from tkv.tkv.storage import StorageContextType
-
     from virtuals.container import Container, ContainerProtocol, ContainerStructure
     from virtuals.loc import path as path_
     from virtuals.loc import site as site_
+    from virtuals.tkv.storage import StorageContextType
 
     from .registry import ViewRegistry
 

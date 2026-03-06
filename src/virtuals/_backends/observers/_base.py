@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, Self, final
 
-from tkv.tkv.observer import (
+from virtuals.tkv.observer import (
     ObserverConnectionError,
     Subscription,
     SubscriptionOptions,
@@ -24,8 +24,8 @@ from tkv.tkv.observer import (
 if TYPE_CHECKING:
     from types import TracebackType
 
-    from tkv.tkv.codec import CodecProtocol
-    from tkv.tkv.types import Key
+    from virtuals.tkv.codec import CodecProtocol
+    from virtuals.tkv.types import Key
 
 
 logger = getLogger(__name__)

@@ -16,7 +16,7 @@ from ._base import BaseObserver
 if TYPE_CHECKING:
     from logging import Logger
 
-    from tkv.tkv.observer import ObserverProtocol
+    from virtuals.tkv.observer import ObserverProtocol
 
 
 logger: Logger = getLogger(__name__)
@@ -37,7 +37,7 @@ class InMemoryObserver(BaseObserver[str]):
     the legacy API (subscribe with prefix and callback).
 
     Examples:
-        >>> from tkv.tkv.storage.observer.subscription import (
+        >>> from virtuals.tkv.storage.observer.subscription import (
         ...     PrefixFilter,
         ...     SubscriptionOptions,
         ... )

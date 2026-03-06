@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import pytest
-from tkv.tkv.filter import (
+
+from virtuals.tkv.filter import (
     WILDCARD,
     And,
     Filter,

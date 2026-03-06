@@ -7,7 +7,7 @@ handled by BaseObserver - this class only provides connection management.
 
 from __future__ import annotations
 
-from tkv._observers.mem import InMemoryObserver
+from virtuals._backends.observers.mem import InMemoryObserver
 
 
 __all__ = [

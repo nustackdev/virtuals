@@ -9,7 +9,7 @@ Usage:
     Inherit from StorageProtocolCompliance and override the storage fixture:
 
     ```python
-    from tkv.testing import StorageProtocolCompliance
+    from virtuals.testing import StorageProtocolCompliance
 
 
     class TestMyStorageAdapter(StorageProtocolCompliance):
@@ -40,17 +40,18 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
-from tkv.tkv import StorageScanOptions
-from tkv.tkv.filter import LengthFilter, PrefixFilter
-from tkv.tkv.storage import (
+
+from virtuals.tkv import StorageScanOptions
+from virtuals.tkv.filter import LengthFilter, PrefixFilter
+from virtuals.tkv.storage import (
     StorageClosedError,
     StorageInterfaceError,
 )
-from tkv.tkv.types import EMPTY
+from virtuals.tkv.types import EMPTY
 
 
 if TYPE_CHECKING:
-    from tkv.tkv.storage import StorageProtocol
+    from virtuals.tkv.storage import StorageProtocol
 
 
 class StorageProtocolCompliance:

@@ -9,9 +9,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
-from tkv._storages.rocksdb import RocksDBStorage
-from tkv.codecs import BinaryCodec
-from tkv.testing import StorageProtocolCompliance
+
+from virtuals._backends.storages.rocksdb import RocksDBStorage
+from virtuals.codecs import BinaryCodec
+from virtuals.testing import StorageProtocolCompliance
 
 
 if TYPE_CHECKING:

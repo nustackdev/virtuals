@@ -1,7 +1,8 @@
 """Tests for observer exception hierarchy."""
 
 import pytest
-from tkv.tkv.observer.exceptions import (
+
+from virtuals.tkv.observer.exceptions import (
     ObserverConnectionError,
     ObserverError,
     ObserverSubscriptionError,

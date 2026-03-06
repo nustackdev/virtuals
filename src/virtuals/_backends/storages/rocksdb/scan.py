@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum, auto
 from typing import TYPE_CHECKING, cast
 
-from tkv.tkv.storage import (
+from virtuals.tkv.storage import (
     ScanProtocol,
     StorageOperationError,
     StorageScanOptions,
@@ -15,7 +15,7 @@ from tkv.tkv.storage import (
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-    from tkv.tkv.types import Key, Value
+    from virtuals.tkv.types import Key, Value
 
     from .context import ContextBase
     from .storage import RocksDBStorage

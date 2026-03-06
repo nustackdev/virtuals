@@ -11,8 +11,9 @@ from typing import TYPE_CHECKING
 import pytest
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
-from tkv._key_codecs import BinaryKeyCodec, PyBinaryKeyCodec, StringKeyCodec
-from tkv._key_codecs.exceptions import (
+
+from virtuals._backends.key_codecs import BinaryKeyCodec, PyBinaryKeyCodec, StringKeyCodec
+from virtuals._backends.key_codecs.exceptions import (
     DecodeError,
     EncodeError,
     IntegerOverflowError,
@@ -20,8 +21,8 @@ from tkv._key_codecs.exceptions import (
 
 
 if TYPE_CHECKING:
-    from tkv._key_codecs.types import Key
-    from tkv.tkv.codec import KeyCodecProtocol
+    from virtuals._backends.key_codecs.types import Key
+    from virtuals.tkv.codec import KeyCodecProtocol
 
 
 # ============================================================================

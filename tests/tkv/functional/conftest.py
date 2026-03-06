@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import pytest
-from tkv._key_codecs import BinaryKeyCodec, PyBinaryKeyCodec, StringKeyCodec
+
+from virtuals._backends.key_codecs import BinaryKeyCodec, PyBinaryKeyCodec, StringKeyCodec
 
 
 @pytest.fixture(

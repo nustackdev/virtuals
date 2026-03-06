@@ -39,7 +39,7 @@ class StorageScanOptions:
         >>> options = StorageScanOptions(start=("users",))
 
         >>> # Scan with prefix filter (efficient - breaks when past prefix)
-        >>> from tkv.tkv.storage.filter import PrefixFilter, LengthFilter
+        >>> from virtuals.tkv.storage.filter import PrefixFilter, LengthFilter
         >>> options = StorageScanOptions(
         ...     start=("users",),
         ...     break_filter=PrefixFilter(prefix=("users",)),

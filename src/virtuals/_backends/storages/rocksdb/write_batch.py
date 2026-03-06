@@ -5,7 +5,7 @@ from __future__ import annotations
 from logging import getLogger
 from typing import TYPE_CHECKING
 
-from tkv.tkv.storage import (
+from virtuals.tkv.storage import (
     StorageClosedError,
     StorageOperationError,
     StorageTransactionError,
@@ -18,7 +18,7 @@ from .context import ContextBase
 if TYPE_CHECKING:
     from types import TracebackType
 
-    from tkv.tkv.types import Key, Value
+    from virtuals.tkv.types import Key, Value
 
     from .storage import RocksDBStorage
 
