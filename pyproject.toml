@@ -49,11 +49,7 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "attrs",
-    "tkv>=0.2.0",
 ]
-
-[tool.uv.sources]
-tkv = { path = "../tkv", editable = true }
 
 [project.urls]
 Homepage = "https://github.com/everyabc/pv"
@@ -63,6 +59,8 @@ Issues = "https://github.com/everyabc/pv/issues"
 Changelog = "https://github.com/everyabc/pv/releases"
 
 [project.optional-dependencies]
+rocksdb = ["rdbpython"]
+lmdb = ["lmdb"]
 
 # Development tools
 dev = [

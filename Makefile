@@ -16,7 +16,7 @@ NC := \033[0m
 # ============================================================================
 
 help:
-	@echo "$(BLUE)PV - Polymorphic Views Development Commands$(NC)"
+	@echo "$(BLUE)Virtuals - Development Commands$(NC)"
 	@echo ""
 	@echo "$(GREEN)Setup:$(NC)"
 	@echo "  make install-uv      - Install uv package manager"
