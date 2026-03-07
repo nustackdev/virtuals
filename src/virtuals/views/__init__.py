@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from virtuals.views import (
+from virtuals._views import (
     ByteArrayView,
     DictISliceView,
     DictView,
