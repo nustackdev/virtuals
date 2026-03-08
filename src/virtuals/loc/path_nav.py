@@ -169,7 +169,7 @@ def open_child_view(
         >>> tags = open_child_view(alice, "tags", ListView)
         >>> last = open_child_view(tags, -1, DictView)  # Negative index!
     """
-    from virtuals.traits import is_nestable
+    from virtuals.collections import is_nestable
 
     if not is_nestable(parent_view):
         raise TypeError(

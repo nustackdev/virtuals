@@ -8,8 +8,7 @@ Tests:
 
 from typing import ClassVar
 
-from virtuals.container import ContainerProtocol, ContainerStructure
-from virtuals.traits import (
+from virtuals.collections import (
     is_addable,
     is_appendable,
     is_assignable,
@@ -29,6 +28,7 @@ from virtuals.traits import (
     is_sizeable,
     is_subscriptable,
 )
+from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import EMPTY, Empty
 from virtuals.view import ViewBase
 

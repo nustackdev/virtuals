@@ -262,7 +262,7 @@ class ChildNestedGetBase:
             ValueError: If child has no structure ID
             TypeError: If child view doesn't support extraction
         """
-        from virtuals.traits import Convertible
+        from virtuals.collections import Convertible
 
         # Get child container
         child_site = (*self.container.site, address)
@@ -359,7 +359,7 @@ class ChildNestedSetBase:
         Raises:
             TypeError: If child view doesn't support initialization
         """
-        from virtuals.traits import Initializable
+        from virtuals.collections import Initializable
 
         # Get view class and structure for this value type
         value_type = type(value)

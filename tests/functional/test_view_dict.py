@@ -15,8 +15,7 @@ from typing import cast
 import pytest
 
 from tests.support.dict_view import DictView
-from virtuals.tkv.storage import TransactionProtocol
-from virtuals.traits import (
+from virtuals.collections import (
     is_assignable,
     is_child_observable,
     is_clearable,
@@ -29,6 +28,7 @@ from virtuals.traits import (
     is_sizeable,
     is_subscriptable,
 )
+from virtuals.tkv.storage import TransactionProtocol
 
 
 # =============================================================================

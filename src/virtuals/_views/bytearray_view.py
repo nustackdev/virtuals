@@ -21,7 +21,7 @@ from .base import StdView
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable
 
-    from virtuals.traits import (
+    from virtuals.collections import (
         Assignable,
         Convertible,
         Initializable,

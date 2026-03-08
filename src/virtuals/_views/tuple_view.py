@@ -28,12 +28,12 @@ from .base import StdView
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable
 
-    from virtuals.collections import SequenceView
-    from virtuals.traits import (
+    from virtuals.collections import (
         Containable,
         Convertible,
         Initializable,
         Nestable,
+        SequenceView,
         Sizeable,
         Subscriptable,
     )

@@ -1,7 +1,9 @@
-"""Container capability protocols.
+"""Atomic capability protocols.
 
-These protocols define optional capabilities for container-like objects.
-Not all containers support all operations - check protocol support before use.
+These protocols define the smallest composable units of collection behavior.
+Collection types (Mapping, Sequence, Set) compose these into complete interfaces.
+
+Check protocol support at runtime with the is_* type guard functions.
 """
 
 from __future__ import annotations

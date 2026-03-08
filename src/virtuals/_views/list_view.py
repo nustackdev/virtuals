@@ -29,8 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable
     from collections.abc import Sequence as PySequence
 
-    from virtuals.collections import MutableSequenceView
-    from virtuals.traits import (
+    from virtuals.collections import (
         Appendable,
         Assignable,
         ChildObservable,
@@ -39,6 +38,7 @@ if TYPE_CHECKING:
         Convertible,
         Deletable,
         Initializable,
+        MutableSequenceView,
         Nestable,
         Observable,
         Sizeable,

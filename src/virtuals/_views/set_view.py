@@ -25,13 +25,13 @@ if TYPE_CHECKING:
     from collections.abc import Generator, Iterable
     from collections.abc import Set as PySet
 
-    from virtuals.collections import MutableSetView
-    from virtuals.traits import (
+    from virtuals.collections import (
         ChildObservable,
         Clearable,
         Containable,
         Convertible,
         Initializable,
+        MutableSetView,
         Observable,
         Sizeable,
     )

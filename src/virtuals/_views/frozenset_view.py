@@ -23,9 +23,14 @@ if TYPE_CHECKING:
     from collections.abc import Generator, Iterable
     from collections.abc import Set as PySet
 
-    from virtuals.collections import SetView
+    from virtuals.collections import (
+        Containable,
+        Convertible,
+        Initializable,
+        SetView,
+        Sizeable,
+    )
     from virtuals.loc import key as key_
-    from virtuals.traits import Containable, Convertible, Initializable, Sizeable
 
 
 __all__ = ["FrozenSetView"]

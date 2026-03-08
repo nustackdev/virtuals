@@ -142,7 +142,7 @@ class IndexedDictView(
                 raise KeyError(address)
             return node_info.primitive_value
         # Container child — extract via registry
-        from virtuals.traits import Convertible
+        from virtuals.collections import Convertible
 
         child_container = Container(ctx=dc.ctx, site=child_site)
         child_info = node_info
@@ -199,7 +199,7 @@ class IndexedDictView(
         is_new = not dc.exists_child(address)
         # Write to __data__
         if self.registry.is_container_type(value):
-            from virtuals.traits import Initializable
+            from virtuals.collections import Initializable
 
             value_type = type(value)
             view_class = self.registry.get_view_for_type(value_type)
@@ -265,7 +265,7 @@ class IndexedDictView(
         dc = self._data_container()
         for key, val in value.items():
             if self.registry.is_container_type(val):
-                from virtuals.traits import Initializable
+                from virtuals.collections import Initializable
 
                 value_type = type(val)
                 view_class = self.registry.get_view_for_type(value_type)

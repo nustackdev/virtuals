@@ -30,8 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator
     from collections.abc import Mapping as PyMapping
 
-    from virtuals.collections import MutableMappingView
-    from virtuals.traits import (
+    from virtuals.collections import (
         Assignable,
         ChildObservable,
         Clearable,
@@ -39,6 +38,7 @@ if TYPE_CHECKING:
         Convertible,
         Deletable,
         Initializable,
+        MutableMappingView,
         Nestable,
         Observable,
         Sizeable,
