@@ -1,11 +1,16 @@
-"""Virtual collection protocols.
+"""Virtual collection toolkit.
 
-Atomic capabilities (abc) compose into collection hierarchies:
-    Container → Collection → Mapping/Sequence/Set → Mutable* → Reactive*
+Atomic protocols (abc):
+    Containable, Sizeable, Subscriptable, Assignable, Deletable, ...
+    + is_* type guard functions
 
-Usage:
-    from virtuals.collections import MutableMappingView, ReactiveSequenceView
-    from virtuals.collections import Convertible, is_convertible
+Collection bases (mapping, sequence, set):
+    MappingBase → MutableMappingBase
+    SequenceBase → MutableSequenceBase
+    SetBase → MutableSetBase
+
+Reactive protocols (abc):
+    ReactiveMappingView, ReactiveSequenceView, ReactiveSetView
 """
 
 from __future__ import annotations
@@ -26,6 +31,9 @@ from .abc import (
     Nestable,
     Observable,
     Poppable,
+    ReactiveMappingView,
+    ReactiveSequenceView,
+    ReactiveSetView,
     Removable,
     Sizeable,
     Subscriptable,
@@ -48,19 +56,9 @@ from .abc import (
     is_sizeable,
     is_subscriptable,
 )
-from .collections import (
-    CollectionView,
-    ContainerView,
-    MappingView,
-    MutableMappingView,
-    MutableSequenceView,
-    MutableSetView,
-    ReactiveMappingView,
-    ReactiveSequenceView,
-    ReactiveSetView,
-    SequenceView,
-    SetView,
-)
+from .mapping import MappingBase, MutableMappingBase
+from .sequence import MutableSequenceBase, SequenceBase
+from .set import MutableSetBase, SetBase
 
 
 __all__ = [
@@ -70,29 +68,28 @@ __all__ = [
     "Assignable",
     "ChildObservable",
     "Clearable",
-    # Collection hierarchy
-    "CollectionView",
     "Containable",
-    "ContainerView",
     "Convertible",
     "Deletable",
     "DescendantsObservable",
     "Discardable",
     "Initializable",
     "Insertable",
-    "MappingView",
-    "MutableMappingView",
-    "MutableSequenceView",
-    "MutableSetView",
+    # Collection bases
+    "MappingBase",
+    "MutableMappingBase",
+    "MutableSequenceBase",
+    "MutableSetBase",
     "Nestable",
     "Observable",
     "Poppable",
+    # Reactive protocols
     "ReactiveMappingView",
     "ReactiveSequenceView",
     "ReactiveSetView",
     "Removable",
-    "SequenceView",
-    "SetView",
+    "SequenceBase",
+    "SetBase",
     "Sizeable",
     "Subscriptable",
     # Type guards

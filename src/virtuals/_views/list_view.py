@@ -38,9 +38,9 @@ if TYPE_CHECKING:
         Convertible,
         Deletable,
         Initializable,
-        MutableSequenceView,
         Nestable,
         Observable,
+        ReactiveSequenceView,
         Sizeable,
         Subscriptable,
     )
@@ -720,7 +720,7 @@ if TYPE_CHECKING:
     _deletable: type[Deletable[int]] = ListView
     _clearable: type[Clearable] = ListView
     _appendable: type[Appendable[object]] = ListView
-    _mutable_sequence: type[MutableSequenceView[object]] = ListView
+    _reactive_sequence: type[ReactiveSequenceView[object]] = ListView
     _observable: type[Observable] = ListView
     _observable_children: type[ChildObservable] = ListView
     # Python types

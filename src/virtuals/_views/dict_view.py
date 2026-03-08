@@ -38,9 +38,9 @@ if TYPE_CHECKING:
         Convertible,
         Deletable,
         Initializable,
-        MutableMappingView,
         Nestable,
         Observable,
+        ReactiveMappingView,
         Sizeable,
         Subscriptable,
     )
@@ -511,6 +511,6 @@ if TYPE_CHECKING:
     _sizeable: type[Sizeable] = DictView
     _deletable: type[Deletable[str | int]] = DictView
     _clearable: type[Clearable] = DictView
-    _mutable_mapping: type[MutableMappingView[str | int, object]] = DictView
+    _reactive_mapping: type[ReactiveMappingView[str | int, object]] = DictView
     _Observable: type[Observable] = DictView
     _Observable_children: type[ChildObservable] = DictView

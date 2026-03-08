@@ -27,7 +27,6 @@ if TYPE_CHECKING:
         Containable,
         Convertible,
         Initializable,
-        SetView,
         Sizeable,
     )
     from virtuals.loc import key as key_
@@ -199,4 +198,4 @@ if TYPE_CHECKING:
     _initializable: type[Initializable[Iterable[object]]] = FrozenSetView
     _containable: type[Containable[object]] = FrozenSetView
     _sizeable: type[Sizeable] = FrozenSetView
-    _set: type[SetView[object]] = FrozenSetView
+    pass

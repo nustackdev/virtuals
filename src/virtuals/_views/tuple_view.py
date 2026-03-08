@@ -33,7 +33,6 @@ if TYPE_CHECKING:
         Convertible,
         Initializable,
         Nestable,
-        SequenceView,
         Sizeable,
         Subscriptable,
     )
@@ -236,4 +235,4 @@ if TYPE_CHECKING:
     _nestable: type[Nestable[int]] = TupleView
     _containable: type[Containable[object]] = TupleView
     _sizeable: type[Sizeable] = TupleView
-    _sequence: type[SequenceView[object]] = TupleView
+    pass

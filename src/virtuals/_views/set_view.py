@@ -31,8 +31,8 @@ if TYPE_CHECKING:
         Containable,
         Convertible,
         Initializable,
-        MutableSetView,
         Observable,
+        ReactiveSetView,
         Sizeable,
     )
 
@@ -266,6 +266,6 @@ if TYPE_CHECKING:
     _containable: type[Containable[object]] = SetView
     _sizeable: type[Sizeable] = SetView
     _clearable: type[Clearable] = SetView
-    _mutable_set: type[MutableSetView[object]] = SetView
+    _reactive_set: type[ReactiveSetView[object]] = SetView
     _Observable: type[Observable] = SetView
     _Observable_children: type[ChildObservable] = SetView
