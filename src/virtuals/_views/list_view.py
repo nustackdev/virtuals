@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence as PySequence
 
     from virtuals.collections import (
-        Appendable,
         Assignable,
         ChildObservable,
         Clearable,
@@ -40,7 +39,7 @@ if TYPE_CHECKING:
         Initializable,
         Nestable,
         Observable,
-        ReactiveSequenceView,
+        ReactiveSequenceProtocol,
         Sizeable,
         Subscriptable,
     )
@@ -719,8 +718,7 @@ if TYPE_CHECKING:
     _sizeable: type[Sizeable] = ListView
     _deletable: type[Deletable[int]] = ListView
     _clearable: type[Clearable] = ListView
-    _appendable: type[Appendable[object]] = ListView
-    _reactive_sequence: type[ReactiveSequenceView[object]] = ListView
+    _reactive_sequence: type[ReactiveSequenceProtocol[object]] = ListView
     _observable: type[Observable] = ListView
     _observable_children: type[ChildObservable] = ListView
     # Python types

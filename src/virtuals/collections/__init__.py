@@ -1,23 +1,36 @@
 """Virtual collection toolkit.
 
-Atomic protocols (abc):
-    Containable, Sizeable, Subscriptable, Assignable, Deletable, ...
+Fundamental bases (bases):
+    ContainerBase — abstract __contains__
+    IterableBase  — abstract __iter__
+    SizedBase     — abstract __len__
+    CollectionBase(ContainerBase, IterableBase, SizedBase)
+
+Protocols (protocols):
+    Convertible, Initializable, Nestable — conversion & navigation
+    Subscriptable, Assignable, Containable, Sizeable, Deletable, Clearable — access
+    Observable, ChildObservable, DescendantsObservable — observation
     + is_* type guard functions
 
 Collection bases (mapping, sequence, set):
-    MappingBase → MutableMappingBase
-    SequenceBase → MutableSequenceBase
-    SetBase → MutableSetBase
+    MappingBase → MutableMappingBase → ReactiveMappingBase
+    SequenceBase → MutableSequenceBase → ReactiveSequenceBase
+    SetBase → MutableSetBase → ReactiveSetBase
 
-Reactive protocols (abc):
-    ReactiveMappingView, ReactiveSequenceView, ReactiveSetView
+Reactive protocols (mapping, sequence, set):
+    ReactiveMappingProtocol, ReactiveSequenceProtocol, ReactiveSetProtocol
 """
 
 from __future__ import annotations
 
-from .abc import (
-    Addable,
-    Appendable,
+from .bases import CollectionBase, ContainerBase, IterableBase, SizedBase
+from .mapping import (
+    MappingBase,
+    MutableMappingBase,
+    ReactiveMappingBase,
+    ReactiveMappingProtocol,
+)
+from .protocols import (
     Assignable,
     ChildObservable,
     Clearable,
@@ -25,20 +38,11 @@ from .abc import (
     Convertible,
     Deletable,
     DescendantsObservable,
-    Discardable,
     Initializable,
-    Insertable,
     Nestable,
     Observable,
-    Poppable,
-    ReactiveMappingView,
-    ReactiveSequenceView,
-    ReactiveSetView,
-    Removable,
     Sizeable,
     Subscriptable,
-    is_addable,
-    is_appendable,
     is_assignable,
     is_child_observable,
     is_clearable,
@@ -46,35 +50,35 @@ from .abc import (
     is_convertible,
     is_deletable,
     is_descendants_observable,
-    is_discardable,
     is_initializable,
-    is_insertable,
     is_nestable,
     is_observable,
-    is_poppable,
-    is_removable,
     is_sizeable,
     is_subscriptable,
 )
-from .mapping import MappingBase, MutableMappingBase, ReactiveMappingBase
-from .sequence import MutableSequenceBase, ReactiveSequenceBase, SequenceBase
-from .set import MutableSetBase, ReactiveSetBase, SetBase
+from .sequence import (
+    MutableSequenceBase,
+    ReactiveSequenceBase,
+    ReactiveSequenceProtocol,
+    SequenceBase,
+)
+from .set import MutableSetBase, ReactiveSetBase, ReactiveSetProtocol, SetBase
 
 
 __all__ = [
-    # Atomic protocols
-    "Addable",
-    "Appendable",
     "Assignable",
     "ChildObservable",
     "Clearable",
+    # Fundamental bases
+    "CollectionBase",
+    # Protocols
     "Containable",
+    "ContainerBase",
     "Convertible",
     "Deletable",
     "DescendantsObservable",
-    "Discardable",
     "Initializable",
-    "Insertable",
+    "IterableBase",
     # Collection bases
     "MappingBase",
     "MutableMappingBase",
@@ -82,23 +86,20 @@ __all__ = [
     "MutableSetBase",
     "Nestable",
     "Observable",
-    "Poppable",
     # Reactive bases
     "ReactiveMappingBase",
     # Reactive protocols
-    "ReactiveMappingView",
+    "ReactiveMappingProtocol",
     "ReactiveSequenceBase",
-    "ReactiveSequenceView",
+    "ReactiveSequenceProtocol",
     "ReactiveSetBase",
-    "ReactiveSetView",
-    "Removable",
+    "ReactiveSetProtocol",
     "SequenceBase",
     "SetBase",
     "Sizeable",
+    "SizedBase",
     "Subscriptable",
     # Type guards
-    "is_addable",
-    "is_appendable",
     "is_assignable",
     "is_child_observable",
     "is_clearable",
@@ -106,13 +107,9 @@ __all__ = [
     "is_convertible",
     "is_deletable",
     "is_descendants_observable",
-    "is_discardable",
     "is_initializable",
-    "is_insertable",
     "is_nestable",
     "is_observable",
-    "is_poppable",
-    "is_removable",
     "is_sizeable",
     "is_subscriptable",
 ]

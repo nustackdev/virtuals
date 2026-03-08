@@ -14,37 +14,29 @@ Provided for free:
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from .bases import CollectionBase
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Iterable
 
 
 __all__ = [
     "MutableSetBase",
     "ReactiveSetBase",
+    "ReactiveSetProtocol",
     "SetBase",
 ]
 
 
-class SetBase[V]:
+class SetBase[V](CollectionBase[V]):
     """Read-only set base. Provides set algebra from contains/iter/len.
 
-    Abstract:
-        __contains__(value) -> bool
-        __iter__() -> Iterator[value]
-        __len__() -> int
+    All three abstract methods (__contains__, __iter__, __len__) inherited
+    from CollectionBase — subclasses must implement all of them.
     """
-
-    @abstractmethod
-    def __contains__(self, value: object) -> bool: ...
-
-    @abstractmethod
-    def __iter__(self) -> Iterator[V]: ...
-
-    @abstractmethod
-    def __len__(self) -> int: ...
 
     def isdisjoint(self, other: Iterable[object]) -> bool:
         """Check if no elements in common with other."""
@@ -125,3 +117,18 @@ class ReactiveSetBase[V](MutableSetBase[V]):
     def on_change(self) -> object:
         """Subscribe to all changes in this set."""
         ...
+
+
+@runtime_checkable
+class ReactiveSetProtocol[V](Protocol):
+    """Protocol: MutableSet + Observable.
+
+    Use for type-checking views that support both mutation and change subscription.
+    """
+
+    def __contains__(self, value: object) -> bool: ...
+    def __iter__(self) -> object: ...
+    def __len__(self) -> int: ...
+    def add(self, value: V) -> None: ...  # noqa: D102
+    def discard(self, value: V) -> None: ...  # noqa: D102
+    def on_change(self) -> object: ...  # noqa: D102

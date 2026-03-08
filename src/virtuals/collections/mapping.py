@@ -13,37 +13,34 @@ Provided for free:
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from .bases import CollectionBase
 
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterator, Mapping
+    from collections.abc import Generator, Mapping
 
 
 __all__ = [
     "MappingBase",
     "MutableMappingBase",
     "ReactiveMappingBase",
+    "ReactiveMappingProtocol",
 ]
 
 
-class MappingBase[K, V]:
+class MappingBase[K, V](CollectionBase[K]):
     """Read-only mapping base. Provides keys/values/items/get/__contains__ from core methods.
+
+    Inherits abstract __iter__, __len__ from CollectionBase.
 
     Abstract:
         __getitem__(key) -> value
-        __iter__() -> Iterator[key]
-        __len__() -> int
     """
 
     @abstractmethod
     def __getitem__(self, key: K) -> V: ...
-
-    @abstractmethod
-    def __iter__(self) -> Iterator[K]: ...
-
-    @abstractmethod
-    def __len__(self) -> int: ...
 
     def __contains__(self, key: object) -> bool:
         """Check if key exists. Override for O(1) lookup."""
@@ -141,3 +138,20 @@ class ReactiveMappingBase[K, V](MutableMappingBase[K, V]):
     def on_children_change(self) -> object:
         """Subscribe to changes on any key."""
         ...
+
+
+@runtime_checkable
+class ReactiveMappingProtocol[K, V](Protocol):
+    """Protocol: MutableMapping + Observable + ChildObservable.
+
+    Use for type-checking views that support both mutation and change subscription.
+    """
+
+    def __getitem__(self, key: K) -> V: ...
+    def __setitem__(self, key: K, value: V) -> None: ...
+    def __delitem__(self, key: K) -> None: ...
+    def __iter__(self) -> object: ...
+    def __len__(self) -> int: ...
+    def on_change(self) -> object: ...  # noqa: D102
+    def on_child_change(self, address: K) -> object: ...  # noqa: D102
+    def on_children_change(self) -> object: ...  # noqa: D102

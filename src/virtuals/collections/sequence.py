@@ -14,7 +14,9 @@ Provided for free:
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from .bases import CollectionBase
 
 
 if TYPE_CHECKING:
@@ -24,23 +26,23 @@ if TYPE_CHECKING:
 __all__ = [
     "MutableSequenceBase",
     "ReactiveSequenceBase",
+    "ReactiveSequenceProtocol",
     "SequenceBase",
 ]
 
 
-class SequenceBase[V]:
+class SequenceBase[V](CollectionBase[V]):
     """Read-only sequence base. Provides iteration/search from getitem/len.
+
+    Inherits abstract __len__ from CollectionBase.
+    Overrides __contains__ and __iter__ with index-based implementations.
 
     Abstract:
         __getitem__(index) -> value
-        __len__() -> int
     """
 
     @abstractmethod
     def __getitem__(self, index: int) -> V: ...
-
-    @abstractmethod
-    def __len__(self) -> int: ...
 
     def __iter__(self) -> Generator[V, None, None]:
         """Iterate over items in order."""
@@ -163,3 +165,20 @@ class ReactiveSequenceBase[V](MutableSequenceBase[V]):
     def on_children_change(self) -> object:
         """Subscribe to changes on any index."""
         ...
+
+
+@runtime_checkable
+class ReactiveSequenceProtocol[V](Protocol):
+    """Protocol: MutableSequence + Observable + ChildObservable.
+
+    Use for type-checking views that support both mutation and change subscription.
+    """
+
+    def __getitem__(self, index: int) -> V: ...
+    def __setitem__(self, index: int, value: V) -> None: ...
+    def __delitem__(self, index: int) -> None: ...
+    def __len__(self) -> int: ...
+    def insert(self, index: int, value: V) -> None: ...  # noqa: D102
+    def on_change(self) -> object: ...  # noqa: D102
+    def on_child_change(self, address: int) -> object: ...  # noqa: D102
+    def on_children_change(self) -> object: ...  # noqa: D102
