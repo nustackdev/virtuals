@@ -115,3 +115,95 @@ def tuple_factory(root_view: EagerDictView) -> Callable[[str, tuple[Any, ...] | 
         return view
 
     return _create
+
+
+@pytest.fixture
+def frozenset_factory(root_view: EagerDictView) -> Callable[[str, frozenset[Any] | None], View]:
+    """Factory for creating FrozenSetViews with test data."""
+
+    def _create(address: str, data: frozenset | set | None = None) -> View:
+        from virtuals._views import FrozenSetView
+
+        view = root_view.open_child(address, FrozenSetView)
+        if data is not None:
+            view.store(data)
+        return view
+
+    return _create
+
+
+@pytest.fixture
+def bytearray_factory(root_view: EagerDictView) -> Callable[[str, bytearray | None], View]:
+    """Factory for creating ByteArrayViews with test data."""
+
+    def _create(address: str, data: bytearray | bytes | None = None) -> View:
+        from virtuals._views import ByteArrayView
+
+        view = root_view.open_child(address, ByteArrayView)
+        if data is not None:
+            view.store(data)
+        return view
+
+    return _create
+
+
+@pytest.fixture
+def flat_dict_factory(root_view: EagerDictView) -> Callable[[str, dict[str, Any] | None], View]:
+    """Factory for creating FlatDictViews with test data."""
+
+    def _create(address: str, data: dict | None = None) -> View:
+        from virtuals._views import FlatDictView
+
+        view = root_view.open_child(address, FlatDictView)
+        if data is not None:
+            view.store(data)
+        return view
+
+    return _create
+
+
+@pytest.fixture
+def flat_list_factory(root_view: EagerDictView) -> Callable[[str, list[Any] | None], View]:
+    """Factory for creating FlatListViews with test data."""
+
+    def _create(address: str, data: list | None = None) -> View:
+        from virtuals._views import FlatListView
+
+        view = root_view.open_child(address, FlatListView)
+        if data is not None:
+            view.store(data)
+        return view
+
+    return _create
+
+
+@pytest.fixture
+def light_dict_factory(root_view: EagerDictView) -> Callable[[str, dict[str, Any] | None], View]:
+    """Factory for creating LightDictViews with test data."""
+
+    def _create(address: str, data: dict | None = None) -> View:
+        from virtuals._views import LightDictView
+
+        view = root_view.open_child(address, LightDictView)
+        if data is not None:
+            view.store(data)
+        return view
+
+    return _create
+
+
+@pytest.fixture
+def indexed_dict_factory(
+    root_view: EagerDictView,
+) -> Callable[[str, dict[str, Any] | None], View]:
+    """Factory for creating EagerIndexedDictViews with test data."""
+
+    def _create(address: str, data: dict | None = None) -> View:
+        from virtuals._views import EagerIndexedDictView
+
+        view = root_view.open_child(address, EagerIndexedDictView)
+        if data is not None:
+            view.store(data)
+        return view
+
+    return _create

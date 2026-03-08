@@ -183,10 +183,14 @@ class FrozenSetView(
         """
         self.ensure_created()
         self.container.clear_children()
+        self._set_length(0)
 
+        count = 0
         for item in value:
             key = self._make_key(item)
             self._set_child_value(key, item)
+            count += 1
+        self._set_length(count)
 
 
 SetABC.register(FrozenSetView)

@@ -160,6 +160,7 @@ class ByteArrayView(
         self.ensure_created()
         index = len(self)
         self.container.put_child_primitive(index, value)
+        self._set_length(index + 1)
 
     def insert(self, index: int, value: int) -> None:
         """Insert byte at index. Not supported — requires element shifting."""
@@ -197,6 +198,7 @@ class ByteArrayView(
         """Remove all bytes."""
         self.ensure_created()
         self.container.clear_children()
+        self._set_length(0)
 
     def extract(self) -> bytearray:
         """Extract all bytes as bytearray.
@@ -216,8 +218,11 @@ class ByteArrayView(
         self.ensure_created()
         self.clear()
 
+        count = 0
         for index, byte in enumerate(value):
             self.container.put_child_primitive(index, byte)
+            count = index + 1
+        self._set_length(count)
 
 
 MutableSequence.register(ByteArrayView)
