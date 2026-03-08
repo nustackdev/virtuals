@@ -3,29 +3,33 @@
 from __future__ import annotations
 
 from .bytearray_view import ByteArrayView
-from .dict_view import DictISliceView, DictView
+from .dict_view import DictViewBase, EagerDictView, LazyDictView
 from .flat_dict_view import FlatDictView
 from .flat_list_view import FlatListView
 from .frozenset_view import FrozenSetView
-from .indexed_dict_view import IndexedDictSliceView, IndexedDictView
+from .indexed_dict_view import EagerIndexedDictView, IndexedDictViewBase, LazyIndexedDictView
 from .light_dict_view import LightDictView
-from .list_view import ListSliceView, ListView
+from .list_view import EagerListView, LazyListView, ListSliceView, ListViewBase
 from .set_view import SetView
 from .tuple_view import TupleView
 
 
 __all__ = (
     "ByteArrayView",
-    "DictISliceView",
-    "DictView",
+    "DictViewBase",
+    "EagerDictView",
+    "EagerIndexedDictView",
+    "EagerListView",
     "FlatDictView",
     "FlatListView",
     "FrozenSetView",
-    "IndexedDictSliceView",
-    "IndexedDictView",
+    "IndexedDictViewBase",
+    "LazyDictView",
+    "LazyIndexedDictView",
+    "LazyListView",
     "LightDictView",
     "ListSliceView",
-    "ListView",
+    "ListViewBase",
     "SetView",
     "TupleView",
 )

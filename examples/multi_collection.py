@@ -1,6 +1,6 @@
 """Multiple collection types sharing one storage."""
 
-from virtuals._views import DictView, ListView, SetView
+from virtuals._views import EagerDictView, EagerListView, SetView
 from virtuals.codecs import NoOpCodec
 from virtuals.storages.mem import InMemoryStorage
 
@@ -9,16 +9,16 @@ storage = InMemoryStorage(codec=NoOpCodec())
 storage.open()
 
 with storage.transaction() as tx:
-    root = DictView.open_root(tx)
+    root = EagerDictView.open_root(tx)
 
     # Users — dict of dicts
-    users = root.open_child("users", DictView)
+    users = root.open_child("users", EagerDictView)
     users["alice"] = {"role": "admin", "active": True}
     users["bob"] = {"role": "member", "active": True}
     users["charlie"] = {"role": "member", "active": False}
 
     # Events — ordered list
-    events = root.open_child("events", ListView)
+    events = root.open_child("events", EagerListView)
     events.append("alice logged in")
     events.append("bob signed up")
     events.append("charlie deactivated")

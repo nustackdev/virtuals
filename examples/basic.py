@@ -1,6 +1,6 @@
 """Basic Virtuals usage — dict and list over in-memory storage."""
 
-from virtuals._views import DictView, ListView
+from virtuals._views import EagerDictView, EagerListView
 from virtuals.codecs import NoOpCodec
 from virtuals.storages.mem import InMemoryStorage
 
@@ -11,7 +11,7 @@ storage.open()
 
 with storage.transaction() as tx:
     # Root is a dict — everything lives under it
-    root = DictView.open_root(tx)
+    root = EagerDictView.open_root(tx)
 
     # Store users as nested dicts
     root["alice"] = {"name": "Alice", "age": 30}
@@ -31,7 +31,7 @@ with storage.transaction() as tx:
     print("bob" in root)  # False
 
     # Open a child list under the root dict
-    scores = root.open_child("scores", ListView)
+    scores = root.open_child("scores", EagerListView)
     scores.store([100, 200, 300])
     print(scores[0])  # 100
     print(list(scores))  # [100, 200, 300]

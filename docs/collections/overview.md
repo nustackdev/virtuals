@@ -130,9 +130,11 @@ Collections provide the **abstract shape**. Views provide the **concrete impleme
 ```text
 Collections (abstract)          Views (concrete)
 ─────────────────────           ────────────────
-ReactiveMappingBase   ←───────  DictView (via mixins)
-ReactiveSequenceBase  ←───────  ListView (via mixins)
-ReactiveSetBase       ←───────  SetView (via mixins)
+ReactiveMappingBase   ←───────  DictViewBase → EagerDictView / LazyDictView
+ReactiveSequenceBase  ←───────  ListViewBase → EagerListView / LazyListView
+ReactiveSetBase       ←───────  SetView
 ```
+
+Views that support nested containers have two **facets** — eager (reads return Python values) and lazy (reads return child Views). Both share a common base with mutations, keys, and lifecycle. See [Eager vs Lazy Access](eager-lazy.md) for details.
 
 Views compose collection behavior with storage machinery (container access, observation wiring, metadata management) through the mixin bases in `virtuals.view`.

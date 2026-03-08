@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from virtuals._views import DictView
+from virtuals._views import EagerDictView
 from virtuals.codecs import NoOpCodec
 from virtuals.storages.mem import InMemoryStorage
 
@@ -25,11 +25,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture
 def storage() -> Generator[StorageProtocol, None, None]:
-    """Memory storage instance for functional tests.
-
-    Provides a clean storage instance for each test with automatic cleanup.
-    """
-    # No-op codec
+    """Memory storage instance for functional tests."""
     storage = InMemoryStorage(codec=NoOpCodec())
     storage.open()
     try:
@@ -40,28 +36,22 @@ def storage() -> Generator[StorageProtocol, None, None]:
 
 @pytest.fixture
 def tx(storage: StorageProtocol) -> Generator[TransactionProtocol, None, None]:
-    """Read-write transaction context.
-
-    Auto-commits on successful completion, rolls back on exception.
-    """
+    """Read-write transaction context."""
     with storage.transaction() as transaction:
         yield transaction
 
 
 @pytest.fixture
 def snapshot(storage: StorageProtocol) -> Generator[SnapshotProtocol, None, None]:
-    """Read-only snapshot context.
-
-    Useful for testing isolation and concurrent read scenarios.
-    """
+    """Read-only snapshot context."""
     with storage.snapshot() as snap:
         yield snap
 
 
 @pytest.fixture
-def root_view(tx: TransactionProtocol) -> DictView:
-    """Create a DictView at root for testing."""
-    return DictView.open_root(tx)
+def root_view(tx: TransactionProtocol) -> EagerDictView:
+    """Create an EagerDictView at root for testing."""
+    return EagerDictView.open_root(tx)
 
 
 # ============================================================================
@@ -70,21 +60,11 @@ def root_view(tx: TransactionProtocol) -> DictView:
 
 
 @pytest.fixture
-def dict_factory(root_view: DictView) -> Callable[[str, dict[str, Any] | None], View]:
-    """Factory for creating DictViews with test data.
-
-    Navigates from root_view using open_child() to create child DictView.
-
-    Usage:
-        def test_example(dict_factory):
-            users = dict_factory("users", {"alice": {"name": "Alice"}})
-            assert "alice" in users
-    """
+def dict_factory(root_view: EagerDictView) -> Callable[[str, dict[str, Any] | None], View]:
+    """Factory for creating EagerDictViews with test data."""
 
     def _create(address: str, data: dict | None = None) -> View:
-        from virtuals._views import DictView
-
-        view = root_view.open_child(address, DictView)
+        view = root_view.open_child(address, EagerDictView)
         if data is not None:
             view.store(data)
         return view
@@ -93,21 +73,13 @@ def dict_factory(root_view: DictView) -> Callable[[str, dict[str, Any] | None], 
 
 
 @pytest.fixture
-def list_factory(root_view: DictView) -> Callable[[str, list[Any] | None], View]:
-    """Factory for creating ListViews with test data.
-
-    Navigates from root_view using open_child() to create child ListView.
-
-    Usage:
-        def test_example(list_factory):
-            items = list_factory("items", [1, 2, 3])
-            assert len(items) == 3
-    """
+def list_factory(root_view: EagerDictView) -> Callable[[str, list[Any] | None], View]:
+    """Factory for creating EagerListViews with test data."""
 
     def _create(address: str, data: list | None = None) -> View:
-        from virtuals._views import ListView
+        from virtuals._views import EagerListView
 
-        view = root_view.open_child(address, ListView)
+        view = root_view.open_child(address, EagerListView)
         if data is not None:
             view.store(data)
         return view
@@ -116,16 +88,8 @@ def list_factory(root_view: DictView) -> Callable[[str, list[Any] | None], View]
 
 
 @pytest.fixture
-def set_factory(root_view: DictView) -> Callable[[str, set[Any] | None], View]:
-    """Factory for creating SetViews with test data.
-
-    Navigates from root_view using open_child() to create child SetView.
-
-    Usage:
-        def test_example(set_factory):
-            tags = set_factory("tags", {"python", "rust"})
-            assert "python" in tags
-    """
+def set_factory(root_view: EagerDictView) -> Callable[[str, set[Any] | None], View]:
+    """Factory for creating SetViews with test data."""
 
     def _create(address: str, data: set | None = None) -> View:
         from virtuals._views import SetView
@@ -139,16 +103,8 @@ def set_factory(root_view: DictView) -> Callable[[str, set[Any] | None], View]:
 
 
 @pytest.fixture
-def tuple_factory(root_view: DictView) -> Callable[[str, tuple[Any, ...] | None], View]:
-    """Factory for creating TupleViews with test data.
-
-    Navigates from root_view using open_child() to create child TupleView.
-
-    Usage:
-        def test_example(tuple_factory):
-            coords = tuple_factory("coords", (10, 20, 30))
-            assert coords[0] == 10
-    """
+def tuple_factory(root_view: EagerDictView) -> Callable[[str, tuple[Any, ...] | None], View]:
+    """Factory for creating TupleViews with test data."""
 
     def _create(address: str, data: tuple | None = None) -> View:
         from virtuals._views import TupleView

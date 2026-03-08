@@ -24,20 +24,20 @@ class StdView(ViewBase):
     def get_available_views(cls) -> tuple[type[View], ...]:
         """Returns tuple of views defined in collections module."""
         from .bytearray_view import ByteArrayView
-        from .dict_view import DictView
+        from .dict_view import EagerDictView
         from .frozenset_view import FrozenSetView
-        from .list_view import ListView
+        from .list_view import EagerListView
         from .set_view import SetView
         from .tuple_view import TupleView
 
-        return (ByteArrayView, DictView, FrozenSetView, ListView, SetView, TupleView)
+        return (ByteArrayView, EagerDictView, FrozenSetView, EagerListView, SetView, TupleView)
 
     @classmethod
     def get_default_parent_view(cls) -> type[View]:
-        """Returns DictView as a default view."""
-        from .dict_view import DictView
+        """Returns EagerDictView as a default view."""
+        from .dict_view import EagerDictView
 
-        return DictView
+        return EagerDictView
 
 
 if TYPE_CHECKING:

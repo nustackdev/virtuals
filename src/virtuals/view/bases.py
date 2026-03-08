@@ -30,6 +30,7 @@ __all__ = [
     "ChildNestedGetBase",
     "ChildNestedSetBase",
     "ChildPrimitiveSetBase",
+    "LazyChildReadBase",
     "LiveChildrenCountBase",
     "MetadataBasedChildrenCountBase",
     "UnsafePrimitiveOpsBase",
@@ -307,6 +308,62 @@ class ChildNestedGetBase:
             },
         )
         return child_view.extract()
+
+
+class LazyChildReadBase:
+    """Base for getting child values as Views (lazy) instead of extracting.
+
+    Like ChildNestedGetBase but stops before extraction — returns the child
+    View for containers, raw value for primitives. This is the lazy counterpart
+    to ChildNestedGetBase's eager reads.
+
+    Used by lazy view facets (LazyDictView, LazyListView, etc.) and available
+    for community views building custom lazy facets.
+    """
+
+    container: Container
+    registry: ViewRegistry
+
+    def _get_child_view_or_value(
+        self,
+        address: site_.SiteSegment,
+        *,
+        node_info: NodeInfo | None = None,
+    ) -> object:
+        """Get child as View (container) or raw value (primitive).
+
+        Args:
+            address: Child address
+            node_info: Pre-fetched node info to avoid redundant storage read
+
+        Returns:
+            Child View for containers, primitive value for leaves
+
+        Raises:
+            KeyError: If child doesn't exist
+        """
+        # Use pre-fetched info or fetch it
+        if node_info is None:
+            child_site = (*self.container.site, address)
+            node_info = node_ops.get_node_info(child_site, self.container.ctx)
+
+        if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
+            raise KeyError(address)
+
+        if node_info.node_type == NodeType.PRIMITIVE:
+            if is_empty(node_info.primitive_value):
+                raise KeyError(address)
+            return node_info.primitive_value
+
+        # Container — resolve view but do NOT extract
+        child_site = (*self.container.site, address)
+        child_container = Container(ctx=self.container.ctx, site=child_site)
+
+        if node_info.structure is None:
+            raise ValueError(f"Child container '{address}' has no structure ID")
+
+        view_class = self.registry.get_view_for_structure(node_info.structure)
+        return view_class(container=child_container, registry=self.registry)
 
 
 class ChildNestedSetBase:

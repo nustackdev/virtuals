@@ -133,18 +133,20 @@ virtuals/
 
 ## Views
 
-| View | What |
-| ---- | ---- |
-| `DictView` | Dict — keys + nested values |
-| `ListView` | Ordered list with index-based access |
-| `SetView` | Unique unordered set |
-| `IndexedDictView` | Dict with explicit key ordering |
-| `FlatDictView` | Dict with primitive-only values |
-| `FlatListView` | List with primitive-only values |
-| `LightDictView` | Minimal dict (no metadata) |
-| `TupleView` | Immutable ordered sequence |
-| `FrozensetView` | Immutable set |
-| `BytearrayView` | Binary data |
+Views that support nested containers have eager/lazy facets (see `docs/collections/eager-lazy.md`):
+
+| View | What | Facets |
+| ---- | ---- | ------ |
+| `EagerDictView` / `LazyDictView` | Dict — keys + nested values | yes |
+| `EagerListView` / `LazyListView` | Ordered list with index-based access | yes |
+| `EagerIndexedDictView` / `LazyIndexedDictView` | Dict with explicit key ordering | yes |
+| `SetView` | Unique unordered set | no (primitives only) |
+| `FrozenSetView` | Immutable set | no (primitives only) |
+| `FlatDictView` | Dict with primitive-only values | no |
+| `FlatListView` | List with primitive-only values | no |
+| `LightDictView` | Minimal dict (no metadata) | no |
+| `TupleView` | Immutable ordered sequence | no |
+| `ByteArrayView` | Binary data | no |
 
 ## Backends
 

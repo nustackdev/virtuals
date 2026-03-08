@@ -1,127 +1,152 @@
 # Eager vs Lazy Access
 
-## The Problem
+## The Principle
 
-Views need to serve two use cases:
+Every collection view that supports nested containers has **two symmetric facets** — eager and lazy. Neither is primary. Both share the same storage, differ only in how reads surface results.
 
-1. **Eager** — `dictview["key"]` returns a Python value. Works naturally with the entire Python ecosystem (`json.dumps`, `itertools`, `sorted`, `pprint`, etc.).
-
-2. **Lazy** — `dictview["key"]` returns a child View. Enables composition without materializing data — a slice of a dict is just `islice` over child Views, no need for specialized `DictSliceView`.
-
-## Design Decision: `.lazy` Accessor
-
-Default is **eager**. Lazy access is available via a `.lazy` property that returns a lightweight proxy implementing the same collection interface but yielding Views instead of values.
-
-```python
-# Eager (default) — Python values out
-dictview["key"]              # → value
-list(dictview.values())      # → [val1, val2, ...]
-for key in dictview:         # → keys
-
-# Lazy — Views out
-dictview.lazy["key"]         # → child View
-list(dictview.lazy.values()) # → [View1, View2, ...]
-for key in dictview.lazy:    # → keys (same for mappings)
+```text
+DictViewBase                  shared: mutations, keys, lifecycle
+├── EagerDictView             reads return Python values
+│   └── .lazy → LazyDictView
+└── LazyDictView              reads return child Views
+    └── .eager → EagerDictView
 ```
 
-### Why this approach
+Cross-navigation is a first-class operation. Switching facets creates a lightweight view over the same container — no data copied, no state carried over.
 
-**Considered alternatives:**
-
-| Approach | Problem |
-|----------|---------|
-| Default lazy, explicit eager | Breaks Python ecosystem. `list(view)` gives Views, not data. Every stdlib tool needs `.extract()` calls. |
-| Instance config (`lazy=True`) | Same type, different behavior. Can't reason statically. Function receives a view — is it lazy or eager? |
-| Two classes per type (`LazyDictView`) | Class explosion. Every utility must handle both. |
-
-**Why `.lazy` wins:**
-
-- Python ecosystem works by default — `islice(dictview, 5)`, `sorted(listview)`, `json.dumps(dict(d.items()))` all just work
-- Lazy is equally Pythonic — the proxy implements the same protocols, so `islice(dictview.lazy.values(), 5)` works identically
-- Single access point, discoverable, minimal API surface
-- Type-safe — the proxy has different return types than the eager view
-- Lightweight — wraps the same underlying storage, only changes how results surface
-
-## Key Property: `.lazy` Is Not a Mode
-
-`.lazy` is an **accessor**, not a configuration. It doesn't infect child views:
+## How It Works
 
 ```python
-for user_view in islice(dictview.lazy.values(), 3):
-    # user_view is a regular View — defaults to eager
-    user_view["name"]           # → "Alice" (eager, returns value)
-    user_view.lazy["name"]      # → View (lazy, returns child View)
+users = EagerDictView.open_root(tx)
+users["alice"] = {"name": "Alice", "role": "admin", "score": 95}
+users["bob"] = {"name": "Bob", "role": "member", "score": 82}
+
+# --- Eager: Python values out ---
+users["alice"]              # → {"name": "Alice", "role": "admin", "score": 95}
+list(users.values())        # → [{"name": ...}, {"name": ...}]
+
+# --- Lazy: child Views out ---
+users.lazy["alice"]         # → EagerDictView (a live view, not a dict)
+list(users.lazy.values())   # → [EagerDictView, EagerDictView]
+
+# --- Cross-navigate freely ---
+users.lazy.eager is not users   # different instance, same storage
+users.lazy.eager["alice"]       # → {"name": "Alice", ...}
 ```
 
-Each navigation step, you choose eager or lazy independently. No hidden state, no spooky action at a distance.
+### Primitives pass through
 
-## What Needs a Lazy Variant
+Lazy reads return Views for **container** children and **values** for primitive children. There's nothing to wrap — a primitive has no children to navigate into.
 
-Only **read operations that return/yield child data**:
+```python
+users["score"] = 42
+users.lazy["score"]         # → 42 (not a View)
+```
+
+## Not a Mode
+
+`.lazy` is a **facet**, not a configuration. Child views returned from lazy access are eager by default:
+
+```python
+for user_view in islice(users.lazy.values(), 3):
+    # user_view is an EagerDictView — defaults to eager
+    user_view["name"]           # → "Alice" (value)
+    user_view.lazy["name"]      # → "Alice" (also value — it's a primitive)
+    user_view.extract()         # → {"name": "Alice", "role": "admin", "score": 95}
+```
+
+Each navigation step, you choose eager or lazy independently. No hidden state.
+
+## What Differs Between Facets
+
+Only **read operations that surface child data**:
 
 | Operation | Eager | Lazy |
 |-----------|-------|------|
-| `view["key"]` | value | View |
-| `view.values()` | values | Views |
-| `view.items()` | (key, value) | (key, View) |
-| `iter(listview)` | values | Views |
-| `listview[2:5]` | values | Views |
+| `view["key"]` | value | View (container) / value (primitive) |
+| `view.values()` | values | Views / values |
+| `view.items()` | (key, value) | (key, View / value) |
+| `iter(listview)` | values | Views / values |
+| `view.extract()` | dict / list | eager only |
 
-Operations that don't surface child data are **unchanged**:
+Everything else lives on the shared **base** — same for both facets:
 
-| Operation | Same either way |
-|-----------|----------------|
-| `len(view)` | count |
-| `"key" in view` | bool |
-| `del view["key"]` | mutation |
-| `view["key"] = val` | mutation |
-| `view.clear()` | mutation |
+| Operation | Where |
+|-----------|-------|
+| `len(view)` | base |
+| `"key" in view` | base |
+| `view["key"] = val` | base |
+| `del view["key"]` | base |
+| `view.clear()` | base |
+| `view.update(...)` | base |
+| `view.store(...)` | base |
+| `view.keys()` | base |
 
 ## Composition Without Specialized Views
 
-The primary motivation: `.lazy` eliminates the need for specialized view types.
+The primary motivation: lazy facets eliminate specialized slice/window view types. Python's stdlib tools compose naturally with lazy views.
 
 ```python
-# Before: need DictSliceView, DictISliceView, etc.
-slice_view = DictISliceView(dictview, 0, 5)
+from itertools import islice
 
-# After: just use Python's tools on lazy views
-first_5 = list(islice(dictview.lazy.values(), 5))  # → [View, View, View, View, View]
+# Slice — just islice on lazy values
+first_3 = list(islice(users.lazy.values(), 3))
 
-# Navigate into any of them
-for child in first_5:
-    print(child.extract())  # materialize only what you need
+# Filter without materializing
+admins = [v for v in users.lazy.values() if v["role"] == "admin"]
+
+# Count without extracting
+admin_count = sum(1 for v in users.lazy.values() if v["role"] == "admin")
+
+# Selective extraction — materialize only what you need
+for view in first_3:
+    print(view.extract())
 ```
 
-## Implementation Notes
+## Which Views Have Facets
 
-### The `.lazy` proxy
+Only views that support **nested containers** need the eager/lazy split:
 
-- Property on every View, returns a `LazyProxy` wrapping the same view
-- `LazyProxy` implements the same collection base interface (MappingBase, SequenceBase, etc.)
-- Instead of calling `extract()` on child containers, returns the child View directly
-- For primitives (leaf values), returns the value as-is (no View to wrap)
+| View | Facets | Why |
+|------|--------|-----|
+| `EagerDictView` / `LazyDictView` | yes | children can be containers |
+| `EagerListView` / `LazyListView` | yes | children can be containers |
+| `EagerIndexedDictView` / `LazyIndexedDictView` | yes | children can be containers |
+| `SetView` | no | stores primitives only |
+| `FrozenSetView` | no | stores primitives only |
+| `FlatDictView` | no | primitives only by design |
+| `FlatListView` | no | primitives only by design |
+| `LightDictView` | no | primitives only, no nesting |
+| `TupleView` | no | immutable, primitives only |
+| `ByteArrayView` | no | raw bytes |
 
-### `.lazy[key]` vs `open_child`
+## Architecture
 
-`.lazy[key]` is ergonomic sugar for `view.open_child(key, auto_detected_view_type)`. The proxy auto-selects the appropriate view type based on the child's container structure.
+### Three classes per view concept
 
-### Type signatures
+```text
+DictViewBase                    shared mutations, keys, contains, len, lifecycle
+├── EagerDictView               eager reads, extract(), functional ops
+└── LazyDictView                lazy reads, facet cross-navigation
+```
+
+Both facets inherit from the same base. The base carries all mixin capabilities (observable, navigation, nested get/set, etc.). The facets only override the read methods.
+
+### Standardization bases
+
+`view/bases.py` provides reusable bases for building custom views with eager/lazy support:
+
+- `ChildNestedGetBase` — eager reads: `_get_child_value()` extracts containers
+- `LazyChildReadBase` — lazy reads: `_get_child_view_or_value()` returns Views for containers
+
+Community views can compose these bases to get the same eager/lazy pattern.
+
+### Facet switching is cheap
+
+Views are stateless (`@attrs.frozen`). Switching facets creates a new instance pointing to the same container and registry — no data copied, no overhead:
 
 ```python
-class DictView:
-    def __getitem__(self, key: str) -> object:           # eager
-        ...
-
-    @property
-    def lazy(self) -> LazyMappingProxy[str, View]:       # lazy accessor
-        ...
-
-class LazyMappingProxy[K, V]:
-    def __getitem__(self, key: K) -> View:               # returns View
-        ...
-    def values(self) -> Iterator[View]:                  # yields Views
-        ...
-    def items(self) -> Iterator[tuple[K, View]]:         # yields (key, View)
-        ...
+# These are equivalent — both point to the same storage
+lazy = EagerDictView(container, registry).lazy
+lazy = LazyDictView(container=container, registry=registry)
 ```
