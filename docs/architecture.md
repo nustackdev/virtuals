@@ -127,8 +127,7 @@ virtuals/
 ├── container/              # hierarchical container model
 ├── loc/                    # location/navigation (key, path, site)
 ├── types/                  # core types (Empty, NotSet, Value)
-├── traits/                 # container traits
-├── collections/            # collection protocol hierarchy
+├── collections/            # collection bases, protocols, hierarchy
 └── testing/                # compliance test suites
 ```
 
