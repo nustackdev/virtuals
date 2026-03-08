@@ -1,4 +1,4 @@
-# Storage Layer 1 — Filtering System
+# Storage Layer — Filtering System
 
 Filters are **composable, hashable predicates** for key matching.
 

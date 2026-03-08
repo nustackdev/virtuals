@@ -1,4 +1,4 @@
-# Container Layer — Philosophy
+# Container Layer — Design Philosophy
 
 The container layer adds **hierarchy semantics** to flat storage.
 
@@ -109,7 +109,6 @@ Location terms from other layers:
 
 - ~~key~~ → use `site` (key is storage layer)
 - ~~path~~ → use `site` (path is view layer)
-- ~~ref~~ → use `site` (ref is shape layer)
 
 Structural terms:
 
@@ -131,7 +130,7 @@ No implicit context. No global state. Every operation declares what it needs.
 ## What Container Does NOT Do
 
 - **No data structure semantics** — dict/list/set behavior is View layer
-- **No business logic** — application rules are Shape layer
+- **No application logic** — business rules are the consumer's concern
 - **No query language** — filtering/aggregation built on top
 
 Container layer is structural plumbing. It knows paths and types, not meaning.

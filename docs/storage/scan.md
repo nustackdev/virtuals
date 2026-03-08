@@ -1,4 +1,4 @@
-# Storage Layer 1 — Scan Operation
+# Storage Layer — Scan Operation
 
 `scan` provides ordered, streaming access to key ranges.
 
@@ -19,7 +19,7 @@ It is a **system-level iteration primitive**, not a collection.
 
 - Iteration is backend-driven
 - Results are streamed, not materialized
-- Order follows the storage engine’s native key order
+- Order follows the storage engine's native key order
 - No guarantees beyond the active context
 
 ## Constraints
@@ -38,7 +38,7 @@ It is a **system-level iteration primitive**, not a collection.
 
 Any stronger guarantees belong in higher layers.
 
-## Mehcanics
+## Mechanics
 
 scan(self, options: StorageScanOptions) -> ScanProtocol:
 
@@ -83,4 +83,4 @@ ScanProtocol:
         ...
 
 Only keys/values are yielded if all Filters match, otherwise items are skipped.
-Filters are hashable
+Filters are hashable.

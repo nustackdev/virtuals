@@ -1,52 +1,50 @@
-# Layer 2: Container - Hierarchical Semantics
+# Layer 2: Container — Detailed Reference
 
 ## Overview
 
-The Tree layer interprets flat tuple-key-value storage as a hierarchical structure, providing parent-child relationships and distinguishing containers (nodes with children) from primitives (leaf values).
+The Container layer interprets flat tuple-key-value storage as a hierarchical structure, providing parent-child relationships and distinguishing containers (nodes with children) from primitives (leaf values).
 
-**Core Responsibility**: Add hierarchy semantics to flat storage - nothing more.
+**Core Responsibility**: Add hierarchy semantics to flat storage — nothing more.
 
 ## Layer Position
 
 ```
 ┌─────────────────────────────────────────────┐
-│ Layer 4: Shapes                             │
-├─────────────────────────────────────────────┤
 │ Layer 3: Views (Data Structures)            │
 ├─────────────────────────────────────────────┤
-│ Layer 2: Tree (Hierarchical Semantics)   ◄──│  THIS LAYER
+│ Layer 2: Container (Hierarchical Semantics) ◄──│  THIS LAYER
 ├─────────────────────────────────────────────┤
 │ Layer 1: Storage (Tuple-Key-Value)          │
 └─────────────────────────────────────────────┘
 ```
 
-## What Tree Does
+## What Container Does
 
-✅ **Hierarchy Interpretation**
-- Treats tuple keys as paths: `("users", "alice", "profile")`
-- Parent-child relationships from key structure
-- Root is empty tuple `()`
+- **Hierarchy Interpretation**
+  - Treats tuple keys as paths: `("users", "alice", "profile")`
+  - Parent-child relationships from key structure
+  - Root is empty tuple `()`
 
-✅ **Type Distinction**
-- Containers: Can have children (internal nodes)
-- Primitives: Leaf values (terminal nodes)
-- Type markers embedded in storage values
+- **Type Distinction**
+  - Containers: Can have children (internal nodes)
+  - Primitives: Leaf values (terminal nodes)
+  - Type markers embedded in storage values
 
-✅ **Rule Enforcement**
-- Parent must exist before child
-- Well-formed parent chain validation
-- Type compatibility checking
+- **Rule Enforcement**
+  - Parent must exist before child
+  - Well-formed parent chain validation
+  - Type compatibility checking
 
-✅ **Container Metadata**
-- Structure ID: For View layer reconstruction
-- Protocol flags: Hints for behavior (mutable/ordered/etc)
+- **Container Metadata**
+  - Structure ID: For View layer reconstruction
+  - Protocol flags: Hints for behavior (mutable/ordered/etc)
 
-## What Tree Does NOT Do
+## What Container Does NOT Do
 
-❌ Data structure implementation (Views Layer 3)
-❌ Application logic (Semantics Layer 4)
-❌ Dict/list/queue semantics
-❌ Protocol enforcement (protocols are hints only)
+- Data structure implementation (View Layer 3)
+- Dict/list/queue semantics
+- Application logic
+- Protocol enforcement (protocols are hints only)
 
 ## Architecture
 
@@ -423,10 +421,10 @@ except PathTypeError:
 
 ## Integration with Storage Layer
 
-Tree operations translate to storage operations:
+Container operations translate to storage operations:
 
 ```python
-# Tree operation
+# Container operation
 create_container(("users", "alice"), structure, protocol, ctx)
 
 # Storage operation
@@ -435,7 +433,7 @@ ctx.set(
     ("\ue000\U000f0000", structure, protocol, "\ue000\U000f0000")
 )
 
-# Tree operation
+# Container operation
 list_child_keys(("users",), ctx)
 
 # Storage operation

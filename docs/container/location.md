@@ -1,11 +1,11 @@
-# Location Vocabulary — Philosophy
+# Location Vocabulary
 
 Each layer has its own location abstraction. This is intentional.
 
 ## The Progression
 
 ```text
-key → site → path → ref
+key → site → path
 ```
 
 | Layer | Term | What it is |
@@ -13,7 +13,6 @@ key → site → path → ref
 | Storage | **key** | Raw tuple coordinates |
 | Container | **site** | Hierarchical place |
 | View | **path** | Typed navigation segments |
-| Shape | **ref** | Declarative handle |
 
 Each adds meaning while preserving the location abstraction.
 
@@ -85,25 +84,6 @@ Views translate paths to sites. A path segment like `-1` resolves to an actual s
 
 ---
 
-## Ref (Shape Layer)
-
-A **ref** is a declarative handle to a typed location.
-
-```python
-User.profile.email        # Ref[str]
-Users["alice"].tags[-1]   # Ref[str]
-```
-
-Refs are:
-
-- Composable — chain with `.` and `[]`
-- Typed — carry type information (`Ref[str]`)
-- Lazy — resolve to paths when executed
-
-Refs are what developers write. The system translates down: ref → path → site → key.
-
----
-
 ## Why Distinct Terms?
 
 Clarity. Each layer operates on the same underlying tuple, but with different semantics.
@@ -111,6 +91,5 @@ Clarity. Each layer operates on the same underlying tuple, but with different se
 When you say "key", you mean storage address.
 When you say "site", you mean hierarchical place.
 When you say "path", you mean typed navigation.
-When you say "ref", you mean developer-facing handle.
 
 No ambiguity about which layer you're talking about.

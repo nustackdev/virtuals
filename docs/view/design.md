@@ -1,4 +1,4 @@
-# View Layer — Philosophy
+# View Layer — Design Philosophy
 
 The view layer adds **data structure semantics** to hierarchical containers.
 
@@ -191,7 +191,7 @@ Navigation preserves registry context. Child views use parent's registry.
 
 | Term | Meaning |
 | ------ | --------- |
-| `view` | The lense through which container is accessed |
+| `view` | The lens through which container is accessed |
 | `address` | User-facing location (may be `-1`, `"alice"`, etc.) |
 | `path` | Sequence of typed navigation segments |
 | `structure` | Storage marker identifying view type |
@@ -231,7 +231,7 @@ View doesn't handle:
 - Transaction management
 - Byte-level operations
 
-These are Storage Layer 1 responsibilities.
+These are Storage (Layer 1) responsibilities.
 
 ### No Hierarchy Enforcement
 
@@ -241,9 +241,9 @@ View doesn't handle:
 - Container creation rules
 - Type consistency across tree
 
-These are Container Layer 2 responsibilities.
+These are Container (Layer 2) responsibilities.
 
-### No Business Logic
+### No Application Logic
 
 View doesn't handle:
 
@@ -252,7 +252,7 @@ View doesn't handle:
 - Application constraints
 - Schema enforcement
 
-These are Shape Layer 4 responsibilities.
+These are application-level responsibilities.
 
 ### No Caching
 

@@ -1,4 +1,4 @@
-# Storage Layer 1 — Context Model
+# Storage Layer — Context Model
 
 All storage operations execute inside an explicit **context**.
 
@@ -65,7 +65,7 @@ They only record intended mutations.
 
 ## Transaction (Read + Write)
 
-Purpose: isolated read–modify–write workflows.
+Purpose: isolated read-modify-write sequences.
 
 Allowed operations:
 

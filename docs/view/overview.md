@@ -2,18 +2,18 @@
 
 ## What It Is
 
-View adds data structure semantics on top of Tree's containers. It makes containers behave like Python data structures (dicts, lists, sets) while handling all storage details automatically.
+View adds data structure semantics on top of Container's hierarchy. It makes containers behave like Python data structures (dicts, lists, sets) while handling all storage details automatically.
 
 ## Key Concepts
 
 ### Views as Data Structures
 
-Tree sees containers. Views see data structures:
+Container sees containers. Views see data structures:
 
 ```python
-# Tree Layer 2: generic containers
-tree.create_container(("users",))
-tree.set_child("alice", value)
+# Container Layer 2: generic containers
+container.create_container(("users",))
+container.set_child("alice", value)
 
 # View Layer 3: Python data structures
 users["alice"] = {"name": "Alice"}
@@ -230,7 +230,7 @@ events = queue.extract()
 
 ## How It Uses Layer 2
 
-View operations map to Tree operations:
+View operations map to Container operations:
 
 ### DictView: `users["alice"] = {"name": "Alice"}`
 
@@ -238,9 +238,9 @@ View operations map to Tree operations:
 # View Layer 3
 users["alice"] = {"name": "Alice"}
 
-# ↓ uses Tree Layer 2
-tree.create_container(("users", "alice"), structure=1)
-tree.set_child_primitive(("users", "alice"), "name", "Alice")
+# ↓ uses Container Layer 2
+container.create_container(("users", "alice"), structure=1)
+container.set_child_primitive(("users", "alice"), "name", "Alice")
 
 # ↓ uses Storage Layer 1
 storage.put(("users", "alice"), <CONTAINER: structure=1>)
@@ -253,9 +253,9 @@ storage.put(("users", "alice", "name"), "Alice")
 # View Layer 3
 tasks.append("Task 1")
 
-# ↓ uses Tree Layer 2
-count = tree.count_children(("tasks",))
-tree.set_child_primitive(("tasks",), count, "Task 1")
+# ↓ uses Container Layer 2
+count = container.count_children(("tasks",))
+container.set_child_primitive(("tasks",), count, "Task 1")
 
 # ↓ uses Storage Layer 1
 storage.put(("tasks", 0), "Task 1")
@@ -382,7 +382,7 @@ Doesn't handle:
 - Encoding/decoding
 - Transaction management
 
-These are Storage Layer 1 responsibilities.
+These are Storage (Layer 1) responsibilities.
 
 ### No Hierarchy Enforcement
 
@@ -392,7 +392,7 @@ Doesn't handle:
 - Container creation rules
 - Type consistency
 
-These are Tree Layer 2 responsibilities.
+These are Container (Layer 2) responsibilities.
 
 ### No Application Logic
 
@@ -402,4 +402,4 @@ Doesn't handle:
 - Domain validation
 - Command/query patterns
 
-These are Shapes Layer 4 responsibilities.
+These are application-level responsibilities.

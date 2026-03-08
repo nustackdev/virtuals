@@ -2,14 +2,14 @@
 
 ## What It Is
 
-Tree adds hierarchical semantics on top of flat TKV storage. It interprets tuple keys as paths and introduces the concept of containers.
+Container adds hierarchical semantics on top of flat TKV storage. It interprets tuple keys as paths and introduces the concept of containers.
 
 ## Key Concepts
 
 ### Tuples as Paths
 
 TKV Storage sees: `("users", "alice")` as just a key
-Tree sees: `("users", "alice")` as a path where `("users",)` is parent of `("users", "alice")`
+Container sees: `("users", "alice")` as a path where `("users",)` is parent of `("users", "alice")`
 
 ### Containers vs Values
 
@@ -39,7 +39,7 @@ Containers are marked by storing a special sentinel value:
 }
 ```
 
-### Tree Rules
+### Container Rules
 
 1. **Parent must exist before children**
    - Can't create `("users", "alice")` unless `("users",)` exists
@@ -58,68 +58,68 @@ Containers are marked by storing a special sentinel value:
 
 ```python
 # Create container (validates parent exists)
-tree.create_container(("users",))
+container.create_container(("users",))
 
 # Check if key is a container
-is_container = tree.is_container(("users",))
+is_container = container.is_container(("users",))
 
 # Check if container has children
-has_children = tree.has_children(("users",))
+has_children = container.has_children(("users",))
 
 # Delete container and all descendants
-tree.delete_subtree(("users", "alice"))
+container.delete_subtree(("users", "alice"))
 ```
 
 ### Child Operations
 
 ```python
 # List direct children
-children = tree.list_children(("users",))
+children = container.list_children(("users",))
 # Returns: [("users", "alice"), ("users", "bob")]
 
 # List all descendants (recursive)
-descendants = tree.list_descendants(("users",))
+descendants = container.list_descendants(("users",))
 # Returns: [("users", "alice"), ("users", "alice", "profile"), ("users", "bob")]
 
 # Count children
-count = tree.count_children(("users",))
+count = container.count_children(("users",))
 ```
 
 ### Value Operations
 
 ```python
 # Set value at path (parent must exist)
-tree.set_value(("users", "alice", "age"), 30)
+container.set_value(("users", "alice", "age"), 30)
 
 # Get value
-value = tree.get_value(("users", "alice", "age"))
+value = container.get_value(("users", "alice", "age"))
 
 # Delete value
-tree.delete_value(("users", "alice", "age"))
+container.delete_value(("users", "alice", "age"))
 ```
 
 ### Navigation
 
 ```python
 # Get parent
-parent = tree.get_parent(("users", "alice"))  # Returns: ("users",)
+parent = container.get_parent(("users", "alice"))  # Returns: ("users",)
 
 # Get children keys
-keys = tree.child_keys(("users",))  # Returns: ["alice", "bob"]
+keys = container.child_keys(("users",))  # Returns: ["alice", "bob"]
 
 # Check if path exists
-exists = tree.exists(("users", "alice"))
+exists = container.exists(("users", "alice"))
 ```
 
 ## How It Uses Layer 1
 
-Tree operations map to TKV Storage operations:
+Container operations map to TKV Storage operations:
 
 ### list_children()
 
 ```python
-# Tree Layer 2
-children = tree.list_children(("users",))
+# Container Layer 2
+children = container.list_children(("users",))
 
 # ↓ maps to TKV Layer 1
 results = []
@@ -131,8 +131,8 @@ for key, value in tx.scan(start=("users",), end=("users", "￿")):
 ### delete_subtree()
 
 ```python
-# Tree Layer 2
-tree.delete_subtree(("users", "alice"))
+# Container Layer 2
+container.delete_subtree(("users", "alice"))
 
 # ↓ maps to TKV Layer 1
 # Delete all keys in range [("users", "alice"), ("users", "alice", "￿"))
@@ -143,8 +143,8 @@ tx.rangeDelete(start=("users", "alice"))
 ### create_container()
 
 ```python
-# Tree Layer 2
-tree.create_container(("users", "alice"))
+# Container Layer 2
+container.create_container(("users", "alice"))
 
 # ↓ maps to TKV Layer 1
 # 1. Check parent exists
@@ -165,11 +165,11 @@ Containers store structure IDs for View layer reconstruction.
 
 ```python
 # When creating a DictView
-tree.create_container(("users",), structure_id=DictView.structure_id)
+container.create_container(("users",), structure_id=DictView.structure_id)
 
 # When reading back
-container = tree.get_container(("users",))
-structure_id = container["structure_id"]
+info = container.get_container(("users",))
+structure_id = info["structure_id"]
 view_class = registry.get_view(structure_id)  # Returns: DictView
 ```
 
@@ -177,36 +177,36 @@ This allows Views to recreate themselves from storage.
 
 ## Validation
 
-Tree enforces rules that TKV Storage doesn't:
+Container enforces rules that Storage doesn't:
 
 ### Parent Existence
 
 ```python
-# TKV Storage: allows this
+# Storage: allows this
 tx.put(("a", "b", "c"), "value")  # No parent check
 
-# Tree: creates parents or raises
-tree.set_value(("a", "b", "c"), "value")
+# Container: creates parents or raises
+container.set_value(("a", "b", "c"), "value")
 ```
 
 ### Type Consistency
 
 ```python
-# TKV Storage: allows this
+# Storage: allows this
 tx.put(("users", "alice"), <CONTAINER_SENTINEL>)
 tx.put(("users", "alice"), "some value")  # Overwrites
 
-# Tree: rejects this
-tree.create_container(("users", "alice"))
-tree.set_value(("users", "alice"), "value")  # Raises: AlreadyExistsError
+# Container: rejects this
+container.create_container(("users", "alice"))
+container.set_value(("users", "alice"), "value")  # Raises: AlreadyExistsError
 ```
 
 ## Isolation
 
-Tree operations use TKV transactions:
+Container operations use TKV transactions:
 
 ```python
-# All Tree operations happen in a transaction
+# All Container operations happen in a transaction
 with storage.begin(write=True) as tx:
     tree = Tree(tx)
     tree.create_container(("users",))
@@ -215,9 +215,9 @@ with storage.begin(write=True) as tx:
     # Auto-commits on exit
 ```
 
-Multiple Tree operations in one transaction are atomic.
+Multiple Container operations in one transaction are atomic.
 
-## What Tree Does NOT Do
+## What Container Does NOT Do
 
 ### No Data Structure Semantics
 
@@ -227,7 +227,7 @@ Doesn't know:
 - That `("tasks",)` should behave like a list
 - How to append, pop, or other structure-specific operations
 
-These are Layer 3 (Views) responsibilities.
+These are View (Layer 3) responsibilities.
 
 ### No Application Logic
 
@@ -237,7 +237,7 @@ Doesn't know:
 - Business rules or validation
 - Domain models
 
-These are Layer 4 (Semantics) responsibilities.
+These are application-level responsibilities.
 
 ### No Query Language
 
@@ -247,7 +247,7 @@ Doesn't provide:
 - Filters, sorting, aggregation
 - Complex queries
 
-Build these on top using Tree's iteration primitives.
+Build these on top using Container's iteration primitives.
 
 ## Usage Example
 

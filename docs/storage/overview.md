@@ -143,7 +143,7 @@ Tuples naturally represent paths:
 ("users", "alice", "profile")
 ```
 
-But KV Storage doesn't KNOW this is hierarchical. Higher layers interpret it.
+But Storage doesn't KNOW this is hierarchical. Higher layers interpret it.
 
 ### Type Safety
 
@@ -155,7 +155,7 @@ db["user:alice:age"] = "30"  # Should be int?
 db[("users", "alice", "age")] = 30  # Clear
 ```
 
-## What KV Storage Does NOT Do
+## What Storage Does NOT Do
 
 ### No Hierarchy
 
@@ -165,7 +165,7 @@ Doesn't know:
 - That certain keys are "containers"
 - That parent should exist before children
 
-These are Layer 2 (Tree) concepts.
+These are Container (Layer 2) concepts.
 
 ### No Validation
 
@@ -175,7 +175,7 @@ Doesn't check:
 - Key types are consistent
 - Structure is valid
 
-These are Layer 2 responsibilities.
+These are Container (Layer 2) responsibilities.
 
 ### No Semantics
 
@@ -185,13 +185,13 @@ Doesn't know:
 - What a "DictView" or "ListView" is
 - Application logic
 
-These are Layer 3+ responsibilities.
+These are View (Layer 3) responsibilities.
 
 ## Implementation Notes
 
 ### Encoding
 
-KV keys must be encoded to backend format:
+Storage keys must be encoded to backend format:
 
 ```python
 tuple → bytes (eg for LMDB)
@@ -203,7 +203,7 @@ Encoding must preserve lexicographic order:
 encode(("a",)) < encode(("a", "b"))  # Must be true
 ```
 
-Custom ecnoder used.
+Custom encoder used.
 
 ### Backend Requirements
 
