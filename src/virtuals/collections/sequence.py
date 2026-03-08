@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MutableSequenceBase",
+    "ReactiveSequenceBase",
     "SequenceBase",
 ]
 
@@ -137,3 +138,28 @@ class MutableSequenceBase[V](SequenceBase[V]):
     def __radd__(self, other: Iterable[V]) -> list[V]:
         """Support other + sequence."""
         return list(other) + list(self)
+
+
+class ReactiveSequenceBase[V](MutableSequenceBase[V]):
+    """Reactive sequence base. Mutable sequence with change observation.
+
+    Additional abstract:
+        on_change() -> Subscription
+        on_child_change(index) -> Subscription
+        on_children_change() -> Subscription
+    """
+
+    @abstractmethod
+    def on_change(self) -> object:
+        """Subscribe to all changes in this sequence."""
+        ...
+
+    @abstractmethod
+    def on_child_change(self, address: int) -> object:
+        """Subscribe to changes at a specific index."""
+        ...
+
+    @abstractmethod
+    def on_children_change(self) -> object:
+        """Subscribe to changes on any index."""
+        ...

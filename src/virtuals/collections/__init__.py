@@ -56,9 +56,9 @@ from .abc import (
     is_sizeable,
     is_subscriptable,
 )
-from .mapping import MappingBase, MutableMappingBase
-from .sequence import MutableSequenceBase, SequenceBase
-from .set import MutableSetBase, SetBase
+from .mapping import MappingBase, MutableMappingBase, ReactiveMappingBase
+from .sequence import MutableSequenceBase, ReactiveSequenceBase, SequenceBase
+from .set import MutableSetBase, ReactiveSetBase, SetBase
 
 
 __all__ = [
@@ -83,9 +83,13 @@ __all__ = [
     "Nestable",
     "Observable",
     "Poppable",
+    # Reactive bases
+    "ReactiveMappingBase",
     # Reactive protocols
     "ReactiveMappingView",
+    "ReactiveSequenceBase",
     "ReactiveSequenceView",
+    "ReactiveSetBase",
     "ReactiveSetView",
     "Removable",
     "SequenceBase",

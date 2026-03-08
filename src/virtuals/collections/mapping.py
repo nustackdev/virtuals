@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 __all__ = [
     "MappingBase",
     "MutableMappingBase",
+    "ReactiveMappingBase",
 ]
 
 
@@ -115,3 +116,28 @@ class MutableMappingBase[K, V](MappingBase[K, V]):
         """Remove all items. Override for bulk delete."""
         for key in list(self):
             del self[key]
+
+
+class ReactiveMappingBase[K, V](MutableMappingBase[K, V]):
+    """Reactive mapping base. Mutable mapping with change observation.
+
+    Additional abstract:
+        on_change() -> Subscription
+        on_child_change(key) -> Subscription
+        on_children_change() -> Subscription
+    """
+
+    @abstractmethod
+    def on_change(self) -> object:
+        """Subscribe to all changes in this mapping."""
+        ...
+
+    @abstractmethod
+    def on_child_change(self, address: K) -> object:
+        """Subscribe to changes on a specific key."""
+        ...
+
+    @abstractmethod
+    def on_children_change(self) -> object:
+        """Subscribe to changes on any key."""
+        ...

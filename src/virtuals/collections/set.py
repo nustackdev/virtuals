@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MutableSetBase",
+    "ReactiveSetBase",
     "SetBase",
 ]
 
@@ -111,3 +112,16 @@ class MutableSetBase[V](SetBase[V]):
         """Remove all items. Override for bulk delete."""
         for value in list(self):
             self.discard(value)
+
+
+class ReactiveSetBase[V](MutableSetBase[V]):
+    """Reactive set base. Mutable set with change observation.
+
+    Additional abstract:
+        on_change() -> Subscription
+    """
+
+    @abstractmethod
+    def on_change(self) -> object:
+        """Subscribe to all changes in this set."""
+        ...
