@@ -23,8 +23,13 @@ from virtuals._views import (
 )
 
 
+DictView = LazyDictView
+IndexedDictView = LazyIndexedDictView
+ListView = LazyListView
+
 __all__ = (
     "ByteArrayView",
+    "DictView",
     "DictViewBase",
     "EagerDictView",
     "EagerIndexedDictView",
@@ -32,12 +37,14 @@ __all__ = (
     "FlatDictView",
     "FlatListView",
     "FrozenSetView",
+    "IndexedDictView",
     "IndexedDictViewBase",
     "LazyDictView",
     "LazyIndexedDictView",
     "LazyListView",
     "LightDictView",
     "ListSliceView",
+    "ListView",
     "ListViewBase",
     "SetView",
     "TupleView",
