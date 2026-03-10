@@ -13,13 +13,14 @@ Provided for free:
 from __future__ import annotations
 
 from abc import abstractmethod
+from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from .bases import CollectionBase
 
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Mapping
+    from collections.abc import Mapping
 
 
 __all__ = [
@@ -50,19 +51,17 @@ class MappingBase[K, V](CollectionBase[K]):
             return False
         return True
 
-    def keys(self) -> Generator[K, None, None]:
-        """Yield all keys."""
-        yield from self
+    def keys(self) -> KeysView[K]:
+        """Get all keys as a set-like view."""
+        return KeysView(self)  # type: ignore[arg-type]
 
-    def values(self) -> Generator[V, None, None]:
-        """Yield all values."""
-        for key in self:
-            yield self[key]
+    def values(self) -> ValuesView[V]:
+        """Get all values as a collection view."""
+        return ValuesView(self)  # type: ignore[arg-type]
 
-    def items(self) -> Generator[tuple[K, V], None, None]:
-        """Yield all (key, value) pairs."""
-        for key in self:
-            yield key, self[key]
+    def items(self) -> ItemsView[K, V]:
+        """Get all items as a set-like view."""
+        return ItemsView(self)  # type: ignore[arg-type]
 
     def get(self, key: K, default: object = None) -> V | object:
         """Get value with default fallback."""

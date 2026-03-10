@@ -10,7 +10,7 @@ Ultra-lightweight dict view with no:
 
 from __future__ import annotations
 
-from collections.abc import MutableMapping
+from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from virtuals.container import ContainerProtocol, ContainerStructure
@@ -113,7 +113,7 @@ class LightDictView(
 
     def __iter__(self) -> Generator[str | int, None, None]:
         """Iterate over keys."""
-        yield from self.keys()
+        yield from self.container.iter_child_keys(validate=False)
 
     def get(self, key: str | int, default: Value | Empty = EMPTY) -> Value | Empty:
         """Get value with default fallback."""
@@ -122,19 +122,17 @@ class LightDictView(
         except KeyError:
             return default
 
-    def keys(self) -> Generator[str | int, None, None]:
-        """Iterate over keys."""
-        yield from self.container.iter_child_keys(validate=False)
+    def keys(self) -> KeysView[str | int]:
+        """Get all keys as a set-like view."""
+        return KeysView(self)  # type: ignore[arg-type]
 
-    def values(self) -> Generator[Value, None, None]:
-        """Iterate over values."""
-        for _k, v in self.container.iter_children(validate=False):
-            yield cast("Value", v.primitive_value)
+    def values(self) -> ValuesView[Value]:
+        """Get all values as a collection view."""
+        return _LightValuesView(self)
 
-    def items(self) -> Generator[tuple[str | int, Value], None, None]:
-        """Iterate over (key, value) pairs."""
-        for k, v in self.container.iter_children(validate=False):
-            yield k, cast("Value", v.primitive_value)
+    def items(self) -> ItemsView[str | int, Value]:
+        """Get all items as a set-like view."""
+        return _LightItemsView(self)
 
     def clear(self) -> None:
         """Remove all items."""
@@ -165,6 +163,26 @@ class LightDictView(
             self.clear()
         for key, val in value.items():
             self[key] = val
+
+
+class _LightValuesView(ValuesView):
+    """Efficient ValuesView for LightDictView — single-pass iteration."""
+
+    _mapping: LightDictView
+
+    def __iter__(self) -> Generator[Value, None, None]:  # type: ignore[override]
+        for _k, v in self._mapping.container.iter_children(validate=False):
+            yield cast("Value", v.primitive_value)
+
+
+class _LightItemsView(ItemsView):
+    """Efficient ItemsView for LightDictView — single-pass iteration."""
+
+    _mapping: LightDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, Value], None, None]:  # type: ignore[override]
+        for k, v in self._mapping.container.iter_children(validate=False):
+            yield k, cast("Value", v.primitive_value)
 
 
 MutableMapping.register(LightDictView)

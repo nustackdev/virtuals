@@ -8,7 +8,7 @@ Provides three classes following the eager/lazy facet pattern:
 
 from __future__ import annotations
 
-from collections.abc import MutableMapping
+from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
 from typing import TYPE_CHECKING, ClassVar
 
 from virtuals.container import (
@@ -110,15 +110,15 @@ class DictViewBase(
 
     def __iter__(self) -> Generator[str | int, None, None]:
         """Iterate over keys."""
-        yield from self.keys()
-
-    def keys(self) -> Generator[str | int, None, None]:
-        """Get all keys.
-
-        Yields:
-            Keys in storage order
-        """
         yield from self.container.iter_child_keys(validate=False)
+
+    def keys(self) -> KeysView[str | int]:
+        """Get all keys as a set-like view.
+
+        Returns a proper KeysView supporting len, contains, and set
+        operations (union, intersection, difference, etc.).
+        """
+        return KeysView(self)  # type: ignore[arg-type]
 
     # =========================================================================
     # MUTATIONS (same for both facets)
@@ -198,16 +198,33 @@ class EagerDictView(DictViewBase):
         except ContainerNotFoundError as e:
             raise KeyError(address) from e
 
-    def values(self) -> Generator[object, None, None]:
-        """Get all values — yields extracted Python values."""
+    def values(self) -> ValuesView[object]:
+        """Get all values as a collection view.
+
+        Returns a proper ValuesView supporting len and contains.
+        Uses efficient single-pass iteration over storage.
+        """
+        return _EagerValuesView(self)
+
+    def items(self) -> ItemsView[str | int, object]:
+        """Get all key-value pairs as a set-like view.
+
+        Returns a proper ItemsView supporting len, contains, and set
+        operations (union, intersection, difference, etc.).
+        Uses efficient single-pass iteration over storage.
+        """
+        return _EagerItemsView(self)
+
+    def _iter_values(self) -> Generator[object, None, None]:
+        """Efficient single-pass value iteration over storage."""
         for k, v in self.container.iter_children(validate=False):
             if v.node_type == NodeType.PRIMITIVE:
                 yield v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
                 yield self._get_child_value(k, node_info=v)
 
-    def items(self) -> Generator[tuple[str | int, object], None, None]:
-        """Get all key-value pairs — yields (key, extracted_value)."""
+    def _iter_items(self) -> Generator[tuple[str | int, object], None, None]:
+        """Efficient single-pass items iteration over storage."""
         for k, v in self.container.iter_children(validate=False):
             if v.node_type == NodeType.PRIMITIVE:
                 yield k, v.primitive_value
@@ -316,16 +333,30 @@ class LazyDictView(DictViewBase):
         except ContainerNotFoundError as e:
             raise KeyError(address) from e
 
-    def values(self) -> Generator[object, None, None]:
-        """Get all children — yields Views for containers, values for primitives."""
+    def values(self) -> ValuesView[object]:
+        """Get all children as a collection view.
+
+        Returns Views for containers, values for primitives.
+        """
+        return _LazyValuesView(self)
+
+    def items(self) -> ItemsView[str | int, object]:
+        """Get all pairs as a set-like view.
+
+        Returns (key, View|value) pairs.
+        """
+        return _LazyItemsView(self)
+
+    def _iter_values(self) -> Generator[object, None, None]:
+        """Efficient single-pass value iteration over storage."""
         for k, v in self.container.iter_children(validate=False):
             if v.node_type == NodeType.PRIMITIVE:
                 yield v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
                 yield self._get_child_view_or_value(k, node_info=v)
 
-    def items(self) -> Generator[tuple[str | int, object], None, None]:
-        """Get all pairs — yields (key, View|value)."""
+    def _iter_items(self) -> Generator[tuple[str | int, object], None, None]:
+        """Efficient single-pass items iteration over storage."""
         for k, v in self.container.iter_children(validate=False):
             if v.node_type == NodeType.PRIMITIVE:
                 yield k, v.primitive_value
@@ -345,6 +376,47 @@ class LazyDictView(DictViewBase):
     def lazy(self) -> LazyDictView:
         """Identity — already lazy."""
         return self
+
+
+# =============================================================================
+# VIEW CLASSES — proper KeysView / ValuesView / ItemsView
+# =============================================================================
+
+
+class _EagerValuesView(ValuesView):
+    """Efficient ValuesView — single-pass iteration over storage."""
+
+    _mapping: EagerDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values()
+
+
+class _EagerItemsView(ItemsView):
+    """Efficient ItemsView — single-pass iteration over storage."""
+
+    _mapping: EagerDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items()
+
+
+class _LazyValuesView(ValuesView):
+    """Efficient ValuesView — single-pass iteration, lazy child access."""
+
+    _mapping: LazyDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values()
+
+
+class _LazyItemsView(ItemsView):
+    """Efficient ItemsView — single-pass iteration, lazy child access."""
+
+    _mapping: LazyDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items()
 
 
 MutableMapping.register(EagerDictView)

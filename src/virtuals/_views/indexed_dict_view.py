@@ -22,7 +22,7 @@ Provides three classes following the eager/lazy facet pattern:
 
 from __future__ import annotations
 
-from collections.abc import MutableMapping
+from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType
@@ -140,13 +140,15 @@ class IndexedDictViewBase(
         return self._data_container().exists_child(obj)
 
     def __iter__(self) -> Generator[str | int, None, None]:
-        yield from self.keys()
+        self._ensure_keys_synced()
+        yield from self._keys_view()
 
     def key_at(self, idx: int) -> str | int:
         """Get key at index — single O(1) read from __keys__ FlatListView."""
         return self._keys_view()[idx]
 
-    def keys(self) -> Generator[str | int, None, None]:
+    def _ensure_keys_synced(self) -> None:
+        """Sync __keys__ from __data__ if empty."""
         kv = self._keys_view()
         if len(kv) == 0:
             dc = self._data_container()
@@ -156,7 +158,11 @@ class IndexedDictViewBase(
                     self._ensure_layout()
                     kv = self._keys_view()
                     kv.store(data_keys)
-        yield from kv
+
+    def keys(self) -> KeysView[str | int]:
+        """Get all keys as a set-like view."""
+        self._ensure_keys_synced()
+        return KeysView(self)  # type: ignore[arg-type]
 
     def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
         try:
@@ -323,13 +329,13 @@ class EagerIndexedDictView(IndexedDictViewBase):
             return node_info.primitive_value  # type: ignore[union-attr]
         return self._extract_data_child(address, node_info)
 
-    def values(self) -> Generator[object, None, None]:
-        for k in self.keys():
-            yield self[k]
+    def values(self) -> ValuesView[object]:
+        """Get all values as a collection view."""
+        return ValuesView(self)  # type: ignore[arg-type]
 
-    def items(self) -> Generator[tuple[str | int, object], None, None]:
-        for k in self.keys():
-            yield k, self[k]
+    def items(self) -> ItemsView[str | int, object]:
+        """Get all items as a set-like view."""
+        return ItemsView(self)  # type: ignore[arg-type]
 
     def pop(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
         try:
@@ -344,7 +350,7 @@ class EagerIndexedDictView(IndexedDictViewBase):
             return default
 
     def extract(self) -> dict[str | int, object]:
-        return {k: self[k] for k in self.keys()}
+        return {k: self[k] for k in self}
 
     # -- Facet navigation --------------------------------------------------
 
@@ -380,13 +386,13 @@ class LazyIndexedDictView(IndexedDictViewBase):
             return node_info.primitive_value  # type: ignore[union-attr]
         return self._view_data_child(address, node_info)
 
-    def values(self) -> Generator[object, None, None]:
-        for k in self.keys():
-            yield self[k]
+    def values(self) -> ValuesView[object]:
+        """Get all values as a collection view."""
+        return ValuesView(self)  # type: ignore[arg-type]
 
-    def items(self) -> Generator[tuple[str | int, object], None, None]:
-        for k in self.keys():
-            yield k, self[k]
+    def items(self) -> ItemsView[str | int, object]:
+        """Get all items as a set-like view."""
+        return ItemsView(self)  # type: ignore[arg-type]
 
     # -- Facet navigation --------------------------------------------------
 
