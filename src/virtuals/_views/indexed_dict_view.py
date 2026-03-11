@@ -93,7 +93,9 @@ class IndexedDictViewBase(
 
     @classmethod
     def is_address_static(cls, address: object) -> bool:
-        return True
+        # Must be False: data lives under __data__/ so navigate_view
+        # must go through open_child() to insert the __data__ segment.
+        return False
 
     def normalize_address(self, address: str | int) -> str | int:
         return address
