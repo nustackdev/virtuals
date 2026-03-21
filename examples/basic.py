@@ -6,13 +6,9 @@ from virtuals.navigator import Navigator
 from virtuals.storages.mem import InMemoryStorage
 
 
-# Set up storage
-storage = InMemoryStorage(codec=NoOpCodec())
-storage.open()
+nav = Navigator(InMemoryStorage(codec=NoOpCodec()))
 
-nav = Navigator(storage)
-
-with storage.transaction() as tx:
+with nav.storage as storage, storage.transaction() as tx:
     # Root is a dict - everything lives under it
     root = nav.root(tx)
 
@@ -43,5 +39,3 @@ with storage.transaction() as tx:
 
     # Extract - materialize the whole thing
     print(root.extract())
-
-storage.close()
