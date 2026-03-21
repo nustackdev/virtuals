@@ -194,13 +194,6 @@ _playground/
 .state*/
 .logs*/
 
-# AI-related
-.cursor/
-.agent.md/
-.claude/
-Claude.md
-repomix*.txt
-
 # cython files
 *.c
 *.cpp
