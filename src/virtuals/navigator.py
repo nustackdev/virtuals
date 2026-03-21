@@ -1,95 +1,83 @@
 """Navigator - high-level entrypoint for virtuals storage.
 
-Wraps storage + views into a convenient API. Manages storage lifecycle,
-transaction/snapshot contexts, and provides path-based access.
+Central coordinator for storage access. Owns the ViewRegistry, creates
+root views, provides path-based access. All views flow from Navigator.
 
 Usage:
     nav = Navigator(storage)
 
-    with nav.transaction() as tx:
-        tx.root["users"] = {"alice": {"name": "Alice"}}
+    with storage.transaction() as tx:
+        root = nav.root(tx)
+        root["users"] = {"alice": {"name": "Alice"}}
 
-    with nav.snapshot() as snap:
-        print(snap.root["users"]["alice"])
+    with storage.snapshot() as snap:
+        root = nav.root(snap)
+        print(root["users"]["alice"])
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from virtuals._views import LazyDictView
-from virtuals.loc.path_nav import navigate_view
+from virtuals.container import Container
+from virtuals.loc import DATA_ROOT
+
+from .view.registry import ViewRegistry
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
+    from virtuals.loc import site as site_
     from virtuals.tkv.storage import StorageContextType
     from virtuals.view import View
 
 
 __all__ = [
     "Navigator",
-    "ViewScope",
 ]
 
 
-class ViewScope:
-    """A scoped view context (transaction or snapshot) with a root view.
+def _default_views() -> tuple[type[View], ...]:
+    """Standard views registered by default."""
+    from virtuals._views.bytearray_view import ByteArrayView
+    from virtuals._views.dict_view import EagerDictView
+    from virtuals._views.frozenset_view import FrozenSetView
+    from virtuals._views.list_view import EagerListView
+    from virtuals._views.set_view import SetView
+    from virtuals._views.tuple_view import TupleView
 
-    Provides path-based access to the storage tree.
-    """
-
-    def __init__(self, ctx: StorageContextType, root_view_cls: type[View] = LazyDictView) -> None:
-        """Initialize scope with storage context and root view class."""
-        self._ctx = ctx
-        self._root = root_view_cls.open_root(ctx)
-
-    @property
-    def root(self) -> View:
-        """The root view of this scope."""
-        return self._root
-
-    @property
-    def ctx(self) -> StorageContextType:
-        """The underlying storage context (transaction/snapshot)."""
-        return self._ctx
-
-    def view(self, *path: tuple[str, type[View]]) -> View:
-        """Navigate to a view at the given path.
-
-        Args:
-            *path: sequence of (address, ViewType) tuples
-
-        Returns:
-            View at the target path
-
-        Example:
-            tx.view(("users", DictView), ("alice", DictView))
-        """
-        return navigate_view(self._root, path)
+    return (ByteArrayView, EagerDictView, FrozenSetView, EagerListView, SetView, TupleView)
 
 
 class Navigator:
     """High-level entrypoint for virtuals storage.
 
-    Holds a storage reference and root view class.
-    Used as base for NavigatorResource in composables integration.
+    Owns the ViewRegistry and provides view creation methods.
+    All views should be created through Navigator.
 
     Args:
         storage: a virtuals storage backend (InMemoryStorage, RocksDBStorage, etc.)
-        root_view: view class for the root (default: LazyDictView)
+        root_view: view class for the root (default: DictView)
+        views: tuple of view classes to register. None = standard views.
+        site: root site for this navigator (default: DATA_ROOT)
     """
 
     def __init__(
         self,
         storage: object,
-        root_view: type[View] = LazyDictView,
+        root_view: type[View] | None = None,
+        views: tuple[type[View], ...] | None = None,
+        site: site_.Site | None = None,
     ) -> None:
-        """Initialize navigator with storage and root view class."""
+        """Initialize Navigator with storage, root view class, and optional views."""
+        if root_view is None:
+            from virtuals._views.dict_view import EagerDictView
+
+            root_view = EagerDictView
+
         self._storage = storage
-        self._root_view = root_view
+        self._root_view_cls = root_view
+        self._site: site_.Site = site if site is not None else (DATA_ROOT,)
+        self._registry = self._build_registry(views)
 
     @property
     def storage(self) -> object:
@@ -97,18 +85,45 @@ class Navigator:
         return self._storage
 
     @property
-    def root_view(self) -> type[View]:
-        """The root view class."""
-        return self._root_view
+    def registry(self) -> ViewRegistry:
+        """The view registry."""
+        return self._registry
 
-    @contextmanager
-    def transaction(self) -> Iterator[ViewScope]:
-        """Open a read-write transaction scope."""
-        with self._storage.transaction() as tx:
-            yield ViewScope(tx, self._root_view)
+    @property
+    def site(self) -> site_.Site:
+        """The root site for this navigator."""
+        return self._site
 
-    @contextmanager
-    def snapshot(self) -> Iterator[ViewScope]:
-        """Open a read-only snapshot scope."""
-        with self._storage.snapshot() as snap:
-            yield ViewScope(snap, self._root_view)
+    def root(self, ctx: StorageContextType) -> View:
+        """Open root view on a storage context (transaction/snapshot).
+
+        This is the primary entry point for accessing storage.
+
+        Args:
+            ctx: storage context (transaction, snapshot, or write batch)
+
+        Returns:
+            Root view with navigator's registry attached.
+        """
+        container = Container(ctx=ctx, site=self._site)
+        return self._root_view_cls(container, self._registry)
+
+    def root_at(self, site: site_.Site, ctx: StorageContextType) -> View:
+        """Open a view at a specific site.
+
+        Args:
+            site: target site tuple
+            ctx: storage context
+
+        Returns:
+            View at the given site with navigator's registry.
+        """
+        container = Container(ctx=ctx, site=site)
+        return self._root_view_cls(container, self._registry)
+
+    def _build_registry(self, views: tuple[type[View], ...] | None = None) -> ViewRegistry:
+        """Build registry from provided views or defaults."""
+        registry = ViewRegistry()
+        for view in views or _default_views():
+            registry.register(view)
+        return registry

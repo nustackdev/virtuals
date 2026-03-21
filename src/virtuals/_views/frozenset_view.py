@@ -14,9 +14,8 @@ from virtuals.view import (
     ChildPrimitiveSetBase,
     MetadataBasedChildrenCountBase,
     UnsafePrimitiveOpsBase,
+    ViewBase,
 )
-
-from .base import StdView
 
 
 if TYPE_CHECKING:
@@ -40,7 +39,7 @@ class FrozenSetView(
     ChildNestedSetBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
-    StdView,
+    ViewBase,
 ):
     """Frozenset-like view over container (immutable set).
 

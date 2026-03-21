@@ -13,9 +13,8 @@ from virtuals.view import (
     MetadataBasedChildrenCountBase,
     ObservableBase,
     UnsafePrimitiveOpsBase,
+    ViewBase,
 )
-
-from .base import StdView
 
 
 if TYPE_CHECKING:
@@ -38,7 +37,7 @@ class ByteArrayView(
     MetadataBasedChildrenCountBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
-    StdView,
+    ViewBase,
 ):
     """ByteArray-like view over container.
 

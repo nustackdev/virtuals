@@ -2,28 +2,31 @@
 
 from virtuals._views import EagerDictView, EagerListView, SetView
 from virtuals.codecs import NoOpCodec
+from virtuals.navigator import Navigator
 from virtuals.storages.mem import InMemoryStorage
 
 
 storage = InMemoryStorage(codec=NoOpCodec())
 storage.open()
 
-with storage.transaction() as tx:
-    root = EagerDictView.open_root(tx)
+nav = Navigator(storage)
 
-    # Users — dict of dicts
+with storage.transaction() as tx:
+    root = nav.root(tx)
+
+    # Users - dict of dicts
     users = root.open_child("users", EagerDictView)
     users["alice"] = {"role": "admin", "active": True}
     users["bob"] = {"role": "member", "active": True}
     users["charlie"] = {"role": "member", "active": False}
 
-    # Events — ordered list
+    # Events - ordered list
     events = root.open_child("events", EagerListView)
     events.append("alice logged in")
     events.append("bob signed up")
     events.append("charlie deactivated")
 
-    # Tags — unique set
+    # Tags - unique set
     tags = root.open_child("tags", SetView)
     tags.add("python")
     tags.add("rust")

@@ -28,9 +28,8 @@ from virtuals.view import (
     MetadataBasedChildrenCountBase,
     ObservableBase,
     UnsafePrimitiveOpsBase,
+    ViewBase,
 )
-
-from .base import StdView
 
 
 if TYPE_CHECKING:
@@ -74,7 +73,7 @@ class DictViewBase(
     ChildPrimitiveSetBase,
     LazyChildReadBase,
     UnsafePrimitiveOpsBase,
-    StdView,
+    ViewBase,
 ):
     """Dict-like view base — shared by eager and lazy facets.
 
@@ -83,7 +82,7 @@ class DictViewBase(
     EagerDictView and LazyDictView facets.
 
     Example:
-        >>> users = EagerDictView.open_root(ctx)
+        >>> users = nav.root(ctx)
         >>> users["alice"] = {"name": "Alice", "tags": ["python"]}
         >>> list(users.keys())
     """

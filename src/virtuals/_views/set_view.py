@@ -16,9 +16,8 @@ from virtuals.view import (
     MetadataBasedChildrenCountBase,
     ObservableBase,
     UnsafePrimitiveOpsBase,
+    ViewBase,
 )
-
-from .base import StdView
 
 
 if TYPE_CHECKING:
@@ -47,7 +46,7 @@ class SetView(
     ChildNestedSetBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
-    StdView,
+    ViewBase,
 ):
     """Set-like view over container.
 

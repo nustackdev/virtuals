@@ -27,9 +27,8 @@ from virtuals.view import (
     MetadataBasedChildrenCountBase,
     ObservableBase,
     UnsafePrimitiveOpsBase,
+    ViewBase,
 )
-
-from .base import StdView
 
 
 if TYPE_CHECKING:
@@ -77,7 +76,7 @@ class ListViewBase(
     ChildPrimitiveSetBase,
     LazyChildReadBase,
     UnsafePrimitiveOpsBase,
-    StdView,
+    ViewBase,
 ):
     """List-like view base — shared by eager and lazy facets.
 
@@ -86,7 +85,7 @@ class ListViewBase(
     EagerListView and LazyListView facets.
 
     Example:
-        >>> tasks = EagerListView.open_root(ctx)
+        >>> tasks = nav.root(ctx)
         >>> tasks.append("Buy groceries")
         >>> tasks.append("Write code")
         >>> print(len(tasks))  # 2

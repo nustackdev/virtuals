@@ -36,9 +36,9 @@ from virtuals.view import (
     LazyChildReadBase,
     ObservableBase,
     UnsafePrimitiveOpsBase,
+    ViewBase,
 )
 
-from .base import StdView
 from .flat_list_view import FlatListView
 
 
@@ -73,7 +73,7 @@ class IndexedDictViewBase(
     ChildPrimitiveSetBase,
     LazyChildReadBase,
     UnsafePrimitiveOpsBase,
-    StdView,
+    ViewBase,
 ):
     """Dict view base with hierarchical internal layout for O(1) key access.
 
@@ -82,7 +82,7 @@ class IndexedDictViewBase(
 
     Example::
 
-        >>> dct = EagerIndexedDictView.open_root(ctx)
+        >>> dct = nav.root(ctx)
         >>> dct.store({"a": 1, "b": 2, "c": 3})
         >>> list(dct.keys())   # reads from __keys__/
         ['a', 'b', 'c']

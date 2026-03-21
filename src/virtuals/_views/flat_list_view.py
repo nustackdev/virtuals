@@ -19,9 +19,8 @@ from virtuals.view import (
     ChildPrimitiveSetBase,
     MetadataBasedChildrenCountBase,
     UnsafePrimitiveOpsBase,
+    ViewBase,
 )
-
-from .base import StdView
 
 
 if TYPE_CHECKING:
@@ -37,7 +36,7 @@ class FlatListView(
     MetadataBasedChildrenCountBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
-    StdView,
+    ViewBase,
 ):
     """Primitives-only list with O(1) append and length tracking.
 

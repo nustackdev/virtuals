@@ -1,17 +1,20 @@
-"""Eager vs lazy access — navigate and slice without materializing data."""
+"""Eager vs lazy access - navigate and slice without materializing data."""
 
 from itertools import islice
 
-from virtuals._views import EagerDictView, EagerListView
+from virtuals._views import EagerListView
 from virtuals.codecs import NoOpCodec
+from virtuals.navigator import Navigator
 from virtuals.storages.mem import InMemoryStorage
 
 
 storage = InMemoryStorage(codec=NoOpCodec())
 storage.open()
 
+nav = Navigator(storage)
+
 with storage.transaction() as tx:
-    root = EagerDictView.open_root(tx)
+    root = nav.root(tx)
 
     # Populate some data
     root["alice"] = {"name": "Alice", "role": "admin", "score": 95}
@@ -21,19 +24,19 @@ with storage.transaction() as tx:
     root["eve"] = {"name": "Eve", "role": "member", "score": 76}
 
     # =========================================================================
-    # EAGER — the default, returns Python values
+    # EAGER - the default, returns Python values
     # =========================================================================
 
     # Just like a regular dict
     print(root["alice"])
-    # → {'name': 'Alice', 'role': 'admin', 'score': 95}
+    # -> {'name': 'Alice', 'role': 'admin', 'score': 95}
 
     # Standard iteration yields materialized dicts
     for uid, profile in root.items():
         print(f"  {uid}: {profile['name']} ({profile['role']})")
 
     # =========================================================================
-    # LAZY — returns child Views instead of extracting
+    # LAZY - returns child Views instead of extracting
     # =========================================================================
 
     lazy = root.lazy
@@ -41,14 +44,14 @@ with storage.transaction() as tx:
     # Lazy access returns a View, not a dict
     alice_view = lazy["alice"]
     print(type(alice_view).__name__)
-    # → EagerDictView  (child views are eager by default)
+    # -> EagerDictView  (child views are eager by default)
 
-    # The View is live — you can read, navigate, or extract from it
-    print(alice_view["name"])  # → Alice  (eager read on the child)
-    print(alice_view.extract())  # → {'name': 'Alice', 'role': 'admin', 'score': 95}
+    # The View is live - you can read, navigate, or extract from it
+    print(alice_view["name"])  # -> Alice  (eager read on the child)
+    print(alice_view.extract())  # -> {'name': 'Alice', 'role': 'admin', 'score': 95}
 
     # =========================================================================
-    # COMPOSITION — lazy + Python stdlib = no specialized views needed
+    # COMPOSITION - lazy + Python stdlib = no specialized views needed
     # =========================================================================
 
     # Get the first 3 users as Views (no data materialized yet)
@@ -62,9 +65,9 @@ with storage.transaction() as tx:
     # Pair keys with lazy views, take a slice
     top_2_items = list(islice(lazy.items(), 2))
     for uid, view in top_2_items:
-        print(f"  {uid} → {view.extract()}")
+        print(f"  {uid} -> {view.extract()}")
 
-    # Filter with a generator — only extract matching users
+    # Filter with a generator - only extract matching users
     admins = [view.extract() for view in lazy.values() if view["role"] == "admin"]
     print(f"Admins: {admins}")
 
@@ -73,33 +76,33 @@ with storage.transaction() as tx:
     print(f"Admin count: {admin_count}")
 
     # =========================================================================
-    # LAZY IS NOT A MODE — each step chooses independently
+    # LAZY IS NOT A MODE - each step chooses independently
     # =========================================================================
 
     # Navigate lazily to get a child view
     alice_view = lazy["alice"]
 
     # The child view is eager by default
-    print(alice_view["name"])  # → "Alice" (value)
+    print(alice_view["name"])  # -> "Alice" (value)
 
     # Explicitly go lazy on the child too
-    print(alice_view.lazy["name"])  # → "Alice" (still a value — it's a primitive)
+    print(alice_view.lazy["name"])  # -> "Alice" (still a value - it's a primitive)
 
     # =========================================================================
-    # CROSS-NAVIGATION — switch between eager and lazy freely
+    # CROSS-NAVIGATION - switch between eager and lazy freely
     # =========================================================================
 
     # Start eager, go lazy, come back
     eager_again = lazy.eager
-    print(eager_again["alice"])  # → {'name': 'Alice', ...}  (extracted dict again)
+    print(eager_again["alice"])  # -> {'name': 'Alice', ...}  (extracted dict again)
 
-    # Mutations work through either facet — same storage underneath
+    # Mutations work through either facet - same storage underneath
     lazy["frank"] = {"name": "Frank", "role": "member", "score": 70}
-    print("frank" in root)  # → True (visible from eager)
-    print(root["frank"]["name"])  # → Frank
+    print("frank" in root)  # -> True (visible from eager)
+    print(root["frank"]["name"])  # -> Frank
 
     # =========================================================================
-    # LISTS — same pattern
+    # LISTS - same pattern
     # =========================================================================
 
     scores_list = root.open_child("scores", EagerListView)
@@ -112,10 +115,10 @@ with storage.transaction() as tx:
         ]
     )
 
-    # Eager — plain Python values
-    print(scores_list[0])  # → {'user': 'alice', 'points': 100}
+    # Eager - plain Python values
+    print(scores_list[0])  # -> {'user': 'alice', 'points': 100}
 
-    # Lazy — Views
+    # Lazy - Views
     lazy_scores = scores_list.lazy
     first_score = lazy_scores[0]
     print(f"{first_score['user']}: {first_score['points']} pts")
