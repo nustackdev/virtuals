@@ -8,6 +8,7 @@ import pytest
 
 from virtuals._views import EagerDictView
 from virtuals.codecs import NoOpCodec
+from virtuals.navigator import Navigator
 from virtuals.storages.mem import InMemoryStorage
 
 
@@ -49,9 +50,15 @@ def snapshot(storage: StorageProtocol) -> Generator[SnapshotProtocol, None, None
 
 
 @pytest.fixture
-def root_view(tx: TransactionProtocol) -> EagerDictView:
+def nav(storage: StorageProtocol) -> Navigator:
+    """Navigator instance for testing."""
+    return Navigator(storage)
+
+
+@pytest.fixture
+def root_view(tx: TransactionProtocol, nav: Navigator) -> EagerDictView:
     """Create an EagerDictView at root for testing."""
-    return EagerDictView.open_root(tx)
+    return nav.root(tx)
 
 
 # ============================================================================

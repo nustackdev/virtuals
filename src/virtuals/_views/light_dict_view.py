@@ -15,9 +15,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import EMPTY, Empty, Value
-from virtuals.view import ChildPrimitiveSetBase, UnsafePrimitiveOpsBase
-
-from .base import StdView
+from virtuals.view import ChildPrimitiveSetBase, UnsafePrimitiveOpsBase, ViewBase
 
 
 if TYPE_CHECKING:
@@ -33,7 +31,7 @@ __all__ = [
 class LightDictView(
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
-    StdView,
+    ViewBase,
 ):
     """Ultra-lightweight dict view for maximum performance.
 
@@ -46,7 +44,7 @@ class LightDictView(
     - You don't need len() or iteration often
 
     Example:
-        >>> cache = LightDictView.open_root(tx)
+        >>> cache = nav.root(tx)
         >>> cache["key"] = "value"
         >>> print(cache["key"])
     """

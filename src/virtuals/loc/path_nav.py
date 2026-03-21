@@ -214,11 +214,14 @@ def navigate_view(
     # Fast-path the static prefix: build site directly, one View at the end
     current_view = start_view
     if static_end > 0:
+        from virtuals.container import Container
+
         site = start_view.container.site
         for address, _ in path[:static_end]:
             site = (*site, address)
         pivot_type = path[static_end - 1][1]
-        current_view = pivot_type.open_at_site(site, start_view.container.ctx)
+        container = Container(ctx=start_view.container.ctx, site=site)
+        current_view = pivot_type(container, start_view.registry)
 
     # Slow-path the remaining dynamic segments
     for address, expected_type in path[static_end:]:

@@ -28,6 +28,9 @@ from virtuals.collections import (
     is_sizeable,
     is_subscriptable,
 )
+from virtuals.container import Container
+from virtuals.loc import DATA_ROOT
+from virtuals.navigator import Navigator
 from virtuals.tkv.storage import TransactionProtocol
 
 
@@ -37,9 +40,10 @@ from virtuals.tkv.storage import TransactionProtocol
 
 
 @pytest.fixture
-def view(tx: TransactionProtocol) -> DictView:
-    """Create a DictView at root for testing."""
-    return DictView.open_root(tx)
+def view(tx: TransactionProtocol, nav: Navigator) -> DictView:
+    """Create a test DictView at root for testing."""
+    container = Container(ctx=tx, site=(DATA_ROOT,))
+    return DictView(container, nav.registry)
 
 
 # =============================================================================

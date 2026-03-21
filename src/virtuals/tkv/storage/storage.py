@@ -6,12 +6,14 @@ and iteration. Implementations must conform to these protocols.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 from .context import TransactionalStorageProtocol
 
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from virtuals.tkv.observer import Subscription, SubscriptionOptions
 
 
@@ -52,6 +54,19 @@ class StorageProtocol(TransactionalStorageProtocol, Protocol):
         Raises:
             StorageOperationError: If close fails.
         """
+        ...
+
+    def __enter__(self) -> Self:
+        """Open storage via context manager."""
+        ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Close storage via context manager."""
         ...
 
     # ========================================================================

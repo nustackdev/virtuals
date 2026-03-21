@@ -18,9 +18,8 @@ from virtuals.view import (
     ChildPrimitiveSetBase,
     MetadataBasedChildrenCountBase,
     UnsafePrimitiveOpsBase,
+    ViewBase,
 )
-
-from .base import StdView
 
 
 if TYPE_CHECKING:
@@ -37,7 +36,7 @@ class FlatDictView(
     MetadataBasedChildrenCountBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
-    StdView,
+    ViewBase,
 ):
     """Flat dict view with length tracking but no nested containers.
 
@@ -50,7 +49,7 @@ class FlatDictView(
     - You don't need nested containers or observables
 
     Example:
-        >>> scores = FlatDictView.open_root(tx)
+        >>> scores = nav.root(tx)
         >>> scores["alice"] = 100
         >>> scores["bob"] = 95
         >>> print(len(scores))  # 2

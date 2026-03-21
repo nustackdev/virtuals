@@ -1,17 +1,16 @@
-"""Basic Virtuals usage — dict and list over in-memory storage."""
+"""Basic Virtuals usage - dict and list over in-memory storage."""
 
-from virtuals._views import EagerDictView, EagerListView
+from virtuals._views import EagerListView
 from virtuals.codecs import NoOpCodec
+from virtuals.navigator import Navigator
 from virtuals.storages.mem import InMemoryStorage
 
 
-# Set up storage
-storage = InMemoryStorage(codec=NoOpCodec())
-storage.open()
+nav = Navigator(InMemoryStorage(codec=NoOpCodec()))
 
-with storage.transaction() as tx:
-    # Root is a dict — everything lives under it
-    root = EagerDictView.open_root(tx)
+with nav.storage as storage, storage.transaction() as tx:
+    # Root is a dict - everything lives under it
+    root = nav.root(tx)
 
     # Store users as nested dicts
     root["alice"] = {"name": "Alice", "age": 30}
@@ -38,7 +37,5 @@ with storage.transaction() as tx:
     scores.append(400)
     print(len(scores))  # 4
 
-    # Extract — materialize the whole thing
+    # Extract - materialize the whole thing
     print(root.extract())
-
-storage.close()

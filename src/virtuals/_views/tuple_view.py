@@ -20,9 +20,8 @@ from virtuals.view import (
     MetadataBasedChildrenCountBase,
     UnsafePrimitiveOpsBase,
     View,
+    ViewBase,
 )
-
-from .base import StdView
 
 
 if TYPE_CHECKING:
@@ -48,7 +47,7 @@ class TupleView(
     ChildNestedSetBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
-    StdView,
+    ViewBase,
 ):
     """Tuple-like view over container (immutable sequence).
 

@@ -5,6 +5,7 @@ from collections.abc import Generator
 import pytest
 
 from virtuals.codecs import NoOpCodec
+from virtuals.navigator import Navigator
 from virtuals.observers.mem import InMemoryObserver
 from virtuals.storages.mem import InMemoryStorage
 from virtuals.tkv.storage import SnapshotProtocol, TransactionProtocol
@@ -48,3 +49,9 @@ def snapshot(storage: InMemoryStorage) -> Generator[SnapshotProtocol, None, None
     """
     with storage.snapshot() as snap:
         yield snap
+
+
+@pytest.fixture
+def nav(storage: InMemoryStorage) -> Navigator:
+    """Navigator instance for testing."""
+    return Navigator(storage)
