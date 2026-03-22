@@ -49,6 +49,7 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "attrs",
+    "virtuals-binary-codec",
 ]
 
 [project.urls]
@@ -58,8 +59,10 @@ Repository = "https://github.com/everyabc/virtuals"
 Issues = "https://github.com/everyabc/virtuals/issues"
 Changelog = "https://github.com/everyabc/virtuals/releases"
 
+[tool.uv.sources]
+virtuals-binary-codec = { path = "lib/binary-codec", editable = true }
+
 [project.optional-dependencies]
-binary = ["virtuals-binary-codec"]
 rocksdb = ["rdbpython"]
 lmdb = ["lmdb"]
 
