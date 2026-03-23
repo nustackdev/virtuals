@@ -38,7 +38,11 @@ from .context import (
     require_readwrite_context,
     require_write_context,
 )
-from .exceptions import ContainerExistsError, ContainerInvalidDepthError, ContainerTypeError
+from .exceptions import (
+    ContainerExistsError,
+    ContainerInvalidDepthError,
+    ContainerTypeError,
+)
 from .marker import create_marker, is_marker
 from .node_ops import get_node_info, get_node_type
 from .types import (
@@ -150,10 +154,12 @@ def create_container(
         # Primitive check
         if node_info.node_type != NodeType.CONTAINER:
             logger.error(
-                "Site exists as primitive, cannot create container",
+                "Site exists as non-container, cannot create container",
                 extra={"site": site, "node_type": node_info.node_type.name},
             )
-            raise ContainerTypeError(f"Site exists as primitive: {site}")
+            raise ContainerTypeError(
+                f"Site exists as non-container, cannot create container: {site}"
+            )
 
         # Existing container type compatibility
         try:

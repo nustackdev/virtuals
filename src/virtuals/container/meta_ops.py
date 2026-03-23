@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from virtuals.loc.constants import METADATA_ROOT
 from virtuals.tkv.filter import LengthFilter, PrefixFilter
 from virtuals.tkv.storage import StorageScanOptions
-from virtuals.types import EMPTY
+from virtuals.types import Empty
 
 from .context import require_read_context, require_write_context
 
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
     from virtuals.loc import site as site_
     from virtuals.tkv.storage import StorageContextType
-    from virtuals.types import Empty, Value
+    from virtuals.types import Value
 
 __all__ = [
     "delete_metadata",
@@ -77,7 +77,7 @@ def get_metadata(
     """
     meta_site = (METADATA_ROOT, *site[1:], key)
     value = require_read_context(ctx).get(meta_site)
-    if value is EMPTY:
+    if isinstance(value, Empty):
         return default
     return value
 
