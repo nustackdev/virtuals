@@ -221,7 +221,8 @@ class ViewRegistry:
         Returns:
             True if value matches a registered container type
         """
-        value_type = type(value)
+        # Use __class__ to support transparent proxies (invisibles netrefs)
+        value_type = value.__class__
 
         # Check cache first
         if value_type in self._container_type_cache:

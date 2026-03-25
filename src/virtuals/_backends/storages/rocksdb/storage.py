@@ -474,12 +474,17 @@ class RocksDBStorage:
                 except Exception as e:
                     raise StorageError(f"Invalid transaction options: {e}") from e
 
+            # Write options (e.g. disable WAL for bulk writes)
+            write_options = None
+            if self._disable_wal:
+                write_options = {"disable_wal": True}
+
             # Begin transaction
             try:
                 if txn_options is not None:
-                    rdbpy_txn = self._db.begin_transaction(txn_options)
+                    rdbpy_txn = self._db.begin_transaction(txn_options, write_options=write_options)
                 else:
-                    rdbpy_txn = self._db.begin_transaction()
+                    rdbpy_txn = self._db.begin_transaction(write_options=write_options)
             except Exception as e:
                 raise StorageError(f"Failed to begin transaction: {e}") from e
 

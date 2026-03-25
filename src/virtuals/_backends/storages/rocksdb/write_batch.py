@@ -141,7 +141,7 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
 
         # Write to RocksDB
         try:
-            self._storage._db.write(batch)
+            self._storage._db.write(batch, disable_wal=self._storage._disable_wal)
         except Exception as e:
             logger.error("Write batch write failed")
             raise StorageTransactionError(f"Failed to write batch: {e}") from e

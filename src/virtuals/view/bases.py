@@ -419,7 +419,9 @@ class ChildNestedSetBase:
         from virtuals.collections import Initializable
 
         # Get view class and structure for this value type
-        value_type = type(value)
+        # Use __class__ instead of type() to support transparent proxies
+        # (e.g. invisibles netrefs where __class__ returns the remote type)
+        value_type = value.__class__
         view_class = self.registry.get_view_for_type(value_type)
         structure_id = view_class.get_structure()
         protocol_hints = view_class.get_protocol()

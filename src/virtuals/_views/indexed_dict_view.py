@@ -182,7 +182,7 @@ class IndexedDictViewBase(
         if self.registry.is_container_type(value):
             from virtuals.collections import Initializable
 
-            value_type = type(value)
+            value_type = value.__class__
             view_class = self.registry.get_view_for_type(value_type)
             structure_id = view_class.get_structure()
             protocol_hints = view_class.get_protocol()
@@ -234,7 +234,7 @@ class IndexedDictViewBase(
             if self.registry.is_container_type(val):
                 from virtuals.collections import Initializable
 
-                value_type = type(val)
+                value_type = val.__class__
                 view_class = self.registry.get_view_for_type(value_type)
                 structure_id = view_class.get_structure()
                 protocol_hints = view_class.get_protocol()
