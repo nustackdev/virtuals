@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 from virtuals.tkv.storage import (
     ReadAccessProtocol,
     ReadWriteAccessProtocol,
@@ -25,7 +23,6 @@ __all__ = [
 ]
 
 
-@lru_cache(maxsize=2048)
 def require_read_context(ctx: object) -> ReadAccessProtocol:
     """Assert that context supports read operations.
 
@@ -46,7 +43,6 @@ def require_read_context(ctx: object) -> ReadAccessProtocol:
     return ctx
 
 
-@lru_cache(maxsize=2048)
 def require_write_context(ctx: object) -> WriteAccessProtocol:
     """Assert that context supports write operations.
 
@@ -67,7 +63,6 @@ def require_write_context(ctx: object) -> WriteAccessProtocol:
     return ctx
 
 
-@lru_cache(maxsize=2048)
 def require_readwrite_context(ctx: object) -> ReadWriteAccessProtocol:
     """Assert that context supports both read and write operations.
 
@@ -88,7 +83,6 @@ def require_readwrite_context(ctx: object) -> ReadWriteAccessProtocol:
     return ctx
 
 
-@lru_cache(maxsize=2048)
 def require_transaction(ctx: object) -> TransactionProtocol:
     """Assert that context is a transaction.
 
@@ -109,7 +103,6 @@ def require_transaction(ctx: object) -> TransactionProtocol:
     return ctx
 
 
-@lru_cache(maxsize=2048)
 def require_snapshot(ctx: object) -> SnapshotProtocol:
     """Assert that context is a snapshot.
 
@@ -130,7 +123,6 @@ def require_snapshot(ctx: object) -> SnapshotProtocol:
     return ctx
 
 
-@lru_cache(maxsize=2048)
 def require_write_batch(ctx: object) -> WriteBatchProtocol:
     """Assert that context is a write batch.
 
