@@ -200,6 +200,23 @@ def light_dict_factory(root_view: EagerDictView) -> Callable[[str, dict[str, Any
 
 
 @pytest.fixture
+def log_indexed_dict_factory(
+    root_view: EagerDictView,
+) -> Callable[[str, dict[str, Any] | None], View]:
+    """Factory for creating EagerLogIndexedDictViews with test data."""
+
+    def _create(address: str, data: dict | None = None) -> View:
+        from virtuals._views import EagerLogIndexedDictView
+
+        view = root_view.open_child(address, EagerLogIndexedDictView)
+        if data is not None:
+            view.store(data)
+        return view
+
+    return _create
+
+
+@pytest.fixture
 def indexed_dict_factory(
     root_view: EagerDictView,
 ) -> Callable[[str, dict[str, Any] | None], View]:

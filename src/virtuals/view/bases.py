@@ -33,6 +33,7 @@ __all__ = [
     "LazyChildReadBase",
     "LiveChildrenCountBase",
     "MetadataBasedChildrenCountBase",
+    "PrimitiveOpsBase",
     "UnsafePrimitiveOpsBase",
 ]
 
@@ -484,6 +485,40 @@ class ChildPrimitiveSetBase:
         """
         self.ensure_created()  # type: ignore[attr-defined]
         self.container.put_child_primitive(address, cast("Value", value), validate_parent=False)
+
+
+class PrimitiveOpsBase:
+    """Primitive storage operations for controlled granularity.
+
+    Provides explicit methods for storing and reading compound values as
+    single primitive blobs. This is the intended API for controlled
+    granularity (primitive=True on Shape slots) where a compound value
+    (list, dict, etc.) is deliberately stored as a single key.
+
+    Unlike UnsafePrimitiveOpsBase (which is about bypassing validation for
+    performance), PrimitiveOpsBase expresses deliberate storage strategy.
+
+    Methods:
+        _primitive_read(address)   - read a primitive blob at address
+        _primitive_write(address, value) - write a primitive blob at address
+    """
+
+    container: Container
+
+    def _primitive_read(self, address: site_.SiteSegment) -> object:
+        """Read a value stored as a single primitive blob."""
+        child_site = (*self.container.site, address)
+        return self.container.ctx.get(child_site)  # type: ignore
+
+    def _primitive_write(self, address: site_.SiteSegment, value: object) -> None:
+        """Write a value as a single primitive blob.
+
+        Ensures the container chain exists, then stores the value directly
+        as a single key-value pair regardless of the value's structure.
+        """
+        self.ensure_created()  # type: ignore[attr-defined]
+        child_site = (*self.container.site, address)
+        self.container.ctx.put(child_site, value)  # type: ignore
 
 
 class UnsafePrimitiveOpsBase:

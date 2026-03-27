@@ -27,6 +27,7 @@ from virtuals.view import (
     LazyChildReadBase,
     MetadataBasedChildrenCountBase,
     ObservableBase,
+    PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
 )
@@ -72,6 +73,7 @@ class DictViewBase(
     ChildNestedSetBase,
     ChildPrimitiveSetBase,
     LazyChildReadBase,
+    PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
 ):

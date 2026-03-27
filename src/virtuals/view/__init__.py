@@ -20,6 +20,7 @@ from .bases import (
     LazyChildReadBase,
     LiveChildrenCountBase,
     MetadataBasedChildrenCountBase,
+    PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
 )
 from .bases_observable import (
@@ -38,6 +39,7 @@ __all__ = [  # noqa: RUF022
     "ChildNestedSetBase",
     "ChildPrimitiveSetBase",
     "LazyChildReadBase",
+    "PrimitiveOpsBase",
     "UnsafePrimitiveOpsBase",
     "ChildObservableBase",
     "DescendantsObservableBase",

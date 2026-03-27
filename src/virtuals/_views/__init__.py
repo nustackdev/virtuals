@@ -10,6 +10,11 @@ from .frozenset_view import FrozenSetView
 from .indexed_dict_view import EagerIndexedDictView, IndexedDictViewBase, LazyIndexedDictView
 from .light_dict_view import LightDictView
 from .list_view import EagerListView, LazyListView, ListSliceView, ListViewBase
+from .log_indexed_dict_view import (
+    EagerLogIndexedDictView,
+    LazyLogIndexedDictView,
+    LogIndexedDictViewBase,
+)
 from .set_view import SetView
 from .tuple_view import TupleView
 
@@ -20,6 +25,7 @@ __all__ = (
     "EagerDictView",
     "EagerIndexedDictView",
     "EagerListView",
+    "EagerLogIndexedDictView",
     "FlatDictView",
     "FlatListView",
     "FrozenSetView",
@@ -27,9 +33,11 @@ __all__ = (
     "LazyDictView",
     "LazyIndexedDictView",
     "LazyListView",
+    "LazyLogIndexedDictView",
     "LightDictView",
     "ListSliceView",
     "ListViewBase",
+    "LogIndexedDictViewBase",
     "SetView",
     "TupleView",
 )
