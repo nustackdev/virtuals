@@ -21,7 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from virtuals.container import Container
-from virtuals.loc import DATA_ROOT
+from virtuals.loc import DATA_ROOT, path
 
 from .view.registry import ViewRegistry
 
@@ -111,6 +111,24 @@ class Navigator[ViewT: View]:
 
         container = Container(ctx=ctx, site=self._site)
         return self._root_view_cls(container, self._registry)
+
+    def open_at_path(self, view_path: path.PathToView, ctx: StorageContextType) -> View:
+        """Navigate to a view given a path.
+
+        Creates the root view and runs the full navigation server-side.
+        Path is a tuple of (address, view_type) segments — pure immutable data.
+
+        Args:
+            view_path: Path tuple, e.g. (("users", DictView), ("alice", DictView))
+            ctx: storage context (transaction, snapshot, or write batch)
+
+        Returns:
+            View at the end of the path.
+        """
+        from virtuals.loc.path_nav import navigate_view
+
+        root = self.root(ctx)
+        return navigate_view(root, view_path)
 
     def root_at(self, site: site_.Site, ctx: StorageContextType) -> ViewT:
         """Open a view at a specific site.
