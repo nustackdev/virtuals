@@ -502,6 +502,13 @@ class ObserverCompliance:
         """Override to provide storage with observer support."""
         raise NotImplementedError("Subclass must provide observable_storage fixture")
 
+    @staticmethod
+    def _flush(storage) -> None:
+        """Flush observer notifications. Call after writes to ensure delivery."""
+        observer = getattr(storage, "_observer", None)
+        if observer is not None and hasattr(observer, "flush"):
+            observer.flush(timeout=1.0)
+
     def test_subscribe_and_notify(self, observable_storage) -> None:
         """Test basic subscription and notification flow."""
         notifications: list = []
@@ -517,6 +524,7 @@ class ObserverCompliance:
         with observable_storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
 
+        self._flush(observable_storage)
         assert len(notifications) == 1
         assert notifications[0] == ("users", "alice")
 
@@ -537,6 +545,7 @@ class ObserverCompliance:
             tx.put(("posts", "123"), b"post")  # Should NOT notify
             tx.put(("users", "bob"), b"data")
 
+        self._flush(observable_storage)
         assert len(notifications) == 2
         assert ("users", "alice") in notifications
         assert ("users", "bob") in notifications
@@ -547,6 +556,7 @@ class ObserverCompliance:
         # First create a key
         with observable_storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
+        self._flush(observable_storage)  # drain before subscribing
 
         notifications: list = []
 
@@ -562,6 +572,7 @@ class ObserverCompliance:
         with observable_storage.transaction() as tx:
             tx.delete(("users", "alice"))
 
+        self._flush(observable_storage)
         assert len(notifications) == 1
         assert notifications[0] == ("users", "alice")
 
@@ -581,6 +592,7 @@ class ObserverCompliance:
         with observable_storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
 
+        self._flush(observable_storage)
         assert len(notifications) == 0
 
     def test_multiple_subscriptions(self, observable_storage) -> None:
@@ -607,6 +619,7 @@ class ObserverCompliance:
             tx.put(("users", "alice", "profile"), b"p")  # Matches only prefix
             tx.put(("posts", "123"), b"post")  # Matches only length
 
+        self._flush(observable_storage)
         assert len(user_notifications) == 2
         assert len(length_notifications) == 2
         assert ("users", "alice") in user_notifications
@@ -629,6 +642,7 @@ class ObserverCompliance:
         with observable_storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
 
+        self._flush(observable_storage)
         assert len(notifications) == 1
 
         sub.unbind(callback)
@@ -636,6 +650,7 @@ class ObserverCompliance:
         with observable_storage.transaction() as tx:
             tx.put(("users", "bob"), b"data")
 
+        self._flush(observable_storage)
         # Should still be 1 - callback was unbound
         assert len(notifications) == 1
 
@@ -659,6 +674,7 @@ class ObserverCompliance:
         with observable_storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
 
+        self._flush(observable_storage)
         assert len(notifications1) == 1
         assert len(notifications2) == 1
 
@@ -680,6 +696,7 @@ class ObserverCompliance:
             # Length 3 but has "users" prefix - should match via Or's second filter
             tx.put(("users", "alice", "profile"), b"data")
 
+        self._flush(observable_storage)
         assert len(notifications) == 1
         assert notifications[0] == ("users", "alice", "profile")
 
@@ -699,4 +716,5 @@ class ObserverCompliance:
         tx.put(("users", "alice"), b"data")
         tx.abort()  # Abort instead of commit
 
+        self._flush(observable_storage)
         assert len(notifications) == 0

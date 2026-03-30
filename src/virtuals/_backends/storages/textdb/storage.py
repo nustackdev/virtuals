@@ -314,15 +314,15 @@ class TextStorage:
                     # Lock may already be released or not held; ignore
                     pass
 
-    def _notify(self, key: Key) -> None:
-        """Notify observer of key change.
+    def _notify_batch(self, keys: set[Key]) -> None:
+        """Notify observer of key changes (batch).
 
         Args:
-            key: Key that changed
+            keys: Keys that changed
         """
-        if self.observer is not None:
+        if self.observer is not None and keys:
             try:
-                self.observer.notify(key)
+                self.observer.notify(keys)
             except Exception:
                 logger.error("Observer notification failed")
 

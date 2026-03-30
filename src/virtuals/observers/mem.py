@@ -1,15 +1,14 @@
-"""In-memory observer implementation with thread-safe subscription management.
+"""In-memory observer with fire-and-forget notifications.
 
-The InMemoryObserver provides efficient pattern matching using the
-SubscriptionRegistry from the base class. All subscription logic is
-handled by BaseObserver - this class only provides connection management.
+InMemoryObserver = Observer + InMemoryPublisher.
 """
 
 from __future__ import annotations
 
-from virtuals._backends.observers.mem import InMemoryObserver
+from virtuals._backends.observers.mem import InMemoryObserver, InMemoryPublisher
 
 
 __all__ = [
     "InMemoryObserver",
+    "InMemoryPublisher",
 ]

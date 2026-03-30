@@ -90,9 +90,8 @@ class TextWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
             self._written = True
             self._mark_closed()
 
-            # Notify observers
-            for key in self._modified_keys:
-                self._storage._notify(key)
+            # Notify observers (batch)
+            self._storage._notify_batch(self._modified_keys)
 
             self._storage._untrack_write_batch(self)
         except Exception as e:

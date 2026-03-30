@@ -1,10 +1,12 @@
 """Protocol definitions for observer system.
 
 Defines the abstract interfaces for observers and subscriptions.
-The new subscription system provides:
+The observer system provides:
+- Fire-and-forget notifications (non-blocking enqueue)
+- Background thread for matching and delivery
+- Pluggable delivery backends (Publisher)
 - Flexible filtering (prefix, suffix, wildcard, length, composite)
 - Decoupled subscription from callbacks (subscribe once, bind/unbind callbacks)
-- Efficient pattern matching with hash-based indexing
 """
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from virtuals.tkv.codec import CodecProtocol
 
     from ..types import Key
@@ -29,13 +33,12 @@ __all__ = [
 class ObserverProtocol[EncodedKeyT](Protocol):
     """Protocol for observable adapters.
 
-    Observers provide subscription capabilities for storage changes, such as:
-    - Flexible filtering (prefix, suffix, wildcard, length, composite)
-    - Decoupled subscriptions from callbacks
-    - Efficient pattern matching
+    Observers provide fire-and-forget notification for storage changes:
+    - notify() enqueues keys and returns immediately
+    - Background thread matches and delivers via pluggable Publisher
+    - subscribe() registers subscriptions with flexible filtering
 
     Examples:
-        >>> # Subscribe with options
         >>> sub = observer.subscribe(
         ...     SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         ... )
@@ -55,49 +58,27 @@ class ObserverProtocol[EncodedKeyT](Protocol):
 
         Returns:
             Subscription object for binding callbacks and managing lifecycle.
-
-        Raises:
-            ObserverError: If subscription fails.
-
-        Examples:
-            >>> # Subscribe to all keys under "users"
-            >>> sub = observer.subscribe(
-            ...     SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
-            ... )
-
-            >>> # Subscribe with wildcard pattern
-            >>> sub = observer.subscribe(
-            ...     SubscriptionOptions(
-            ...         filter=WildcardFilter(pattern=("users", "*", "profile"))
-            ...     )
-            ... )
-
-            >>> # Subscribe to keys with specific prefix AND length
-            >>> sub = observer.subscribe(
-            ...     SubscriptionOptions(
-            ...         filter=PrefixFilter(prefix=("users",)) & LengthFilter(length=3)
-            ...     )
-            ... )
         """
         ...
 
-    def notify(self, topic: Key) -> None:
-        """Notify observers of a change at the specified topic.
+    def notify(self, keys: Key | Iterable[Key]) -> None:
+        """Enqueue keys for notification. Returns immediately.
+
+        Accepts a single key (tuple) or a batch of keys (set, list, etc).
+        Fire-and-forget: background thread handles matching and delivery.
 
         Args:
-            topic: Topic identifying changed state.
+            keys: Single key or batch of keys to notify about.
+        """
+        ...
 
-        Raises:
-            ObserverError: If notification fails.
+    def flush(self, timeout: float = 1.0) -> None:
+        """Wait for pending notifications to be delivered.
+
+        Blocks until the queue is drained. Useful for testing.
         """
         ...
 
     def _close_subscription(self, subscription: Subscription) -> None:
-        """Internal method to close a subscription.
-
-        Called by Subscription.close() to remove subscription from observer.
-
-        Args:
-            subscription: Subscription to close.
-        """
+        """Remove subscription from registry. Called by Subscription.close()."""
         ...

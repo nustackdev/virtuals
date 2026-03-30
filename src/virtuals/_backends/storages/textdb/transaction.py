@@ -90,9 +90,8 @@ class TextTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
             self._committed = True
             self._mark_closed()
 
-            # Notify observers
-            for key in self._modified_keys:
-                self._storage._notify(key)
+            # Notify observers (batch)
+            self._storage._notify_batch(self._modified_keys)
 
             self._storage._untrack_transaction(self)
 

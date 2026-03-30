@@ -96,9 +96,8 @@ class RocksDBTransaction(
         self._committed = True
         self._mark_closed()
 
-        # Notify observers of all modifications
-        for key in self._modified_keys:
-            self._storage._notify(key)
+        # Notify observers (batch)
+        self._storage._notify_batch(self._modified_keys)
 
         # Remove from active transactions
         self._storage._remove_transaction(self)

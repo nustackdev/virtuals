@@ -106,15 +106,15 @@ class InMemoryStorage:
         if not self._opened:
             raise StorageClosedError("Storage is not open")
 
-    def _notify(self, key: Key) -> None:
-        """Notify observer of key change.
+    def _notify_batch(self, keys: set[Key]) -> None:
+        """Notify observer of key changes (batch).
 
         Args:
-            key: Key that changed
+            keys: Keys that changed
         """
-        if self._observer is not None:
+        if self._observer is not None and keys:
             try:
-                self._observer.notify(key)
+                self._observer.notify(keys)
             except Exception:
                 logger.error("Observer notification failed")
 

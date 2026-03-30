@@ -15,6 +15,7 @@ from .exceptions import (
     ObserverValidationError,
 )
 from .observer import ObserverProtocol
+from .publisher import PublisherProtocol, deliver_local
 from .registry import SubscriptionRegistry
 from .subscription import (
     Subscription,
@@ -32,9 +33,11 @@ __all__ = [
     "ObserverProtocol",
     "ObserverSubscriptionError",
     "ObserverValidationError",
+    "PublisherProtocol",
     "Subscription",
     "SubscriptionCallback",
     "SubscriptionOptions",
     "SubscriptionReceiver",
     "SubscriptionRegistry",
+    "deliver_local",
 ]
