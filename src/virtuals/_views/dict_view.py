@@ -24,6 +24,7 @@ from virtuals.view import (
     ChildNestedSetBase,
     ChildObservableBase,
     ChildPrimitiveSetBase,
+    DescendantsObservableBase,
     LazyChildReadBase,
     MetadataBasedChildrenCountBase,
     ObservableBase,
@@ -67,6 +68,7 @@ __all__ = [
 class DictViewBase(
     ObservableBase,
     ChildObservableBase[str | int],
+    DescendantsObservableBase,
     MetadataBasedChildrenCountBase,
     ChildNavigationBase[str | int],
     ChildNestedGetBase,

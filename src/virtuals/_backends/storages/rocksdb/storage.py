@@ -579,6 +579,7 @@ class RocksDBStorage:
         if self._observer is not None and keys:
             try:
                 self._observer.notify(keys)
+                self._observer.flush()
             except Exception as e:
                 logger.error(f"Observer notification failed: {e}")
 

@@ -323,6 +323,7 @@ class TextStorage:
         if self.observer is not None and keys:
             try:
                 self.observer.notify(keys)
+                self.observer.flush()
             except Exception:
                 logger.error("Observer notification failed")
 

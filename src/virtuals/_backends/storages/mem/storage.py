@@ -115,6 +115,7 @@ class InMemoryStorage:
         if self._observer is not None and keys:
             try:
                 self._observer.notify(keys)
+                self._observer.flush()
             except Exception:
                 logger.error("Observer notification failed")
 
