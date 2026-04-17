@@ -336,3 +336,86 @@ def test_ordering_preserved_across_many_inserts(log_dict_factory):
         dct[key] = i
         expected.append(key)
     assert list(dct) == expected
+
+
+# ============================================================================
+# PARENT-WALK EXTRACTION (LazyLogIndexedDictView registered at structure 15)
+#
+# Regression: when the log-indexed variant is registered via the public
+# `virtuals.views.LogIndexedDictView` alias (which is `LazyLogIndexedDictView`),
+# reading `parent["child"]` from an EagerDictView parent walks through
+# `_extract_child_container`, which requires the child view to implement the
+# Convertible protocol (i.e. an `extract()` method). Without it, the access
+# raised `TypeError: Child view LazyLogIndexedDictView does not support
+# extraction`.
+# ============================================================================
+
+
+def test_parent_eager_walk_to_lazy_log_indexed_child():
+    """Eager parent walking into a LazyLogIndexedDictView child should extract."""
+    from virtuals._views.bytearray_view import ByteArrayView
+    from virtuals._views.dict_view import EagerDictView
+    from virtuals._views.frozenset_view import FrozenSetView
+    from virtuals._views.list_view import EagerListView
+    from virtuals._views.set_view import SetView
+    from virtuals._views.tuple_view import TupleView
+    from virtuals.codecs import NoOpCodec
+    from virtuals.navigator import Navigator
+    from virtuals.storages.mem import InMemoryStorage
+    from virtuals.views import LogIndexedDictView  # alias for LazyLogIndexedDictView
+
+    storage = InMemoryStorage(codec=NoOpCodec())
+    storage.open()
+    try:
+        views = (
+            ByteArrayView,
+            EagerDictView,
+            FrozenSetView,
+            EagerListView,
+            SetView,
+            TupleView,
+            LogIndexedDictView,
+        )
+        nav = Navigator(storage, views=views)
+
+        # Write: parent Eager dict with a LogIndexed child named "txs".
+        with storage.transaction() as tx:
+            root = nav.root(tx)
+            txs = root.open_child("txs", EagerLogIndexedDictView)
+            txs.store({"sig_a": {"slot": 1, "fee": 5000}, "sig_b": {"slot": 2, "fee": 4000}})
+
+        # Read back through a snapshot: registry resolves structure 15 to the
+        # Lazy variant; Eager parent __getitem__ triggers child extraction.
+        with storage.snapshot() as snap:
+            root = nav.root(snap)
+            child = root["txs"]  # extraction path — this is what was failing
+            assert isinstance(child, dict)
+            assert set(child.keys()) == {"sig_a", "sig_b"}
+            assert child["sig_a"] == {"slot": 1, "fee": 5000}
+            assert child["sig_b"] == {"slot": 2, "fee": 4000}
+    finally:
+        storage.close()
+
+
+def test_lazy_log_indexed_view_extract_directly():
+    """LazyLogIndexedDictView.extract() returns a plain dict."""
+    from virtuals.codecs import NoOpCodec
+    from virtuals.navigator import Navigator
+    from virtuals.storages.mem import InMemoryStorage
+
+    storage = InMemoryStorage(codec=NoOpCodec())
+    storage.open()
+    try:
+        nav = Navigator(storage)
+        with storage.transaction() as tx:
+            root = nav.root(tx)
+            eager = root.open_child("dct", EagerLogIndexedDictView)
+            eager.store({"a": 1, "b": {"nested": "v"}})
+
+        with storage.snapshot() as snap:
+            root = nav.root(snap)
+            lazy = root.open_child("dct", LazyLogIndexedDictView)
+            extracted = lazy.extract()
+            assert extracted == {"a": 1, "b": {"nested": "v"}}
+    finally:
+        storage.close()

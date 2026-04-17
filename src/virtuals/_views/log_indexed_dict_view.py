@@ -476,6 +476,15 @@ class LazyLogIndexedDictView(LogIndexedDictViewBase):
     def items(self) -> ItemsView[str | int, object]:
         return ItemsView(self)  # type: ignore[arg-type]
 
+    def extract(self) -> dict[str | int, object]:
+        """Extract all items as a native dict.
+
+        Delegates to the eager facet so `_extract_child_container` on a parent
+        view works when this class is registered as the log-indexed variant
+        (e.g., via `virtuals.views.LogIndexedDictView`).
+        """
+        return self.eager.extract()
+
     @property
     def eager(self) -> EagerLogIndexedDictView:
         return EagerLogIndexedDictView(container=self.container, registry=self.registry)
