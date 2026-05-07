@@ -7,8 +7,10 @@ from typing import TYPE_CHECKING, Any
 from virtuals.tkv.storage import (
     ScanProtocol,
     StorageClosedError,
+    StorageLockTimeoutError,
     StorageOperationError,
     StorageScanOptions,
+    StorageTransactionConflictError,
 )
 from virtuals.tkv.types import EMPTY, Empty
 
@@ -24,6 +26,22 @@ __all__ = [
     "ReadOperationsMixin",
     "WriteOperationsMixin",
 ]
+
+
+def _classify_rdbpy(key: Key, action: str, e: Exception) -> StorageOperationError:
+    """Map an rdbpy exception to the right storage exception.
+
+    rdbpy surfaces RocksDB statuses as plain `Exception` with a bytes
+    message; we sniff for the canonical status strings and map to
+    typed errors so policy spans (e.g. RetryOnConflict) can target them.
+    """
+    msg = str(e)
+    lower = msg.lower()
+    if "timeout waiting to lock" in lower or "lock timeout" in lower:
+        return StorageLockTimeoutError(f"Failed to {action} key {key}: {e}")
+    if "busy" in lower or "conflict" in lower or "deadlock" in lower:
+        return StorageTransactionConflictError(f"Failed to {action} key {key}: {e}")
+    return StorageOperationError(f"Failed to {action} key {key}: {e}")
 
 
 class ContextBase:
@@ -138,7 +156,7 @@ class ReadOperationsMixin:
         try:
             encoded_value = txn.get(encoded_key)
         except Exception as e:
-            raise StorageOperationError(f"Failed to get key {key}: {e}") from e
+            raise _classify_rdbpy(key, "get", e) from e
 
         # Handle not found - return EMPTY instead of raising
         if encoded_value is None:
@@ -174,7 +192,7 @@ class ReadOperationsMixin:
         try:
             return txn.get(encoded_key) is not None
         except Exception as e:
-            raise StorageOperationError(f"Failed to check key {key}: {e}") from e
+            raise _classify_rdbpy(key, "check", e) from e
 
     def multiget(self, keys: list[Key]) -> dict[Key, Value]:
         """Get multiple keys.
@@ -258,7 +276,7 @@ class WriteOperationsMixin:
         try:
             txn.put(encoded_key, encoded_value)
         except Exception as e:
-            raise StorageOperationError(f"Failed to put key {key}: {e}") from e
+            raise _classify_rdbpy(key, "put", e) from e
 
         # Track modification for notifications
         self._modified_keys.add(key)
@@ -294,7 +312,7 @@ class WriteOperationsMixin:
             # Delete the key
             txn.delete_single(encoded_key)
         except Exception as e:
-            raise StorageOperationError(f"Failed to delete key {key}: {e}") from e
+            raise _classify_rdbpy(key, "delete", e) from e
 
         # Track modification for notifications
         self._modified_keys.add(key)

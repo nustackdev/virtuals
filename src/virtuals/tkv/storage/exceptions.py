@@ -77,6 +77,15 @@ class StorageTransactionAbortedError(StorageTransactionError):
     """
 
 
+class StorageLockTimeoutError(StorageTransactionError):
+    """Lock acquisition timed out.
+
+    Raised under pessimistic concurrency when a transaction cannot
+    acquire a row/key lock held by a concurrent transaction within the
+    backend's configured timeout. Retryable with backoff + jitter.
+    """
+
+
 class StorageClosedError(StorageError):
     """Operation attempted on closed resource.
 
@@ -99,6 +108,7 @@ __all__ = [
     "StorageInterfaceError",
     "StorageIteratorError",
     "StorageKeyError",
+    "StorageLockTimeoutError",
     "StorageLookupError",
     "StorageOperationError",
     "StorageTransactionAbortedError",
