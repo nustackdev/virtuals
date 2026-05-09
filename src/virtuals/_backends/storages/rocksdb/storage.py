@@ -142,6 +142,13 @@ class RocksDBStorage:
     def _build_options(self) -> rdbpy.Options:
         """Build RocksDB options from configuration.
 
+        Recognized non-rocksdb keys in options dict:
+          block_table: dict of kwargs for rdbpy.BlockBasedTableFactory
+            (e.g. cache_index_and_filter_blocks, pin_l0_filter_and_index_blocks_in_cache,
+            partition_filters, format_version, ...)
+          block_cache_mb: int — convenience, builds a shared LRU and passes it as
+            block_cache into BlockBasedTableFactory
+
         Returns:
             Configured Options object
 
@@ -152,10 +159,22 @@ class RocksDBStorage:
         if "create_if_missing" not in options_dict:
             options_dict["create_if_missing"] = self._create_if_missing
 
+        block_table_kwargs = options_dict.pop("block_table", None)
+        block_cache_mb = options_dict.pop("block_cache_mb", None)
+
         try:
             options = rdbpy.Options(**options_dict)
         except Exception as e:
             raise StorageError(f"Invalid RocksDB options: {e}") from e
+
+        if block_table_kwargs is not None or block_cache_mb is not None:
+            tf_kwargs = dict(block_table_kwargs or {})
+            if block_cache_mb is not None and "block_cache" not in tf_kwargs:
+                tf_kwargs["block_cache"] = rdbpy.PyLRUCache(int(block_cache_mb) * 1024 * 1024)
+            try:
+                options.table_factory = rdbpy.BlockBasedTableFactory(**tf_kwargs)
+            except Exception as e:
+                raise StorageError(f"Invalid block-table options: {e}") from e
 
         if self._wal_path is not None:
             options.wal_dir = str(self._wal_path)
