@@ -53,7 +53,8 @@ class RocksDBSnapshot(ContextBase, ReadOperationsMixin):
             return
 
         if self._storage._is_secondary:
-            # Secondary DB snapshots don't need rollback
+            # Secondary snapshots wrap the shared DB handle; no rollback needed.
+            self._storage._remove_snapshot(self)
             return
             # FIXME
 

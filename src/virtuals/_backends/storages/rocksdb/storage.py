@@ -7,6 +7,7 @@ and optional change notifications via an observer.
 from __future__ import annotations
 
 import threading
+import time
 from contextlib import contextmanager
 from logging import getLogger
 from pathlib import Path
@@ -64,6 +65,7 @@ class RocksDBStorage:
         *,
         read_only: bool = False,
         secondary_path: Path | str | None = None,
+        secondary_refresh_interval: float | None = 0.05,
         wal_path: Path | str | None = None,
         options: dict[str, Any] | None = None,
         txn_db_options: dict[str, Any] | None = None,
@@ -81,6 +83,11 @@ class RocksDBStorage:
             read_only: Open database in read-only mode
             secondary_path: Path to open db via "rocksdb::DB::OpenAsSecondary"
                 (allows multiple parallel readers)
+            secondary_refresh_interval: Minimum interval in seconds between
+                try_catch_up_with_primary() calls on secondary DBs. Catch-up
+                runs lazily inside begin_snapshot when the last catch-up is
+                older than this. Set to 0 to catch up on every snapshot, or
+                None to never catch up (callers drive freshness manually).
             wal_path: Optional separate WAL directory
             options: RocksDB options dict
             txn_db_options: TransactionDB options dict
@@ -104,6 +111,9 @@ class RocksDBStorage:
 
         if not self._read_only and self._is_secondary:
             raise ValueError("Secondary dbs can only be opened in readonly mode.")
+
+        self._secondary_refresh_interval = secondary_refresh_interval
+        self._last_catchup_monotonic: float = 0.0
 
         # Paths
         self._path = Path(path) if isinstance(path, str) else path
@@ -423,16 +433,22 @@ class RocksDBStorage:
             raise StorageError("Invalid snapshot creation")
 
         with self._db_lock:
-            try:
-                self._db.try_catch_up_with_primary()
-            except Exception as e:
-                raise StorageError(f"Failed to catch up with primary: {e}") from e
+            interval = self._secondary_refresh_interval
+            if interval is not None:
+                now = time.monotonic()
+                if now - self._last_catchup_monotonic >= interval:
+                    try:
+                        self._db.try_catch_up_with_primary()
+                    except Exception as e:
+                        raise StorageError(f"Failed to catch up with primary: {e}") from e
+                    self._last_catchup_monotonic = now
 
             try:
                 snapshot = RocksDBSnapshot(self, self._db)
-                return snapshot
             except Exception as e:
                 raise StorageError(f"Failed to begin snapshot: {e}") from e
+            self._active_snapshots.add(snapshot)
+            return snapshot
 
     def _begin_snapshot_on_txdb(self) -> RocksDBSnapshot:
         """Begin read-only snapshot on TransactionDB instance.
