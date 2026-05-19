@@ -450,6 +450,25 @@ class RocksDBStorage:
             self._active_snapshots.add(snapshot)
             return snapshot
 
+    def force_catch_up_with_primary(self) -> None:
+        """Catch up to the primary's current manifest immediately.
+
+        Unlike the throttled catch-up in `_begin_snapshot_on_secdb`, this
+        bypasses `secondary_refresh_interval`. It exists to recover from a
+        read that hit an SST file the primary compacted away: the secondary
+        is pinned to an old manifest version that still references the
+        deleted file, and catching up to the current manifest drops that
+        reference. No-op on a primary (non-secondary) storage.
+        """
+        if not self._is_secondary:
+            return
+        with self._db_lock:
+            try:
+                self._db.try_catch_up_with_primary()
+            except Exception as e:
+                raise StorageError(f"Failed to catch up with primary: {e}") from e
+            self._last_catchup_monotonic = time.monotonic()
+
     def _begin_snapshot_on_txdb(self) -> RocksDBSnapshot:
         """Begin read-only snapshot on TransactionDB instance.
 

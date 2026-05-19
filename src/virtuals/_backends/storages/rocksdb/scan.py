@@ -11,6 +11,13 @@ from virtuals.tkv.storage import (
     StorageScanOptions,
 )
 
+from .context import _is_missing_file_error
+
+
+# Bounded restarts when a secondary scan touches an SST the primary
+# compacted away. Mirrors the point-read retry budget in `context.py`.
+_SCAN_STALE_RETRIES = 6
+
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -59,7 +66,47 @@ class RocksDBScan(ScanProtocol):
         self._options = options
 
     def _iterate_impl(self, iterator_type: _IteratorType) -> Generator[object, None, None]:
-        """Core iteration implementation.
+        """Stale-secondary-safe wrapper around `_scan_once`.
+
+        A read-only secondary can be pinned to a manifest version that
+        references an SST the primary already compacted away; an iterator
+        touching that file raises an IO error. The fix is the same as for
+        point reads: catch up to the current manifest and retry.
+
+        A scan cannot retry a single key, so it restarts the whole pass and
+        skips the items already emitted. This is exact for append-only /
+        immutable ranges (the ledger's per-block tx dicts -- a synced block
+        never changes); for a range mutated concurrently a restart may shift
+        which rows land after the skip, but that is strictly better than
+        crashing the reader, and a secondary scan is already only
+        eventually-consistent across refreshes.
+        """
+        storage = self._storage
+        yielded = 0
+        attempt = 0
+        while True:
+            skip = yielded
+            try:
+                for item in self._scan_once(iterator_type):
+                    if skip > 0:
+                        skip -= 1
+                        continue
+                    yielded += 1
+                    yield item
+                return
+            except Exception as e:
+                if not (storage._is_secondary and _is_missing_file_error(e)):
+                    raise
+                attempt += 1
+                if attempt > _SCAN_STALE_RETRIES:
+                    raise
+                storage.force_catch_up_with_primary()
+
+    def _scan_once(self, iterator_type: _IteratorType) -> Generator[object, None, None]:
+        """One full iteration pass over the configured range.
+
+        May raise mid-stream; `_iterate_impl` handles a stale-secondary
+        failure by restarting this pass and skipping already-emitted items.
 
         Args:
             iterator_type: Type of iteration (keys/values/items)

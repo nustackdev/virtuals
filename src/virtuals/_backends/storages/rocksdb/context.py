@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from virtuals.tkv.storage import (
     ScanProtocol,
@@ -16,6 +16,9 @@ from virtuals.tkv.types import EMPTY, Empty
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import Any
+
     from virtuals.tkv.types import Key, Value
 
     from .storage import RocksDBStorage
@@ -42,6 +45,23 @@ def _classify_rdbpy(key: Key, action: str, e: Exception) -> StorageOperationErro
     if "busy" in lower or "conflict" in lower or "deadlock" in lower:
         return StorageTransactionConflictError(f"Failed to {action} key {key}: {e}")
     return StorageOperationError(f"Failed to {action} key {key}: {e}")
+
+
+# Bounded retries for a read-only secondary whose manifest version still
+# references an SST file the primary has compacted away. Each retry forces a
+# fresh primary catch-up, which advances the secondary past the stale version.
+_SECONDARY_STALE_RETRIES = 6
+
+
+def _is_missing_file_error(e: Exception) -> bool:
+    """True if a read failed because it touched a now-deleted SST file.
+
+    This is the signature of a read-only secondary pinned to a manifest
+    version older than the primary's current one: the primary compacted and
+    deleted the file, but the secondary's view still references it. A
+    catch-up to the current manifest drops the reference.
+    """
+    return "no such file or directory" in str(e).lower()
 
 
 class ContextBase:
@@ -129,6 +149,27 @@ class ReadOperationsMixin:
     _storage: RocksDBStorage
     _require_active: Any  # Method from ContextBase
 
+    def _read_with_catchup(self, key: Key, action: str, op: Callable[[], object]) -> object:
+        """Run a read `op`, surviving a stale-manifest secondary.
+
+        On a read-only secondary, `op` can fail because the secondary's
+        manifest version references an SST the primary already compacted
+        away. That is recoverable: force a catch-up to the current manifest
+        and retry. Any other failure -- and any failure at all on a primary
+        -- is classified and raised immediately, exactly as before.
+        """
+        storage = self._storage
+        last: Exception | None = None
+        for _ in range(_SECONDARY_STALE_RETRIES):
+            try:
+                return op()
+            except Exception as e:
+                if not (storage._is_secondary and _is_missing_file_error(e)):
+                    raise _classify_rdbpy(key, action, e) from e
+                last = e
+                storage.force_catch_up_with_primary()
+        raise _classify_rdbpy(key, action, last) from last  # type: ignore[arg-type]
+
     def get(self, key: Key) -> Value | Empty:
         """Get value by key.
 
@@ -152,11 +193,9 @@ class ReadOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        # Retrieve from RocksDB
-        try:
-            encoded_value = txn.get(encoded_key)
-        except Exception as e:
-            raise _classify_rdbpy(key, "get", e) from e
+        # Retrieve from RocksDB. `_read_with_catchup` absorbs a stale-manifest
+        # secondary (an SST the primary compacted away) by catching up + retrying.
+        encoded_value = self._read_with_catchup(key, "get", lambda: txn.get(encoded_key))
 
         # Handle not found - return EMPTY instead of raising
         if encoded_value is None:
@@ -189,10 +228,7 @@ class ReadOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        try:
-            return txn.get(encoded_key) is not None
-        except Exception as e:
-            raise _classify_rdbpy(key, "check", e) from e
+        return self._read_with_catchup(key, "check", lambda: txn.get(encoded_key) is not None)
 
     def multiget(self, keys: list[Key]) -> dict[Key, Value]:
         """Get multiple keys.
