@@ -9,7 +9,7 @@ Provides three classes following the eager/lazy facet pattern:
 from __future__ import annotations
 
 from collections.abc import MutableSequence
-from typing import TYPE_CHECKING, ClassVar, overload
+from typing import TYPE_CHECKING, ClassVar
 
 from virtuals.container import (
     ContainerNotFoundError,
@@ -54,9 +54,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "EagerListView",
-    "LazyListSliceView",
     "LazyListView",
-    "ListSliceView",
     "ListViewBase",
 ]
 
@@ -230,16 +228,8 @@ class EagerListView(ListViewBase):
 
     CONTAINER_CLS: ClassVar[type] = list
 
-    @overload
-    def __getitem__(self, address: int) -> object | Empty: ...
-    @overload
-    def __getitem__(self, address: slice) -> ListSliceView: ...
-
-    def __getitem__(self, address: int | slice) -> object | Empty | ListSliceView:
-        """Get item at index or slice — returns extracted Python value."""
-        if isinstance(address, slice):
-            return ListSliceView(self, address)
-
+    def __getitem__(self, address: int) -> object | Empty:
+        """Get item at index — returns extracted Python value."""
         normalized = self.normalize_address(address)
         try:
             return self._get_child_value(normalized)
@@ -358,16 +348,8 @@ class LazyListView(ListViewBase):
     Cross-navigate to eager facet via .eager property.
     """
 
-    @overload
-    def __getitem__(self, address: int) -> object: ...
-    @overload
-    def __getitem__(self, address: slice) -> LazyListSliceView: ...
-
-    def __getitem__(self, address: int | slice) -> object:
+    def __getitem__(self, address: int) -> object:
         """Get child — returns View for containers, value for primitives."""
-        if isinstance(address, slice):
-            return LazyListSliceView(self, address)
-
         normalized = self.normalize_address(address)
         try:
             return self._get_child_view_or_value(normalized)
@@ -400,337 +382,6 @@ class LazyListView(ListViewBase):
     def lazy(self) -> LazyListView:
         """Identity — already lazy."""
         return self
-
-
-# =============================================================================
-# SLICE VIEW (eager-based)
-# =============================================================================
-
-
-class ListSliceView(EagerListView):
-    """A view over a slice of a ListView.
-
-    Provides a window into a portion of a list without copying data.
-    Supports read operations; mutating operations raise errors.
-
-    Example:
-        >>> lst = EagerListView(container, registry)
-        >>> lst.store([0, 1, 2, 3, 4, 5])
-        >>> view = lst[1:4]  # ListSliceView over indices 1, 2, 3
-        >>> print(len(view))  # 3
-        >>> print(view[0])  # 1
-        >>> print(list(view))  # [1, 2, 3]
-    """
-
-    _slice_start: int
-    _slice_stop: int
-    _slice_step: int
-    _slice_length: int
-
-    def __init__(
-        self,
-        parent: EagerListView,
-        slc: slice,
-    ) -> None:
-        """Initialize a slice view."""
-        super().__init__(parent.container, parent.registry)
-
-        parent_length = len(parent)
-        start, stop, step = slc.indices(parent_length)
-
-        # Use object.__setattr__ to bypass attrs frozen
-        object.__setattr__(self, "_slice_start", start)
-        object.__setattr__(self, "_slice_stop", stop)
-        object.__setattr__(self, "_slice_step", step)
-
-        if step > 0:
-            length = max(0, (stop - start + step - 1) // step)
-        else:
-            length = max(0, (stop - start + step + 1) // step)
-        object.__setattr__(self, "_slice_length", length)
-
-    def __len__(self) -> int:
-        """Return the length of the slice view."""
-        return self._slice_length
-
-    def _to_parent_index(self, address: int) -> int:
-        """Convert a slice-relative index to a parent index."""
-        return self._slice_start + address * self._slice_step
-
-    @classmethod
-    def is_address_static(cls, address: object) -> bool:
-        """Slice views always remap to parent indices."""
-        return False
-
-    def normalize_address(self, address: int) -> int:
-        """Normalize index and convert to parent index."""
-        length = self._slice_length
-
-        if address < 0:
-            address = length + address
-
-        if address < 0 or address >= length:
-            raise IndexError("list index out of range")
-
-        return self._to_parent_index(address)
-
-    @overload
-    def __getitem__(self, address: int) -> object: ...
-    @overload
-    def __getitem__(self, address: slice) -> ListSliceView: ...
-
-    def __getitem__(self, address: int | slice) -> object | ListSliceView:
-        """Get item at index or create sub-slice view."""
-        if isinstance(address, slice):
-            start, stop, step = address.indices(self._slice_length)
-
-            new_start = self._to_parent_index(start)
-            new_step = self._slice_step * step
-
-            if step > 0:
-                new_stop = (
-                    self._to_parent_index(stop - 1) + self._slice_step
-                    if stop > start
-                    else new_start
-                )
-            else:
-                new_stop = (
-                    self._to_parent_index(stop + 1) - self._slice_step
-                    if stop < start
-                    else new_start
-                )
-
-            return ListSliceView._from_absolute(
-                self.container, self.registry, new_start, new_stop, new_step
-            )
-
-        normalized = self.normalize_address(address)
-        try:
-            return self._get_child_value(normalized)
-        except ContainerNotFoundError as e:
-            raise IndexError("list index out of bounds") from e
-
-    @classmethod
-    def _from_absolute(
-        cls,
-        container: object,
-        registry: object,
-        start: int,
-        stop: int,
-        step: int,
-    ) -> ListSliceView:
-        """Create a slice view from pre-computed absolute indices."""
-        instance = object.__new__(cls)
-        EagerListView.__init__(instance, container, registry)  # type: ignore[arg-type]
-        object.__setattr__(instance, "_slice_start", start)
-        object.__setattr__(instance, "_slice_stop", stop)
-        object.__setattr__(instance, "_slice_step", step)
-        if step > 0:
-            length = max(0, (stop - start + step - 1) // step)
-        else:
-            length = max(0, (stop - start + step + 1) // step)
-        object.__setattr__(instance, "_slice_length", length)
-        return instance
-
-    def __iter__(self) -> Generator[Value, None, None]:
-        """Iterate over items in the slice."""
-        for i in range(self._slice_length):
-            parent_idx = self._to_parent_index(i)
-            child_type = self.container.get_child_type(parent_idx)
-            if child_type == NodeType.PRIMITIVE:
-                yield self.container.get_child_primitive(parent_idx)
-            elif child_type == NodeType.CONTAINER:
-                yield self._get_child_value(parent_idx)
-
-    # Mutating operations are not supported on slice views
-    def __setitem__(self, address: int, value: object) -> None:
-        """Not supported on slice views."""
-        raise TypeError("ListSliceView does not support item assignment")
-
-    def __delitem__(self, address: int) -> None:
-        """Not supported on slice views."""
-        raise TypeError("ListSliceView does not support item deletion")
-
-    def append(self, value: object) -> None:
-        """Not supported on slice views."""
-        raise TypeError("ListSliceView does not support append")
-
-    def pop(self, address: int = -1) -> object:
-        """Not supported on slice views."""
-        raise TypeError("ListSliceView does not support pop")
-
-    def insert(self, address: int, value: object) -> None:
-        """Not supported on slice views."""
-        raise TypeError("ListSliceView does not support insert")
-
-    def clear(self) -> None:
-        """Not supported on slice views."""
-        raise TypeError("ListSliceView does not support clear")
-
-    def store(self, value: Iterable[object]) -> None:
-        """Not supported on slice views."""
-        raise TypeError("ListSliceView does not support store")
-
-
-# =============================================================================
-# LAZY SLICE VIEW
-# =============================================================================
-
-
-class LazyListSliceView(LazyListView):
-    """A lazy view over a slice of a ListView.
-
-    Same window semantics as ListSliceView, but reads return child Views
-    for containers instead of extracted Python values.
-
-    Example:
-        >>> lst = LazyListView(container, registry)
-        >>> lst.store([{"a": 1}, {"b": 2}, {"c": 3}])
-        >>> view = lst[0:2]  # LazyListSliceView
-        >>> for item in view:  # yields child Views, not dicts
-        ...     print(type(item))
-    """
-
-    _slice_start: int
-    _slice_stop: int
-    _slice_step: int
-    _slice_length: int
-
-    def __init__(
-        self,
-        parent: LazyListView,
-        slc: slice,
-    ) -> None:
-        """Initialize a lazy slice view."""
-        super().__init__(parent.container, parent.registry)
-
-        parent_length = len(parent)
-        start, stop, step = slc.indices(parent_length)
-
-        # Use object.__setattr__ to bypass attrs frozen
-        object.__setattr__(self, "_slice_start", start)
-        object.__setattr__(self, "_slice_stop", stop)
-        object.__setattr__(self, "_slice_step", step)
-
-        if step > 0:
-            length = max(0, (stop - start + step - 1) // step)
-        else:
-            length = max(0, (stop - start + step + 1) // step)
-        object.__setattr__(self, "_slice_length", length)
-
-    def __len__(self) -> int:
-        """Return the length of the slice view."""
-        return self._slice_length
-
-    def _to_parent_index(self, address: int) -> int:
-        """Convert a slice-relative index to a parent index."""
-        return self._slice_start + address * self._slice_step
-
-    @classmethod
-    def is_address_static(cls, address: object) -> bool:
-        """Slice views always remap to parent indices."""
-        return False
-
-    def normalize_address(self, address: int) -> int:
-        """Normalize index and convert to parent index."""
-        length = self._slice_length
-
-        if address < 0:
-            address = length + address
-
-        if address < 0 or address >= length:
-            raise IndexError("list index out of range")
-
-        return self._to_parent_index(address)
-
-    @overload
-    def __getitem__(self, address: int) -> object: ...
-    @overload
-    def __getitem__(self, address: slice) -> LazyListSliceView: ...
-
-    def __getitem__(self, address: int | slice) -> object | LazyListSliceView:
-        """Get child at index or create sub-slice view."""
-        if isinstance(address, slice):
-            start, stop, step = address.indices(self._slice_length)
-
-            new_start = self._to_parent_index(start)
-            new_step = self._slice_step * step
-
-            if step > 0:
-                new_stop = (
-                    self._to_parent_index(stop - 1) + self._slice_step
-                    if stop > start
-                    else new_start
-                )
-            else:
-                new_stop = (
-                    self._to_parent_index(stop + 1) - self._slice_step
-                    if stop < start
-                    else new_start
-                )
-
-            return LazyListSliceView._from_absolute(
-                self.container, self.registry, new_start, new_stop, new_step
-            )
-
-        normalized = self.normalize_address(address)
-        try:
-            return self._get_child_view_or_value(normalized)
-        except ContainerNotFoundError as e:
-            raise IndexError("list index out of bounds") from e
-
-    @classmethod
-    def _from_absolute(
-        cls,
-        container: object,
-        registry: object,
-        start: int,
-        stop: int,
-        step: int,
-    ) -> LazyListSliceView:
-        """Create a lazy slice view from pre-computed absolute indices."""
-        instance = object.__new__(cls)
-        LazyListView.__init__(instance, container, registry)  # type: ignore[arg-type]
-        object.__setattr__(instance, "_slice_start", start)
-        object.__setattr__(instance, "_slice_stop", stop)
-        object.__setattr__(instance, "_slice_step", step)
-        if step > 0:
-            length = max(0, (stop - start + step - 1) // step)
-        else:
-            length = max(0, (stop - start + step + 1) // step)
-        object.__setattr__(instance, "_slice_length", length)
-        return instance
-
-    def __iter__(self) -> Generator[object, None, None]:
-        """Iterate over items in the slice — Views for containers, values for primitives."""
-        for i in range(self._slice_length):
-            parent_idx = self._to_parent_index(i)
-            yield self._get_child_view_or_value(parent_idx)
-
-    # Mutating operations are not supported on slice views
-    def __setitem__(self, address: int, value: object) -> None:
-        """Not supported on slice views."""
-        raise TypeError("LazyListSliceView does not support item assignment")
-
-    def __delitem__(self, address: int) -> None:
-        """Not supported on slice views."""
-        raise TypeError("LazyListSliceView does not support item deletion")
-
-    def append(self, value: object) -> None:
-        """Not supported on slice views."""
-        raise TypeError("LazyListSliceView does not support append")
-
-    def insert(self, address: int, value: object) -> None:
-        """Not supported on slice views."""
-        raise TypeError("LazyListSliceView does not support insert")
-
-    def clear(self) -> None:
-        """Not supported on slice views."""
-        raise TypeError("LazyListSliceView does not support clear")
-
-    def store(self, value: Iterable[object]) -> None:
-        """Not supported on slice views."""
-        raise TypeError("LazyListSliceView does not support store")
 
 
 MutableSequence.register(EagerListView)
