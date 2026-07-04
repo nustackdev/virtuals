@@ -46,10 +46,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Database",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "attrs",
     "virtuals-binary-codec",
+    "kh57",
 ]
 
 [project.urls]
@@ -61,6 +62,7 @@ Changelog = "https://github.com/everyabc/virtuals/releases"
 
 [tool.uv.sources]
 virtuals-binary-codec = { path = "lib/binary-codec", editable = true }
+kh57 = { path = "../kh57", editable = true }
 
 [project.optional-dependencies]
 rocksdb = ["rdbpython"]

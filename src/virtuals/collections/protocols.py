@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Protocol, TypeGuard, runtime_checkable
 
 
 if TYPE_CHECKING:
+    import random
+
     from virtuals.loc import key
     from virtuals.tkv.observer import Subscription
     from virtuals.types import Empty
@@ -29,6 +31,7 @@ __all__ = [
     "Initializable",
     "Nestable",
     "Observable",
+    "Sampleable",
     "Sizeable",
     "Subscriptable",
     "is_assignable",
@@ -41,6 +44,7 @@ __all__ = [
     "is_initializable",
     "is_nestable",
     "is_observable",
+    "is_sampleable",
     "is_sizeable",
     "is_subscriptable",
 ]
@@ -247,6 +251,46 @@ class Sizeable(Protocol):
 
         Returns:
             Number of items
+        """
+        ...
+
+
+@runtime_checkable
+class Sampleable[V](Protocol):
+    """Protocol for containers that support kh57-style range reservoir sampling.
+
+    Sampleable containers implement sample() to return up to ``n`` uniform
+    (int_key, value) pairs from an optional integer key sub-range.
+
+    Type Parameters:
+        V: The type of value paired with each sampled key.
+
+    Example:
+        >>> if isinstance(container, Sampleable):
+        ...     picks = container.sample(500, begin=0, end=1_000_000)
+    """
+
+    def sample(
+        self,
+        n: int,
+        begin: int | None = None,
+        end: int | None = None,
+        *,
+        rng: random.Random | None = None,
+    ) -> list[tuple[int, V]]:
+        """Return up to `n` uniform samples from [begin, end).
+
+        Args:
+            n: Number of items to sample. Fewer are returned if the range
+                holds fewer than `n` items.
+            begin: Inclusive lower bound on the original int key. None
+                means unbounded from below.
+            end: Exclusive upper bound on the original int key. None means
+                unbounded from above.
+            rng: Optional seeded random.Random for deterministic sampling.
+
+        Returns:
+            List of (int_key, value) pairs. Order is unspecified.
         """
         ...
 
@@ -498,6 +542,18 @@ def is_sizeable(obj: object) -> TypeGuard[Sizeable]:
         True if object implements Sizeable protocol
     """
     return isinstance(obj, Sizeable)
+
+
+def is_sampleable(obj: object) -> TypeGuard[Sampleable]:
+    """Check if object supports kh57-style range sampling.
+
+    Args:
+        obj: Object to check
+
+    Returns:
+        True if object implements Sampleable protocol
+    """
+    return isinstance(obj, Sampleable)
 
 
 def is_deletable(obj: object) -> TypeGuard[Deletable]:

@@ -41,6 +41,7 @@ from .protocols import (
     Initializable,
     Nestable,
     Observable,
+    Sampleable,
     Sizeable,
     Subscriptable,
     is_assignable,
@@ -53,6 +54,7 @@ from .protocols import (
     is_initializable,
     is_nestable,
     is_observable,
+    is_sampleable,
     is_sizeable,
     is_subscriptable,
 )
@@ -94,6 +96,7 @@ __all__ = [
     "ReactiveSequenceProtocol",
     "ReactiveSetBase",
     "ReactiveSetProtocol",
+    "Sampleable",
     "SequenceBase",
     "SetBase",
     "Sizeable",
@@ -110,6 +113,7 @@ __all__ = [
     "is_initializable",
     "is_nestable",
     "is_observable",
+    "is_sampleable",
     "is_sizeable",
     "is_subscriptable",
 ]

@@ -231,3 +231,21 @@ def indexed_dict_factory(
         return view
 
     return _create
+
+
+@pytest.fixture
+def kh57_factory(
+    root_view: EagerDictView,
+) -> Callable[[str, dict[int, Any] | None], View]:
+    """Factory for creating EagerKh57Views with test data."""
+
+    def _create(address: str, data: dict[int, Any] | None = None) -> View:
+        from virtuals._views import EagerKh57View
+
+        view = root_view.open_child(address, EagerKh57View)
+        if data is not None:
+            for k, v in data.items():
+                view[k] = v
+        return view
+
+    return _create
