@@ -31,6 +31,7 @@ Provides three classes following the eager/lazy facet pattern:
 from __future__ import annotations
 
 import heapq
+from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from kh57 import kh57
@@ -402,6 +403,20 @@ class Kh57ViewBase(
             return self[address]  # type: ignore[index]
         except KeyError:
             return default
+
+    # -- Mapping surface --------------------------------------------------
+
+    def keys(self) -> KeysView:
+        """Return an iterable of int keys in original int order."""
+        return KeysView(self)
+
+    def values(self) -> ValuesView:
+        """Return an iterable of values in original-key order."""
+        return ValuesView(self)
+
+    def items(self) -> ItemsView:
+        """Return an iterable of (int_key, value) pairs in original-key order."""
+        return ItemsView(self)
 
     # -- Navigation -------------------------------------------------------
 

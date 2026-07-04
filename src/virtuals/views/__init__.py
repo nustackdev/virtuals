@@ -7,14 +7,17 @@ from virtuals._views import (
     DictViewBase,
     EagerDictView,
     EagerIndexedDictView,
+    EagerKh57View,
     EagerListView,
     EagerLogIndexedDictView,
     FlatDictView,
     FlatListView,
     FrozenSetView,
     IndexedDictViewBase,
+    Kh57ViewBase,
     LazyDictView,
     LazyIndexedDictView,
+    LazyKh57View,
     LazyListView,
     LazyLogIndexedDictView,
     LightDictView,
@@ -27,6 +30,7 @@ from virtuals._views import (
 
 DictView = LazyDictView
 IndexedDictView = LazyIndexedDictView
+Kh57View = LazyKh57View
 LogIndexedDictView = LazyLogIndexedDictView
 ListView = LazyListView
 
@@ -36,6 +40,7 @@ __all__ = (
     "DictViewBase",
     "EagerDictView",
     "EagerIndexedDictView",
+    "EagerKh57View",
     "EagerListView",
     "EagerLogIndexedDictView",
     "FlatDictView",
@@ -43,8 +48,11 @@ __all__ = (
     "FrozenSetView",
     "IndexedDictView",
     "IndexedDictViewBase",
+    "Kh57View",
+    "Kh57ViewBase",
     "LazyDictView",
     "LazyIndexedDictView",
+    "LazyKh57View",
     "LazyListView",
     "LazyLogIndexedDictView",
     "LightDictView",
