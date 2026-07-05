@@ -228,8 +228,14 @@ class EagerListView(ListViewBase):
 
     CONTAINER_CLS: ClassVar[type] = list
 
-    def __getitem__(self, address: int) -> object | Empty:
-        """Get item at index — returns extracted Python value."""
+    def __getitem__(self, address: int | slice) -> object | Empty | list:
+        """Get item at index — returns extracted Python value.
+
+        With a slice, returns a plain list of extracted values (matches
+        Python list semantics; negative/step handled via ``slice.indices``).
+        """
+        if isinstance(address, slice):
+            return [self[i] for i in range(*address.indices(len(self)))]
         normalized = self.normalize_address(address)
         try:
             return self._get_child_value(normalized)
@@ -348,8 +354,14 @@ class LazyListView(ListViewBase):
     Cross-navigate to eager facet via .eager property.
     """
 
-    def __getitem__(self, address: int) -> object:
-        """Get child — returns View for containers, value for primitives."""
+    def __getitem__(self, address: int | slice) -> object | list:
+        """Get child — returns View for containers, value for primitives.
+
+        With a slice, returns a plain list of child views/values (matches
+        Python list semantics; negative/step handled via ``slice.indices``).
+        """
+        if isinstance(address, slice):
+            return [self[i] for i in range(*address.indices(len(self)))]
         normalized = self.normalize_address(address)
         try:
             return self._get_child_view_or_value(normalized)
