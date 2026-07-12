@@ -29,6 +29,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install build
 
+      - name: Strip [tool.uv.sources] from pyproject
+        # local-dev path overrides don't belong in the published sdist
+        run: |
+          python - <<'EOF'
+          import re, pathlib
+          p = pathlib.Path("pyproject.toml")
+          s = p.read_text()
+          # Drop the [tool.uv.sources] table and its body (until next top-level table or EOF)
+          new = re.sub(r"\n\[tool\.uv\.sources\][\s\S]*?(?=\n\[|\Z)", "\n", s)
+          p.write_text(new)
+          EOF
+          echo "--- pyproject.toml after strip ---"
+          grep -c 'tool.uv.sources' pyproject.toml && exit 1 || echo "clean"
+
       - name: Build sdist and wheel
         run: python -m build
 
