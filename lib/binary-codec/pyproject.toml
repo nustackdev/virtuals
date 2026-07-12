@@ -34,7 +34,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Cython",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -83,10 +82,8 @@ virtuals_binary_codec = [
 # cibuildwheel
 # ============================================================================
 [tool.cibuildwheel]
-build = ["cp310-*", "cp311-*", "cp312-*", "cp313-*", "cp314-*", "cp315-*"]
-
-# opt into pre-release CPython so cp315 wheels build until 3.15 is stable
-enable = ["cpython-prerelease"]
+# cp315 will be added when Python 3.15 reaches beta and cibuildwheel accepts it as a selector.
+build = ["cp310-*", "cp311-*", "cp312-*", "cp313-*", "cp314-*"]
 
 skip = [
     "*-musllinux_*",
