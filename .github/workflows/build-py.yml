@@ -1,0 +1,47 @@
+name: Build virtuals-py
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: virtuals-py-dist
+          path: dist/*
+          retention-days: 7
+
+  verify:
+    name: Verify built artifacts
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: virtuals-py-dist
+          path: dist
+
+      - name: List artifacts
+        run: |
+          ls -lh dist/
+          echo "Wheels: $(ls -1 dist/*.whl 2>/dev/null | wc -l)"
+          echo "Sdist: $(ls -1 dist/*.tar.gz 2>/dev/null | wc -l)"

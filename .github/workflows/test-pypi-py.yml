@@ -1,0 +1,58 @@
+name: Test PyPI virtuals-py
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to test (e.g., 0.1.0). Leave empty for latest.'
+        required: false
+        default: ''
+
+jobs:
+  smoke_test:
+    name: Smoke test on ${{ matrix.os }} (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.12', '3.13', '3.14', '3.15']
+
+    steps:
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - name: Install virtuals-py from PyPI
+        run: |
+          python -m pip install --upgrade pip
+          if [ -z "${{ inputs.version }}" ]; then
+            pip install virtuals-py
+          else
+            pip install virtuals-py==${{ inputs.version }}
+          fi
+
+      - name: Show installed version
+        run: |
+          python -c "import virtuals; print('imported ok')"
+          pip show virtuals-py
+
+      - name: Smoke test - fabric surface
+        run: |
+          python << 'EOF'
+          import virtuals
+
+          # Navigator is the primary entry
+          assert hasattr(virtuals, "Navigator"), "Navigator not exposed"
+          print(f"  Navigator ok: {virtuals.Navigator}")
+
+          # transitive deps that virtuals-py pulls in
+          import virtuals_binary_codec
+          import kh57
+          print(f"  virtuals_binary_codec ok: {virtuals_binary_codec}")
+          print(f"  kh57 ok: {kh57}")
+
+          print("All smoke tests passed!")
+          EOF
