@@ -1,6 +1,6 @@
 # virtuals-binary-codec
 
-Cython-optimized binary key codec for [Virtuals](https://github.com/everyabc/virtuals).
+Cython-optimized binary key codec for [Virtuals](https://github.com/nustackdev/virtuals).
 
 Encodes tuple keys into binary format while preserving lexicographic ordering. Supports mixed integer and string components.
 

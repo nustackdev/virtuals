@@ -87,4 +87,4 @@ See `docs/` for detailed documentation:
 
 ## License
 
-MIT
+Apache-2.0

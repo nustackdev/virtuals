@@ -1,0 +1,52 @@
+# ============================================================================
+# MANIFEST.in - Source Distribution File Inclusion
+# ============================================================================
+
+# ============================================================================
+# Documentation and Metadata
+# ============================================================================
+include README.md
+include LICENSE
+include pyproject.toml
+include setup.py
+
+# ============================================================================
+# virtuals-binary-codec Package Files
+# ============================================================================
+# Cython source files (.pyx, .pxd)
+recursive-include src/virtuals_binary_codec *.pyx
+recursive-include src/virtuals_binary_codec *.pxd
+
+# Python type stubs and py.typed marker
+recursive-include src/virtuals_binary_codec *.pyi
+recursive-include src py.typed
+
+# Python files
+recursive-include src/virtuals_binary_codec *.py
+
+# ============================================================================
+# Exclusions
+# ============================================================================
+# Exclude compiled files
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.pyd
+global-exclude __pycache__
+
+# Exclude Cython-generated C/C++ files
+global-exclude *.c
+global-exclude *.cpp
+
+# Exclude build artifacts
+global-exclude *.so
+global-exclude *.dylib
+global-exclude *.dll
+prune build
+prune dist
+prune *.egg-info
+
+# Exclude IDE and editor files
+global-exclude .DS_Store
+global-exclude *.swp
+global-exclude *.swo
+global-exclude *~

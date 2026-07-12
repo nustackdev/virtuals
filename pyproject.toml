@@ -13,7 +13,7 @@ name = "virtuals-py"
 version = "0.1.0"
 description = "Virtual Python collections over any storage."
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 authors = [
     {name = "Gor Arakelyan", email = "gorarkln@gmail.com"}
 ]
@@ -54,11 +54,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/everyabc/virtuals"
-Documentation = "https://github.com/everyabc/virtuals#readme"
-Repository = "https://github.com/everyabc/virtuals"
-Issues = "https://github.com/everyabc/virtuals/issues"
-Changelog = "https://github.com/everyabc/virtuals/releases"
+Homepage = "https://github.com/nustackdev/virtuals"
+Documentation = "https://github.com/nustackdev/virtuals#readme"
+Repository = "https://github.com/nustackdev/virtuals"
+Issues = "https://github.com/nustackdev/virtuals/issues"
+Changelog = "https://github.com/nustackdev/virtuals/releases"
 
 [tool.uv.sources]
 virtuals-binary-codec = { path = "lib/binary-codec", editable = true }
