@@ -131,6 +131,23 @@ class ListViewBase(
         normalized = self.normalize_address(address)
         self._set_child_value(normalized, value)
 
+    def set_child_container_as(
+        self,
+        address: int,
+        value: object,
+        view_class: type,
+    ) -> None:
+        """Peer of ``__setitem__`` with an explicit child view class.
+
+        Mirrors ``__setitem__`` — normalize the index and populate the child
+        — but takes ``view_class`` explicitly instead of dispatching by
+        Python value type. Used by Refs that already know the child layout
+        (``ShapesListRef[Shape]`` overwriting a slot, etc.).
+        """
+        normalized = self.normalize_address(address)
+        self.ensure_created()
+        self._populate_child_container(normalized, value, view_class=view_class)
+
     def __delitem__(self, address: int) -> None:
         """Delete item at index and shift remaining items."""
         self.ensure_created()

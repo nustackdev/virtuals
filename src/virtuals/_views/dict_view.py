@@ -176,6 +176,27 @@ class DictViewBase(
 
         self._set_length(count)
 
+    def set_child_container_as(
+        self,
+        address: str | int,
+        value: object,
+        view_class: type,
+    ) -> None:
+        """Peer of ``__setitem__`` that takes the child's view class explicitly.
+
+        ``__setitem__`` dispatches child layout by Python value type
+        (``dict → DictView``) — a convention for callers who don't know or
+        care. A Ref that carries ``view_type=view_class`` in its slot payload
+        already knows; this is the door for it to say so on the write path,
+        so non-default layouts (``Kh57View``, ``IndexedDictView``, …) round-
+        trip correctly.
+        """
+        is_new = not self.container.exists_child(address)
+        self.ensure_created()
+        self._populate_child_container(address, value, view_class=view_class)
+        if is_new:
+            self._increment_length()
+
 
 # =============================================================================
 # EAGER FACET — reads return extracted Python values

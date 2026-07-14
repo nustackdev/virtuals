@@ -59,6 +59,7 @@ from virtuals.view import (
 if TYPE_CHECKING:
     import random
     from collections.abc import Callable, Generator, Iterator
+    from collections.abc import Mapping as PyMapping
 
     from virtuals.container.types import NodeInfo
     from virtuals.view import View
@@ -197,30 +198,42 @@ class Kh57ViewBase(
 
     # -- Internal encoded-key ops -----------------------------------------
 
-    def _put_encoded(self, encoded: int, value: object) -> None:
-        """Write `value` at the kh57-encoded child segment `encoded`."""
+    def _put_encoded(
+        self,
+        encoded: int,
+        value: object,
+        view_class: type | None = None,
+    ) -> None:
+        """Write `value` at the kh57-encoded child segment `encoded`.
+
+        If `view_class` is given, force the container child to that layout;
+        otherwise fall back to the registry's type-based dispatch. Callers
+        that already know the child layout (Refs via
+        :meth:`set_child_container_as`) pass it explicitly.
+        """
         self.ensure_created()
         is_new = not self.container.exists_child(encoded)
         if self.registry.is_container_type(value):
-            from virtuals.collections import Initializable
-
-            value_type = value.__class__
-            view_class = self.registry.get_view_for_type(value_type)
-            structure_id = view_class.get_structure()
-            protocol_hints = view_class.get_protocol()
-            child_container = self.container.create_child_container(
-                encoded,
-                structure=ContainerStructure(structure_id),
-                protocol=protocol_hints,
-            )
-            child_view = view_class(container=child_container, registry=self.registry)
-            if not isinstance(child_view, Initializable):
-                raise TypeError(f"Child view {view_class.__name__} does not support initialization")
-            child_view.store(value)
+            self._populate_child_container(encoded, value, view_class=view_class)
         else:
             self.container.put_child_primitive(encoded, cast("Value", value))
         if is_new:
             self._increment_length()
+
+    def set_child_container_as(
+        self,
+        address: int,
+        value: object,
+        view_class: type,
+    ) -> None:
+        """Peer of ``__setitem__`` with an explicit child view class.
+
+        Same as ``__setitem__`` — encode address via ``kh57`` and populate
+        — but takes ``view_class`` explicitly so nested Refs (e.g. a
+        ``ShapeRef`` inside a ``Kh57ShapesRef``) get their declared layout
+        instead of the registry's default for the Python value's type.
+        """
+        self._put_encoded(self.normalize_address(address), value, view_class=view_class)
 
     def _delete_encoded(self, encoded: int) -> None:
         """Remove the child at `encoded` if present. Silent on miss."""
@@ -321,6 +334,34 @@ class Kh57ViewBase(
         self.ensure_created()
         self.container.clear_children(validate=False)
         self._set_length(0)
+
+    def update(
+        self,
+        other: PyMapping[int, object] | None = None,
+        **kwargs: object,
+    ) -> None:
+        """Update from mapping or kwargs — int keys only."""
+        if other:
+            for key, value in other.items():
+                self[key] = value
+        for key, value in kwargs.items():
+            self[key] = value  # type: ignore[assignment,index]
+
+    def store(self, value: PyMapping[int, object], *, replace: bool = True) -> None:
+        """Bulk-load mapping contents under kh57-encoded segments."""
+        self.ensure_created()
+        if replace and len(self) > 0:
+            self.clear()
+        count = len(self)
+        for key, val in value.items():
+            if not isinstance(key, int) or key < 0:
+                raise TypeError(f"Kh57View keys must be non-negative int, got {key!r}")
+            encoded = kh57(key)
+            is_new = not self.container.exists_child(encoded)
+            self._set_child_value(encoded, val)
+            if is_new:
+                count += 1
+        self._set_length(count)
 
     # -- Iteration in original int order ---------------------------------
 
@@ -479,6 +520,19 @@ class EagerKh57View(Kh57ViewBase):
     def extract(self) -> dict[int, object]:
         """Materialize as a plain dict keyed by original int keys."""
         return dict(self.items())
+
+    def pop(self, address: int, default: object | Empty = EMPTY) -> object | Empty:
+        """Remove item at ``address`` and return its extracted value."""
+        from virtuals.types import is_empty
+
+        try:
+            value = self[address]
+            del self[address]
+            return value
+        except KeyError:
+            if is_empty(default):
+                raise
+            return default
 
     # -- Facet navigation ------------------------------------------------
 

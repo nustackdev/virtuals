@@ -407,23 +407,32 @@ class ChildNestedSetBase:
             # Primitive value - store directly
             self.container.put_child_primitive(address, cast("Value", value))
 
-    def _populate_child_container(self, address: site_.SiteSegment, value: object) -> None:
-        """Populate child container from Python value using registry.
+    def _populate_child_container(
+        self,
+        address: site_.SiteSegment,
+        value: object,
+        view_class: type[View] | None = None,
+    ) -> None:
+        """Populate child container from Python value.
 
         Args:
             address: Child address
             value: Container value to store
+            view_class: Explicit child view class. If ``None``, resolved from
+                the registry by Python type (``dict → DictView`` etc.). Pass an
+                explicit class when the caller already knows the intended
+                layout (e.g. a Ref whose slot declares ``view_type=Kh57View``).
 
         Raises:
             TypeError: If child view doesn't support initialization
         """
         from virtuals.collections import Initializable
 
-        # Get view class and structure for this value type
+        # Resolve view class: caller-supplied, else registry lookup by type.
         # Use __class__ instead of type() to support transparent proxies
         # (e.g. invisibles netrefs where __class__ returns the remote type)
-        value_type = value.__class__
-        view_class = self.registry.get_view_for_type(value_type)
+        if view_class is None:
+            view_class = self.registry.get_view_for_type(value.__class__)
         structure_id = view_class.get_structure()
         protocol_hints = view_class.get_protocol()
 
@@ -432,7 +441,7 @@ class ChildNestedSetBase:
             extra={
                 "parent_site": self.container.site,
                 "child_address": address,
-                "value_type": value_type.__name__,
+                "value_type": value.__class__.__name__,
                 "view_class": view_class.__name__,
                 "structure": structure_id,
             },

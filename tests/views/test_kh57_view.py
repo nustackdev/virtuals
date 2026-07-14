@@ -236,3 +236,71 @@ def test_kh57_clear(kh57_factory):
     view.clear()
     assert len(view) == 0
     assert list(view) == []
+
+
+# ============================================================================
+# STORE / UPDATE / POP
+# ============================================================================
+
+
+def test_kh57_store_bulk_loads(kh57_factory):
+    view = kh57_factory("v")
+    view.store({1: "a", 42: "b", 999: "c"})
+    assert len(view) == 3
+    assert view[42] == "b"
+    assert list(view) == [1, 42, 999]
+
+
+def test_kh57_store_replaces_by_default(kh57_factory):
+    view = kh57_factory("v", {1: "old", 2: "old"})
+    view.store({10: "new", 20: "new"})
+    assert len(view) == 2
+    assert 1 not in view
+    assert view[10] == "new"
+
+
+def test_kh57_store_merges_when_replace_false(kh57_factory):
+    view = kh57_factory("v", {1: "keep"})
+    view.store({2: "add"}, replace=False)
+    assert len(view) == 2
+    assert view[1] == "keep"
+    assert view[2] == "add"
+
+
+def test_kh57_store_rejects_non_int_key(kh57_factory):
+    view = kh57_factory("v")
+    with pytest.raises(TypeError):
+        view.store({"bad": 1})
+
+
+def test_kh57_update_from_mapping(kh57_factory):
+    view = kh57_factory("v", {1: "a"})
+    view.update({2: "b", 3: "c"})
+    assert view.extract() == {1: "a", 2: "b", 3: "c"}
+
+
+def test_kh57_update_overwrites(kh57_factory):
+    view = kh57_factory("v", {1: "old"})
+    view.update({1: "new"})
+    assert view[1] == "new"
+    assert len(view) == 1
+
+
+def test_kh57_pop_returns_and_deletes(kh57_factory):
+    view = kh57_factory("v", {1: "a", 2: "b"})
+    got = view.pop(1)
+    assert got == "a"
+    assert 1 not in view
+    assert len(view) == 1
+
+
+def test_kh57_pop_missing_raises(kh57_factory):
+    view = kh57_factory("v", {1: "a"})
+    with pytest.raises(KeyError):
+        view.pop(42)
+
+
+def test_kh57_pop_missing_with_default(kh57_factory):
+    view = kh57_factory("v", {1: "a"})
+    assert view.pop(42, default="miss") == "miss"
+    assert len(view) == 1

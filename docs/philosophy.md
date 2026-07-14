@@ -37,7 +37,3 @@ Storage    — byte persistence
 Each layer depends only on the layer below. Each layer is independently replaceable. The contracts between layers are thin — just protocols.
 
 This isn't modular design for its own sake. It's recognition that these concerns are orthogonal. How you interpret structure shouldn't know how you persist bytes. How you enforce hierarchy shouldn't know what "dict" means.
-
----
-
-Topology as type. Structure as protocol.
