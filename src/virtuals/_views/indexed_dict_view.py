@@ -202,6 +202,38 @@ class IndexedDictViewBase(
         if is_new:
             self._keys_view().append(address)
 
+    def set_child_container_as(
+        self,
+        address: str | int,
+        value: object,
+        view_class: type,
+    ) -> None:
+        """Peer of ``__setitem__`` with an explicit child view class.
+
+        Same shape as ``__setitem__`` -- write into ``__data__/<address>``
+        and record the key -- but takes ``view_class`` explicitly instead of
+        dispatching by Python value type. Used by Refs that carry
+        ``view_type=view_class`` in their slot payload.
+        """
+        from virtuals.collections import Initializable
+
+        self._ensure_layout()
+        dc = self._data_container()
+        is_new = not dc.exists_child(address)
+        structure_id = view_class.get_structure()
+        protocol_hints = view_class.get_protocol()
+        child_container = dc.create_child_container(
+            address,
+            structure=ContainerStructure(structure_id),
+            protocol=protocol_hints,
+        )
+        child_view = view_class(container=child_container, registry=self.registry)
+        if not isinstance(child_view, Initializable):
+            raise TypeError(f"Child view {view_class.__name__} does not support initialization")
+        child_view.store(value)
+        if is_new:
+            self._keys_view().append(address)
+
     def __delitem__(self, address: str | int) -> None:
         self._ensure_layout()
         dc = self._data_container()

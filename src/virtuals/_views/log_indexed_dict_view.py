@@ -320,6 +320,52 @@ class LogIndexedDictViewBase(
         self._data_container().clear_children(validate=False)
         self._keys_container().clear_children(validate=False)
 
+    def set_child_container_as(
+        self,
+        address: str | int,
+        value: object,
+        view_class: type,
+    ) -> None:
+        """Peer of ``__setitem__`` with an explicit child view class.
+
+        Same shape as ``__setitem__`` -- write into ``__data__/<address>``
+        and log the key into ``__keys__/`` if new -- but takes ``view_class``
+        explicitly instead of dispatching by Python value type. Used by Refs
+        that carry ``view_type=view_class`` in their slot payload and know
+        the child layout up front.
+        """
+        from virtuals.collections import Initializable
+
+        self._ensure_layout()
+        dc = self._data_container()
+        is_new = not dc.exists_child(address)
+        structure_id = view_class.get_structure()
+        protocol_hints = view_class.get_protocol()
+        child_container = dc.create_child_container(
+            address,
+            structure=ContainerStructure(structure_id),
+            protocol=protocol_hints,
+        )
+        child_view = view_class(container=child_container, registry=self.registry)
+        if not isinstance(child_view, Initializable):
+            raise TypeError(f"Child view {view_class.__name__} does not support initialization")
+        child_view.store(value)
+        if is_new:
+            self._append_log_key(address)
+
+    def append(self, value: object) -> str:
+        """Append value under a freshly generated unique log key.
+
+        Convenience for callers that treat the view as an append-only log
+        without a natural key. The generated log key is used as both the
+        actual dict key and the entry in ``__keys__/``; each writer picks
+        an independently unique key so parallel appends never touch the
+        same rocksdb row. Returns the generated key.
+        """
+        key = _generate_log_key()
+        self[key] = value
+        return key
+
     def update(self, other: PyMapping[str | int, object] | None = None, **kwargs: object) -> None:
         if other:
             for key, value in other.items():
