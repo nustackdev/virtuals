@@ -171,17 +171,38 @@ class LogIndexedDictViewBase(
     def _scan_log_keys(
         self,
         after: str | None = None,
+        *,
+        reverse: bool = False,
+        before: str | None = None,
+        limit: int | None = None,
     ) -> Generator[tuple[str, str | int], None, None]:
-        """Scan __keys__/ log entries, optionally starting after a cursor.
+        """Scan __keys__/ log entries.
+
+        Args:
+            after: forward-scan only -- start just past this cursor.
+            reverse: scan newest-first instead of oldest-first.
+            before: reverse-scan only -- start just below this cursor.
+                If omitted for a reverse scan, uses a max-sentinel that
+                sorts after any real log key.
+            limit: optional cap on yielded rows (before-filter counting;
+                honored by the storage layer).
 
         Yields:
-            (log_key, actual_key) tuples in chronological order.
+            (log_key, actual_key) tuples in chosen chronological direction.
         """
         kc = self._keys_container()
         site = kc.site
 
-        if after is not None:
-            # Seek past the cursor: start from (site..., after) and skip it
+        if reverse:
+            # Reverse scans need an upper bound within our prefix range,
+            # else seek_to_last drops us past our prefix and break_filter
+            # trips on the first row. "\x7f" (DEL) sorts after every ASCII
+            # char that shows up in log keys (digits, dash, hex), so it
+            # bounds any real log key from above.
+            cursor = before if before is not None else "\x7f"
+            start = (*site, cursor)
+        elif after is not None:
+            # Forward: start just past the cursor (we skip the cursor row).
             start = (*site, after)
         else:
             start = site
@@ -190,6 +211,8 @@ class LogIndexedDictViewBase(
         child_len = LengthFilter(length=len(site) + 1)
         opts = StorageScanOptions(
             start=start,
+            reverse=reverse,
+            limit=limit,
             break_filter=prefix,
             filter=prefix & child_len,
         )
@@ -199,8 +222,10 @@ class LogIndexedDictViewBase(
         rctx = require_read_context(kc.ctx)
         for key, value in rctx.scan(opts).items():
             log_key = key[-1]
-            # Skip the cursor key itself when using after=
-            if after is not None and log_key == after:
+            # Skip the exact-cursor row on either direction.
+            if (after is not None and log_key == after) or (
+                before is not None and log_key == before
+            ):
                 continue
             yield log_key, cast("Value", value)
 
@@ -216,22 +241,56 @@ class LogIndexedDictViewBase(
         for _log_key, actual_key in self._scan_log_keys():
             yield actual_key
 
+    def __reversed__(self) -> Generator[str | int, None, None]:
+        """Yield actual keys in reverse insertion order (newest first)."""
+        for _log_key, actual_key in self._scan_log_keys(reverse=True):
+            yield actual_key
+
     def keys(
-        self, *, after: str | None = None
+        self,
+        *,
+        after: str | None = None,
+        limit: int | None = None,
     ) -> KeysView[str | int] | Generator[str | int, None, None]:
         """Get keys in insertion order.
 
         Args:
-            after: If provided, return a generator starting after this cursor
-                   (log key). Otherwise return a standard KeysView.
+            after: If provided, start iteration past this log-key cursor.
+            limit: Optional cap on the number of keys yielded.
+                Requires ``after`` or triggers a generator (KeysView has
+                no natural cap).
         """
-        if after is not None:
-            return self._keys_after(after)
+        if after is not None or limit is not None:
+            return self._keys_scan(after=after, limit=limit)
         return KeysView(self)  # type: ignore[arg-type]
 
-    def _keys_after(self, cursor: str) -> Generator[str | int, None, None]:
-        """Yield actual keys starting after the given cursor."""
-        for _log_key, actual_key in self._scan_log_keys(after=cursor):
+    def keys_reverse(
+        self,
+        *,
+        before: str | None = None,
+        limit: int | None = None,
+    ) -> Generator[str | int, None, None]:
+        """Yield actual keys in reverse insertion order (newest first).
+
+        Args:
+            before: If provided, start just below this log-key cursor
+                (older-than semantics).
+            limit: Optional cap on the number of keys yielded.
+
+        Cost: O(limit) via a reverse rocksdb range scan over ``__keys__/``,
+        so ``keys_reverse(limit=n)`` is safe against arbitrarily large
+        streams -- the natural fit for tail-N reads on this view.
+        """
+        for _log_key, actual_key in self._scan_log_keys(
+            reverse=True, before=before, limit=limit,
+        ):
+            yield actual_key
+
+    def _keys_scan(
+        self, *, after: str | None, limit: int | None,
+    ) -> Generator[str | int, None, None]:
+        """Yield actual keys with forward cursor + optional cap."""
+        for _log_key, actual_key in self._scan_log_keys(after=after, limit=limit):
             yield actual_key
 
     def keys_with_log_keys(
