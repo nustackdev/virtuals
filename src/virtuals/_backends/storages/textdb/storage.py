@@ -317,13 +317,15 @@ class TextStorage:
     def _notify_batch(self, keys: set[Key]) -> None:
         """Notify observer of key changes (batch).
 
+        Fire-and-forget: writer enqueues and returns. Callers that need a
+        delivery barrier call observer.flush() explicitly.
+
         Args:
             keys: Keys that changed
         """
         if self._observer is not None and keys:
             try:
                 self._observer.notify(keys)
-                self._observer.flush()
             except Exception:
                 logger.error("Observer notification failed")
 

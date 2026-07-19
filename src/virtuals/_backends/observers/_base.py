@@ -1,16 +1,22 @@
 """Observer implementation with fire-and-forget notifications.
 
 The Observer provides:
-- Non-blocking notify(): enqueues keys and returns immediately
-- Background thread for matching and delivery
-- Pluggable Publisher for delivery backend (InMemory, Redis, etc.)
-- SubscriptionRegistry for efficient pattern matching
+- Non-blocking notify(): enqueues keys and returns. Bounded queue provides
+  natural backpressure -- notify() blocks briefly when the queue is full
+  rather than dropping keys or growing memory unbounded.
+- Background thread for matching and delivery.
+- Pluggable Publisher for delivery backend (InMemory, Redis, etc.).
+- SubscriptionRegistry for efficient pattern matching.
+
+The storage write path calls only notify() -- it no longer blocks on flush().
+flush() remains public for tests, shutdown, and callers that explicitly want
+a delivery barrier.
 """
 
 from __future__ import annotations
 
+import queue
 import threading
-from collections import deque
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, Self
 
@@ -39,13 +45,24 @@ __all__ = [
 ]
 
 
+# Default queue capacity. At 1200 keys/s target throughput this is ~80s of
+# buffer -- comfortable headroom for bursts, small enough that a stuck
+# subscriber surfaces as writer backpressure well before OOM.
+DEFAULT_QUEUE_MAXSIZE: int = 100_000
+
+# Sentinel used to unblock a worker sleeping on Queue.get() during disconnect.
+_STOP_MARKER: object = object()
+
+
 class Observer[EncodedKeyT]:
     """Observer with fire-and-forget notifications.
 
-    Owns a queue, background thread, subscription registry, and a pluggable
-    Publisher for delivery. notify() enqueues keys and returns immediately.
-    The background thread drains the queue, matches against the registry,
-    and hands matched notifications to the publisher for delivery.
+    Owns a bounded queue, background thread, subscription registry, and a
+    pluggable Publisher. notify() enqueues keys; the background thread drains,
+    matches, and hands matches to the publisher.
+
+    Backpressure: notify() blocks briefly when the queue is full (default
+    capacity DEFAULT_QUEUE_MAXSIZE). No silent drops.
 
     Type Parameters:
         EncodedKeyT: Encoded topic type (e.g., str for in-memory, bytes for RocksDB)
@@ -55,16 +72,15 @@ class Observer[EncodedKeyT]:
         self,
         codec: CodecProtocol[EncodedKeyT, Any],
         publisher: PublisherProtocol,
+        queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
     ) -> None:
         self._codec = codec
         self._publisher = publisher
+        self._queue_maxsize = queue_maxsize
         self._connected: bool = False
 
-        # Queue and threading (initialized on connect)
-        # Queue holds Key tuples and flush sentinels (threading.Event)
-        self._queue: deque[Key | threading.Event] = deque()
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=queue_maxsize)
         self._registry: SubscriptionRegistry | None = None
-        self._event = threading.Event()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -84,12 +100,11 @@ class Observer[EncodedKeyT]:
         try:
             self._registry = SubscriptionRegistry()
             self._stop_event.clear()
-            self._queue.clear()
+            # Fresh queue on each connect so re-connect doesn't inherit stale items.
+            self._queue = queue.Queue(maxsize=self._queue_maxsize)
 
-            # Start publisher
             self._publisher.start(self._registry)
 
-            # Start background worker
             self._thread = threading.Thread(
                 target=self._worker,
                 name=f"Observer-{id(self)}",
@@ -106,35 +121,39 @@ class Observer[EncodedKeyT]:
         if not self._connected:
             return
         try:
-            # Signal worker to stop and wake it
             self._stop_event.set()
-            self._event.set()
+            # Best-effort wake if worker is blocked on Queue.get().
+            try:
+                self._queue.put_nowait(_STOP_MARKER)
+            except queue.Full:
+                pass  # worker will wake via get() timeout instead
 
             if self._thread is not None and self._thread.is_alive():
                 self._thread.join(timeout=2.0)
                 self._thread = None
 
-            # Stop publisher
             self._publisher.stop()
         finally:
             if self._registry is not None:
                 self._registry.clear()
                 self._registry = None
             self._connected = False
-            self._queue.clear()
 
     def notify(self, keys: Key | Iterable[Key]) -> None:
-        """Enqueue keys for notification. Returns immediately.
+        """Enqueue keys for notification.
 
-        Accepts a single key (tuple) or a batch of keys (set, list, etc).
-        Fire-and-forget: the background thread handles matching and delivery.
+        Fire-and-forget: writer just enqueues; the background worker handles
+        matching and delivery. When the queue is full, notify() blocks
+        (backpressure) rather than dropping keys.
+
+        Accepts a single key (tuple) or a batch of keys (set, list, etc.).
         """
         self._ensure_connected()
         if isinstance(keys, tuple):
-            self._queue.append(keys)
+            self._queue.put(keys)
         else:
-            self._queue.extend(keys)
-        self._event.set()
+            for k in keys:
+                self._queue.put(k)
 
     def subscribe(self, options: SubscriptionOptions) -> Subscription:
         """Subscribe to key changes with flexible filtering."""
@@ -158,8 +177,11 @@ class Observer[EncodedKeyT]:
     def flush(self, timeout: float = 1.0) -> None:
         """Wait for pending notifications to be delivered.
 
-        Places a sentinel in the queue. When the worker reaches it,
-        it signals completion. Guarantees all prior items are processed.
+        Places a sentinel in the queue. When the worker reaches it, all
+        previously-enqueued keys have been processed and dispatched to
+        callbacks. Public API for tests, shutdown, and callers that
+        explicitly want a delivery barrier. Storage write paths do NOT
+        call this -- they enqueue and return.
 
         Args:
             timeout: Maximum seconds to wait.
@@ -167,32 +189,35 @@ class Observer[EncodedKeyT]:
         if not self._connected:
             return
         done = threading.Event()
-        self._queue.append(done)  # sentinel after all pending keys
-        self._event.set()  # wake worker
+        self._queue.put(done)  # sentinel after all pending keys
         done.wait(timeout=timeout)
 
     def _worker(self) -> None:
         """Background thread: drain queue, match, deliver via publisher."""
         while not self._stop_event.is_set():
-            self._event.wait(timeout=0.1)
-            self._event.clear()
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
 
-            # Drain queue, separating keys from flush sentinels
+            # Drain what's queued right now into a single batch. Sentinels
+            # flush the accumulated batch first, then signal.
             batch: list[Key] = []
-            while self._queue:
-                try:
-                    item = self._queue.popleft()
-                except IndexError:
-                    break
+            while True:
+                if item is _STOP_MARKER:
+                    self._deliver_batch(batch)
+                    return
                 if isinstance(item, threading.Event):
-                    # Process keys accumulated so far, then signal
                     self._deliver_batch(batch)
                     batch = []
                     item.set()
                 else:
-                    batch.append(item)
+                    batch.append(item)  # Key tuple
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
 
-            # Deliver remaining keys
             self._deliver_batch(batch)
 
     def _deliver_batch(self, batch: list[Key]) -> None:
@@ -217,7 +242,6 @@ class Observer[EncodedKeyT]:
         self._publisher.deliver(batch, notifications)
 
     def __enter__(self) -> Self:
-        """Enter context manager."""
         self.connect()
         return self
 
@@ -227,5 +251,4 @@ class Observer[EncodedKeyT]:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        """Exit context manager."""
         self.disconnect()
