@@ -17,6 +17,9 @@ from .filter import (
     PrefixFilter,
     SuffixFilter,
     WildcardFilter,
+    canonicalize,
+    filter_from_dict,
+    filter_hash,
 )
 
 
@@ -31,4 +34,7 @@ __all__ = [
     "PrefixFilter",
     "SuffixFilter",
     "WildcardFilter",
+    "canonicalize",
+    "filter_from_dict",
+    "filter_hash",
 ]

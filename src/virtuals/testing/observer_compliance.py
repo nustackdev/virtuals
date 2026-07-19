@@ -101,6 +101,9 @@ class ContainsSegmentFilter(Filter):
             return NotImplemented
         return self.segment == other.segment
 
+    def to_dict(self) -> dict:
+        return {"type": "contains_segment", "segment": self.segment}
+
 
 # =============================================================================
 # Registry Compliance Tests
