@@ -44,6 +44,7 @@ from virtuals.view import (
     ChildNestedSetBase,
     ChildObservableBase,
     ChildPrimitiveSetBase,
+    DescendantsObservableBase,
     LazyChildReadBase,
     ObservableBase,
     PrimitiveOpsBase,
@@ -101,6 +102,7 @@ def _generate_log_key() -> str:
 class LogIndexedDictViewBase(
     ObservableBase,
     ChildObservableBase[str | int],
+    DescendantsObservableBase,
     ChildNavigationBase[str | int],
     ChildNestedGetBase,
     ChildNestedSetBase,
@@ -145,9 +147,12 @@ class LogIndexedDictViewBase(
             site=(*self.container.site, _KEYS),
         )
 
-    def _ensure_layout(self) -> None:
-        """Ensure both child containers exist."""
-        self.ensure_created()
+    def _ensure_internal_layout(self) -> None:
+        """Materialize ``__data__/`` and ``__keys__/`` sub-containers.
+
+        Called from ``ensure_created`` (via the base hook) after this view's
+        own marker is stamped. Idempotent.
+        """
         self.container.create_child_container(
             _DATA,
             structure=ContainerStructure(1),
@@ -202,6 +207,22 @@ class LogIndexedDictViewBase(
         keys_site = (*self.container.site, _KEYS)
         return self.container.subscribe(
             SubscriptionOptions(WildcardFilter(pattern=(*keys_site, "*"))),
+        )
+
+    def on_descendants_change(
+        self,
+        address: object,
+        *addresses: object,
+    ) -> Subscription:
+        """Wildcard match under __data__/. Callers pattern relative to the
+        view's dict (e.g. ("*", "total_txs")); the __data__/ prefix is
+        prepended so real writes match. Name matches nu.core.reactive's
+        OnDescendantsChangeQuery (spelled with 'a'); the base's
+        `on_descendents_change` (with 'e') is a legacy typo, unused."""
+        pattern = (address, *addresses)
+        wildcard_site = (*self.container.site, _DATA, *pattern)
+        return self.container.subscribe(
+            SubscriptionOptions(WildcardFilter(pattern=wildcard_site)),
         )
 
     def _scan_log_keys(
@@ -359,7 +380,7 @@ class LogIndexedDictViewBase(
     # -- Mutations ---------------------------------------------------------
 
     def __setitem__(self, address: str | int, value: object) -> None:
-        self._ensure_layout()
+        self.ensure_created()
         dc = self._data_container()
         is_new = not dc.exists_child(address)
         # Write to __data__
@@ -391,7 +412,7 @@ class LogIndexedDictViewBase(
         it would normally be decomposed into sub-keys. Use for controlled
         granularity (e.g., storing a list or dict as a single key).
         """
-        self._ensure_layout()
+        self.ensure_created()
         dc = self._data_container()
         is_new = not dc.exists_child(address)
         dc.put_child_primitive(address, cast("Value", value))
@@ -399,7 +420,11 @@ class LogIndexedDictViewBase(
             self._append_log_key(address)
 
     def __delitem__(self, address: str | int) -> None:
-        self._ensure_layout()
+        # No ensure_created here: deletes must not materialize the view as
+        # a side effect. If the underlying __data__/ container doesn't
+        # exist yet, exists_child returns False against raw storage and we
+        # raise KeyError -- matching Python dict semantics and letting ref
+        # callers no-op via their KeyError/IndexError catch.
         dc = self._data_container()
         if not dc.exists_child(address):
             raise KeyError(address)
@@ -411,7 +436,7 @@ class LogIndexedDictViewBase(
                 break
 
     def clear(self) -> None:
-        self._ensure_layout()
+        self.ensure_created()
         self._data_container().clear_children(validate=False)
         self._keys_container().clear_children(validate=False)
 
@@ -431,7 +456,7 @@ class LogIndexedDictViewBase(
         """
         from virtuals.collections import Initializable
 
-        self._ensure_layout()
+        self.ensure_created()
         dc = self._data_container()
         is_new = not dc.exists_child(address)
         structure_id = view_class.get_structure()
@@ -469,7 +494,7 @@ class LogIndexedDictViewBase(
             self[key] = value  # type: ignore[assignment]
 
     def store(self, value: PyMapping[str | int, object], *, replace: bool = True) -> None:
-        self._ensure_layout()
+        self.ensure_created()
         if replace and any(True for _ in self._scan_log_keys()):
             self.clear()
 

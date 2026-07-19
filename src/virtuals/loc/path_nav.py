@@ -42,6 +42,7 @@ __all__ = [  # noqa: RUF022
     "open_child_view",
     "navigate_view",
     "navigate_value",
+    "navigate_and_ensure",
     "open_parent_view",
 ]
 
@@ -227,6 +228,85 @@ def navigate_view(
     for address, expected_type in path[static_end:]:
         current_view = open_child_view(current_view, address, expected_type)
 
+    return current_view
+
+
+def navigate_and_ensure(
+    start_view: View,
+    path: PathToView,
+) -> View:
+    """Navigate a ViewPath and ensure every level is materialized with its
+    declared view type.
+
+    Sibling of ``navigate_view`` for the write path. Same walk shape; the
+    difference is that at each step this calls ``ensure_created()`` on the
+    child view -- stamping the container's marker with the DECLARED view
+    type's structure and running the view's ``_ensure_internal_layout``
+    hook (e.g. building ``__keys__/`` + ``__data__/`` sub-containers on
+    log/indexed dict views).
+
+    Why this exists: the container-layer auto-parent-creation
+    (``ensure_healthy_parents=True`` inside ``Container.create``) is
+    view-blind and stamps a hardcoded default structure at each missing
+    ancestor. When a ref writes a leaf like ``blocks[100].committed``, the
+    leaf's own ``ensure_created`` would auto-create ``/blocks`` with the
+    default marker, silently -- so a later operation that opens
+    ``/blocks`` as its DECLARED ``LogIndexedDictView`` (structure 15) hits
+    a marker mismatch and raises ``ContainerExistsError``. Routing writes
+    through this walk guarantees every ancestor is stamped with its
+    declared type before any leaf write, so the invariant "any container
+    reachable via a ref-write path has been ensured with its declared view
+    type" holds by construction.
+
+    Fast path: one existence probe on the deepest site in ``path``. If it
+    already exists, every ancestor exists too (invariant maintained by
+    prior walks through this same helper), so the walk is skipped and the
+    view is opened directly. Hot-path cost is a single storage read --
+    same as today's leaf-existence check in ``ensure_created``.
+
+    Cold path: walk root -> leaf via ``open_child_view`` (pure navigation,
+    zero storage), calling ``ensure_created`` at each level. Views whose
+    markers already match short-circuit inside ``Container.create``, so
+    ancestor levels are cheap.
+
+    Args:
+        start_view: Starting view (usually a Navigator root).
+        path: ViewPath -- ``((addr_1, view_type_1), (addr_2, view_type_2), ...)``.
+            Each ``view_type`` is the DECLARED class the ref layer expects
+            for that level; ancestors get stamped with the corresponding
+            structure IDs.
+
+    Returns:
+        The view at the end of the path, guaranteed materialized.
+    """
+    from virtuals.container import Container
+    from virtuals.container.node_ops import node_exists
+
+    if not path:
+        start_view.ensure_created()
+        return start_view
+
+    # Fast path: if the deepest container already exists, ancestors are
+    # already correct (invariant from prior walks). Skip the walk.
+    leaf_site = start_view.container.site
+    for address, _ in path:
+        leaf_site = (*leaf_site, address)
+    if node_exists(leaf_site, start_view.container.ctx):
+        # Open the view at the final segment's declared class without
+        # re-walking. This mirrors the fast-path in ``navigate_view``.
+        leaf_view_type = path[-1][1]
+        container = Container(ctx=start_view.container.ctx, site=leaf_site)
+        return leaf_view_type(container, start_view.registry)
+
+    # Cold path: walk with ensure at each level. ``open_child_view`` is
+    # pure navigation; ``ensure_created`` on each level does one
+    # ``get_node_info`` (silent return if the marker already matches) or
+    # stamps + runs the view's ``_ensure_internal_layout`` hook.
+    start_view.ensure_created()
+    current_view = start_view
+    for address, expected_type in path:
+        current_view = open_child_view(current_view, address, expected_type)
+        current_view.ensure_created()
     return current_view
 
 

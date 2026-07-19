@@ -118,6 +118,11 @@ class Navigator[ViewT: View]:
         Creates the root view and runs the full navigation server-side.
         Path is a tuple of (address, view_type) segments — pure immutable data.
 
+        Pure navigation — safe on read-only storage contexts (snapshots,
+        RO secondaries). Does NOT create any containers along the way. Use
+        ``open_at_path_and_ensure`` when the caller is a writer and needs
+        each level materialized with its declared view type.
+
         Args:
             view_path: Path tuple, e.g. (("users", DictView), ("alice", DictView))
             ctx: storage context (transaction, snapshot, or write batch)
@@ -129,6 +134,37 @@ class Navigator[ViewT: View]:
 
         root = self.root(ctx)
         return navigate_view(root, view_path)
+
+    def open_at_path_and_ensure(
+        self, view_path: path.PathToView, ctx: StorageContextType,
+    ) -> View:
+        """Write-side sibling of ``open_at_path``.
+
+        Walks the path and calls ``ensure_created()`` at each level, so every
+        intermediate container is stamped with its declared view type's
+        marker (and its ``_ensure_internal_layout`` hook runs). This is the
+        entry point ref-write code uses so that custom-layout views along a
+        path (``LogIndexedDictView``, ``IndexedDictView``, etc.) never get
+        auto-created with the default marker by the container layer's
+        view-blind parent-fill.
+
+        Fast path: single existence probe on the deepest site. If already
+        present, skips the walk (invariant: prior walks through this helper
+        stamped every ancestor correctly).
+
+        Requires a write-capable context.
+
+        Args:
+            view_path: Path tuple.
+            ctx: Write-capable storage context.
+
+        Returns:
+            View at the end of the path, guaranteed materialized.
+        """
+        from virtuals.loc.path_nav import navigate_and_ensure
+
+        root = self.root(ctx)
+        return navigate_and_ensure(root, view_path)
 
     def root_at(self, site: site_.Site, ctx: StorageContextType) -> ViewT:
         """Open a view at a specific site.

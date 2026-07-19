@@ -85,7 +85,8 @@ class ViewBase(ABC):
     # =========================================================================
 
     def ensure_created(self) -> None:
-        """Ensure this view's container marker exists in storage.
+        """Ensure this view's container marker exists in storage, and run any
+        view-specific internal layout setup (``_ensure_internal_layout``).
 
         Call before any write operation. Idempotent - safe to call
         multiple times (Container.create short-circuits when the marker
@@ -93,6 +94,11 @@ class ViewBase(ABC):
 
         Creates the full parent chain via ensure_healthy_parents=True,
         so even deeply navigated containers get materialized on first write.
+        Note: when the write path routed through the ref layer's
+        walk-and-ensure helper (``navigate_and_ensure``), every ancestor
+        has already been stamped with its declared view type, so the
+        default-parent-structure fallback here is a redundant safety net
+        for direct container-API callers, not the hot path.
         """
         dpv = self.get_default_parent_view()
         Container.create(
@@ -104,6 +110,18 @@ class ViewBase(ABC):
             default_parent_protocol=dpv.get_protocol() if dpv else DEFAULT_PARENT_PROTOCOL,
             ensure_healthy_parents=True,
         )
+        self._ensure_internal_layout()
+
+    def _ensure_internal_layout(self) -> None:
+        """View-specific layout setup, called at the end of ``ensure_created``.
+
+        Default is a no-op. Views with an internal container layout
+        (``LogIndexedDictView``'s ``__keys__/`` + ``__data__/``, etc.) override
+        this to materialize their sub-containers with the correct structure.
+
+        Runs AFTER the view's own marker is stamped, so ``self.container``
+        is guaranteed to exist. Idempotent.
+        """
 
     # =========================================================================
     # NAVIGATION HELPERS

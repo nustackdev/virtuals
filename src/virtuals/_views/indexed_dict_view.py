@@ -119,9 +119,13 @@ class IndexedDictViewBase(
         )
         return FlatListView(container, self.registry)
 
-    def _ensure_layout(self) -> None:
-        """Ensure both child containers exist."""
-        self.ensure_created()
+    def _ensure_internal_layout(self) -> None:
+        """Materialize ``__data__/`` (plain dict) and ``__keys__/`` (FlatListView)
+        sub-containers.
+
+        Called from ``ensure_created`` (via the base hook) after this view's
+        own marker is stamped. Idempotent.
+        """
         self.container.create_child_container(
             _DATA,
             structure=ContainerStructure(1),
@@ -159,7 +163,7 @@ class IndexedDictViewBase(
             if dc.exists():
                 data_keys = list(dc.iter_child_keys(validate=False))
                 if data_keys:
-                    self._ensure_layout()
+                    self.ensure_created()
                     kv = self._keys_view()
                     kv.store(data_keys)
 
@@ -177,7 +181,7 @@ class IndexedDictViewBase(
     # -- Mutations (same for both facets) -----------------------------------
 
     def __setitem__(self, address: str | int, value: object) -> None:
-        self._ensure_layout()
+        self.ensure_created()
         dc = self._data_container()
         is_new = not dc.exists_child(address)
         # Write to __data__
@@ -217,7 +221,7 @@ class IndexedDictViewBase(
         """
         from virtuals.collections import Initializable
 
-        self._ensure_layout()
+        self.ensure_created()
         dc = self._data_container()
         is_new = not dc.exists_child(address)
         structure_id = view_class.get_structure()
@@ -235,7 +239,11 @@ class IndexedDictViewBase(
             self._keys_view().append(address)
 
     def __delitem__(self, address: str | int) -> None:
-        self._ensure_layout()
+        # No ensure_created here: deletes must not materialize the view as
+        # a side effect. If the underlying __data__/ container doesn't
+        # exist yet, exists_child returns False against raw storage and we
+        # raise KeyError -- matching Python dict semantics and letting ref
+        # callers no-op via their KeyError/IndexError catch.
         dc = self._data_container()
         if not dc.exists_child(address):
             raise KeyError(address)
@@ -246,7 +254,7 @@ class IndexedDictViewBase(
         kv.store(remaining)
 
     def clear(self) -> None:
-        self._ensure_layout()
+        self.ensure_created()
         self._data_container().clear_children(validate=False)
         self._keys_view().clear()
 
@@ -258,7 +266,7 @@ class IndexedDictViewBase(
             self[key] = value  # type: ignore[assignment]
 
     def store(self, value: PyMapping[str | int, object], *, replace: bool = True) -> None:
-        self._ensure_layout()
+        self.ensure_created()
         if replace and len(self) > 0:
             self.clear()
 
