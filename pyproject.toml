@@ -66,6 +66,10 @@ kh57 = { path = "../kh57", editable = true }
 [project.optional-dependencies]
 rocksdb = ["rdbpython"]
 lmdb = ["lmdb"]
+redis = [
+    "redis>=5.0",
+    "msgpack>=1.0",
+]
 
 # Development tools
 dev = [

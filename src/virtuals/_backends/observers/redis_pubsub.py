@@ -22,7 +22,9 @@ from ._base import Observer
 try:
     import redis
 except ImportError as e:
-    raise ImportError("redis is required for RedisObserver. Install via: pip install redis") from e
+    raise ImportError(
+        "redis is required for RedisObserver. Install with: pip install virtuals-py[redis]"
+    ) from e
 
 
 if TYPE_CHECKING:
