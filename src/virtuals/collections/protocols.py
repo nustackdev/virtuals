@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     import random
 
     from virtuals.loc import key
-    from virtuals.tkv.observer import Subscription
+    from virtuals.tkv.observer import SubscriptionOptions
     from virtuals.types import Empty
     from virtuals.view import View
 
@@ -344,25 +344,28 @@ class Clearable(Protocol):
 class Observable(Protocol):
     """Protocol for containers that support observing changes.
 
-    Observable containers implement on_change() to subscribe to all
-    changes within this view.
+    Observable containers implement on_change() to produce
+    SubscriptionOptions for all changes within this view. Callers hand
+    those options to a process-scope observer's subscribe().
 
     Example:
         >>> if isinstance(container, Observable):
-        ...     sub = container.on_change()
+        ...     options = container.on_change()
+        ...     sub = observer.subscribe(options)
         ...     sub.bind(my_callback)
         ...     # ... later
         ...     sub.close()
     """
 
-    def on_change(self) -> Subscription:
-        """Subscribe to all changes in this view.
+    def on_change(self) -> SubscriptionOptions:
+        """Build subscription options for all changes in this view.
 
         Returns:
-            Subscription handle that can be bound to callbacks
+            SubscriptionOptions describing the filter shape.
 
         Example:
-            >>> sub = view.on_change()
+            >>> options = view.on_change()
+            >>> sub = observer.subscribe(options)
             >>> sub.bind(callback)
             >>> sub.close()
         """
@@ -373,45 +376,48 @@ class Observable(Protocol):
 class ChildObservable[A](Protocol):
     """Protocol for containers that support observing child changes.
 
-    ChildObservable containers implement on_child_change() to subscribe
-    to changes on a specific child, and on_children_change() to subscribe
-    to all children changes.
+    ChildObservable containers implement on_child_change() and
+    on_children_change() to produce SubscriptionOptions for child
+    changes. Callers hand those options to observer.subscribe().
 
     Type Parameters:
         A: The type of address for children
 
     Example:
         >>> if isinstance(container, ChildObservable):
-        ...     sub = container.on_child_change("alice")
+        ...     options = container.on_child_change("alice")
+        ...     sub = observer.subscribe(options)
         ...     sub.bind(my_callback)
         ...     # ... later
         ...     sub.close()
     """
 
-    def on_child_change(self, address: A) -> Subscription:
-        """Watch changes to a specific child and its subtree.
+    def on_child_change(self, address: A) -> SubscriptionOptions:
+        """Build subscription options for a specific child and its subtree.
 
         Args:
             address: Child address to watch
 
         Returns:
-            Subscription handle that can be bound to callbacks
+            SubscriptionOptions describing the filter shape.
 
         Example:
-            >>> sub = view.on_child_change("users")
+            >>> options = view.on_child_change("users")
+            >>> sub = observer.subscribe(options)
             >>> sub.bind(callback)
             >>> sub.close()
         """
         ...
 
-    def on_children_change(self) -> Subscription:
-        """Watch changes of all children.
+    def on_children_change(self) -> SubscriptionOptions:
+        """Build subscription options for all children.
 
         Returns:
-            Subscription handle that can be bound to callbacks
+            SubscriptionOptions describing the filter shape.
 
         Example:
-            >>> sub = view.on_children_change()
+            >>> options = view.on_children_change()
+            >>> sub = observer.subscribe(options)
             >>> sub.bind(callback)
             >>> sub.close()
         """
@@ -422,33 +428,35 @@ class ChildObservable[A](Protocol):
 class DescendantsObservable(Protocol):
     """Protocol for containers that support observing descendant changes.
 
-    DescendantsObservable containers implement on_descendents_change() to
-    subscribe to changes matching a pattern within descendants.
+    DescendantsObservable containers implement on_descendants_change() to
+    produce SubscriptionOptions for descendants matching a pattern.
 
     Example:
         >>> if isinstance(container, DescendantsObservable):
-        ...     sub = container.on_descendents_change("users", "*", "age")
+        ...     options = container.on_descendants_change("users", "*", "age")
+        ...     sub = observer.subscribe(options)
         ...     sub.bind(my_callback)
         ...     # ... later
         ...     sub.close()
     """
 
-    def on_descendents_change(
+    def on_descendants_change(
         self,
         address: key.KeySegment,
         *addresses: key.KeySegment,
-    ) -> Subscription:
-        """Watch changes of descendants for a given pattern.
+    ) -> SubscriptionOptions:
+        """Build subscription options for descendants matching a pattern.
 
         Args:
             address: First address segment in the pattern
             *addresses: Additional address segments (use "*" for wildcards)
 
         Returns:
-            Subscription handle that can be bound to callbacks
+            SubscriptionOptions describing the filter shape.
 
         Example:
-            >>> sub = view.on_descendents_change("users", "*", "age")
+            >>> options = view.on_descendants_change("users", "*", "age")
+            >>> sub = observer.subscribe(options)
             >>> sub.bind(callback)
             >>> sub.close()
         """

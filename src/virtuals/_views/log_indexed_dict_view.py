@@ -57,7 +57,6 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from collections.abc import Mapping as PyMapping
 
-    from virtuals.tkv.observer import Subscription
     from virtuals.view import View
 
 
@@ -177,53 +176,44 @@ class LogIndexedDictViewBase(
 
     # -- Observability overrides -------------------------------------------
     # LogIndexedDictView stores data under `__data__/` and log keys under
-    # `__keys__/`, not directly under `container.site`. The base observer
+    # `__keys__/`, not directly under `container.site`. The base observable
     # methods (ChildObservableBase, ObservableBase) build filters at
     # `(container.site, ...)`, so no notifs would ever match real writes.
     # These overrides rewrite the filter sites so callers can watch the
     # view the way they'd watch a plain dict.
 
-    def on_change(self) -> Subscription:
+    def on_change(self) -> SubscriptionOptions:
         """Any data-side write. Scoped to __data__/ so log-key appends
         (bookkeeping noise) don't fire the callback."""
-        return self.container.subscribe(
-            SubscriptionOptions(PrefixFilter(prefix=(*self.container.site, _DATA))),
-        )
+        return SubscriptionOptions(PrefixFilter(prefix=(*self.container.site, _DATA)))
 
-    def on_child_change(self, address: str | int) -> Subscription:
+    def on_child_change(self, address: str | int) -> SubscriptionOptions:
         """Any write at or under __data__/<address> -- matches primitive
         set/replace on this child AND nested field writes for compound
         (shape) children."""
         normalized = self.normalize_address(address)
         child_data_site = (*self.container.site, _DATA, normalized)
-        return self.container.subscribe(
-            SubscriptionOptions(PrefixFilter(prefix=child_data_site)),
-        )
+        return SubscriptionOptions(PrefixFilter(prefix=child_data_site))
 
-    def on_children_change(self) -> Subscription:
+    def on_children_change(self) -> SubscriptionOptions:
         """Fires once per new key ever added. Watches __keys__/ appends,
         which happen exactly once when `__setitem__` sees `is_new`. New
         mints appear here; replacements of an existing key don't."""
         keys_site = (*self.container.site, _KEYS)
-        return self.container.subscribe(
-            SubscriptionOptions(WildcardFilter(pattern=(*keys_site, "*"))),
-        )
+        return SubscriptionOptions(WildcardFilter(pattern=(*keys_site, "*")))
 
     def on_descendants_change(
         self,
         address: object,
         *addresses: object,
-    ) -> Subscription:
+    ) -> SubscriptionOptions:
         """Wildcard match under __data__/. Callers pattern relative to the
         view's dict (e.g. ("*", "total_txs")); the __data__/ prefix is
         prepended so real writes match. Name matches nu.core.reactive's
-        OnDescendantsChangeQuery (spelled with 'a'); the base's
-        `on_descendents_change` (with 'e') is a legacy typo, unused."""
+        OnDescendantsChangeQuery (spelled with 'a')."""
         pattern = (address, *addresses)
         wildcard_site = (*self.container.site, _DATA, *pattern)
-        return self.container.subscribe(
-            SubscriptionOptions(WildcardFilter(pattern=wildcard_site)),
-        )
+        return SubscriptionOptions(WildcardFilter(pattern=wildcard_site))
 
     def _scan_log_keys(
         self,

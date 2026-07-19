@@ -1,7 +1,7 @@
 """RocksDB storage backend implementation.
 
 Provides persistent key-value storage with transactions, snapshots,
-and optional change notifications via an observer.
+and optional change notifications via a publisher.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from virtuals.tkv.storage import (
     SnapshotProtocol,
     StorageClosedError,
     StorageError,
-    StorageOperationError,
     TransactionProtocol,
     WriteBatchProtocol,
 )
@@ -32,7 +31,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from virtuals.tkv.codec import CodecProtocol
-    from virtuals.tkv.observer import ObserverProtocol, Subscription, SubscriptionOptions
+    from virtuals.tkv.publisher import PublisherProtocol
     from virtuals.tkv.types import Key
 
 try:
@@ -54,14 +53,14 @@ class RocksDBStorage:
     """RocksDB storage implementation conforming to StorageProtocol.
 
     Provides persistent key-value storage with transactions, snapshots,
-    and optional change notifications via an observer.
+    and optional change notifications via a publisher.
     """
 
     def __init__(
         self,
         path: Path | str,
         codec: CodecProtocol[bytes, bytes],
-        observer: ObserverProtocol | None = None,
+        publisher: PublisherProtocol | None = None,
         *,
         read_only: bool = False,
         secondary_path: Path | str | None = None,
@@ -79,7 +78,7 @@ class RocksDBStorage:
         Args:
             path: Database directory path
             codec: Codec for key/value encoding
-            observer: Optional observer for change notifications
+            publisher: Optional publisher for change notifications
             read_only: Open database in read-only mode
             secondary_path: Path to open db via "rocksdb::DB::OpenAsSecondary"
                 (allows multiple parallel readers)
@@ -98,7 +97,7 @@ class RocksDBStorage:
         """
         # Core dependencies
         self._codec = codec
-        self._observer = observer
+        self._publisher = publisher
 
         # Open options
         self._read_only = read_only
@@ -333,30 +332,6 @@ class RocksDBStorage:
     ) -> None:
         """Exit context manager - close storage."""
         self.close()
-
-    # =========================================================================
-    # Subscriptions
-    # =========================================================================
-
-    def subscribe(self, options: SubscriptionOptions) -> Subscription:
-        """Subscribe to key changes with flexible filtering.
-
-        Args:
-            options: Subscription options including filter specification
-
-        Returns:
-            Subscription object for binding callbacks and managing lifecycle.
-
-        Raises:
-            StorageOperationError: If subscription fails or observer not configured.
-        """
-        if self._observer is None:
-            raise StorageOperationError("Observer not configured for this storage")
-
-        try:
-            return self._observer.subscribe(options)
-        except Exception as e:
-            raise StorageOperationError(f"Failed to subscribe: {e}") from e
 
     # =========================================================================
     # Transaction Management
@@ -625,19 +600,19 @@ class RocksDBStorage:
     # =========================================================================
 
     def _notify_batch(self, keys: set[Key]) -> None:
-        """Notify observer of key changes (batch).
+        """Notify publisher of key changes (batch).
 
         Fire-and-forget: writer enqueues and returns. Callers that need a
-        delivery barrier call observer.flush() explicitly.
+        delivery barrier call publisher.flush() explicitly.
 
         Args:
             keys: Keys that changed
         """
-        if self._observer is not None and keys:
+        if self._publisher is not None and keys:
             try:
-                self._observer.notify(keys)
+                self._publisher.notify(keys)
             except Exception as e:
-                logger.error(f"Observer notification failed: {e}")
+                logger.error(f"Publisher notification failed: {e}")
 
     def _remove_transaction(self, transaction: RocksDBTransaction) -> None:
         """Remove transaction from active set.

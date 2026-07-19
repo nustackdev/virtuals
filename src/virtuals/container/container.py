@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from virtuals.loc import site as site_
-    from virtuals.tkv.observer import Subscription, SubscriptionOptions
     from virtuals.tkv.storage import StorageContextType
     from virtuals.types import Empty, Value
 
@@ -672,24 +671,6 @@ class Container:
             StorageInterfaceError: If context doesn't support reads
         """
         yield from meta_ops.iter_metadata_keys(self.site, self.ctx)
-
-    # ========================================================================
-    # SUBSCRIPTIONS: CONTAINER CHANGES
-    # ========================================================================
-
-    def subscribe(self, options: SubscriptionOptions) -> Subscription:
-        """Subscribe to key changes with flexible filtering.
-
-        Args:
-            options: Subscription options including filter specification
-
-        Returns:
-            Subscription object for binding callbacks and managing lifecycle.
-
-        Raises:
-            StorageOperationError: If subscription fails or observer not configured.
-        """
-        return self.ctx.storage.subscribe(options)
 
     # ========================================================================
     # UTILITY METHODS

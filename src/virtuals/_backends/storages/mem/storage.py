@@ -6,7 +6,7 @@ for efficient transaction isolation without full state copies.
 Features:
 - Copy-on-write transaction isolation (overlay pattern)
 - Thread-safe with RLock
-- Optional observer support for notifications
+- Optional publisher support for change notifications
 - No persistence - all data lost on close
 - Implements full StorageProtocol
 
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from virtuals.tkv.codec import CodecProtocol
-    from virtuals.tkv.observer import ObserverProtocol, Subscription, SubscriptionOptions
+    from virtuals.tkv.publisher import PublisherProtocol
     from virtuals.tkv.types import Key
 
 
@@ -65,18 +65,18 @@ class InMemoryStorage:
     def __init__(
         self,
         codec: CodecProtocol,
-        observer: ObserverProtocol | None = None,
+        publisher: PublisherProtocol | None = None,
         read_only: bool = False,
     ) -> None:
         """Initialize in-memory storage.
 
         Args:
             codec: Codec for key/value encoding
-            observer: Optional observer for change notifications
+            publisher: Optional publisher for change notifications
             read_only: Mode
         """
         self.codec = codec
-        self._observer = observer
+        self._publisher = publisher
 
         self._read_only = read_only
 
@@ -107,20 +107,20 @@ class InMemoryStorage:
             raise StorageClosedError("Storage is not open")
 
     def _notify_batch(self, keys: set[Key]) -> None:
-        """Notify observer of key changes (batch).
+        """Notify publisher of key changes (batch).
 
         Fire-and-forget: writer enqueues and returns. Delivery happens on
-        the observer's worker thread. Callers that need a delivery barrier
-        call observer.flush() explicitly.
+        the publisher's worker thread. Callers that need a delivery barrier
+        call publisher.flush() explicitly.
 
         Args:
             keys: Keys that changed
         """
-        if self._observer is not None and keys:
+        if self._publisher is not None and keys:
             try:
-                self._observer.notify(keys)
+                self._publisher.notify(keys)
             except Exception:
-                logger.error("Observer notification failed")
+                logger.error("Publisher notification failed")
 
     def _untrack_transaction(self, txn: InMemoryTransaction) -> None:
         """Remove transaction from active set.
@@ -223,30 +223,6 @@ class InMemoryStorage:
     ) -> None:
         """Exit context manager."""
         self.close()
-
-    # =========================================================================
-    # Subscriptions
-    # =========================================================================
-
-    def subscribe(self, options: SubscriptionOptions) -> Subscription:
-        """Subscribe to key changes with flexible filtering.
-
-        Args:
-            options: Subscription options including filter specification
-
-        Returns:
-            Subscription object for binding callbacks and managing lifecycle.
-
-        Raises:
-            StorageOperationError: If subscription fails or observer not configured.
-        """
-        if self._observer is None:
-            raise StorageOperationError("Observer not configured for this storage")
-
-        try:
-            return self._observer.subscribe(options)
-        except Exception as e:
-            raise StorageOperationError(f"Failed to subscribe: {e}") from e
 
     # =========================================================================
     # Transaction Management

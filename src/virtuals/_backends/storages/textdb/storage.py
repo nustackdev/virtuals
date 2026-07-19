@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from virtuals.tkv.codec import CodecProtocol
-    from virtuals.tkv.observer import ObserverProtocol, Subscription, SubscriptionOptions
+    from virtuals.tkv.publisher import PublisherProtocol
     from virtuals.tkv.types import Key, Value
 
 
@@ -108,7 +108,7 @@ class TextStorage:
         self,
         path: str | Path,
         codec: CodecProtocol,
-        observer: ObserverProtocol | None = None,
+        publisher: PublisherProtocol | None = None,
         log_operations: bool = False,
         read_only: bool = False,
     ) -> None:
@@ -117,13 +117,13 @@ class TextStorage:
         Args:
             path: Directory path for storage files
             codec: Codec for key/value encoding
-            observer: Observer instance for managing update notifications
+            publisher: Publisher instance for managing update notifications
             log_operations: Enable operation logging (default: False)
             read_only: Mode
         """
         self.path = Path(path)
         self.codec = codec
-        self._observer = observer
+        self._publisher = publisher
         self._log_operations = log_operations
         self._read_only = read_only
 
@@ -315,19 +315,19 @@ class TextStorage:
                     pass
 
     def _notify_batch(self, keys: set[Key]) -> None:
-        """Notify observer of key changes (batch).
+        """Notify publisher of key changes (batch).
 
         Fire-and-forget: writer enqueues and returns. Callers that need a
-        delivery barrier call observer.flush() explicitly.
+        delivery barrier call publisher.flush() explicitly.
 
         Args:
             keys: Keys that changed
         """
-        if self._observer is not None and keys:
+        if self._publisher is not None and keys:
             try:
-                self._observer.notify(keys)
+                self._publisher.notify(keys)
             except Exception:
-                logger.error("Observer notification failed")
+                logger.error("Publisher notification failed")
 
     # =========================================================================
     # Lifecycle
@@ -404,30 +404,6 @@ class TextStorage:
     ) -> None:
         """Exit context manager."""
         self.close()
-
-    # =========================================================================
-    # Subscriptions
-    # =========================================================================
-
-    def subscribe(self, options: SubscriptionOptions) -> Subscription:
-        """Subscribe to key changes with flexible filtering.
-
-        Args:
-            options: Subscription options including filter specification
-
-        Returns:
-            Subscription object for binding callbacks and managing lifecycle.
-
-        Raises:
-            StorageOperationError: If subscription fails or observer not configured.
-        """
-        if self._observer is None:
-            raise StorageOperationError("Observer not configured for this storage")
-
-        try:
-            return self._observer.subscribe(options)
-        except Exception as e:
-            raise StorageOperationError(f"Failed to subscribe: {e}") from e
 
     # =========================================================================
     # Transaction Management

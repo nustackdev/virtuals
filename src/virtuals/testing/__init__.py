@@ -8,6 +8,7 @@ Example:
     from virtuals.testing import (
         StorageProtocolCompliance,
         ObserverCompliance,
+        ObservableBundle,
         KeyCodecCompliance,
     )
 
@@ -23,8 +24,10 @@ Example:
 
     class TestMyObserver(ObserverCompliance):
         @pytest.fixture
-        def observable_storage(self):
-            return MyObservableStorage()
+        def bundle(self):
+            ...
+            yield ObservableBundle(storage, publisher, observer)
+            ...
 
 
     class TestMyCodec(KeyCodecCompliance):
@@ -39,6 +42,7 @@ from .codec_compliance import (
     ValueCodecCompliance,
 )
 from .observer_compliance import (
+    ObservableBundle,
     ObserverCompliance,
     RegistryCompliance,
     SubscriptionCompliance,
@@ -48,6 +52,7 @@ from .storage_compliance import StorageProtocolCompliance
 
 __all__ = [
     "KeyCodecCompliance",
+    "ObservableBundle",
     "ObserverCompliance",
     "RegistryCompliance",
     "StorageProtocolCompliance",

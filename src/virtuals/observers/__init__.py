@@ -1,6 +1,6 @@
-"""Observers for storage change notifications.
+"""Observers for storage change notifications (read-side).
 
 Import directly from submodules:
-    from every_adapters.observers.in_memory import InMemoryObserver
-    from every_adapters.observers.redis_pubsub import RedisObserver
+    from virtuals.observers.mem import InMemoryObserver
+    from virtuals.observers.redis_pubsub import RedisObserver
 """

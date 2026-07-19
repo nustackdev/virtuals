@@ -1,7 +1,8 @@
-"""Abstract compliance test suite for ObserverProtocol implementations.
+"""Abstract compliance test suite for storage/publisher/observer trios.
 
-This module provides a test framework for verifying that observer implementations
-correctly implement the ObserverProtocol interface. These are compliance tests
+This module provides a test framework for verifying that a
+`(storage, publisher, observer)` trio correctly implements the
+end-to-end write-notify-subscribe contract. These are compliance tests
 that verify the subscription and notification system works correctly.
 
 Usage:
@@ -11,6 +12,7 @@ Usage:
     from virtuals.testing import (
         RegistryCompliance,
         ObserverCompliance,
+        ObservableBundle,
     )
 
 
@@ -22,8 +24,18 @@ Usage:
 
     class TestMyObserver(ObserverCompliance):
         @pytest.fixture
-        def observable_storage(self):
-            return MyObservableStorage()
+        def bundle(self):
+            transport = InMemoryTransport()
+            publisher = InMemoryPublisher(transport)
+            publisher.connect()
+            observer = InMemoryObserver(transport)
+            observer.connect()
+            storage = InMemoryStorage(codec=codec, publisher=publisher)
+            storage.open()
+            yield ObservableBundle(storage, publisher, observer)
+            storage.close()
+            observer.disconnect()
+            publisher.disconnect()
     ```
 
 Test Coverage:
@@ -47,6 +59,7 @@ Test Coverage:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -483,122 +496,194 @@ class SubscriptionCompliance:
 # =============================================================================
 
 
+@dataclass
+class ObservableBundle:
+    """A storage + publisher + observer trio wired to the same transport.
+
+    Compliance tests use this to drive end-to-end scenarios: writes go
+    through `storage`, and callbacks flow through `observer`. `publisher`
+    is exposed so tests can flush the write queue when a barrier is
+    needed (for the redis backend the publisher's flush is what makes
+    delivery deterministic).
+    """
+
+    storage: object
+    publisher: object
+    observer: object
+
+
 class ObserverCompliance:
     """Compliance tests for ObserverProtocol implementations.
 
-    Tests the full observer integration: subscribe, notify, bind, unbind, close.
+    Tests the full storage + publisher + observer integration:
+    subscribe on the observer, write through the storage, callbacks
+    fire on the observer.
 
     Usage:
-        Inherit and provide an `observable_storage` fixture that returns a storage
-        implementing both StorageProtocol and ObserverProtocol.
+        Inherit and provide a `bundle` fixture that returns an
+        `ObservableBundle` bound to an already-open storage, connected
+        publisher, and connected observer.
 
         ```python
         class TestMyObserver(ObserverCompliance):
             @pytest.fixture
-            def observable_storage(self):
-                return MyObservableStorage()
+            def bundle(self):
+                transport = InMemoryTransport()
+                publisher = InMemoryPublisher(transport)
+                publisher.connect()
+                observer = InMemoryObserver(transport)
+                observer.connect()
+                storage = InMemoryStorage(codec=codec, publisher=publisher)
+                storage.open()
+                yield ObservableBundle(storage, publisher, observer)
+                storage.close()
+                observer.disconnect()
+                publisher.disconnect()
         ```
     """
 
     @pytest.fixture
-    def observable_storage(self):
-        """Override to provide storage with observer support."""
-        raise NotImplementedError("Subclass must provide observable_storage fixture")
+    def bundle(self) -> ObservableBundle:
+        """Override to provide a paired storage/publisher/observer trio."""
+        raise NotImplementedError("Subclass must provide bundle fixture")
 
     @staticmethod
-    def _flush(storage) -> None:
-        """Flush observer notifications. Call after writes to ensure delivery."""
-        observer = getattr(storage, "_observer", None)
-        if observer is not None and hasattr(observer, "flush"):
-            observer.flush(timeout=1.0)
+    def _flush(bundle: ObservableBundle) -> None:
+        """Drain the write-side and read-side queues so delivery is observable.
 
-    def test_subscribe_and_notify(self, observable_storage) -> None:
+        Publisher.flush drains the write queue and pushes through the
+        transport; Observer.flush drains the observer's own dispatch queue
+        so callbacks have fired by the time this returns.
+
+        For redis-backed pairs there's still a network round-trip between
+        `publisher.flush` and messages hitting the observer's listener; we
+        give the observer's own queue enough time to receive multi-message
+        fanout before draining and asserting.
+        """
+        publisher = bundle.publisher
+        if publisher is not None and hasattr(publisher, "flush"):
+            publisher.flush(timeout=1.0)
+        observer = bundle.observer
+        if observer is None or not hasattr(observer, "flush"):
+            return
+        # Only wait for network fanout if the transport is external
+        # (i.e. no `_transport` attribute of type InMemoryTransport). For
+        # the in-mem transport, publish is synchronous through the shared
+        # object; the publisher.flush + observer.flush pair is sufficient.
+        transport = getattr(observer, "_transport", None)
+        if transport is None:
+            time.sleep(0.3)
+        observer.flush(timeout=1.0)
+
+    @staticmethod
+    def _await_sync(bundle: ObservableBundle, expected: int = 1) -> None:
+        """Wait for the publisher to see `expected` observer subscriptions.
+
+        For in-process transports there's nothing to wait for. For the
+        Redis pair, the observer HSETs + PUBLISHes on subscribe and the
+        publisher refreshes its cache off a debounced HGETALL. Tests
+        that write immediately after subscribe must let that catch up.
+        """
+        publisher = bundle.publisher
+        remote_registry = getattr(publisher, "_remote_registry", None)
+        if remote_registry is None:
+            return
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if len(remote_registry) >= expected:
+                return
+            time.sleep(0.02)
+
+    def test_subscribe_and_notify(self, bundle: ObservableBundle) -> None:
         """Test basic subscription and notification flow."""
         notifications: list = []
 
         def callback(key):
             notifications.append(key)
 
-        sub = observable_storage.subscribe(
+        sub = bundle.observer.subscribe(
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
+        self._await_sync(bundle)
 
-        with observable_storage.transaction() as tx:
+        with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
 
-        self._flush(observable_storage)
+        self._flush(bundle)
         assert len(notifications) == 1
         assert notifications[0] == ("users", "alice")
 
-    def test_subscribe_filter_matching(self, observable_storage) -> None:
+    def test_subscribe_filter_matching(self, bundle: ObservableBundle) -> None:
         """Test subscription only notifies for matching keys."""
         notifications: list = []
 
         def callback(key):
             notifications.append(key)
 
-        sub = observable_storage.subscribe(
+        sub = bundle.observer.subscribe(
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
+        self._await_sync(bundle)
 
-        with observable_storage.transaction() as tx:
+        with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
             tx.put(("posts", "123"), b"post")  # Should NOT notify
             tx.put(("users", "bob"), b"data")
 
-        self._flush(observable_storage)
+        self._flush(bundle)
         assert len(notifications) == 2
         assert ("users", "alice") in notifications
         assert ("users", "bob") in notifications
         assert ("posts", "123") not in notifications
 
-    def test_subscribe_delete_notifies(self, observable_storage) -> None:
+    def test_subscribe_delete_notifies(self, bundle: ObservableBundle) -> None:
         """Test deletion also triggers notification."""
         # First create a key
-        with observable_storage.transaction() as tx:
+        with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
-        self._flush(observable_storage)  # drain before subscribing
+        self._flush(bundle)  # drain before subscribing
 
         notifications: list = []
 
         def callback(key):
             notifications.append(key)
 
-        sub = observable_storage.subscribe(
+        sub = bundle.observer.subscribe(
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
+        self._await_sync(bundle)
 
         # Delete the key
-        with observable_storage.transaction() as tx:
+        with bundle.storage.transaction() as tx:
             tx.delete(("users", "alice"))
 
-        self._flush(observable_storage)
+        self._flush(bundle)
         assert len(notifications) == 1
         assert notifications[0] == ("users", "alice")
 
-    def test_subscription_close_stops_notifications(self, observable_storage) -> None:
+    def test_subscription_close_stops_notifications(self, bundle: ObservableBundle) -> None:
         """Test closed subscription stops receiving notifications."""
         notifications: list = []
 
         def callback(key):
             notifications.append(key)
 
-        sub = observable_storage.subscribe(
+        sub = bundle.observer.subscribe(
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
         sub.close()
 
-        with observable_storage.transaction() as tx:
+        with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
 
-        self._flush(observable_storage)
+        self._flush(bundle)
         assert len(notifications) == 0
 
-    def test_multiple_subscriptions(self, observable_storage) -> None:
+    def test_multiple_subscriptions(self, bundle: ObservableBundle) -> None:
         """Test multiple subscriptions receive appropriate notifications."""
         user_notifications: list = []
         length_notifications: list = []
@@ -609,20 +694,21 @@ class ObserverCompliance:
         def length_callback(key):
             length_notifications.append(key)
 
-        sub1 = observable_storage.subscribe(
+        sub1 = bundle.observer.subscribe(
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub1.bind(user_callback)
 
-        sub2 = observable_storage.subscribe(SubscriptionOptions(filter=LengthFilter(length=2)))
+        sub2 = bundle.observer.subscribe(SubscriptionOptions(filter=LengthFilter(length=2)))
         sub2.bind(length_callback)
+        self._await_sync(bundle, expected=2)
 
-        with observable_storage.transaction() as tx:
+        with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")  # Matches both (prefix + length 2)
             tx.put(("users", "alice", "profile"), b"p")  # Matches only prefix
             tx.put(("posts", "123"), b"post")  # Matches only length
 
-        self._flush(observable_storage)
+        self._flush(bundle)
         assert len(user_notifications) == 2
         assert len(length_notifications) == 2
         assert ("users", "alice") in user_notifications
@@ -630,34 +716,35 @@ class ObserverCompliance:
         assert ("users", "alice") in length_notifications
         assert ("posts", "123") in length_notifications
 
-    def test_subscription_bind_unbind(self, observable_storage) -> None:
+    def test_subscription_bind_unbind(self, bundle: ObservableBundle) -> None:
         """Test binding and unbinding callbacks."""
         notifications: list = []
 
         def callback(key):
             notifications.append(key)
 
-        sub = observable_storage.subscribe(
+        sub = bundle.observer.subscribe(
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
+        self._await_sync(bundle)
 
-        with observable_storage.transaction() as tx:
+        with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
 
-        self._flush(observable_storage)
+        self._flush(bundle)
         assert len(notifications) == 1
 
         sub.unbind(callback)
 
-        with observable_storage.transaction() as tx:
+        with bundle.storage.transaction() as tx:
             tx.put(("users", "bob"), b"data")
 
-        self._flush(observable_storage)
+        self._flush(bundle)
         # Should still be 1 - callback was unbound
         assert len(notifications) == 1
 
-    def test_subscription_multiple_callbacks(self, observable_storage) -> None:
+    def test_subscription_multiple_callbacks(self, bundle: ObservableBundle) -> None:
         """Test subscription with multiple callbacks."""
         notifications1: list = []
         notifications2: list = []
@@ -668,20 +755,21 @@ class ObserverCompliance:
         def callback2(key):
             notifications2.append(key)
 
-        sub = observable_storage.subscribe(
+        sub = bundle.observer.subscribe(
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback1)
         sub.bind(callback2)
+        self._await_sync(bundle)
 
-        with observable_storage.transaction() as tx:
+        with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
 
-        self._flush(observable_storage)
+        self._flush(bundle)
         assert len(notifications1) == 1
         assert len(notifications2) == 1
 
-    def test_or_filter_subscription(self, observable_storage) -> None:
+    def test_or_filter_subscription(self, bundle: ObservableBundle) -> None:
         """Test Or filter subscription (verifies the Or indexing fix)."""
         notifications: list = []
 
@@ -690,34 +778,36 @@ class ObserverCompliance:
 
         # LengthFilter(2) | PrefixFilter("users") - should match via second filter
         # even though first filter is indexed
-        sub = observable_storage.subscribe(
+        sub = bundle.observer.subscribe(
             SubscriptionOptions(filter=LengthFilter(length=2) | PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
+        self._await_sync(bundle)
 
-        with observable_storage.transaction() as tx:
+        with bundle.storage.transaction() as tx:
             # Length 3 but has "users" prefix - should match via Or's second filter
             tx.put(("users", "alice", "profile"), b"data")
 
-        self._flush(observable_storage)
+        self._flush(bundle)
         assert len(notifications) == 1
         assert notifications[0] == ("users", "alice", "profile")
 
-    def test_aborted_transaction_no_notify(self, observable_storage) -> None:
+    def test_aborted_transaction_no_notify(self, bundle: ObservableBundle) -> None:
         """Test aborted transaction does not trigger notifications."""
         notifications: list = []
 
         def callback(key):
             notifications.append(key)
 
-        sub = observable_storage.subscribe(
+        sub = bundle.observer.subscribe(
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
+        self._await_sync(bundle)
 
-        tx = observable_storage.begin_transaction()
+        tx = bundle.storage.begin_transaction()
         tx.put(("users", "alice"), b"data")
         tx.abort()  # Abort instead of commit
 
-        self._flush(observable_storage)
+        self._flush(bundle)
         assert len(notifications) == 0

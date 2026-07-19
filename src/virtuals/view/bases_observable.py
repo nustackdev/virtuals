@@ -20,7 +20,6 @@ from .bases import AddressMappingBase
 if TYPE_CHECKING:
     from virtuals.container import Container
     from virtuals.loc import site as site_
-    from virtuals.tkv.observer import Subscription
 
 
 __all__ = [
@@ -33,14 +32,15 @@ logger = getLogger(__name__)
 
 
 class ObservableBase:
-    """Base providing subscription-based observability for the whole view.
+    """Base providing subscription-options for the whole view.
 
-    This base enables views to observe any modifications within
-    the view's scope.
+    Views expose the filter shape; callers pass the returned
+    `SubscriptionOptions` to a process-scope observer's `subscribe`.
 
     Example:
         >>> class MyView(ObservableBase, View): ...
-        >>> sub = view.on_change()
+        >>> options = view.on_change()
+        >>> sub = observer.subscribe(options)
         >>> sub.bind(my_callback)
         >>> # ... later
         >>> sub.close()
@@ -48,90 +48,89 @@ class ObservableBase:
 
     container: Container
 
-    def on_change(self) -> Subscription:
-        """Subscribe to all changes in this view.
+    def on_change(self) -> SubscriptionOptions:
+        """Build subscription options for all changes in this view.
 
         Returns:
-            Subscription handle that can be bound to callbacks
+            SubscriptionOptions describing the filter shape.
 
         Example:
-            >>> sub = view.on_change()
+            >>> options = view.on_change()
+            >>> sub = observer.subscribe(options)
             >>> sub.bind(callback)
             >>> sub.close()
         """
-        return self.container.subscribe(
-            SubscriptionOptions(PrefixFilter(prefix=(self.container.site)))
-        )
+        return SubscriptionOptions(PrefixFilter(prefix=(self.container.site)))
 
 
 class ChildObservableBase[A](AddressMappingBase[A]):
-    """Base providing subscription-based observability for view's children.
+    """Base providing subscription-options for a view's children.
 
-    This base enables views to observe changes on specific children
-    or all children at once.
+    Views expose the filter shape; callers pass the returned
+    `SubscriptionOptions` to a process-scope observer's `subscribe`.
 
     Type Parameters:
         A: The type of address for children
 
     Example:
         >>> class MyView(ChildObservableBase[int], View): ...
-        >>> sub = view.on_child_change(0)
+        >>> options = view.on_child_change(0)
+        >>> sub = observer.subscribe(options)
         >>> sub.bind(my_callback)
         >>> # ... later
         >>> sub.close()
     """
 
-    def on_child_change(self, address: A) -> Subscription:
-        """Watch changes to a specific child and its subtree.
+    def on_child_change(self, address: A) -> SubscriptionOptions:
+        """Build subscription options for a specific child and its subtree.
 
         Args:
             address: Child address to watch
 
         Returns:
-            Subscription handle that can be bound to callbacks
+            SubscriptionOptions describing the filter shape.
 
         Example:
-            >>> sub = view.on_child_change("users")
+            >>> options = view.on_child_change("users")
+            >>> sub = observer.subscribe(options)
             >>> sub.bind(callback)
             >>> sub.close()
         """
         normalized = self.normalize_address(address)
         child_full_site = (*self.container.site, normalized)
-        return self.container.subscribe(
-            SubscriptionOptions(
-                filter=PrefixFilter(prefix=child_full_site)
-                & LengthFilter(length=len(child_full_site))
-            )
+        return SubscriptionOptions(
+            filter=PrefixFilter(prefix=child_full_site)
+            & LengthFilter(length=len(child_full_site))
         )
 
-    def on_children_change(self) -> Subscription:
-        """Watch changes of all children.
+    def on_children_change(self) -> SubscriptionOptions:
+        """Build subscription options for all children.
 
         Returns:
-            Subscription handle that can be bound to callbacks
+            SubscriptionOptions describing the filter shape.
 
         Example:
-            >>> sub = view.on_children_change()
+            >>> options = view.on_children_change()
+            >>> sub = observer.subscribe(options)
             >>> sub.bind(callback)
             >>> sub.close()
         """
         child_full_site = (*self.container.site, "*")
-        return self.container.subscribe(
-            SubscriptionOptions(
-                WildcardFilter(pattern=child_full_site),
-            )
+        return SubscriptionOptions(
+            WildcardFilter(pattern=child_full_site),
         )
 
 
 class DescendantsObservableBase:
-    """Base providing subscription-based observability for view's descendants.
+    """Base providing subscription-options for a view's descendants.
 
-    This base enables views to observe changes on descendants matching
-    a pattern, using wildcards to match any address at specific levels.
+    Views expose the filter shape; callers pass the returned
+    `SubscriptionOptions` to a process-scope observer's `subscribe`.
 
     Example:
         >>> class MyView(DescendantsObservableBase, View): ...
-        >>> sub = view.on_descendents_change("users", "*", "age")
+        >>> options = view.on_descendants_change("users", "*", "age")
+        >>> sub = observer.subscribe(options)
         >>> sub.bind(my_callback)
         >>> # ... later
         >>> sub.close()
@@ -139,25 +138,26 @@ class DescendantsObservableBase:
 
     container: Container
 
-    def on_descendents_change(
+    def on_descendants_change(
         self,
         address: site_.SiteSegment,
         *addresses: site_.SiteSegment,
-    ) -> Subscription:
-        """Watch changes of descendants for a given pattern.
+    ) -> SubscriptionOptions:
+        """Build subscription options for descendants matching a pattern.
 
         Args:
             address: First address segment in the pattern
             *addresses: Additional address segments (use "*" for wildcards)
 
         Returns:
-            Subscription handle that can be bound to callbacks
+            SubscriptionOptions describing the filter shape.
 
         Example:
-            >>> sub = view.on_descendents_change("users", "*", "age")
+            >>> options = view.on_descendants_change("users", "*", "age")
+            >>> sub = observer.subscribe(options)
             >>> sub.bind(callback)
             >>> sub.close()
         """
         pattern = (address, *addresses)
         wildcard_site = (*self.container.site, *pattern)
-        return self.container.subscribe(SubscriptionOptions(WildcardFilter(pattern=wildcard_site)))
+        return SubscriptionOptions(WildcardFilter(pattern=wildcard_site))

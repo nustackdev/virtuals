@@ -1,27 +1,20 @@
-"""In-memory observer and publisher.
+"""In-memory observer.
 
-InMemoryPublisher delivers notifications by calling subscriber callbacks
-directly on the observer's background thread.
-
-InMemoryObserver is a convenience class: Observer + InMemoryPublisher.
+Registers a listener on a shared InMemoryTransport. On every publish, the
+transport calls back into `_dispatch_incoming(batch)` and the observer's
+worker matches against its local SubscriptionRegistry.
 """
 
 from __future__ import annotations
 
 from logging import getLogger
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from virtuals.tkv.observer.publisher import deliver_local
-
-from ._base import Observer
+from ._base import DEFAULT_DISPATCH_QUEUE_MAXSIZE, ObserverBase
 
 
 if TYPE_CHECKING:
-    from virtuals.tkv.codec import CodecProtocol
-    from virtuals.tkv.observer import SubscriptionRegistry
-    from virtuals.tkv.observer.publisher import PublisherProtocol
-    from virtuals.tkv.observer.subscription import Subscription
-    from virtuals.tkv.types import Key
+    from virtuals.tkv.transport import InMemoryTransport
 
 
 logger = getLogger(__name__)
@@ -29,44 +22,23 @@ logger = getLogger(__name__)
 
 __all__ = [
     "InMemoryObserver",
-    "InMemoryPublisher",
 ]
 
 
-class InMemoryPublisher:
-    """Publisher that delivers notifications via local callbacks.
+class InMemoryObserver(ObserverBase):
+    """Observer that receives batches from a shared InMemoryTransport."""
 
-    Calls subscriber callbacks directly. No external broadcast.
-    """
-
-    def start(self, registry: SubscriptionRegistry) -> None:
-        """No-op. No external resources to start."""
-
-    def stop(self) -> None:
-        """No-op. No external resources to stop."""
-
-    def deliver(
+    def __init__(
         self,
-        keys: list[Key],
-        notifications: list[tuple[Key, list[Subscription]]],
+        transport: InMemoryTransport,
+        *,
+        dispatch_queue_maxsize: int = DEFAULT_DISPATCH_QUEUE_MAXSIZE,
     ) -> None:
-        """Deliver matched notifications to local subscribers."""
-        deliver_local(notifications)
+        super().__init__(dispatch_queue_maxsize=dispatch_queue_maxsize)
+        self._transport = transport
 
+    def _on_connect(self) -> None:
+        self._transport.register(self._dispatch_incoming)
 
-class InMemoryObserver(Observer[str]):
-    """Observer with in-memory local delivery.
-
-    Convenience class: Observer + InMemoryPublisher.
-    """
-
-    def __init__(self, codec: CodecProtocol[str, Any]) -> None:
-        """Initialize with InMemoryPublisher."""
-        super().__init__(codec=codec, publisher=InMemoryPublisher())
-
-
-if TYPE_CHECKING:
-    from virtuals.tkv.observer import ObserverProtocol
-
-    _: type[ObserverProtocol[str]] = InMemoryObserver
-    _p: type[PublisherProtocol] = InMemoryPublisher
+    def _on_disconnect(self) -> None:
+        self._transport.unregister(self._dispatch_incoming)

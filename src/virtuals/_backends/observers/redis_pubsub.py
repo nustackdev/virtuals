@@ -1,37 +1,30 @@
-"""Redis pub/sub observer with per-hash channel routing.
+"""Redis observer: listens to per-filter-hash pubsub channels.
 
-Design:
+Owns:
+- `_local_hash_refcount`: per-hash refcount so we only SUBSCRIBE once
+  regardless of how many local subs share a filter shape.
+- HSET / HDEL of the registry HASH (`{prefix}:subs:registry`).
+- PUBLISH of the control channel (`{prefix}:subs:changed`) after every
+  HSET / HDEL, so cluster publishers refresh their caches.
+- The listener thread that owns `self._pubsub` and dispatches inbound
+  notif messages via `_dispatch_incoming(keys)`.
+- A cleanup thread that periodically sweeps the registry HASH: for every
+  entry with zero cluster subscribers (PUBSUB NUMSUB), HDEL + PUBLISH.
 
-- HASH `{prefix}:subs:registry` is the source of truth for active filter
-  shapes across the whole cluster. Maps `filter_hash -> filter_json`.
-- Channel `{prefix}:subs:changed` carries a signal (no payload) whenever
-  the registry HASH mutates. Every observer subscribes to it and refreshes
-  its local cache via HGETALL on receipt (debounced to coalesce bursts).
-- Per-hash channels `{prefix}:notif:{hash}` carry actual key notifications
-  (msgpack-encoded `{"iid": instance_id, "keys": [[seg, ...], ...]}`).
-  Observers only publish to hashes that have at least one subscriber
-  somewhere in the cluster (checked against the local cache of the HASH).
+Does NOT own the publish queue, publish pipeline, or the publisher-side
+remote-registry cache -- those live in RedisPublisher.
 
-Zero-interest publish is impossible by construction: an empty local cache
-means no publishes happen. Cleanup of dead hashes is lazy via a periodic
-sweep that calls `PUBSUB NUMSUB` per hash and `HDEL`s any with zero global
-subscribers.
+Self-echo: per the split design, this observer does NOT suppress
+messages whose `iid` matches. In the split architecture, the observer
+never publishes, so a same-process publisher's echo is simply an
+ordinary inbound message. This is a behaviour change from the old fused
+code (which self-suppressed), noted in the design doc.
 
-Threading:
-
-- Base `Observer` worker thread calls `deliver()` from `_deliver_batch`.
-  Local delivery is inline; remote publishes are enqueued to a separate
-  publish thread that pipelines them (writer thread never pays network
-  RTT for publishes).
-- Listener thread pumps redis pubsub messages: control-channel signals
-  trigger debounced HGETALL; notif-channel messages fan out to local
-  subscribers via `registry.match(key)` (same code path as local delivery).
-- Cleanup thread runs every N seconds, HDEL-ing hashes with zero remote
-  subscribers.
-- All redis-pubsub state (`self._pubsub`) is guarded by `_pubsub_lock`.
-
-RedisObserver = Observer + RedisPublisher (thin wrapper that hooks
-subscribe/unsubscribe into publisher-side hash registration).
+Wire format is identical to the fused code so the old and new pair are
+interoperable during migration:
+- Channels: `{prefix}:notif:{filter_hash}`, `{prefix}:subs:changed`.
+- HASH key: `{prefix}:subs:registry`.
+- msgpack payload: `{"iid": pub_id, "keys": [[...], ...]}`.
 """
 
 from __future__ import annotations
@@ -42,10 +35,9 @@ import threading
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
 
-from virtuals.tkv.filter import Filter, filter_from_dict, filter_hash
-from virtuals.tkv.observer.publisher import deliver_local
+from virtuals.tkv.filter import Filter, filter_hash
 
-from ._base import DEFAULT_QUEUE_MAXSIZE, Observer
+from ._base import DEFAULT_DISPATCH_QUEUE_MAXSIZE, ObserverBase
 
 
 try:
@@ -64,87 +56,58 @@ except ImportError as e:
 
 
 if TYPE_CHECKING:
-    from virtuals.tkv.codec import CodecProtocol
-    from virtuals.tkv.observer import Subscription, SubscriptionOptions, SubscriptionRegistry
-    from virtuals.tkv.observer.publisher import PublisherProtocol
+    from virtuals.tkv.observer import Subscription
     from virtuals.tkv.types import Key
 
-
-__all__ = [
-    "RedisObserver",
-    "RedisPublisher",
-]
 
 logger = getLogger(__name__)
 
 
-# Default publish queue capacity. Batches accumulate here between drains.
-# Values larger than DEFAULT_PUBLISH_QUEUE_MAXSIZE will block the observer
-# worker briefly (backpressure), which is the intended overload behavior.
-DEFAULT_PUBLISH_QUEUE_MAXSIZE: int = 10_000
+__all__ = [
+    "RedisObserver",
+]
+
 
 # Default HASH cleanup sweep interval (seconds). Lazy; correctness never hurts.
 DEFAULT_CLEANUP_INTERVAL_SECONDS: float = 30.0
 
-# Default HGETALL refresh debounce window (seconds). Coalesces bursts of
-# "changed" signals from many observers subscribing at once.
-DEFAULT_REFRESH_DEBOUNCE_SECONDS: float = 0.01
-
-# Pubsub polling timeout (seconds). Bounds the max latency a subscribe/
-# unsubscribe waits for the pubsub lock.
+# Pubsub polling timeout (seconds).
 _PUBSUB_POLL_TIMEOUT: float = 0.05
 
 
-class RedisPublisher:
-    """Publisher: local callbacks + per-hash routed redis pub/sub."""
+class RedisObserver(ObserverBase):
+    """Observer that receives per-hash routed notifications over Redis pubsub."""
 
     def __init__(
         self,
         *,
         redis_url: str = "redis://localhost:6379",
         channel_prefix: str = "everyshape",
-        publish_queue_maxsize: int = DEFAULT_PUBLISH_QUEUE_MAXSIZE,
         cleanup_interval_seconds: float = DEFAULT_CLEANUP_INTERVAL_SECONDS,
-        refresh_debounce_seconds: float = DEFAULT_REFRESH_DEBOUNCE_SECONDS,
+        dispatch_queue_maxsize: int = DEFAULT_DISPATCH_QUEUE_MAXSIZE,
     ) -> None:
+        super().__init__(dispatch_queue_maxsize=dispatch_queue_maxsize)
         self._redis_url = redis_url
         self._channel_prefix = channel_prefix
         self._instance_id = id(self)
-        self._publish_queue_maxsize = publish_queue_maxsize
         self._cleanup_interval = cleanup_interval_seconds
-        self._refresh_debounce = refresh_debounce_seconds
 
-        # Redis connections (created on start)
-        self._redis_pub: Any = None  # for publish + HSET/HDEL/HGETALL/PUBSUB NUMSUB
-        self._redis_sub: Any = None  # dedicated connection for pubsub
+        self._redis: Any = None  # HSET/HDEL/HGETALL/PUBSUB NUMSUB/PUBLISH
+        self._redis_sub: Any = None  # dedicated pubsub connection
         self._pubsub: Any = None
-        # NOTE: `self._pubsub` is touched EXCLUSIVELY on the listener thread.
-        # Subscribe/unsubscribe from other threads goes via `_control_cmd_queue`
-        # and awaits an ack event. This is race-free and avoids the pubsub-lock
-        # contention we saw when serialising `get_message` with sub/unsub calls.
+        # NOTE: `self._pubsub` is touched EXCLUSIVELY by the listener thread.
+        # Sub/unsub from other threads goes via `_control_cmd_queue`.
 
-        # Registry + local caches
-        self._registry: SubscriptionRegistry | None = None
-        # remote_registry: filter_hash -> reconstructed Filter. Source of routing decisions.
-        self._remote_registry: dict[str, Filter] = {}
-        # local_hash_refcount: filter_hash -> count of local subs sharing that hash.
-        # Determines when to (un)SUBSCRIBE our notif channel.
         self._local_hash_refcount: dict[str, int] = {}
         self._state_lock = threading.Lock()
 
-        # Threads
-        self._stop_event = threading.Event()
+        self._obs_stop_event = threading.Event()
         self._listener_thread: threading.Thread | None = None
-        self._publish_thread: threading.Thread | None = None
         self._cleanup_thread: threading.Thread | None = None
-        self._publish_queue: queue.Queue[tuple[str, bytes] | None] | None = None
-        # Cross-thread pubsub commands: (action, channel, ack_event)
-        # action is 'sub' or 'unsub'; ack_event is set by listener after redis command
-        # is issued. 'shutdown' with None channel/event tells listener to exit.
-        self._control_cmd_queue: queue.Queue[tuple[str, str | None, threading.Event | None]] | None = None
-        # Debounced refresh: single-shot timer, replaced when new signals arrive.
-        self._refresh_timer: threading.Timer | None = None
-        self._refresh_timer_lock = threading.Lock()
+        # (action, channel, ack_event). action in {'sub', 'unsub', 'shutdown'}.
+        self._control_cmd_queue: queue.Queue[
+            tuple[str, str | None, threading.Event | None]
+        ] | None = None
 
     # -- Channel / key helpers ------------------------------------------------
 
@@ -157,87 +120,56 @@ class RedisPublisher:
     def _registry_key(self) -> str:
         return f"{self._channel_prefix}:subs:registry"
 
-    # -- Lifecycle ------------------------------------------------------------
+    # -- Lifecycle hooks ------------------------------------------------------
 
-    def start(self, registry: SubscriptionRegistry) -> None:
-        """Connect to Redis, subscribe to control channel, seed remote cache, start threads."""
-        self._registry = registry
-        self._redis_pub = redis.from_url(self._redis_url)
+    def _on_connect(self) -> None:
+        """Open connections + pubsub, start listener and cleanup threads."""
+        self._redis = redis.from_url(self._redis_url)
         self._redis_sub = redis.from_url(self._redis_url)
-        self._redis_pub.ping()
+        self._redis.ping()
 
         self._pubsub = self._redis_sub.pubsub()
-        # SUBSCRIBE control channel FIRST so we don't miss changes during HGETALL.
-        # Safe: listener hasn't started yet, only this thread touches _pubsub.
-        self._pubsub.subscribe(self._control_channel())
 
-        # Seed remote registry from current HASH state.
-        self._refresh_remote_registry()
-
-        # Threads
-        self._stop_event.clear()
-        self._publish_queue = queue.Queue(maxsize=self._publish_queue_maxsize)
+        self._obs_stop_event.clear()
         self._control_cmd_queue = queue.Queue()
 
         self._listener_thread = threading.Thread(
             target=self._listener_loop,
-            name=f"RedisListener-{self._instance_id}",
-            daemon=True,
-        )
-        self._publish_thread = threading.Thread(
-            target=self._publish_loop,
-            name=f"RedisPublisher-{self._instance_id}",
+            name=f"RedisObserverListener-{self._instance_id}",
             daemon=True,
         )
         self._cleanup_thread = threading.Thread(
             target=self._cleanup_loop,
-            name=f"RedisCleanup-{self._instance_id}",
+            name=f"RedisObserverCleanup-{self._instance_id}",
             daemon=True,
         )
         self._listener_thread.start()
-        self._publish_thread.start()
         self._cleanup_thread.start()
 
         logger.info(
-            "Redis publisher started at %s (prefix=%s, iid=%d)",
+            "Redis observer started at %s (prefix=%s, iid=%d)",
             self._redis_url,
             self._channel_prefix,
             self._instance_id,
         )
 
-    def stop(self) -> None:
-        """Signal all threads, cancel debounced refresh, close connections."""
-        self._stop_event.set()
+    def _on_disconnect(self) -> None:
+        """Signal threads, wait for them to exit, close connections."""
+        self._obs_stop_event.set()
 
-        # Cancel debounce timer
-        with self._refresh_timer_lock:
-            if self._refresh_timer is not None:
-                self._refresh_timer.cancel()
-                self._refresh_timer = None
-
-        # Wake publish thread
-        if self._publish_queue is not None:
-            try:
-                self._publish_queue.put_nowait(None)  # stop sentinel
-            except queue.Full:
-                pass
-
-        # Wake listener thread (drains cmd queue between polls)
         if self._control_cmd_queue is not None:
             try:
                 self._control_cmd_queue.put_nowait(("shutdown", None, None))
             except queue.Full:
                 pass
 
-        for t in (self._listener_thread, self._publish_thread, self._cleanup_thread):
+        for t in (self._listener_thread, self._cleanup_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=2.0)
         self._listener_thread = None
-        self._publish_thread = None
         self._cleanup_thread = None
 
         if self._pubsub is not None:
-            # Listener thread has exited, safe to touch pubsub from here.
             try:
                 self._pubsub.unsubscribe()
                 self._pubsub.close()
@@ -245,7 +177,7 @@ class RedisPublisher:
                 logger.warning("Error closing pubsub: %s", e)
             self._pubsub = None
 
-        for conn_attr in ("_redis_sub", "_redis_pub"):
+        for conn_attr in ("_redis_sub", "_redis"):
             conn = getattr(self, conn_attr)
             if conn is not None:
                 try:
@@ -255,109 +187,82 @@ class RedisPublisher:
                 setattr(self, conn_attr, None)
 
         with self._state_lock:
-            self._remote_registry = {}
             self._local_hash_refcount = {}
-        self._registry = None
-        logger.info("Redis publisher stopped")
+        logger.info("Redis observer stopped")
 
-    # -- deliver (called from Observer worker thread) -------------------------
+    # -- Subscribe / unsubscribe hooks ---------------------------------------
 
-    def deliver(
-        self,
-        keys: list[Key],
-        notifications: list[tuple[Key, list[Subscription]]],
-    ) -> None:
-        """Local delivery + route to per-hash channels for remote observers."""
-        # Local delivery first (inline, fast)
-        deliver_local(notifications)
+    def _on_subscribe(self, subscription: Subscription) -> None:
+        """First-time local sub for a hash -> SUBSCRIBE + HSET + PUBLISH."""
+        self._register_local_filter(subscription.filter)
 
-        if not keys or self._publish_queue is None:
-            return
+    def _on_unsubscribe(self, subscription: Subscription) -> None:
+        """Last local sub for a hash -> UNSUBSCRIBE. HDEL is lazy (cleanup thread)."""
+        self._unregister_local_filter(subscription.filter)
 
-        # Snapshot remote registry so publish routing doesn't hold the state lock.
+    def _register_local_filter(self, f: Filter) -> None:
+        h = filter_hash(f)
         with self._state_lock:
-            remote = dict(self._remote_registry)
+            prior = self._local_hash_refcount.get(h, 0)
+            self._local_hash_refcount[h] = prior + 1
+            is_new = prior == 0
 
-        if not remote:
-            return  # nobody in the cluster is interested; publish nothing
-
-        # Bucket keys per matching hash.
-        per_hash: dict[str, list[Key]] = {}
-        for key in keys:
-            for h, f in remote.items():
-                if f.matches(key):
-                    per_hash.setdefault(h, []).append(key)
-
-        if not per_hash:
+        if not is_new:
             return
 
-        # Enqueue one publish per bucket. Publish thread will pipeline them.
-        for h, ks in per_hash.items():
-            payload = msgpack.packb(
-                {
-                    "iid": self._instance_id,
-                    "keys": [list(k) for k in ks],
-                },
-                use_bin_type=True,
-            )
+        # SUBSCRIBE FIRST so we don't miss messages between our HSET and other
+        # publishers routing to us. Delegated to listener thread; wait for ack.
+        self._dispatch_pubsub_cmd("sub", self._notif_channel(h), wait=True)
+
+        if self._redis is not None:
             try:
-                self._publish_queue.put_nowait((self._notif_channel(h), payload))
-            except queue.Full:
-                logger.warning(
-                    "Publish queue full; dropping %d keys for hash %s", len(ks), h
+                self._redis.hset(
+                    self._registry_key(),
+                    h,
+                    json.dumps(f.to_dict(), separators=(",", ":")),
                 )
+                self._redis.publish(self._control_channel(), b"")
+            except Exception as e:
+                logger.error("Register HSET/publish for hash %s failed: %s", h, e)
 
-    # -- Publish thread -------------------------------------------------------
+    def _unregister_local_filter(self, f: Filter) -> None:
+        h = filter_hash(f)
+        with self._state_lock:
+            prior = self._local_hash_refcount.get(h, 0)
+            if prior <= 1:
+                self._local_hash_refcount.pop(h, None)
+                is_last = True
+            else:
+                self._local_hash_refcount[h] = prior - 1
+                is_last = False
 
-    def _publish_loop(self) -> None:
-        """Drain publish queue, batch into redis pipelines, execute."""
-        while not self._stop_event.is_set():
-            try:
-                item = self._publish_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if item is None:
-                return
-
-            batch: list[tuple[str, bytes]] = [item]
-            # Drain whatever is ready right now into one pipeline.
-            while True:
-                try:
-                    nxt = self._publish_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if nxt is None:
-                    self._flush_pipeline(batch)
-                    return
-                batch.append(nxt)
-
-            self._flush_pipeline(batch)
-
-    def _flush_pipeline(self, batch: list[tuple[str, bytes]]) -> None:
-        if not batch or self._redis_pub is None:
+        if not is_last:
             return
+        # Fire-and-forget: caller doesn't need to wait for the UNSUBSCRIBE.
+        # HASH cleanup happens in the periodic sweep, not on close.
+        self._dispatch_pubsub_cmd("unsub", self._notif_channel(h), wait=False)
+
+    def _dispatch_pubsub_cmd(self, action: str, channel: str, wait: bool = True) -> None:
+        """Queue a sub/unsub for the listener thread and optionally wait for ack."""
+        if self._control_cmd_queue is None:
+            return
+        ack = threading.Event() if wait else None
         try:
-            pipe = self._redis_pub.pipeline(transaction=False)
-            for channel, payload in batch:
-                pipe.publish(channel, payload)
-            pipe.execute()
-        except Exception as e:
-            logger.error("Publish pipeline failed (%d msgs): %s", len(batch), e)
+            self._control_cmd_queue.put_nowait((action, channel, ack))
+        except queue.Full:
+            logger.warning("pubsub cmd queue full; dropping %s(%s)", action, channel)
+            return
+        if ack is not None:
+            ack.wait(timeout=1.0)
 
     # -- Listener thread ------------------------------------------------------
 
     def _listener_loop(self) -> None:
-        """Sole owner of `self._pubsub`.
-
-        Drains pubsub command queue (sub/unsub requests from other threads),
-        polls redis pubsub for messages, dispatches control -> refresh,
-        notif -> local fanout.
-        """
-        control_channel = self._control_channel()
+        """Owns `self._pubsub`; drains cmd queue; polls messages; fans out notifs."""
         notif_prefix = f"{self._channel_prefix}:notif:"
 
-        while not self._stop_event.is_set():
-            # 1. Drain pending sub/unsub commands (fast, non-blocking)
+        while not self._obs_stop_event.is_set():
+            # 1. Drain pending sub/unsub commands.
             drained_shutdown = False
             while True:
                 try:
@@ -376,16 +281,15 @@ class RedisPublisher:
                     logger.warning("Listener cmd %s(%s) failed: %s", action, channel, e)
                 if ack is not None:
                     ack.set()
-            if drained_shutdown or self._stop_event.is_set():
+            if drained_shutdown or self._obs_stop_event.is_set():
                 return
 
-            # 2. Poll for one message
+            # 2. Poll for one message.
             try:
                 msg = self._pubsub.get_message(timeout=_PUBSUB_POLL_TIMEOUT)
             except Exception as e:
                 logger.warning("Listener get_message failed: %s", e)
-                # Brief pause to avoid tight-looping on a persistent error
-                self._stop_event.wait(0.5)
+                self._obs_stop_event.wait(0.5)
                 continue
 
             if msg is None or msg.get("type") not in ("message", "pmessage"):
@@ -395,82 +299,39 @@ class RedisPublisher:
             if isinstance(channel, bytes):
                 channel = channel.decode("utf-8")
 
-            if channel == control_channel:
-                self._schedule_refresh()
-            elif channel.startswith(notif_prefix):
-                self._handle_notif(msg)
+            if channel.startswith(notif_prefix):
+                filter_hash_str = channel[len(notif_prefix):]
+                self._handle_notif(msg, filter_hash_str)
 
-    def _handle_notif(self, msg: dict) -> None:
+    def _handle_notif(self, msg: dict, filter_hash_str: str) -> None:
         try:
             payload = msgpack.unpackb(msg["data"], raw=False)
         except Exception as e:
             logger.warning("Bad msgpack payload on %s: %s", msg.get("channel"), e)
             return
-        if payload.get("iid") == self._instance_id:
-            return  # self-echo suppression
-        registry = self._registry
-        if registry is None:
-            return
-        for raw_key in payload.get("keys", []):
-            key: Key = tuple(raw_key)
-            matched = registry.match(key)
-            if matched:
-                deliver_local([(key, matched)])
-
-    # -- Debounced refresh ----------------------------------------------------
-
-    def _schedule_refresh(self) -> None:
-        """Coalesce multiple 'changed' signals into a single HGETALL."""
-        with self._refresh_timer_lock:
-            if self._refresh_timer is not None:
-                return  # one already pending
-            t = threading.Timer(self._refresh_debounce, self._do_refresh)
-            t.daemon = True
-            self._refresh_timer = t
-            t.start()
-
-    def _do_refresh(self) -> None:
-        with self._refresh_timer_lock:
-            self._refresh_timer = None
-        if not self._stop_event.is_set():
-            self._refresh_remote_registry()
-
-    def _refresh_remote_registry(self) -> None:
-        """HGETALL registry HASH -> rebuild `_remote_registry`."""
-        if self._redis_pub is None:
-            return
-        try:
-            data = self._redis_pub.hgetall(self._registry_key())
-        except Exception as e:
-            logger.warning("Refresh HGETALL failed: %s", e)
-            return
-
-        new_registry: dict[str, Filter] = {}
-        for h_raw, fj_raw in data.items():
-            h = h_raw.decode("utf-8") if isinstance(h_raw, bytes) else h_raw
-            fj = fj_raw.decode("utf-8") if isinstance(fj_raw, bytes) else fj_raw
-            try:
-                new_registry[h] = filter_from_dict(json.loads(fj))
-            except Exception as e:
-                logger.warning("Skipping unreadable registry entry %s: %s", h, e)
-
-        with self._state_lock:
-            self._remote_registry = new_registry
+        # Self-echo suppression is intentionally dropped in the split design:
+        # the observer never publishes, so any inbound message is a real event.
+        # Hash-scoped dispatch prevents duplicate delivery when a key matches
+        # multiple registered filters (arriving on multiple notif channels).
+        raw_keys = payload.get("keys", [])
+        keys: list[Key] = [tuple(k) for k in raw_keys]
+        if keys:
+            self._dispatch_incoming(keys, filter_hash=filter_hash_str)
 
     # -- Cleanup thread -------------------------------------------------------
 
     def _cleanup_loop(self) -> None:
-        """Periodic sweep: HDEL registry entries with zero global subscribers."""
-        while not self._stop_event.wait(self._cleanup_interval):
-            if self._stop_event.is_set():
+        """Periodic sweep: HDEL registry entries with zero cluster subscribers."""
+        while not self._obs_stop_event.wait(self._cleanup_interval):
+            if self._obs_stop_event.is_set():
                 return
             self._cleanup_orphans()
 
     def _cleanup_orphans(self) -> None:
-        if self._redis_pub is None:
+        if self._redis is None:
             return
         try:
-            data = self._redis_pub.hgetall(self._registry_key())
+            data = self._redis.hgetall(self._registry_key())
         except Exception as e:
             logger.warning("Cleanup HGETALL failed: %s", e)
             return
@@ -482,148 +343,21 @@ class RedisPublisher:
         ]
         channels = [self._notif_channel(h) for h in hashes]
         try:
-            counts = self._redis_pub.pubsub_numsub(*channels)
+            counts = self._redis.pubsub_numsub(*channels)
         except Exception as e:
             logger.warning("Cleanup PUBSUB NUMSUB failed: %s", e)
             return
 
-        # counts: list[(channel_bytes_or_str, int)]
         orphans: list[str] = []
-        for (ch, count), h in zip(counts, hashes, strict=True):
+        for (_ch, count), h in zip(counts, hashes, strict=True):
             if count == 0:
                 orphans.append(h)
 
         if not orphans:
             return
         try:
-            self._redis_pub.hdel(self._registry_key(), *orphans)
-            self._redis_pub.publish(self._control_channel(), b"")
+            self._redis.hdel(self._registry_key(), *orphans)
+            self._redis.publish(self._control_channel(), b"")
             logger.debug("Cleaned %d orphan filter hashes", len(orphans))
         except Exception as e:
             logger.warning("Cleanup HDEL/publish failed: %s", e)
-
-    # -- Called by RedisObserver on local subscribe/unsubscribe --------------
-
-    def _dispatch_pubsub_cmd(self, action: str, channel: str, wait: bool = True) -> None:
-        """Queue a sub/unsub command for the listener thread and optionally wait."""
-        if self._control_cmd_queue is None:
-            return
-        ack = threading.Event() if wait else None
-        try:
-            self._control_cmd_queue.put_nowait((action, channel, ack))
-        except queue.Full:
-            logger.warning("pubsub cmd queue full; dropping %s(%s)", action, channel)
-            return
-        if ack is not None:
-            # Bound the wait so a broken listener never permanently blocks a caller.
-            ack.wait(timeout=1.0)
-
-    def register_local_filter(self, f: Filter) -> None:
-        """Called when a local subscription is created.
-
-        Refcounts the filter hash. On first local sub for a given hash:
-        - SUBSCRIBE the notif channel (so we receive remote publishes).
-        - HSET the registry HASH.
-        - PUBLISH the control channel so others refresh.
-        """
-        h = filter_hash(f)
-        with self._state_lock:
-            prior = self._local_hash_refcount.get(h, 0)
-            self._local_hash_refcount[h] = prior + 1
-            is_new = prior == 0
-
-        if not is_new:
-            return  # already SUBSCRIBEd, already HSET
-
-        # SUBSCRIBE FIRST so we don't miss messages between our HSET and other
-        # publishers routing to us. Delegated to listener thread; wait for ack.
-        self._dispatch_pubsub_cmd("sub", self._notif_channel(h), wait=True)
-
-        if self._redis_pub is not None:
-            try:
-                self._redis_pub.hset(
-                    self._registry_key(), h, json.dumps(f.to_dict(), separators=(",", ":"))
-                )
-                self._redis_pub.publish(self._control_channel(), b"")
-            except Exception as e:
-                logger.error("Register HSET/publish for hash %s failed: %s", h, e)
-
-    def unregister_local_filter(self, f: Filter) -> None:
-        """Called when a local subscription is closed.
-
-        Refcount down. On last local sub for that hash:
-        - UNSUBSCRIBE the notif channel (fire-and-forget; no ack needed).
-
-        HASH cleanup happens in the periodic sweep (checks PUBSUB NUMSUB
-        across the whole cluster), not on close, so we don't race with
-        other observers that might still be interested in this hash.
-        """
-        h = filter_hash(f)
-        with self._state_lock:
-            prior = self._local_hash_refcount.get(h, 0)
-            if prior <= 1:
-                self._local_hash_refcount.pop(h, None)
-                is_last = True
-            else:
-                self._local_hash_refcount[h] = prior - 1
-                is_last = False
-
-        if not is_last:
-            return
-        # Fire-and-forget: caller doesn't need to wait for the UNSUBSCRIBE
-        # to hit redis; delivery filtering happens against the local
-        # SubscriptionRegistry, which was already updated on close().
-        self._dispatch_pubsub_cmd("unsub", self._notif_channel(h), wait=False)
-
-
-class RedisObserver(Observer[Any]):
-    """Observer with per-hash redis pub/sub delivery.
-
-    On `subscribe()`: also registers the filter hash with the publisher so
-    remote publishers can route to us. On `close()`: unregisters.
-    """
-
-    def __init__(
-        self,
-        codec: CodecProtocol[Any, Any],
-        *,
-        redis_url: str = "redis://localhost:6379",
-        channel_prefix: str = "everyshape",
-        queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
-        publish_queue_maxsize: int = DEFAULT_PUBLISH_QUEUE_MAXSIZE,
-        cleanup_interval_seconds: float = DEFAULT_CLEANUP_INTERVAL_SECONDS,
-        refresh_debounce_seconds: float = DEFAULT_REFRESH_DEBOUNCE_SECONDS,
-        **_ignored_kwargs: Any,
-    ) -> None:
-        """Initialize with RedisPublisher.
-
-        `**_ignored_kwargs` silently swallows legacy kwargs (e.g. `notify_self`)
-        so older callers keep working through a deprecation window.
-        """
-        publisher = RedisPublisher(
-            redis_url=redis_url,
-            channel_prefix=channel_prefix,
-            publish_queue_maxsize=publish_queue_maxsize,
-            cleanup_interval_seconds=cleanup_interval_seconds,
-            refresh_debounce_seconds=refresh_debounce_seconds,
-        )
-        super().__init__(codec=codec, publisher=publisher, queue_maxsize=queue_maxsize)
-        self._redis_publisher: RedisPublisher = publisher
-
-    def subscribe(self, options: SubscriptionOptions) -> Subscription:
-        sub = super().subscribe(options)
-        self._redis_publisher.register_local_filter(options.filter)
-        return sub
-
-    def _close_subscription(self, subscription: Subscription) -> None:
-        # Grab filter BEFORE super clears anything on the subscription.
-        f = subscription.options.filter
-        super()._close_subscription(subscription)
-        self._redis_publisher.unregister_local_filter(f)
-
-
-if TYPE_CHECKING:
-    from virtuals.tkv.observer import ObserverProtocol
-
-    _: type[ObserverProtocol[Any]] = RedisObserver
-    _p: type[PublisherProtocol] = RedisPublisher

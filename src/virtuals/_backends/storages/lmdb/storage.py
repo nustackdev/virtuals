@@ -1,7 +1,7 @@
 """LMDB storage backend implementation.
 
 Provides persistent key-value storage over LMDB with transactions,
-MVCC snapshots, and optional change notifications via an observer.
+MVCC snapshots, and optional change notifications via a publisher.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from virtuals.tkv.codec import CodecProtocol
-    from virtuals.tkv.observer import ObserverProtocol, Subscription, SubscriptionOptions
+    from virtuals.tkv.publisher import PublisherProtocol
     from virtuals.tkv.types import Key
 
 
@@ -73,7 +73,7 @@ class LMDBStorage:
         self,
         path: Path | str,
         codec: CodecProtocol[bytes, bytes],
-        observer: ObserverProtocol | None = None,
+        publisher: PublisherProtocol | None = None,
         *,
         read_only: bool = False,
         map_size: int = DEFAULT_MAP_SIZE,
@@ -91,7 +91,7 @@ class LMDBStorage:
         Args:
             path: Database directory (subdir=True) or file (subdir=False).
             codec: Codec for key/value encoding.
-            observer: Optional observer for change notifications.
+            publisher: Optional publisher for change notifications.
             read_only: Open database in read-only mode.
             map_size: Maximum on-disk size in bytes (mmap size).
             max_readers: Maximum concurrent reader slots.
@@ -107,7 +107,7 @@ class LMDBStorage:
             env_options: Extra kwargs passed through to `lmdb.open()`.
         """
         self._codec = codec
-        self._observer = observer
+        self._publisher = publisher
 
         self._read_only = read_only
         self._path = Path(path) if isinstance(path, str) else path
@@ -226,20 +226,6 @@ class LMDBStorage:
     ) -> None:
         """Exit context manager - close storage."""
         self.close()
-
-    # =========================================================================
-    # Subscriptions
-    # =========================================================================
-
-    def subscribe(self, options: SubscriptionOptions) -> Subscription:
-        """Subscribe to key changes with flexible filtering."""
-        if self._observer is None:
-            raise StorageOperationError("Observer not configured for this storage")
-
-        try:
-            return self._observer.subscribe(options)
-        except Exception as e:
-            raise StorageOperationError(f"Failed to subscribe: {e}") from e
 
     # =========================================================================
     # Transaction Management
@@ -367,16 +353,16 @@ class LMDBStorage:
     # =========================================================================
 
     def _notify_batch(self, keys: set[Key]) -> None:
-        """Notify observer of key changes (batch).
+        """Notify publisher of key changes (batch).
 
         Fire-and-forget: writer enqueues and returns. Callers that need a
-        delivery barrier call observer.flush() explicitly.
+        delivery barrier call publisher.flush() explicitly.
         """
-        if self._observer is not None and keys:
+        if self._publisher is not None and keys:
             try:
-                self._observer.notify(keys)
+                self._publisher.notify(keys)
             except Exception as e:
-                logger.error(f"Observer notification failed: {e}")
+                logger.error(f"Publisher notification failed: {e}")
 
     def _untrack_transaction(self, transaction: LMDBTransaction) -> None:
         """Remove transaction from active set."""

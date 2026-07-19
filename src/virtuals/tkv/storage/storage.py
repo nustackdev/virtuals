@@ -14,15 +14,15 @@ from .context import TransactionalStorageProtocol
 if TYPE_CHECKING:
     from types import TracebackType
 
-    from virtuals.tkv.observer import Subscription, SubscriptionOptions
-
 
 @runtime_checkable
 class StorageProtocol(TransactionalStorageProtocol, Protocol):
-    """Storage interface with transactions and subscriptions.
+    """Storage interface with transactions.
 
     Top-level interface for storage operations. Provides transaction
-    management and subscription capabilities.
+    management. Change notifications are delivered via an optional
+    `PublisherProtocol` injected at construction time; subscriptions
+    live on an `ObserverProtocol`, not on the storage.
     """
 
     # ========================================================================
@@ -67,49 +67,6 @@ class StorageProtocol(TransactionalStorageProtocol, Protocol):
         exc_tb: TracebackType | None,
     ) -> None:
         """Close storage via context manager."""
-        ...
-
-    # ========================================================================
-    # Subscriptions
-    # ========================================================================
-
-    def subscribe(self, options: SubscriptionOptions) -> Subscription:
-        """Subscribe to key changes with flexible filtering.
-
-        This is the new subscription API that provides:
-        - Flexible filtering (prefix, suffix, wildcard, length, composite)
-        - Decoupled subscriptions from callbacks
-        - Efficient pattern matching
-
-        Args:
-            options: Subscription options including filter specification.
-
-        Returns:
-            Subscription object for binding callbacks and managing lifecycle.
-
-        Raises:
-            StorageOperationError: If subscription fails.
-
-        Examples:
-            >>> from virtuals.tkv.storage.observer.subscription import (
-            ...     PrefixFilter,
-            ...     SubscriptionOptions,
-            ... )
-
-            >>> # Subscribe to all keys under "users"
-            >>> sub = storage.subscribe(
-            ...     SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
-            ... )
-            >>> sub.bind(lambda key: print(f"Changed: {key}"))
-
-            >>> # Use context manager for temporary binding
-            >>> with sub(my_callback):
-            ...     # Callback is bound during this block
-            ...     pass
-
-            >>> # Close when done
-            >>> sub.close()
-        """
         ...
 
     # ========================================================================

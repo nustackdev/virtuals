@@ -430,63 +430,38 @@ class TestDictViewNavigation:
 
 
 class TestDictViewObservable:
-    """Test observable subscription functionality.
+    """Test observable options exposed by DictView.
 
-    Note: Notifications are sent on transaction commit, not during writes.
-    These tests verify subscription creation and management, not the notification
-    timing which is tested in integration tests with explicit commits.
+    Views build the filter shape and return SubscriptionOptions. Callers
+    hand those options to a process-scope observer.subscribe(). Actual
+    delivery via subscription callbacks is exercised by the compliance
+    suite; here we just verify the view emits the right options.
     """
 
-    def test_on_change_creates_subscription(self, view: DictView) -> None:
-        """Test on_change() creates a valid subscription."""
-        sub = view.on_change()
-        assert sub is not None
-        assert not sub.is_closed
-        sub.close()
-        assert sub.is_closed
+    def test_on_change_returns_subscription_options(self, view: DictView) -> None:
+        """Test on_change() returns SubscriptionOptions with a filter."""
+        from virtuals.tkv.observer import SubscriptionOptions
 
-    def test_on_child_change_creates_subscription(self, view: DictView) -> None:
-        """Test on_child_change() creates a valid subscription."""
+        options = view.on_change()
+        assert isinstance(options, SubscriptionOptions)
+        assert options.filter is not None
+
+    def test_on_child_change_returns_subscription_options(self, view: DictView) -> None:
+        """Test on_child_change() returns SubscriptionOptions with a filter."""
+        from virtuals.tkv.observer import SubscriptionOptions
+
         view["users"] = {}
-        sub = view.on_child_change("users")
-        assert sub is not None
-        assert not sub.is_closed
-        sub.close()
-        assert sub.is_closed
+        options = view.on_child_change("users")
+        assert isinstance(options, SubscriptionOptions)
+        assert options.filter is not None
 
-    def test_subscription_bind_and_unbind(self, view: DictView) -> None:
-        """Test binding and unbinding callbacks to subscription."""
-        changes: list = []
+    def test_on_children_change_returns_subscription_options(self, view: DictView) -> None:
+        """Test on_children_change() returns SubscriptionOptions with a filter."""
+        from virtuals.tkv.observer import SubscriptionOptions
 
-        def callback(key: tuple) -> None:
-            changes.append(key)
-
-        sub = view.on_change()
-        sub.bind(callback)
-
-        # Should be bound
-        assert callback in sub.receivers
-
-        sub.unbind(callback)
-        assert callback not in sub.receivers
-
-        sub.close()
-
-    def test_subscription_close_stops_notifications(self, view: DictView) -> None:
-        """Test closing subscription marks it as closed."""
-        sub = view.on_change()
-        assert not sub.is_closed
-
-        sub.close()
-        assert sub.is_closed
-
-    def test_on_children_change_creates_subscription(self, view: DictView) -> None:
-        """Test on_children_change() creates a valid subscription."""
-        sub = view.on_children_change()
-        assert sub is not None
-        assert not sub.is_closed
-        sub.close()
-        assert sub.is_closed
+        options = view.on_children_change()
+        assert isinstance(options, SubscriptionOptions)
+        assert options.filter is not None
 
 
 # =============================================================================

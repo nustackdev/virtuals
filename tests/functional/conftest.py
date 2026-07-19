@@ -7,8 +7,10 @@ import pytest
 from virtuals.codecs import NoOpCodec
 from virtuals.navigator import Navigator
 from virtuals.observers.mem import InMemoryObserver
+from virtuals.publishers.mem import InMemoryPublisher
 from virtuals.storages.mem import InMemoryStorage
 from virtuals.tkv.storage import SnapshotProtocol, TransactionProtocol
+from virtuals.tkv.transport import InMemoryTransport
 
 
 @pytest.fixture
@@ -17,11 +19,14 @@ def storage() -> Generator[InMemoryStorage, None, None]:
 
     Provides a clean storage instance for each test with automatic cleanup.
     """
-    observer = InMemoryObserver(codec=NoOpCodec())
+    transport = InMemoryTransport()
+    publisher = InMemoryPublisher(transport)
+    observer = InMemoryObserver(transport)
     storage = InMemoryStorage(
         codec=NoOpCodec(),
-        observer=observer,
+        publisher=publisher,
     )
+    publisher.connect()
     observer.connect()
     storage.open()
     try:
@@ -29,6 +34,7 @@ def storage() -> Generator[InMemoryStorage, None, None]:
     finally:
         storage.close()
         observer.disconnect()
+        publisher.disconnect()
 
 
 @pytest.fixture

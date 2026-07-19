@@ -8,6 +8,7 @@ Provides subscription capabilities for storage changes with:
 
 from __future__ import annotations
 
+from ._deliver_local import deliver_local
 from .exceptions import (
     ObserverConnectionError,
     ObserverError,
@@ -15,7 +16,6 @@ from .exceptions import (
     ObserverValidationError,
 )
 from .observer import ObserverProtocol
-from .publisher import PublisherProtocol, deliver_local
 from .registry import SubscriptionRegistry
 from .subscription import (
     Subscription,
@@ -33,7 +33,6 @@ __all__ = [
     "ObserverProtocol",
     "ObserverSubscriptionError",
     "ObserverValidationError",
-    "PublisherProtocol",
     "Subscription",
     "SubscriptionCallback",
     "SubscriptionOptions",
