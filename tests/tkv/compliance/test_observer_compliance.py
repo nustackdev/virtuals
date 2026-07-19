@@ -102,3 +102,50 @@ class TestTextDBObserverCompliance(ObserverCompliance):
             yield storage
             storage.close()
             observer.disconnect()
+
+
+@pytest.mark.redis
+class TestRedisObserverRocksDBCompliance(ObserverCompliance):
+    """ObserverProtocol contract with RedisObserver wired into RocksDB."""
+
+    @pytest.fixture
+    def observable_storage(self, tmp_path: Path, redis_url, unique_channel_prefix, redis_cleanup):
+        from virtuals._backends.observers.redis_pubsub import RedisObserver
+
+        redis_cleanup(unique_channel_prefix)
+        codec = BinaryCodec()
+        observer = RedisObserver(
+            codec=codec, redis_url=redis_url, channel_prefix=unique_channel_prefix
+        )
+        observer.connect()
+        storage = RocksDBStorage(path=tmp_path / "test.db", codec=codec, observer=observer)
+        storage.open()
+        yield storage
+        storage.close()
+        observer.disconnect()
+
+
+@pytest.mark.redis
+class TestRedisObserverLMDBCompliance(ObserverCompliance):
+    """ObserverProtocol contract with RedisObserver wired into LMDB."""
+
+    @pytest.fixture
+    def observable_storage(self, tmp_path: Path, redis_url, unique_channel_prefix, redis_cleanup):
+        from virtuals._backends.observers.redis_pubsub import RedisObserver
+
+        redis_cleanup(unique_channel_prefix)
+        codec = BinaryCodec()
+        observer = RedisObserver(
+            codec=codec, redis_url=redis_url, channel_prefix=unique_channel_prefix
+        )
+        observer.connect()
+        storage = LMDBStorage(
+            path=tmp_path / "test.lmdb",
+            codec=codec,
+            map_size=64 * 1024 * 1024,
+            observer=observer,
+        )
+        storage.open()
+        yield storage
+        storage.close()
+        observer.disconnect()
