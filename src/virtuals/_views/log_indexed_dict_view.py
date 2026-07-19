@@ -34,7 +34,8 @@ from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType
-from virtuals.tkv.filter import LengthFilter, PrefixFilter
+from virtuals.tkv.filter import LengthFilter, PrefixFilter, WildcardFilter
+from virtuals.tkv.observer import SubscriptionOptions
 from virtuals.tkv.storage import StorageScanOptions
 from virtuals.types import EMPTY, Empty, Value
 from virtuals.view import (
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from collections.abc import Mapping as PyMapping
 
+    from virtuals.tkv.observer import Subscription
     from virtuals.view import View
 
 
@@ -167,6 +169,40 @@ class LogIndexedDictViewBase(
         kc = self._keys_container()
         kc.put_child_primitive(log_key, actual_key)
         return log_key
+
+    # -- Observability overrides -------------------------------------------
+    # LogIndexedDictView stores data under `__data__/` and log keys under
+    # `__keys__/`, not directly under `container.site`. The base observer
+    # methods (ChildObservableBase, ObservableBase) build filters at
+    # `(container.site, ...)`, so no notifs would ever match real writes.
+    # These overrides rewrite the filter sites so callers can watch the
+    # view the way they'd watch a plain dict.
+
+    def on_change(self) -> Subscription:
+        """Any data-side write. Scoped to __data__/ so log-key appends
+        (bookkeeping noise) don't fire the callback."""
+        return self.container.subscribe(
+            SubscriptionOptions(PrefixFilter(prefix=(*self.container.site, _DATA))),
+        )
+
+    def on_child_change(self, address: str | int) -> Subscription:
+        """Any write at or under __data__/<address> -- matches primitive
+        set/replace on this child AND nested field writes for compound
+        (shape) children."""
+        normalized = self.normalize_address(address)
+        child_data_site = (*self.container.site, _DATA, normalized)
+        return self.container.subscribe(
+            SubscriptionOptions(PrefixFilter(prefix=child_data_site)),
+        )
+
+    def on_children_change(self) -> Subscription:
+        """Fires once per new key ever added. Watches __keys__/ appends,
+        which happen exactly once when `__setitem__` sees `is_new`. New
+        mints appear here; replacements of an existing key don't."""
+        keys_site = (*self.container.site, _KEYS)
+        return self.container.subscribe(
+            SubscriptionOptions(WildcardFilter(pattern=(*keys_site, "*"))),
+        )
 
     def _scan_log_keys(
         self,
