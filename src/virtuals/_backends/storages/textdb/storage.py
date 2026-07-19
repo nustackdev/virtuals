@@ -123,7 +123,7 @@ class TextStorage:
         """
         self.path = Path(path)
         self.codec = codec
-        self.observer = observer
+        self._observer = observer
         self._log_operations = log_operations
         self._read_only = read_only
 
@@ -320,10 +320,10 @@ class TextStorage:
         Args:
             keys: Keys that changed
         """
-        if self.observer is not None and keys:
+        if self._observer is not None and keys:
             try:
-                self.observer.notify(keys)
-                self.observer.flush()
+                self._observer.notify(keys)
+                self._observer.flush()
             except Exception:
                 logger.error("Observer notification failed")
 
@@ -419,11 +419,11 @@ class TextStorage:
         Raises:
             StorageOperationError: If subscription fails or observer not configured.
         """
-        if self.observer is None:
+        if self._observer is None:
             raise StorageOperationError("Observer not configured for this storage")
 
         try:
-            return self.observer.subscribe(options)
+            return self._observer.subscribe(options)
         except Exception as e:
             raise StorageOperationError(f"Failed to subscribe: {e}") from e
 
