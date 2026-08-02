@@ -1,4 +1,4 @@
-"""Text-based storage adapter for everyshape."""
+"""Text-based storage adapter for nu."""
 
 from .scan import TextScan
 from .snapshot import TextSnapshot

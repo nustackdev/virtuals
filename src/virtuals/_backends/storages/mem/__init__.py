@@ -1,4 +1,4 @@
-"""In-memory storage adapter for everyshape."""
+"""In-memory storage adapter for nu."""
 
 from .scan import InMemoryScan
 from .snapshot import InMemorySnapshot

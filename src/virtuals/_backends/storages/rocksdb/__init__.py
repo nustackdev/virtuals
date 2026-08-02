@@ -1,4 +1,4 @@
-"""RocksDB storage adapter for everyshape."""
+"""RocksDB storage adapter for nu."""
 
 from .scan import RocksDBScan
 from .snapshot import RocksDBSnapshot

@@ -82,7 +82,7 @@ class RedisObserver(ObserverBase):
         self,
         *,
         redis_url: str = "redis://localhost:6379",
-        channel_prefix: str = "everyshape",
+        channel_prefix: str = "nu",
         cleanup_interval_seconds: float = DEFAULT_CLEANUP_INTERVAL_SECONDS,
         dispatch_queue_maxsize: int = DEFAULT_DISPATCH_QUEUE_MAXSIZE,
     ) -> None:
@@ -105,9 +105,9 @@ class RedisObserver(ObserverBase):
         self._listener_thread: threading.Thread | None = None
         self._cleanup_thread: threading.Thread | None = None
         # (action, channel, ack_event). action in {'sub', 'unsub', 'shutdown'}.
-        self._control_cmd_queue: queue.Queue[
-            tuple[str, str | None, threading.Event | None]
-        ] | None = None
+        self._control_cmd_queue: (
+            queue.Queue[tuple[str, str | None, threading.Event | None]] | None
+        ) = None
 
     # -- Channel / key helpers ------------------------------------------------
 
@@ -300,7 +300,7 @@ class RedisObserver(ObserverBase):
                 channel = channel.decode("utf-8")
 
             if channel.startswith(notif_prefix):
-                filter_hash_str = channel[len(notif_prefix):]
+                filter_hash_str = channel[len(notif_prefix) :]
                 self._handle_notif(msg, filter_hash_str)
 
     def _handle_notif(self, msg: dict, filter_hash_str: str) -> None:
@@ -338,9 +338,7 @@ class RedisObserver(ObserverBase):
         if not data:
             return
 
-        hashes = [
-            h.decode("utf-8") if isinstance(h, bytes) else h for h in data.keys()
-        ]
+        hashes = [h.decode("utf-8") if isinstance(h, bytes) else h for h in data.keys()]
         channels = [self._notif_channel(h) for h in hashes]
         try:
             counts = self._redis.pubsub_numsub(*channels)

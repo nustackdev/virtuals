@@ -79,7 +79,7 @@ class RedisPublisher(PublisherBase):
         self,
         *,
         redis_url: str = "redis://localhost:6379",
-        channel_prefix: str = "everyshape",
+        channel_prefix: str = "nu",
         queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
         publish_queue_maxsize: int = DEFAULT_PUBLISH_QUEUE_MAXSIZE,
         refresh_debounce_seconds: float = DEFAULT_REFRESH_DEBOUNCE_SECONDS,
@@ -262,9 +262,7 @@ class RedisPublisher(PublisherBase):
             try:
                 self._publish_queue.put_nowait((self._notif_channel(h), payload))
             except queue.Full:
-                logger.warning(
-                    "Publish queue full; dropping %d keys for hash %s", len(ks), h
-                )
+                logger.warning("Publish queue full; dropping %d keys for hash %s", len(ks), h)
 
     # -- Publish pipeline thread ---------------------------------------------
 
