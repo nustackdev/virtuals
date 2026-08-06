@@ -11,7 +11,7 @@ This module provides reusable bases that encapsulate common view patterns:
 from __future__ import annotations
 
 from logging import getLogger
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Generic, TypeVar, cast
 
 from virtuals.container import Container, ContainerStructure, NodeType, node_ops
 from virtuals.types import Empty, Value, is_empty
@@ -38,6 +38,9 @@ __all__ = [
 ]
 
 logger = getLogger(__name__)
+
+A = TypeVar("A")
+ViewT = TypeVar("ViewT", bound="View")
 
 
 class MetadataBasedChildrenCountBase:
@@ -126,7 +129,7 @@ class LiveChildrenCountBase:
         return sum(1 for _ in self.container.iter_child_keys())
 
 
-class AddressMappingBase[A]:
+class AddressMappingBase(Generic[A]):
     """Base for converting view-level addresses to container keys.
 
     Provides a single hook normalize_address() that defines how a view's
@@ -143,7 +146,7 @@ class AddressMappingBase[A]:
         raise NotImplementedError
 
 
-class ChildNavigationBase[A](AddressMappingBase[A]):
+class ChildNavigationBase(AddressMappingBase[A]):
     """Base for typed child view access with address normalization.
 
     Provides open_child() method that creates a child view with proper
@@ -166,7 +169,7 @@ class ChildNavigationBase[A](AddressMappingBase[A]):
     container: Container
     registry: ViewRegistry
 
-    def open_child[ViewT: View](self, address: A, view: type[ViewT]) -> ViewT:
+    def open_child(self, address: A, view: type[ViewT]) -> ViewT:
         """Open child view at address.
 
         Pure navigation — does not write to storage. Container markers

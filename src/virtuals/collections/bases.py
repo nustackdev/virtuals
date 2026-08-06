@@ -13,7 +13,7 @@ Concrete collection types (Mapping, Sequence, Set) inherit from CollectionBase.
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 
 if TYPE_CHECKING:
@@ -27,6 +27,8 @@ __all__ = [
     "SizedBase",
 ]
 
+V = TypeVar("V")
+
 
 class ContainerBase:
     """Base for containers supporting membership testing via ``in``.
@@ -39,7 +41,7 @@ class ContainerBase:
     def __contains__(self, value: object) -> bool: ...
 
 
-class IterableBase[V]:
+class IterableBase(Generic[V]):
     """Base for containers supporting iteration.
 
     Abstract:
@@ -61,7 +63,7 @@ class SizedBase:
     def __len__(self) -> int: ...
 
 
-class CollectionBase[V](ContainerBase, IterableBase[V], SizedBase):
+class CollectionBase(ContainerBase, IterableBase[V], SizedBase):
     """Base combining Container + Iterable + Sized.
 
     All concrete collection types (Mapping, Sequence, Set) inherit from this.

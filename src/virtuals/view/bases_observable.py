@@ -9,7 +9,7 @@ This module provides reusable bases for common patterns:
 from __future__ import annotations
 
 from logging import getLogger
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from virtuals.tkv.filter import LengthFilter, PrefixFilter, WildcardFilter
 from virtuals.tkv.observer import SubscriptionOptions
@@ -29,6 +29,8 @@ __all__ = [
 ]
 
 logger = getLogger(__name__)
+
+A = TypeVar("A")
 
 
 class ObservableBase:
@@ -63,7 +65,7 @@ class ObservableBase:
         return SubscriptionOptions(PrefixFilter(prefix=(self.container.site)))
 
 
-class ChildObservableBase[A](AddressMappingBase[A]):
+class ChildObservableBase(AddressMappingBase[A]):
     """Base providing subscription-options for a view's children.
 
     Views expose the filter shape; callers pass the returned
@@ -99,8 +101,7 @@ class ChildObservableBase[A](AddressMappingBase[A]):
         normalized = self.normalize_address(address)
         child_full_site = (*self.container.site, normalized)
         return SubscriptionOptions(
-            filter=PrefixFilter(prefix=child_full_site)
-            & LengthFilter(length=len(child_full_site))
+            filter=PrefixFilter(prefix=child_full_site) & LengthFilter(length=len(child_full_site))
         )
 
     def on_children_change(self) -> SubscriptionOptions:

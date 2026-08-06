@@ -18,7 +18,7 @@ Usage:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 from virtuals.container import Container
 from virtuals.loc import DATA_ROOT, path
@@ -36,6 +36,8 @@ __all__ = [
     "Navigator",
 ]
 
+ViewT = TypeVar("ViewT", bound="View")
+
 
 def _default_views() -> tuple[type[View], ...]:
     """Standard views registered by default."""
@@ -49,7 +51,7 @@ def _default_views() -> tuple[type[View], ...]:
     return (ByteArrayView, EagerDictView, FrozenSetView, EagerListView, SetView, TupleView)
 
 
-class Navigator[ViewT: View]:
+class Navigator(Generic[ViewT]):
     """High-level entrypoint for virtuals storage.
 
     Owns the ViewRegistry and provides view creation methods.
@@ -136,7 +138,9 @@ class Navigator[ViewT: View]:
         return navigate_view(root, view_path)
 
     def open_at_path_and_ensure(
-        self, view_path: path.PathToView, ctx: StorageContextType,
+        self,
+        view_path: path.PathToView,
+        ctx: StorageContextType,
     ) -> View:
         """Write-side sibling of ``open_at_path``.
 

@@ -75,16 +75,6 @@ pip install virtuals-py[rocksdb]  # with RocksDB backend
 - **Transactional**: Full ACID support when the backend provides it
 - **Lazy**: Nothing materializes until accessed
 
-## Documentation
-
-See `docs/` for detailed documentation:
-
-- `docs/layers/layer1_storage.md` — Storage layer
-- `docs/layers/layer2_container.md` — Container layer
-- `docs/layers/layer3_view.md` — View layer
-- `docs/general/architecture.md` — Architecture overview
-- `docs/general/philosophy.md` — Design philosophy
-
 ## License
 
 Apache-2.0

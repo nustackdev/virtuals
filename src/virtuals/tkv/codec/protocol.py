@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
 
 if TYPE_CHECKING:
@@ -15,8 +15,11 @@ __all__ = [
     "ValueCodecProtocol",
 ]
 
+EncodedKeyT = TypeVar("EncodedKeyT")
+EncodedValueT = TypeVar("EncodedValueT")
 
-class CodecProtocol[EncodedKeyT, EncodedValueT](Protocol):
+
+class CodecProtocol(Protocol[EncodedKeyT, EncodedValueT]):
     """Protocol for complete storage encoding/decoding.
 
     Combines key and value codec operations into a unified interface
@@ -86,7 +89,7 @@ class CodecProtocol[EncodedKeyT, EncodedValueT](Protocol):
         ...
 
 
-class KeyCodecProtocol[EncodedKeyT](Protocol):
+class KeyCodecProtocol(Protocol[EncodedKeyT]):
     """Protocol for encoding/decoding storage keys.
 
     Type Parameters:
@@ -128,7 +131,7 @@ class KeyCodecProtocol[EncodedKeyT](Protocol):
         ...
 
 
-class ValueCodecProtocol[EncodedValueT](Protocol):
+class ValueCodecProtocol(Protocol[EncodedValueT]):
     """Protocol for encoding/decoding storage values.
 
     Type Parameters:

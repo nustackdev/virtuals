@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import threading
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from logging import getLogger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
@@ -257,7 +257,7 @@ class TextStorage:
         # Prepare log entry
         entry: dict[str, Any] = {
             "op": op,
-            "ts": datetime.now(UTC).isoformat(),
+            "ts": datetime.now(timezone.utc).isoformat(),
         }
 
         if key is not None:

@@ -6,7 +6,9 @@ and iteration. Implementations must conform to these protocols.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from typing_extensions import Self
 
 from .context import TransactionalStorageProtocol
 

@@ -14,7 +14,7 @@ Provided for free:
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable
 
 from .bases import CollectionBase
 
@@ -30,8 +30,10 @@ __all__ = [
     "SetBase",
 ]
 
+V = TypeVar("V")
 
-class SetBase[V](CollectionBase[V]):
+
+class SetBase(CollectionBase[V]):
     """Read-only set base. Provides set algebra from contains/iter/len.
 
     All three abstract methods (__contains__, __iter__, __len__) inherited
@@ -76,7 +78,7 @@ class SetBase[V](CollectionBase[V]):
         return set(self) ^ set(other)  # type: ignore[arg-type]
 
 
-class MutableSetBase[V](SetBase[V]):
+class MutableSetBase(SetBase[V]):
     """Mutable set base. Adds remove/clear from add/discard.
 
     Additional abstract:
@@ -106,7 +108,7 @@ class MutableSetBase[V](SetBase[V]):
             self.discard(value)
 
 
-class ReactiveSetBase[V](MutableSetBase[V]):
+class ReactiveSetBase(MutableSetBase[V]):
     """Reactive set base. Mutable set with change observation.
 
     Additional abstract:
@@ -120,7 +122,7 @@ class ReactiveSetBase[V](MutableSetBase[V]):
 
 
 @runtime_checkable
-class ReactiveSetProtocol[V](Protocol):
+class ReactiveSetProtocol(Protocol[V]):
     """Protocol: MutableSet + Observable.
 
     Use for type-checking views that support both mutation and change subscription.

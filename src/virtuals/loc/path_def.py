@@ -7,10 +7,12 @@ Paths are primarily used in the View layer.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 
 if TYPE_CHECKING:
+    from typing_extensions import Unpack
+
     from virtuals.types import Value
     from virtuals.view import View
 
@@ -30,7 +32,7 @@ __all__ = [
 # CORE TYPES
 # =============================================================================
 
-type PathAddress = object
+PathAddress: TypeAlias = object
 """First component in a path segment (address, type).
 
 This can be ANY object that the View understands:
@@ -47,7 +49,7 @@ Examples:
     hash("user:alice")   # Custom HashMapView key
 """
 
-type PathSegmentType = type[Value] | type[View]
+PathSegmentType: TypeAlias = "type[Value] | type[View]"
 """Second component in a path segment (address, type).
 
 Can be either a View type or a Value (str, int, dict, etc):
@@ -55,7 +57,7 @@ Can be either a View type or a Value (str, int, dict, etc):
 - Valus's indicate type of a final primitive object (leaf object)
 """
 
-type PathViewSegment = tuple[PathAddress, type[View]]
+PathViewSegment: TypeAlias = "tuple[PathAddress, type[View]]"
 """Single navigation step to a View (container).
 
 A ViewSegment specifies:
@@ -70,7 +72,7 @@ Examples:
 """
 
 
-type PathValueSegment = tuple[PathAddress, type[Value]]
+PathValueSegment: TypeAlias = "tuple[PathAddress, type[Value]]"
 """Single navigation step to a primitive value.
 
 A ValueSegment specifies:
@@ -86,7 +88,7 @@ Examples:
     ("price", float)        # Navigate to "price", expect float
 """
 
-type PathSegment = tuple[PathAddress, PathSegmentType]
+PathSegment: TypeAlias = "tuple[PathAddress, PathSegmentType]"
 """A single navigation step in a Path.
 
 Can be both a navigation to a primitive value and to a view.
@@ -98,7 +100,7 @@ Examples:
     ("alice", DictView)     # "alice" -> PathAddress, DictView -> PathSegmentType
 """
 
-type PathToView = tuple[PathViewSegment, ...]
+PathToView: TypeAlias = "tuple[PathViewSegment, ...]"
 """Path that ends at a View (container).
 
 All segments in a ViewPath point to View types. Navigating a ViewPath
@@ -132,7 +134,7 @@ Usage:
 """
 
 
-type PathToValue = tuple[*tuple[PathViewSegment, ...], PathValueSegment]
+PathToValue: TypeAlias = "tuple[Unpack[tuple[PathViewSegment, ...]], PathValueSegment]"
 """Path that ends at a primitive value.
 
 A ValuePath consists of:
@@ -180,7 +182,7 @@ Note:
     by the type system at compile time.
 """
 
-type Path = PathToView | PathToValue
+Path: TypeAlias = "PathToView | PathToValue"
 """
 A path is a sequence of typed segments leading to a destination.
 

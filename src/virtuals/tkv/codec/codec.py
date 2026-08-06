@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 
 if TYPE_CHECKING:
@@ -13,8 +13,11 @@ __all__ = [
     "Codec",
 ]
 
+EncodedKeyT = TypeVar("EncodedKeyT")
+EncodedValueT = TypeVar("EncodedValueT")
 
-class Codec[EncodedKeyT, EncodedValueT]:
+
+class Codec(Generic[EncodedKeyT, EncodedValueT]):
     """Unified codec for storage operations.
 
     Combines separate key and value codecs into a single interface for

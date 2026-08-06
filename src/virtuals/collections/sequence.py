@@ -14,7 +14,7 @@ Provided for free:
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable
 
 from .bases import CollectionBase
 
@@ -30,8 +30,10 @@ __all__ = [
     "SequenceBase",
 ]
 
+V = TypeVar("V")
 
-class SequenceBase[V](CollectionBase[V]):
+
+class SequenceBase(CollectionBase[V]):
     """Read-only sequence base. Provides iteration/search from getitem/len.
 
     Inherits abstract __len__ from CollectionBase.
@@ -77,7 +79,7 @@ class SequenceBase[V](CollectionBase[V]):
         return sum(1 for item in self if item == value)
 
 
-class MutableSequenceBase[V](SequenceBase[V]):
+class MutableSequenceBase(SequenceBase[V]):
     """Mutable sequence base. Adds append/pop/extend/remove/clear from insert/delitem.
 
     Additional abstract:
@@ -142,7 +144,7 @@ class MutableSequenceBase[V](SequenceBase[V]):
         return list(other) + list(self)
 
 
-class ReactiveSequenceBase[V](MutableSequenceBase[V]):
+class ReactiveSequenceBase(MutableSequenceBase[V]):
     """Reactive sequence base. Mutable sequence with change observation.
 
     Additional abstract:
@@ -168,7 +170,7 @@ class ReactiveSequenceBase[V](MutableSequenceBase[V]):
 
 
 @runtime_checkable
-class ReactiveSequenceProtocol[V](Protocol):
+class ReactiveSequenceProtocol(Protocol[V]):
     """Protocol: MutableSequence + Observable + ChildObservable.
 
     Use for type-checking views that support both mutation and change subscription.

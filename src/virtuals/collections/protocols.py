@@ -8,7 +8,7 @@ Check protocol support at runtime with the is_* type guard functions.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, TypeGuard, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypeGuard, TypeVar, runtime_checkable
 
 
 if TYPE_CHECKING:
@@ -55,11 +55,16 @@ __all__ = [
 # =============================================================================
 
 
-# TODO: should inherit from View protocol? class Convertible[V](Protocol):
+A = TypeVar("A")
+V = TypeVar("V")
+ViewT = TypeVar("ViewT", bound="View")
+
+
+# TODO: should inherit from View protocol? class Convertible(Protocol[V]):
 
 
 @runtime_checkable
-class Convertible[V](Protocol):
+class Convertible(Protocol[V]):
     """Protocol for containers that can convert their contents to Python values.
 
     Convertible containers can materialize their entire stored state into
@@ -88,7 +93,7 @@ class Convertible[V](Protocol):
 
 
 @runtime_checkable
-class Initializable[V](Protocol):
+class Initializable(Protocol[V]):
     """Protocol for containers that can be initialized from Python values.
 
     Initializable containers can populate their contents from native Python
@@ -119,7 +124,7 @@ class Initializable[V](Protocol):
 
 
 @runtime_checkable
-class Nestable[A](Protocol):
+class Nestable(Protocol[A]):
     """Protocol for containers that support navigation to child containers.
 
     Nestable containers can navigate their hierarchy, returning appropriate
@@ -131,7 +136,7 @@ class Nestable[A](Protocol):
         ...     # child is another container at the given location
     """
 
-    def open_child[ViewT: View](self, address: A, view: type[ViewT]) -> ViewT:
+    def open_child(self, address: A, view: type[ViewT]) -> ViewT:
         """Navigate to child container.
 
         Args:
@@ -151,7 +156,7 @@ class Nestable[A](Protocol):
 
 
 @runtime_checkable
-class Subscriptable[A, V](Protocol):
+class Subscriptable(Protocol[A, V]):
     """Protocol for containers that support item access via subscript notation.
 
     Subscriptable containers implement __getitem__ to retrieve values by
@@ -180,7 +185,7 @@ class Subscriptable[A, V](Protocol):
 
 
 @runtime_checkable
-class Assignable[A, V](Protocol):
+class Assignable(Protocol[A, V]):
     """Protocol for containers that support item assignment via subscript notation.
 
     Assignable containers implement __setitem__ to store values by
@@ -207,7 +212,7 @@ class Assignable[A, V](Protocol):
 
 
 @runtime_checkable
-class Containable[V](Protocol):
+class Containable(Protocol[V]):
     """Protocol for containers that support membership testing.
 
     Containable containers implement __contains__ to check if an address
@@ -256,7 +261,7 @@ class Sizeable(Protocol):
 
 
 @runtime_checkable
-class Sampleable[V](Protocol):
+class Sampleable(Protocol[V]):
     """Protocol for containers that support kh57-style range reservoir sampling.
 
     Sampleable containers implement sample() to return up to ``n`` uniform
@@ -296,7 +301,7 @@ class Sampleable[V](Protocol):
 
 
 @runtime_checkable
-class Deletable[A](Protocol):
+class Deletable(Protocol[A]):
     """Protocol for containers that support item deletion.
 
     Deletable containers implement __delitem__ to remove items by
@@ -373,7 +378,7 @@ class Observable(Protocol):
 
 
 @runtime_checkable
-class ChildObservable[A](Protocol):
+class ChildObservable(Protocol[A]):
     """Protocol for containers that support observing child changes.
 
     ChildObservable containers implement on_child_change() and

@@ -12,6 +12,8 @@ Sites are used in the container layer to represent locations where containers an
 
 from __future__ import annotations
 
+from typing import TypeAlias
+
 from .key_def import Key, KeySegment
 
 
@@ -21,5 +23,5 @@ __all__ = [
 ]
 
 # Site is the same tuple type as Key, but with hierarchical semantics
-type Site = Key
-type SiteSegment = KeySegment
+Site: TypeAlias = Key
+SiteSegment: TypeAlias = KeySegment

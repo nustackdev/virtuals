@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, TypeVar
 
 from virtuals.container import (
     Container,
@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     from virtuals.types import Empty
 
 __all__ = ["TupleView"]
+
+ViewT = TypeVar("ViewT", bound=View)
 
 
 class TupleView(
@@ -205,7 +207,7 @@ class TupleView(
         # Set final length metadata
         self._set_length(count)
 
-    def open_child[ViewT: View](self, address: int, view: type[ViewT]) -> ViewT:
+    def open_child(self, address: int, view: type[ViewT]) -> ViewT:
         """Open child view at index.
 
         Pure navigation — does not write to storage.

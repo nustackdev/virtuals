@@ -11,7 +11,9 @@ from __future__ import annotations
 import queue
 import threading
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any
+
+from typing_extensions import Self
 
 from virtuals.tkv.publisher import PublisherConnectionError
 

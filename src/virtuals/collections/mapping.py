@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import ItemsView, KeysView, ValuesView
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar, runtime_checkable
 
 from .bases import CollectionBase
 
@@ -30,8 +30,11 @@ __all__ = [
     "ReactiveMappingProtocol",
 ]
 
+K = TypeVar("K")
+V = TypeVar("V")
 
-class MappingBase[K, V](CollectionBase[K]):
+
+class MappingBase(CollectionBase[K], Generic[K, V]):
     """Read-only mapping base. Provides keys/values/items/get/__contains__ from core methods.
 
     Inherits abstract __iter__, __len__ from CollectionBase.
@@ -71,7 +74,7 @@ class MappingBase[K, V](CollectionBase[K]):
             return default
 
 
-class MutableMappingBase[K, V](MappingBase[K, V]):
+class MutableMappingBase(MappingBase[K, V]):
     """Mutable mapping base. Adds pop/update/clear from setitem/delitem.
 
     Additional abstract:
@@ -114,7 +117,7 @@ class MutableMappingBase[K, V](MappingBase[K, V]):
             del self[key]
 
 
-class ReactiveMappingBase[K, V](MutableMappingBase[K, V]):
+class ReactiveMappingBase(MutableMappingBase[K, V]):
     """Reactive mapping base. Mutable mapping with change observation.
 
     Additional abstract:
@@ -140,7 +143,7 @@ class ReactiveMappingBase[K, V](MutableMappingBase[K, V]):
 
 
 @runtime_checkable
-class ReactiveMappingProtocol[K, V](Protocol):
+class ReactiveMappingProtocol(Protocol[K, V]):
     """Protocol: MutableMapping + Observable + ChildObservable.
 
     Use for type-checking views that support both mutation and change subscription.

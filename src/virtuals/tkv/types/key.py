@@ -5,11 +5,13 @@ Keys are tuples of strings and integers, used for identifying entries in storage
 
 from __future__ import annotations
 
+from typing import TypeAlias
+
 
 __all__ = [
     "Key",
     "KeySegment",
 ]
 
-type KeySegment = str | int
-type Key = tuple[KeySegment, ...]
+KeySegment: TypeAlias = str | int
+Key: TypeAlias = tuple[KeySegment, ...]

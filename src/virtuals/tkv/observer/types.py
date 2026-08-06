@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 
 if TYPE_CHECKING:
@@ -19,11 +19,11 @@ __all__ = [
     "SubscriptionReceiver",
 ]
 
-type SubscriptionReceiver = SubscriptionCallback
-"""Receiver function type for subscription notifications."""
-
-type SubscriptionCallback = Callable[[Key], None]
+SubscriptionCallback: TypeAlias = "Callable[[Key], None]"
 """Callback function type for subscription notifications."""
+
+SubscriptionReceiver: TypeAlias = "SubscriptionCallback"
+"""Receiver function type for subscription notifications."""
 
 
 @dataclass(frozen=True, slots=True)

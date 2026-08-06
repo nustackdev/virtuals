@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import NoneType
-from typing import Any
+from typing import Any, TypeAlias
 
 
 __all__ = [
@@ -28,7 +28,7 @@ __all__ = [
 # ---------------------------------------------------------
 
 # Base primitive values
-type PrimitiveValue = NoneType | bytes | bool | int | float | complex | str
+PrimitiveValue: TypeAlias = NoneType | bytes | bool | int | float | complex | str
 
 # Composite values.
 #
@@ -40,7 +40,7 @@ type PrimitiveValue = NoneType | bytes | bool | int | float | complex | str
 # Immutable containers (tuple, frozenset) use precise types:
 # - These are covariant, so tuple[str, ...] IS assignable to tuple[str | int, ...]
 # - Safe because they can't be modified after creation
-type CompositeValue = (
+CompositeValue: TypeAlias = (
     list[Any]
     | set[Any]
     | dict[Any, Any]
@@ -49,4 +49,4 @@ type CompositeValue = (
 )
 
 # A union of all supported value types
-type Value = PrimitiveValue | CompositeValue
+Value: TypeAlias = PrimitiveValue | CompositeValue

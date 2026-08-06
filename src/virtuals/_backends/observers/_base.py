@@ -18,7 +18,9 @@ import queue
 import threading
 from dataclasses import dataclass
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any
+
+from typing_extensions import Self
 
 from virtuals.tkv.filter import filter_hash as _filter_hash
 from virtuals.tkv.observer import (
@@ -74,9 +76,7 @@ class ObserverBase:
         self._connected: bool = False
         self._registry: SubscriptionRegistry | None = None
 
-        self._dispatch_queue: queue.Queue[Any] = queue.Queue(
-            maxsize=dispatch_queue_maxsize
-        )
+        self._dispatch_queue: queue.Queue[Any] = queue.Queue(maxsize=dispatch_queue_maxsize)
         self._stop_event = threading.Event()
         self._dispatch_thread: threading.Thread | None = None
 
@@ -154,9 +154,7 @@ class ObserverBase:
         except Exception as e:
             logger.warning("Observer _on_unsubscribe hook raised: %s", e)
 
-    def _dispatch_incoming(
-        self, keys: Iterable[Key], filter_hash: str | None = None
-    ) -> None:
+    def _dispatch_incoming(self, keys: Iterable[Key], filter_hash: str | None = None) -> None:
         """Transport-facing entry point.
 
         Enqueues keys onto the dispatch queue so the transport thread never

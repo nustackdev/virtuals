@@ -6,7 +6,7 @@ Defines data structures and type aliases used across the storage layer.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 
 if TYPE_CHECKING:
@@ -61,7 +61,7 @@ class StorageScanOptions:
     break_filter: Filter | None = None
 
 
-type StorageContextType = SnapshotProtocol | WriteBatchProtocol | TransactionProtocol
+StorageContextType: TypeAlias = "SnapshotProtocol | WriteBatchProtocol | TransactionProtocol"
 
 
 __all__ = [

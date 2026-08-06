@@ -64,7 +64,7 @@ def build_view_path(*segments: PathViewSegment) -> PathToView:
     return segments
 
 
-def build_value_path(*segments: *tuple[PathViewSegment, ...], v: PathValueSegment) -> PathToValue:
+def build_value_path(*segments: PathViewSegment, v: PathValueSegment) -> PathToValue:
     """Build ValuePath from segments.
 
     Example:
@@ -235,8 +235,9 @@ def navigate_and_ensure(
     start_view: View,
     path: PathToView,
 ) -> View:
-    """Navigate a ViewPath and ensure every level is materialized with its
-    declared view type.
+    """Navigate a ViewPath and ensure every level is materialized.
+
+    Ensures every level is materialized with its declared view type.
 
     Sibling of ``navigate_view`` for the write path. Same walk shape; the
     difference is that at each step this calls ``ensure_created()`` on the
