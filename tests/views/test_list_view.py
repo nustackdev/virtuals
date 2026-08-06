@@ -207,3 +207,190 @@ def test_list_extract_full(list_factory):
 
     assert extracted == [10, 20, 30, 40, 50]
     assert isinstance(extracted, list)
+
+
+# ============================================================================
+# MIDDLE-DELETE / INSERT WITH CONTAINER CHILDREN
+# ============================================================================
+
+
+def test_list_delitem_middle_container_child(list_factory):
+    """Deleting a middle dict child shifts trailing container children down."""
+    items = list_factory(
+        "items",
+        [
+            {"title": "A", "year": 2001},
+            {"title": "B", "year": 2002},
+            {"title": "C", "year": 2003},
+        ],
+    )
+
+    del items[1]
+
+    assert len(items) == 2
+    assert items.extract() == [
+        {"title": "A", "year": 2001},
+        {"title": "C", "year": 2003},
+    ]
+
+
+def test_list_delitem_first_container_child(list_factory):
+    """Deleting index 0 of a list-of-dicts shifts every remaining child."""
+    items = list_factory(
+        "items",
+        [
+            {"title": "A"},
+            {"title": "B"},
+            {"title": "C"},
+            {"title": "D"},
+        ],
+    )
+
+    del items[0]
+
+    assert len(items) == 3
+    assert items.extract() == [
+        {"title": "B"},
+        {"title": "C"},
+        {"title": "D"},
+    ]
+
+
+def test_list_delitem_last_container_child(list_factory):
+    """Deleting the tail of a list-of-dicts still works (regression guard)."""
+    items = list_factory(
+        "items",
+        [
+            {"title": "A"},
+            {"title": "B"},
+            {"title": "C"},
+        ],
+    )
+
+    del items[-1]
+
+    assert len(items) == 2
+    assert items.extract() == [{"title": "A"}, {"title": "B"}]
+
+
+def test_list_delitem_nested_list_child(list_factory):
+    """Middle-delete works when children are lists (nested containers)."""
+    items = list_factory(
+        "items",
+        [
+            [1, 2, 3],
+            [4, 5, 6],
+            [7, 8, 9],
+        ],
+    )
+
+    del items[1]
+
+    assert items.extract() == [[1, 2, 3], [7, 8, 9]]
+
+
+def test_list_delitem_deeply_nested_container_child(list_factory):
+    """Shifting a container child preserves its full subtree, not just the top layer."""
+    items = list_factory(
+        "items",
+        [
+            {"title": "A", "meta": {"tags": ["x", "y"], "score": 1}},
+            {"title": "B", "meta": {"tags": ["z"], "score": 2}},
+            {"title": "C", "meta": {"tags": ["w"], "score": 3}},
+        ],
+    )
+
+    del items[0]
+
+    assert items.extract() == [
+        {"title": "B", "meta": {"tags": ["z"], "score": 2}},
+        {"title": "C", "meta": {"tags": ["w"], "score": 3}},
+    ]
+
+
+def test_list_pop_first_container_child(list_factory):
+    """pop(0) on a list-of-dicts returns the value and shifts the rest down."""
+    items = list_factory(
+        "items",
+        [
+            {"title": "A"},
+            {"title": "B"},
+            {"title": "C"},
+        ],
+    )
+
+    value = items.pop(0)
+
+    assert value == {"title": "A"}
+    assert items.extract() == [{"title": "B"}, {"title": "C"}]
+
+
+def test_list_insert_middle_with_container_children(list_factory):
+    """Inserting in the middle of a list-of-dicts shifts trailing containers up."""
+    items = list_factory(
+        "items",
+        [
+            {"title": "A"},
+            {"title": "C"},
+        ],
+    )
+
+    items.insert(1, {"title": "B"})
+
+    assert items.extract() == [
+        {"title": "A"},
+        {"title": "B"},
+        {"title": "C"},
+    ]
+
+
+def test_list_insert_head_with_container_children(list_factory):
+    """Inserting at head shifts every container child up by one."""
+    items = list_factory(
+        "items",
+        [
+            {"title": "B"},
+            {"title": "C"},
+        ],
+    )
+
+    items.insert(0, {"title": "A"})
+
+    assert items.extract() == [
+        {"title": "A"},
+        {"title": "B"},
+        {"title": "C"},
+    ]
+
+
+def test_list_remove_container_child_by_value(list_factory):
+    """remove() finds and deletes a matching dict child via middle-delete."""
+    items = list_factory(
+        "items",
+        [
+            {"title": "A"},
+            {"title": "B"},
+            {"title": "C"},
+        ],
+    )
+
+    items.remove({"title": "B"})
+
+    assert items.extract() == [{"title": "A"}, {"title": "C"}]
+
+
+def test_list_delitem_mixed_primitive_and_container_children(list_factory):
+    """Deleting into a tail that mixes primitives and containers shifts both."""
+    items = list_factory(
+        "items",
+        [
+            "head",
+            {"title": "A"},
+            "middle",
+            {"title": "B"},
+        ],
+    )
+
+    del items[0]
+
+    assert items.extract() == [{"title": "A"}, "middle", {"title": "B"}]

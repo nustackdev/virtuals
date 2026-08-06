@@ -149,7 +149,12 @@ class ListViewBase(
         self._populate_child_container(normalized, value, view_class=view_class)
 
     def __delitem__(self, address: int) -> None:
-        """Delete item at index and shift remaining items."""
+        """Delete item at index and shift remaining items.
+
+        O(n) in the number of storage entries under the shifted tail. For
+        large lists of container children where middle-position deletes are
+        common, prefer a dict keyed by id.
+        """
         self.ensure_created()
         normalized = self.normalize_address(address)
         length = len(self)
@@ -163,9 +168,7 @@ class ListViewBase(
                 self.container.put_child_primitive(i - 1, value)
                 self.container.delete_child(i)
             elif child_type == NodeType.CONTAINER:
-                raise NotImplementedError(
-                    "Deleting list items with container children not yet supported"
-                )
+                self.container.move_child_subtree(i, i - 1)
 
         self._set_length(length - 1)
 
@@ -191,9 +194,7 @@ class ListViewBase(
                 child_value = self.container.get_child_primitive(i)
                 self.container.put_child_primitive(i + 1, child_value)
             elif child_type == NodeType.CONTAINER:
-                raise NotImplementedError(
-                    "Inserting into list with container children not yet supported"
-                )
+                self.container.move_child_subtree(i, i + 1)
 
         self._set_child_value(address, value)
         self._set_length(length + 1)

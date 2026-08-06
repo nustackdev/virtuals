@@ -59,6 +59,7 @@ from .container_ops import (
     iter_child_values,
     iter_children,
     iter_descendants,
+    move_child_subtree,
     put_child_primitive,
     put_child_primitive_unsafe,
     walk_descendants,
@@ -217,6 +218,7 @@ __all__ = [  # noqa: RUF022
     "clear_children_primitives_unsafe",
     "iter_child_primitive_values",
     "iter_descendants",
+    "move_child_subtree",
     "walk_descendants",
     "create_parents",
     # Metadata operations

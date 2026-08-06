@@ -468,6 +468,23 @@ class Container:
         """
         container_ops.delete_child_primitive_unsafe(self.site, key, self.ctx)
 
+    def move_child_subtree(
+        self,
+        src_key: site_.SiteSegment,
+        dst_key: site_.SiteSegment,
+    ) -> None:
+        """Move a direct child (with its whole subtree) from src_key to dst_key.
+
+        Rewrites storage entries under src_key to dst_key and deletes the
+        originals. Caller must ensure dst_key is empty. Works for both
+        primitive and container children.
+
+        Args:
+            src_key: Current child key
+            dst_key: Target child key
+        """
+        container_ops.move_child_subtree(self.site, src_key, dst_key, self.ctx)
+
     def clear_children(self, *, validate: bool = True) -> None:
         """Delete all direct children.
 

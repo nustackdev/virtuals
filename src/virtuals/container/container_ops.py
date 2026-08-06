@@ -88,6 +88,7 @@ __all__ = [
     "iter_child_values",
     "iter_children",
     "iter_descendants",
+    "move_child_subtree",
     "put_child_primitive",
     "put_child_primitive_unsafe",
     "walk_descendants",
@@ -258,6 +259,57 @@ def delete_descendants(site: site_.Site, ctx: StorageContextType) -> None:
         rwctx.delete(key)
 
     logger.debug("Descendants deleted", extra={"site": site})
+
+
+def move_child_subtree(
+    parent_site: site_.Site,
+    src_key: site_.SiteSegment,
+    dst_key: site_.SiteSegment,
+    ctx: StorageContextType,
+) -> None:
+    """Move a direct child (with its whole subtree) from src_key to dst_key.
+
+    Rewrites every storage entry under ``(*parent_site, src_key)`` to the
+    same relative location under ``(*parent_site, dst_key)``, then deletes
+    the originals. Works for primitive and container children alike.
+
+    Caller must ensure the dst_key slot is empty; existing entries under
+    dst_key are not cleared. Raw storage rewrite — no observability, no
+    validation, no marker parsing.
+
+    O(n) in the number of storage entries under src_key. Prefer key-based
+    collections (dicts) over lists when middle-position mutations of large
+    subtrees are common.
+
+    Args:
+        parent_site: Parent container site
+        src_key: Current child key
+        dst_key: Target child key
+        ctx: Storage context (transaction)
+    """
+    if src_key == dst_key:
+        return
+
+    rwctx = require_readwrite_context(ctx)
+
+    src_site = (*parent_site, src_key)
+    dst_site = (*parent_site, dst_key)
+
+    prefix = PrefixFilter(prefix=src_site)
+    scan_opts = StorageScanOptions(
+        start=src_site,
+        break_filter=prefix,
+        filter=prefix,
+    )
+
+    # Materialize before mutating — modifying storage mid-scan is unsafe.
+    items = list(rwctx.scan(scan_opts).items())
+
+    src_prefix_len = len(src_site)
+    for key, value in items:
+        new_key = (*dst_site, *key[src_prefix_len:])
+        rwctx.put(new_key, value)
+        rwctx.delete(key)
 
 
 # ============================================================================
