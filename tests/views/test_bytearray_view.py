@@ -115,32 +115,89 @@ def test_bytearray_clear(bytearray_factory):
 
 
 # ============================================================================
-# UNSUPPORTED OPERATIONS
+# SHIFT-BASED MUTATIONS
 # ============================================================================
 
 
-def test_bytearray_delitem_raises(bytearray_factory):
+def test_bytearray_delitem_middle(bytearray_factory):
+    data = bytearray_factory("data", b"abcde")
+    del data[2]
+    assert data.extract() == bytearray(b"abde")
+    assert len(data) == 4
+
+
+def test_bytearray_delitem_head(bytearray_factory):
+    data = bytearray_factory("data", b"abcde")
+    del data[0]
+    assert data.extract() == bytearray(b"bcde")
+
+
+def test_bytearray_delitem_tail(bytearray_factory):
+    data = bytearray_factory("data", b"abcde")
+    del data[-1]
+    assert data.extract() == bytearray(b"abcd")
+
+
+def test_bytearray_delitem_out_of_range(bytearray_factory):
     data = bytearray_factory("data", b"abc")
-    with pytest.raises(NotImplementedError):
-        del data[0]
+    with pytest.raises(IndexError):
+        del data[10]
 
 
-def test_bytearray_insert_raises(bytearray_factory):
+def test_bytearray_insert_middle(bytearray_factory):
+    data = bytearray_factory("data", b"ace")
+    data.insert(1, ord("b"))
+    assert data.extract() == bytearray(b"abce")
+
+
+def test_bytearray_insert_head(bytearray_factory):
+    data = bytearray_factory("data", b"bcd")
+    data.insert(0, ord("a"))
+    assert data.extract() == bytearray(b"abcd")
+
+
+def test_bytearray_insert_beyond_end_clamps(bytearray_factory):
     data = bytearray_factory("data", b"abc")
-    with pytest.raises(NotImplementedError):
-        data.insert(0, ord("x"))
+    data.insert(100, ord("d"))
+    assert data.extract() == bytearray(b"abcd")
 
 
-def test_bytearray_pop_raises(bytearray_factory):
+def test_bytearray_insert_validation(bytearray_factory):
     data = bytearray_factory("data", b"abc")
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError):
+        data.insert(0, 999)
+
+
+def test_bytearray_pop_default(bytearray_factory):
+    data = bytearray_factory("data", b"abcde")
+    value = data.pop()
+    assert value == ord("e")
+    assert data.extract() == bytearray(b"abcd")
+
+
+def test_bytearray_pop_index(bytearray_factory):
+    data = bytearray_factory("data", b"abcde")
+    value = data.pop(1)
+    assert value == ord("b")
+    assert data.extract() == bytearray(b"acde")
+
+
+def test_bytearray_pop_empty_raises(bytearray_factory):
+    data = bytearray_factory("data")
+    with pytest.raises(IndexError):
         data.pop()
 
 
-def test_bytearray_remove_raises(bytearray_factory):
+def test_bytearray_remove_first_occurrence(bytearray_factory):
+    data = bytearray_factory("data", b"abcba")
+    data.remove(ord("b"))
+    assert data.extract() == bytearray(b"acba")
+
+
+def test_bytearray_remove_missing_raises(bytearray_factory):
     data = bytearray_factory("data", b"abc")
-    with pytest.raises(NotImplementedError):
-        data.remove(ord("a"))
+    with pytest.raises(ValueError):
+        data.remove(ord("z"))
 
 
 # ============================================================================

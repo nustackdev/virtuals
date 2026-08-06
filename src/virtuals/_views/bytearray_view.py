@@ -141,8 +141,22 @@ class ByteArrayView(
             yield self[i]
 
     def __delitem__(self, address: int) -> None:
-        """Delete byte at index. Not supported — requires element shifting."""
-        raise NotImplementedError("ByteArrayView does not support item deletion")
+        """Delete byte at index and shift remaining bytes down.
+
+        O(n) in the number of bytes after ``address``.
+        """
+        self.ensure_created()
+        normalized = self.normalize_address(address)
+        length = len(self)
+
+        self.container.delete_child(normalized)
+
+        for i in range(normalized + 1, length):
+            value = self.container.get_child_primitive(i)
+            self.container.put_child_primitive(i - 1, value)
+            self.container.delete_child(i)
+
+        self._set_length(length - 1)
 
     def append(self, value: int) -> None:
         """Append byte to end.
@@ -162,12 +176,36 @@ class ByteArrayView(
         self._set_length(index + 1)
 
     def insert(self, index: int, value: int) -> None:
-        """Insert byte at index. Not supported — requires element shifting."""
-        raise NotImplementedError("ByteArrayView does not support insert")
+        """Insert byte at index, shifting later bytes up.
+
+        O(n) in the number of bytes after ``index``.
+        """
+        if not isinstance(value, int) or not 0 <= value <= 255:
+            raise ValueError("byte must be in range(0, 256)")
+
+        self.ensure_created()
+        length = len(self)
+
+        if index < 0:
+            index = max(0, length + index)
+        else:
+            index = min(index, length)
+
+        for i in range(length - 1, index - 1, -1):
+            byte = self.container.get_child_primitive(i)
+            self.container.put_child_primitive(i + 1, byte)
+
+        self.container.put_child_primitive(index, value)
+        self._set_length(length + 1)
 
     def pop(self, index: int = -1) -> int:
-        """Remove and return byte at index. Not supported — requires element shifting."""
-        raise NotImplementedError("ByteArrayView does not support pop")
+        """Remove and return byte at index."""
+        if len(self) == 0:
+            raise IndexError("pop from empty bytearray")
+
+        value = self[index]
+        del self[index]
+        return value
 
     def extend(self, values: Iterable[int]) -> None:
         """Extend with bytes from iterable."""
@@ -175,8 +213,12 @@ class ByteArrayView(
             self.append(value)
 
     def remove(self, value: int) -> None:
-        """Remove first occurrence of byte value. Not supported — requires element shifting."""
-        raise NotImplementedError("ByteArrayView does not support remove")
+        """Remove first occurrence of byte value."""
+        for i, byte in enumerate(self):
+            if byte == value:
+                del self[i]
+                return
+        raise ValueError(f"{value!r} is not in bytearray")
 
     def index(self, value: int) -> int:
         """Find index of first occurrence of byte value.
