@@ -64,7 +64,6 @@ Changelog = "https://github.com/nustackdev/virtuals/releases"
 
 [tool.uv.sources]
 virtuals-binary-codec = { path = "lib/binary-codec", editable = true }
-kh57 = { path = "../kh57", editable = true }
 
 [project.optional-dependencies]
 rocksdb = ["rdbpython"]
