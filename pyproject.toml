@@ -21,17 +21,13 @@ maintainers = [
     {name = "Gor Arakelyan", email = "gorarkln@gmail.com"}
 ]
 keywords = [
-    "key-value",
-    "kv",
+    "nustack",
+    "python",
+    "key-value-store",
+    "collections",
+    "lazy-loading",
+    "rocksdb",
     "storage",
-    "views",
-    "polymorphic",
-    "data-structures",
-    "dict",
-    "list",
-    "set",
-    "database",
-    "persistence",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
