@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 # ============================================================================
 [project]
 name = "virtuals-py"
-version = "0.1.6"
+version = "0.1.7"
 description = "Virtual Python collections over any storage."
 readme = "README.md"
 license = "Apache-2.0"
@@ -46,7 +46,7 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "attrs",
-    "virtuals-binary-codec",
+    "virtuals-binary-codec>=0.1.1",
     "kh57",
     "typing-extensions>=4.7.0",
 ]

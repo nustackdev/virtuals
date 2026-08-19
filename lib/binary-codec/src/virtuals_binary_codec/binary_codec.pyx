@@ -241,6 +241,24 @@ cdef class BinaryKeyCodec:
 
         return result
 
+    def upper_bound_of_prefix(self, tuple key):
+        """Encoded bytes strictly greater than every child key of ``key``.
+
+        Appends ``0xFF`` to ``encode(key)``. The trailing 0xFF sorts strictly
+        above every valid segment type marker (``TYPE_INT=0x01``, ``TYPE_STR=0x02``),
+        so any child key of the form ``key + (segment,)`` compares less than
+        the returned bytes. Used by container-side reverse scans to seed
+        ``StorageScanOptions.start`` with an inclusive upper bound of the
+        child prefix range.
+
+        Args:
+            key: Tuple containing strings and/or integers
+
+        Returns:
+            Binary bytes that sort strictly greater than every child key of ``key``
+        """
+        return self.encode(key) + b"\xff"
+
     def decode(self, bytes encoded):
         """Decode binary data back to original tuple key.
 

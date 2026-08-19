@@ -12,3 +12,7 @@ class BinaryKeyCodec:
     def decode(self, encoded: bytes) -> tuple[str | int, ...]:
         """Decode binary data back to original tuple key."""
         ...
+
+    def upper_bound_of_prefix(self, key: tuple[str | int, ...]) -> bytes:
+        r"""Bytes strictly greater than every child key of ``key`` (``encode(key) + b"\xff"``)."""
+        ...
