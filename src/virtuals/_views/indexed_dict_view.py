@@ -120,9 +120,9 @@ class IndexedDictViewBase(
         return FlatListView(container, self.registry)
 
     def _ensure_internal_layout(self) -> None:
-        """Materialize ``__data__/`` (plain dict) and ``__keys__/`` (FlatListView)
-        sub-containers.
+        """Materialize ``__data__/`` and ``__keys__/`` sub-containers.
 
+        ``__data__/`` is a plain dict, ``__keys__/`` is a FlatListView.
         Called from ``ensure_created`` (via the base hook) after this view's
         own marker is stamped. Idempotent.
         """
@@ -349,6 +349,25 @@ class IndexedDictViewBase(
         view_class = self.registry.get_view_for_structure(node_info.structure)  # type: ignore[union-attr]
         return view_class(container=child_container, registry=self.registry)
 
+    # -- Ordered key iteration --------------------------------------------
+    #
+    # `__data__/`'s natural iter_children order is codec-sorted on the data
+    # keys, which does not match this view's insertion-order contract
+    # (surfaced via `keys()` / `__iter__` / `key_at`). Iterating `__keys__/`
+    # yields the actual keys in insertion order, matching the DictView shape
+    # of "one pass over storage" while preserving the invariant that
+    # `values()` / `items()` line up with `keys()`.
+
+    def _iter_ordered_keys(
+        self,
+        *,
+        reverse: bool = False,
+    ) -> Generator[str | int, None, None]:
+        """Yield actual keys from `__keys__/` in insertion order (or reversed)."""
+        kc = self._keys_view().container
+        for _idx, node_info in kc.iter_children(validate=False, reverse=reverse):
+            yield cast("str | int", node_info.primitive_value)
+
 
 # =============================================================================
 # EAGER FACET — reads return extracted Python values
@@ -374,12 +393,60 @@ class EagerIndexedDictView(IndexedDictViewBase):
         return self._extract_data_child(address, node_info)
 
     def values(self) -> ValuesView[object]:
-        """Get all values as a collection view."""
-        return ValuesView(self)  # type: ignore[arg-type]
+        """Get all values as a collection view.
+
+        Uses efficient single-pass iteration over ``__keys__/`` for order,
+        with per-key ``__data__/`` reads for values.
+        """
+        return _EagerIndexedValuesView(self)
 
     def items(self) -> ItemsView[str | int, object]:
-        """Get all items as a set-like view."""
-        return ItemsView(self)  # type: ignore[arg-type]
+        """Get all items as a set-like view.
+
+        Uses efficient single-pass iteration over ``__keys__/`` for order,
+        with per-key ``__data__/`` reads for values.
+        """
+        return _EagerIndexedItemsView(self)
+
+    def _iter_values(self) -> Generator[object, None, None]:
+        """Efficient single-pass value iteration in insertion order."""
+        for k in self._iter_ordered_keys():
+            node_info, is_container = self._read_child_from_data(k)
+            if not is_container:
+                yield node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield self._extract_data_child(k, node_info)
+
+    def _iter_items(self) -> Generator[tuple[str | int, object], None, None]:
+        """Efficient single-pass items iteration in insertion order."""
+        for k in self._iter_ordered_keys():
+            node_info, is_container = self._read_child_from_data(k)
+            if not is_container:
+                yield k, node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield k, self._extract_data_child(k, node_info)
+
+    def _iter_values_reverse(self) -> Generator[object, None, None]:
+        """Efficient single-pass reverse value iteration."""
+        for k in self._iter_ordered_keys(reverse=True):
+            node_info, is_container = self._read_child_from_data(k)
+            if not is_container:
+                yield node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield self._extract_data_child(k, node_info)
+
+    def _iter_items_reverse(self) -> Generator[tuple[str | int, object], None, None]:
+        """Efficient single-pass reverse items iteration."""
+        for k in self._iter_ordered_keys(reverse=True):
+            node_info, is_container = self._read_child_from_data(k)
+            if not is_container:
+                yield k, node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield k, self._extract_data_child(k, node_info)
+
+    def __reversed__(self) -> Generator[str | int, None, None]:
+        """Iterate keys in reverse insertion order."""
+        yield from self._iter_ordered_keys(reverse=True)
 
     def pop(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
         try:
@@ -431,12 +498,58 @@ class LazyIndexedDictView(IndexedDictViewBase):
         return self._view_data_child(address, node_info)
 
     def values(self) -> ValuesView[object]:
-        """Get all values as a collection view."""
-        return ValuesView(self)  # type: ignore[arg-type]
+        """Get all values as a collection view.
+
+        Returns Views for containers, values for primitives.
+        """
+        return _LazyIndexedValuesView(self)
 
     def items(self) -> ItemsView[str | int, object]:
-        """Get all items as a set-like view."""
-        return ItemsView(self)  # type: ignore[arg-type]
+        """Get all items as a set-like view.
+
+        Returns (key, View|value) pairs.
+        """
+        return _LazyIndexedItemsView(self)
+
+    def _iter_values(self) -> Generator[object, None, None]:
+        """Efficient single-pass value iteration in insertion order."""
+        for k in self._iter_ordered_keys():
+            node_info, is_container = self._read_child_from_data(k)
+            if not is_container:
+                yield node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield self._view_data_child(k, node_info)
+
+    def _iter_items(self) -> Generator[tuple[str | int, object], None, None]:
+        """Efficient single-pass items iteration in insertion order."""
+        for k in self._iter_ordered_keys():
+            node_info, is_container = self._read_child_from_data(k)
+            if not is_container:
+                yield k, node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield k, self._view_data_child(k, node_info)
+
+    def _iter_values_reverse(self) -> Generator[object, None, None]:
+        """Efficient single-pass reverse value iteration."""
+        for k in self._iter_ordered_keys(reverse=True):
+            node_info, is_container = self._read_child_from_data(k)
+            if not is_container:
+                yield node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield self._view_data_child(k, node_info)
+
+    def _iter_items_reverse(self) -> Generator[tuple[str | int, object], None, None]:
+        """Efficient single-pass reverse items iteration."""
+        for k in self._iter_ordered_keys(reverse=True):
+            node_info, is_container = self._read_child_from_data(k)
+            if not is_container:
+                yield k, node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield k, self._view_data_child(k, node_info)
+
+    def __reversed__(self) -> Generator[str | int, None, None]:
+        """Iterate keys in reverse insertion order."""
+        yield from self._iter_ordered_keys(reverse=True)
 
     # -- Facet navigation --------------------------------------------------
 
@@ -449,6 +562,95 @@ class LazyIndexedDictView(IndexedDictViewBase):
     def lazy(self) -> LazyIndexedDictView:
         """Identity — already lazy."""
         return self
+
+
+# =============================================================================
+# VIEW CLASSES — proper ValuesView / ItemsView with single-pass iteration
+# =============================================================================
+
+
+class _EagerIndexedValuesView(ValuesView):
+    """Efficient ValuesView — single-pass iteration in insertion order."""
+
+    _mapping: EagerIndexedDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values()
+
+    def __reversed__(self) -> Generator[object, None, None]:
+        return _EagerIndexedReversedValuesView(self._mapping).__iter__()
+
+
+class _EagerIndexedItemsView(ItemsView):
+    """Efficient ItemsView — single-pass iteration in insertion order."""
+
+    _mapping: EagerIndexedDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items()
+
+    def __reversed__(self) -> Generator[tuple[str | int, object], None, None]:
+        return _EagerIndexedReversedItemsView(self._mapping).__iter__()
+
+
+class _LazyIndexedValuesView(ValuesView):
+    """Efficient ValuesView — single-pass iteration, lazy child access."""
+
+    _mapping: LazyIndexedDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values()
+
+    def __reversed__(self) -> Generator[object, None, None]:
+        return _LazyIndexedReversedValuesView(self._mapping).__iter__()
+
+
+class _LazyIndexedItemsView(ItemsView):
+    """Efficient ItemsView — single-pass iteration, lazy child access."""
+
+    _mapping: LazyIndexedDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items()
+
+    def __reversed__(self) -> Generator[tuple[str | int, object], None, None]:
+        return _LazyIndexedReversedItemsView(self._mapping).__iter__()
+
+
+class _EagerIndexedReversedValuesView(ValuesView):
+    """Reverse-order ValuesView — single-pass reverse iteration."""
+
+    _mapping: EagerIndexedDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values_reverse()
+
+
+class _EagerIndexedReversedItemsView(ItemsView):
+    """Reverse-order ItemsView — single-pass reverse iteration."""
+
+    _mapping: EagerIndexedDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items_reverse()
+
+
+class _LazyIndexedReversedValuesView(ValuesView):
+    """Reverse-order ValuesView — single-pass reverse iteration, lazy child access."""
+
+    _mapping: LazyIndexedDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values_reverse()
+
+
+class _LazyIndexedReversedItemsView(ItemsView):
+    """Reverse-order ItemsView — single-pass reverse iteration, lazy child access."""
+
+    _mapping: LazyIndexedDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items_reverse()
 
 
 MutableMapping.register(EagerIndexedDictView)

@@ -419,3 +419,114 @@ def test_lazy_log_indexed_view_extract_directly():
             assert extracted == {"a": 1, "b": {"nested": "v"}}
     finally:
         storage.close()
+
+
+# ============================================================================
+# VALUES / ITEMS VIEW SUBCLASSES + REVERSED
+# ============================================================================
+
+
+def test_log_values_returns_subclass(log_dict_factory):
+    from virtuals._views.log_indexed_dict_view import _EagerLogIndexedValuesView
+
+    dct = log_dict_factory("dct", {"a": 1, "b": 2})
+    assert isinstance(dct.values(), _EagerLogIndexedValuesView)
+
+
+def test_log_items_returns_subclass(log_dict_factory):
+    from virtuals._views.log_indexed_dict_view import _EagerLogIndexedItemsView
+
+    dct = log_dict_factory("dct", {"a": 1, "b": 2})
+    assert isinstance(dct.items(), _EagerLogIndexedItemsView)
+
+
+def test_lazy_log_values_returns_subclass(log_dict_factory):
+    from virtuals._views.log_indexed_dict_view import _LazyLogIndexedValuesView
+
+    dct = log_dict_factory("dct", {"a": 1}).lazy
+    assert isinstance(dct.values(), _LazyLogIndexedValuesView)
+
+
+def test_lazy_log_items_returns_subclass(log_dict_factory):
+    from virtuals._views.log_indexed_dict_view import _LazyLogIndexedItemsView
+
+    dct = log_dict_factory("dct", {"a": 1}).lazy
+    assert isinstance(dct.items(), _LazyLogIndexedItemsView)
+
+
+def test_log_values_in_log_order(log_dict_factory):
+    dct = log_dict_factory("dct")
+    dct["c"] = 3
+    dct["a"] = 1
+    dct["b"] = 2
+    assert list(dct.values()) == [3, 1, 2]
+
+
+def test_log_items_in_log_order(log_dict_factory):
+    dct = log_dict_factory("dct")
+    dct["c"] = 3
+    dct["a"] = 1
+    dct["b"] = 2
+    assert list(dct.items()) == [("c", 3), ("a", 1), ("b", 2)]
+
+
+def test_log_reversed_values_matches_slice(log_dict_factory):
+    dct = log_dict_factory("dct")
+    for k, v in [("c", 3), ("a", 1), ("b", 2), ("d", 4)]:
+        dct[k] = v
+    fwd = list(dct.values())
+    assert list(reversed(dct.values())) == fwd[::-1]
+
+
+def test_log_reversed_items_matches_slice(log_dict_factory):
+    dct = log_dict_factory("dct")
+    for k, v in [("z", 26), ("a", 1), ("m", 13)]:
+        dct[k] = v
+    fwd = list(dct.items())
+    assert list(reversed(dct.items())) == fwd[::-1]
+
+
+def test_log_reverse_scan_preserves_log_order(log_dict_factory):
+    """Reverse iteration must reflect chronological reverse (newest first),
+    not data-key sort order."""
+    dct = log_dict_factory("dct")
+    order = ["zebra", "alpha", "mango", "beta"]
+    for k in order:
+        dct[k] = k.upper()
+    assert list(reversed(dct)) == list(reversed(order))
+    assert list(reversed(dct.values())) == [k.upper() for k in reversed(order)]
+
+
+def test_log_keys_reverse_still_works(log_dict_factory):
+    """keys_reverse must keep functioning after codec-sentinel migration."""
+    dct = log_dict_factory("dct")
+    for k in ["a", "b", "c", "d"]:
+        dct[k] = k
+    assert list(dct.keys_reverse()) == ["d", "c", "b", "a"]
+    assert list(dct.keys_reverse(limit=2)) == ["d", "c"]
+
+
+def test_log_mixed_primitive_and_container_values(log_dict_factory):
+    dct = log_dict_factory("dct")
+    dct["p1"] = 10
+    dct["n1"] = {"x": 1}
+    dct["p2"] = "hi"
+    dct["n2"] = [1, 2, 3]
+    result = list(dct.values())
+    assert result == [10, {"x": 1}, "hi", [1, 2, 3]]
+
+
+def test_lazy_log_reversed_values_matches_slice(log_dict_factory):
+    from virtuals.view import ViewBase
+
+    dct = log_dict_factory("dct", {"a": {"x": 1}, "b": {"x": 2}, "c": {"x": 3}}).lazy
+    fwd = list(dct.values())
+    assert all(isinstance(v, ViewBase) for v in fwd)
+    rev = list(reversed(dct.values()))
+    assert [v.container.site for v in rev] == [v.container.site for v in fwd[::-1]]
+
+
+def test_lazy_log_reversed_items_matches_slice(log_dict_factory):
+    dct = log_dict_factory("dct", {"a": 1, "b": 2, "c": 3}).lazy
+    fwd = list(dct.items())
+    assert list(reversed(dct.items())) == fwd[::-1]

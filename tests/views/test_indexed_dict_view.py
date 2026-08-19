@@ -327,3 +327,94 @@ class TestIndexedDictCrossNavigation:
         dct = indexed_dict_factory("dct")
         dct["key"] = 42
         assert dct.lazy["key"] == 42
+
+
+# ============================================================================
+# VALUES / ITEMS VIEW SUBCLASSES + REVERSED
+# ============================================================================
+
+
+def test_indexed_values_returns_subclass(indexed_dict_factory):
+    from virtuals._views.indexed_dict_view import _EagerIndexedValuesView
+
+    dct = indexed_dict_factory("dct", {"a": 1, "b": 2})
+    assert isinstance(dct.values(), _EagerIndexedValuesView)
+
+
+def test_indexed_items_returns_subclass(indexed_dict_factory):
+    from virtuals._views.indexed_dict_view import _EagerIndexedItemsView
+
+    dct = indexed_dict_factory("dct", {"a": 1, "b": 2})
+    assert isinstance(dct.items(), _EagerIndexedItemsView)
+
+
+def test_lazy_indexed_values_returns_subclass(indexed_dict_factory):
+    from virtuals._views.indexed_dict_view import _LazyIndexedValuesView
+
+    dct = indexed_dict_factory("dct", {"a": 1}).lazy
+    assert isinstance(dct.values(), _LazyIndexedValuesView)
+
+
+def test_lazy_indexed_items_returns_subclass(indexed_dict_factory):
+    from virtuals._views.indexed_dict_view import _LazyIndexedItemsView
+
+    dct = indexed_dict_factory("dct", {"a": 1}).lazy
+    assert isinstance(dct.items(), _LazyIndexedItemsView)
+
+
+def test_indexed_values_in_insertion_order(indexed_dict_factory):
+    dct = indexed_dict_factory("dct")
+    dct["c"] = 3
+    dct["a"] = 1
+    dct["b"] = 2
+    assert list(dct.values()) == [3, 1, 2]
+
+
+def test_indexed_items_in_insertion_order(indexed_dict_factory):
+    dct = indexed_dict_factory("dct")
+    dct["c"] = 3
+    dct["a"] = 1
+    dct["b"] = 2
+    assert list(dct.items()) == [("c", 3), ("a", 1), ("b", 2)]
+
+
+def test_indexed_reversed_values_matches_slice(indexed_dict_factory):
+    dct = indexed_dict_factory("dct", {"a": 1, "b": 2, "c": 3, "d": 4})
+    fwd = list(dct.values())
+    assert list(reversed(dct.values())) == fwd[::-1]
+
+
+def test_indexed_reversed_items_matches_slice(indexed_dict_factory):
+    dct = indexed_dict_factory("dct", {"a": 1, "b": 2, "c": 3})
+    fwd = list(dct.items())
+    assert list(reversed(dct.items())) == fwd[::-1]
+
+
+def test_indexed_reversed_keys_via_reversed(indexed_dict_factory):
+    dct = indexed_dict_factory("dct", {"a": 1, "b": 2, "c": 3})
+    assert list(reversed(dct)) == ["c", "b", "a"]
+
+
+def test_indexed_mixed_primitive_and_container_values(indexed_dict_factory):
+    dct = indexed_dict_factory(
+        "dct",
+        {"p1": 10, "n1": {"x": 1}, "p2": "hi", "n2": [1, 2, 3]},
+    )
+    result = list(dct.values())
+    assert result == [10, {"x": 1}, "hi", [1, 2, 3]]
+
+
+def test_lazy_indexed_reversed_values_matches_slice(indexed_dict_factory):
+    from virtuals.view import ViewBase
+
+    dct = indexed_dict_factory("dct", {"a": {"x": 1}, "b": {"x": 2}, "c": {"x": 3}}).lazy
+    fwd = list(dct.values())
+    assert all(isinstance(v, ViewBase) for v in fwd)
+    rev = list(reversed(dct.values()))
+    assert [v.container.site for v in rev] == [v.container.site for v in fwd[::-1]]
+
+
+def test_lazy_indexed_reversed_items_matches_slice(indexed_dict_factory):
+    dct = indexed_dict_factory("dct", {"a": 1, "b": 2, "c": 3}).lazy
+    fwd = list(dct.items())
+    assert list(reversed(dct.items())) == fwd[::-1]

@@ -183,22 +183,30 @@ class LogIndexedDictViewBase(
     # view the way they'd watch a plain dict.
 
     def on_change(self) -> SubscriptionOptions:
-        """Any data-side write. Scoped to __data__/ so log-key appends
-        (bookkeeping noise) don't fire the callback."""
+        """Any data-side write.
+
+        Scoped to __data__/ so log-key appends (bookkeeping noise) don't
+        fire the callback.
+        """
         return SubscriptionOptions(PrefixFilter(prefix=(*self.container.site, _DATA)))
 
     def on_child_change(self, address: str | int) -> SubscriptionOptions:
-        """Any write at or under __data__/<address> -- matches primitive
-        set/replace on this child AND nested field writes for compound
-        (shape) children."""
+        """Any write at or under __data__/<address>.
+
+        Matches primitive set/replace on this child AND nested field
+        writes for compound (shape) children.
+        """
         normalized = self.normalize_address(address)
         child_data_site = (*self.container.site, _DATA, normalized)
         return SubscriptionOptions(PrefixFilter(prefix=child_data_site))
 
     def on_children_change(self) -> SubscriptionOptions:
-        """Fires once per new key ever added. Watches __keys__/ appends,
-        which happen exactly once when `__setitem__` sees `is_new`. New
-        mints appear here; replacements of an existing key don't."""
+        """Fires once per new key ever added.
+
+        Watches __keys__/ appends, which happen exactly once when
+        `__setitem__` sees `is_new`. New mints appear here; replacements
+        of an existing key don't.
+        """
         keys_site = (*self.container.site, _KEYS)
         return SubscriptionOptions(WildcardFilter(pattern=(*keys_site, "*")))
 
@@ -207,10 +215,13 @@ class LogIndexedDictViewBase(
         address: object,
         *addresses: object,
     ) -> SubscriptionOptions:
-        """Wildcard match under __data__/. Callers pattern relative to the
-        view's dict (e.g. ("*", "total_txs")); the __data__/ prefix is
-        prepended so real writes match. Name matches nu.core.reactive's
-        OnDescendantsChangeQuery (spelled with 'a')."""
+        """Wildcard match under __data__/.
+
+        Callers pattern relative to the view's dict (e.g.
+        ("*", "total_txs")); the __data__/ prefix is prepended so real
+        writes match. Name matches nu.core.reactive's
+        OnDescendantsChangeQuery (spelled with 'a').
+        """
         pattern = (address, *addresses)
         wildcard_site = (*self.container.site, _DATA, *pattern)
         return SubscriptionOptions(WildcardFilter(pattern=wildcard_site))
@@ -240,29 +251,39 @@ class LogIndexedDictViewBase(
         kc = self._keys_container()
         site = kc.site
 
-        if reverse:
-            # Reverse scans need an upper bound within our prefix range,
-            # else seek_to_last drops us past our prefix and break_filter
-            # trips on the first row. "\x7f" (DEL) sorts after every ASCII
-            # char that shows up in log keys (digits, dash, hex), so it
-            # bounds any real log key from above.
-            cursor = before if before is not None else "\x7f"
-            start = (*site, cursor)
-        elif after is not None:
-            # Forward: start just past the cursor (we skip the cursor row).
-            start = (*site, after)
-        else:
-            start = site
-
         prefix = PrefixFilter(prefix=site)
         child_len = LengthFilter(length=len(site) + 1)
-        opts = StorageScanOptions(
-            start=start,
-            reverse=reverse,
-            limit=limit,
-            break_filter=prefix,
-            filter=prefix & child_len,
-        )
+
+        if reverse and before is None:
+            # Reverse scans need an upper bound within our prefix range;
+            # encoded `site` sorts *below* every child, so it would yield
+            # nothing on a reverse seek. The codec's `upper_bound_of_prefix`
+            # gives a sentinel that sorts strictly above every real log key
+            # under this site — exactly what a reverse scan needs.
+            codec = kc.ctx._storage.codec  # type: ignore[attr-defined]
+            opts = StorageScanOptions(
+                start_encoded=codec.upper_bound_of_prefix(site),
+                reverse=True,
+                limit=limit,
+                break_filter=prefix,
+                filter=prefix & child_len,
+            )
+        else:
+            if reverse:
+                # Reverse with explicit cursor: seek to (site, before).
+                start = (*site, before)
+            elif after is not None:
+                # Forward: start just past the cursor (we skip the cursor row).
+                start = (*site, after)
+            else:
+                start = site
+            opts = StorageScanOptions(
+                start=start,
+                reverse=reverse,
+                limit=limit,
+                break_filter=prefix,
+                filter=prefix & child_len,
+            )
 
         from virtuals.container.context import require_read_context
 
@@ -329,12 +350,17 @@ class LogIndexedDictViewBase(
         streams -- the natural fit for tail-N reads on this view.
         """
         for _log_key, actual_key in self._scan_log_keys(
-            reverse=True, before=before, limit=limit,
+            reverse=True,
+            before=before,
+            limit=limit,
         ):
             yield actual_key
 
     def _keys_scan(
-        self, *, after: str | None, limit: int | None,
+        self,
+        *,
+        after: str | None,
+        limit: int | None,
     ) -> Generator[str | int, None, None]:
         """Yield actual keys with forward cursor + optional cap."""
         for _log_key, actual_key in self._scan_log_keys(after=after, limit=limit):
@@ -579,10 +605,56 @@ class EagerLogIndexedDictView(LogIndexedDictViewBase):
         return self._extract_data_child(address, node_info)
 
     def values(self) -> ValuesView[object]:
-        return ValuesView(self)  # type: ignore[arg-type]
+        """Get all values as a collection view.
+
+        Iterates in `__keys__/`-log order (insertion order), reading each
+        value from `__data__/` per key.
+        """
+        return _EagerLogIndexedValuesView(self)
 
     def items(self) -> ItemsView[str | int, object]:
-        return ItemsView(self)  # type: ignore[arg-type]
+        """Get all items as a set-like view.
+
+        Iterates in `__keys__/`-log order (insertion order), reading each
+        value from `__data__/` per key.
+        """
+        return _EagerLogIndexedItemsView(self)
+
+    def _iter_values(self) -> Generator[object, None, None]:
+        """Single-pass value iteration in log (insertion) order."""
+        for _log_key, actual_key in self._scan_log_keys():
+            node_info, is_container = self._read_child_from_data(actual_key)
+            if not is_container:
+                yield node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield self._extract_data_child(actual_key, node_info)
+
+    def _iter_items(self) -> Generator[tuple[str | int, object], None, None]:
+        """Single-pass items iteration in log (insertion) order."""
+        for _log_key, actual_key in self._scan_log_keys():
+            node_info, is_container = self._read_child_from_data(actual_key)
+            if not is_container:
+                yield actual_key, node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield actual_key, self._extract_data_child(actual_key, node_info)
+
+    def _iter_values_reverse(self) -> Generator[object, None, None]:
+        """Single-pass reverse value iteration (newest first)."""
+        for _log_key, actual_key in self._scan_log_keys(reverse=True):
+            node_info, is_container = self._read_child_from_data(actual_key)
+            if not is_container:
+                yield node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield self._extract_data_child(actual_key, node_info)
+
+    def _iter_items_reverse(self) -> Generator[tuple[str | int, object], None, None]:
+        """Single-pass reverse items iteration (newest first)."""
+        for _log_key, actual_key in self._scan_log_keys(reverse=True):
+            node_info, is_container = self._read_child_from_data(actual_key)
+            if not is_container:
+                yield actual_key, node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield actual_key, self._extract_data_child(actual_key, node_info)
 
     def pop(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
         try:
@@ -627,10 +699,54 @@ class LazyLogIndexedDictView(LogIndexedDictViewBase):
         return self._view_data_child(address, node_info)
 
     def values(self) -> ValuesView[object]:
-        return ValuesView(self)  # type: ignore[arg-type]
+        """Get all values as a collection view.
+
+        Returns Views for containers, values for primitives, in log order.
+        """
+        return _LazyLogIndexedValuesView(self)
 
     def items(self) -> ItemsView[str | int, object]:
-        return ItemsView(self)  # type: ignore[arg-type]
+        """Get all items as a set-like view.
+
+        Returns (key, View|value) pairs in log order.
+        """
+        return _LazyLogIndexedItemsView(self)
+
+    def _iter_values(self) -> Generator[object, None, None]:
+        """Single-pass value iteration in log (insertion) order."""
+        for _log_key, actual_key in self._scan_log_keys():
+            node_info, is_container = self._read_child_from_data(actual_key)
+            if not is_container:
+                yield node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield self._view_data_child(actual_key, node_info)
+
+    def _iter_items(self) -> Generator[tuple[str | int, object], None, None]:
+        """Single-pass items iteration in log (insertion) order."""
+        for _log_key, actual_key in self._scan_log_keys():
+            node_info, is_container = self._read_child_from_data(actual_key)
+            if not is_container:
+                yield actual_key, node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield actual_key, self._view_data_child(actual_key, node_info)
+
+    def _iter_values_reverse(self) -> Generator[object, None, None]:
+        """Single-pass reverse value iteration (newest first)."""
+        for _log_key, actual_key in self._scan_log_keys(reverse=True):
+            node_info, is_container = self._read_child_from_data(actual_key)
+            if not is_container:
+                yield node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield self._view_data_child(actual_key, node_info)
+
+    def _iter_items_reverse(self) -> Generator[tuple[str | int, object], None, None]:
+        """Single-pass reverse items iteration (newest first)."""
+        for _log_key, actual_key in self._scan_log_keys(reverse=True):
+            node_info, is_container = self._read_child_from_data(actual_key)
+            if not is_container:
+                yield actual_key, node_info.primitive_value  # type: ignore[union-attr]
+            else:
+                yield actual_key, self._view_data_child(actual_key, node_info)
 
     def extract(self) -> dict[str | int, object]:
         """Extract all items as a native dict.
@@ -648,6 +764,95 @@ class LazyLogIndexedDictView(LogIndexedDictViewBase):
     @property
     def lazy(self) -> LazyLogIndexedDictView:
         return self
+
+
+# =============================================================================
+# VIEW CLASSES — proper ValuesView / ItemsView with single-pass iteration
+# =============================================================================
+
+
+class _EagerLogIndexedValuesView(ValuesView):
+    """Efficient ValuesView — single-pass iteration in log (insertion) order."""
+
+    _mapping: EagerLogIndexedDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values()
+
+    def __reversed__(self) -> Generator[object, None, None]:
+        return _EagerLogIndexedReversedValuesView(self._mapping).__iter__()
+
+
+class _EagerLogIndexedItemsView(ItemsView):
+    """Efficient ItemsView — single-pass iteration in log (insertion) order."""
+
+    _mapping: EagerLogIndexedDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items()
+
+    def __reversed__(self) -> Generator[tuple[str | int, object], None, None]:
+        return _EagerLogIndexedReversedItemsView(self._mapping).__iter__()
+
+
+class _LazyLogIndexedValuesView(ValuesView):
+    """Efficient ValuesView — single-pass iteration, lazy child access."""
+
+    _mapping: LazyLogIndexedDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values()
+
+    def __reversed__(self) -> Generator[object, None, None]:
+        return _LazyLogIndexedReversedValuesView(self._mapping).__iter__()
+
+
+class _LazyLogIndexedItemsView(ItemsView):
+    """Efficient ItemsView — single-pass iteration, lazy child access."""
+
+    _mapping: LazyLogIndexedDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items()
+
+    def __reversed__(self) -> Generator[tuple[str | int, object], None, None]:
+        return _LazyLogIndexedReversedItemsView(self._mapping).__iter__()
+
+
+class _EagerLogIndexedReversedValuesView(ValuesView):
+    """Reverse-order ValuesView — single-pass reverse iteration."""
+
+    _mapping: EagerLogIndexedDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values_reverse()
+
+
+class _EagerLogIndexedReversedItemsView(ItemsView):
+    """Reverse-order ItemsView — single-pass reverse iteration."""
+
+    _mapping: EagerLogIndexedDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items_reverse()
+
+
+class _LazyLogIndexedReversedValuesView(ValuesView):
+    """Reverse-order ValuesView — single-pass reverse iteration, lazy child access."""
+
+    _mapping: LazyLogIndexedDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values_reverse()
+
+
+class _LazyLogIndexedReversedItemsView(ItemsView):
+    """Reverse-order ItemsView — single-pass reverse iteration, lazy child access."""
+
+    _mapping: LazyLogIndexedDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items_reverse()
 
 
 MutableMapping.register(EagerLogIndexedDictView)
