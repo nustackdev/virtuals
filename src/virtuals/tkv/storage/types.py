@@ -59,6 +59,11 @@ class StorageScanOptions:
     limit: int | None = None
     filter: Filter | None = None
     break_filter: Filter | None = None
+    start_encoded: object | None = None
+    """Pre-encoded start bound. If set, backends use it directly instead of
+    encoding ``start`` — the door to raw sentinels like a codec's
+    ``upper_bound_of_prefix`` output (which cannot be expressed as a plain
+    tuple key). When both are set, ``start_encoded`` wins."""
 
 
 StorageContextType: TypeAlias = "SnapshotProtocol | WriteBatchProtocol | TransactionProtocol"

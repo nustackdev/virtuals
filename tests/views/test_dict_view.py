@@ -100,6 +100,47 @@ def test_dict_items(dict_factory):
     assert items == {"alice": 1, "bob": 2}
 
 
+def test_dict_reversed_values(dict_factory):
+    """reversed(view.values()) yields values in reverse of forward order."""
+    users = dict_factory("users", {"a": 1, "b": 2, "c": 3, "d": 4})
+
+    forward = list(users.values())
+    reverse = list(reversed(users.values()))
+
+    assert reverse == list(reversed(forward))
+
+
+def test_dict_reversed_items(dict_factory):
+    """reversed(view.items()) yields items in reverse of forward order."""
+    users = dict_factory(
+        "users",
+        {"a": 1, "b": {"nested": True}, "c": 3, "d": [1, 2]},
+    )
+
+    forward = list(users.items())
+    reverse = list(reversed(users.items()))
+
+    assert reverse == list(reversed(forward))
+
+
+def test_dict_reversed_lazy_values(dict_factory):
+    """reversed on lazy facet values keeps identity with reversed(forward)."""
+    users = dict_factory("users", {"a": 1, "b": 2, "c": 3})
+
+    forward = list(users.lazy.values())
+    reverse = list(reversed(users.lazy.values()))
+    assert reverse == list(reversed(forward))
+
+
+def test_dict_reversed_lazy_items(dict_factory):
+    """reversed on lazy facet items keeps identity with reversed(forward)."""
+    users = dict_factory("users", {"a": 1, "b": 2, "c": 3})
+
+    forward = list(users.lazy.items())
+    reverse = list(reversed(users.lazy.items()))
+    assert reverse == list(reversed(forward))
+
+
 def test_dict_get_with_default(dict_factory):
     """Test get() with default value."""
     users = dict_factory("users", {"alice": 1})

@@ -299,6 +299,17 @@ class StringKeyCodec:
         # The trailing separator is essential for correct prefix-based range queries
         return _SEPARATOR.join(parts) + _SEPARATOR
 
+    def upper_bound_of_prefix(self, key: Key) -> EncodedStringKey:
+        """Return an encoded sentinel that sorts strictly above every child of ``key``.
+
+        Every child key encodes as ``encode(key) + [<TYPE>]...`` where the first
+        character after the trailing ``.`` is ``[`` (``0x5B``). Appending ``~``
+        (``0x7E`` — the largest printable-ASCII char, strictly above ``[`` and
+        any allowed segment character) yields a string that shares the site
+        prefix and beats every child key in lex order.
+        """
+        return self.encode(key) + "~"
+
     def decode(self, encoded: EncodedStringKey) -> Key:
         """Decode string data back to original tuple key.
 

@@ -130,6 +130,22 @@ class KeyCodecProtocol(Protocol[EncodedKeyT]):
         """
         ...
 
+    def upper_bound_of_prefix(self, key: Key) -> EncodedKeyT:
+        """Encoded sentinel that sorts strictly greater than every valid child key.
+
+        Given a site (tuple key), returns encoded bytes/string that is
+        strictly greater than every possible ``(*site, seg, ...)`` child
+        key, but shares the same site prefix. Used as the inclusive upper
+        bound for reverse child scans.
+
+        Args:
+            key: Site (parent) key
+
+        Returns:
+            Encoded upper-bound sentinel
+        """
+        ...
+
 
 class ValueCodecProtocol(Protocol[EncodedValueT]):
     """Protocol for encoding/decoding storage values.

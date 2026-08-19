@@ -55,6 +55,7 @@ class Codec(Generic[EncodedKeyT, EncodedValueT]):
 
         self.encode_key = self.key_codec.encode
         self.decode_key = self.key_codec.decode
+        self.upper_bound_of_prefix = self.key_codec.upper_bound_of_prefix
         self.encode_value = self.value_codec.encode
         self.decode_value = self.value_codec.decode
 
@@ -64,6 +65,10 @@ class Codec(Generic[EncodedKeyT, EncodedValueT]):
 
     def decode_key(self, encoded: EncodedKeyT) -> Key:
         """Decode a key using the key codec."""
+        raise NotImplementedError
+
+    def upper_bound_of_prefix(self, key: Key) -> EncodedKeyT:
+        """Encoded upper-bound sentinel for a site's child range."""
         raise NotImplementedError
 
     def encode_value(self, value: Value) -> EncodedValueT:

@@ -360,14 +360,40 @@ def get_child_type(site: site_.Site, key: site_.SiteSegment, ctx: StorageContext
     return get_node_type(child_site, ctx)
 
 
-def _child_scan_options(site: site_.Site) -> StorageScanOptions:
+def _child_scan_options(
+    site: site_.Site,
+    ctx: StorageContextType | None = None,
+    *,
+    reverse: bool = False,
+) -> StorageScanOptions:
     """Build scan options for iterating direct children of a site.
 
     Returns StorageScanOptions with PrefixFilter (break on prefix mismatch)
     and LengthFilter (only direct children, not deeper descendants).
+
+    Forward (default): ``start=site`` — every child key sorts ``> site``
+    encoded, so seek lands at the first child.
+
+    Reverse (``reverse=True``): ``start_encoded`` is set to the codec's
+    ``upper_bound_of_prefix(site)``. In reverse mode ``start`` is treated
+    as an inclusive upper bound; encoded ``site`` sorts *below* every
+    child (the forward path relies on this), so it would yield nothing.
+    The upper-bound sentinel sorts strictly *above* every child, which is
+    what a reverse scan actually needs. ``ctx`` is required for reverse
+    since we reach for the storage's codec.
     """
     prefix = PrefixFilter(prefix=site)
     child_len = LengthFilter(length=len(site) + 1)
+    if reverse:
+        if ctx is None:
+            raise ValueError("reverse child scan requires a storage context")
+        codec = ctx._storage.codec  # type: ignore[attr-defined]
+        return StorageScanOptions(
+            start_encoded=codec.upper_bound_of_prefix(site),
+            reverse=True,
+            break_filter=prefix,
+            filter=prefix & child_len,
+        )
     return StorageScanOptions(
         start=site,
         break_filter=prefix,
@@ -379,6 +405,8 @@ def iter_child_keys(
     site: site_.Site,
     ctx: StorageContextType,
     validate: bool = False,
+    *,
+    reverse: bool = False,
 ) -> Generator[site_.SiteSegment, None, None]:
     """Iterate over direct child keys.
 
@@ -386,6 +414,7 @@ def iter_child_keys(
         site: Container site
         ctx: Storage context (transaction, snapshot or write batch)
         validate: If True, validate site is a container (default False)
+        reverse: If True, yield in reverse insertion order (default False)
 
     Yields:
         Child keys (last segment of each child site)
@@ -402,7 +431,9 @@ def iter_child_keys(
     if validate:
         validate_is_container(site, ctx)
 
-    for key in require_read_context(ctx).scan(_child_scan_options(site)).keys():
+    for key in (
+        require_read_context(ctx).scan(_child_scan_options(site, ctx, reverse=reverse)).keys()
+    ):
         yield key[-1]
 
 
@@ -410,6 +441,8 @@ def iter_child_values(
     site: site_.Site,
     ctx: StorageContextType,
     validate: bool = False,
+    *,
+    reverse: bool = False,
 ) -> Generator[NodeInfo, None, None]:
     """Iterate over direct child node info.
 
@@ -417,6 +450,7 @@ def iter_child_values(
         site: Container site
         ctx: Storage context (transaction, snapshot or write batch)
         validate: If True, validate site is a container (default False)
+        reverse: If True, yield in reverse insertion order (default False)
 
     Yields:
         NodeInfo for each direct child
@@ -429,7 +463,9 @@ def iter_child_values(
     if validate:
         validate_is_container(site, ctx)
 
-    for key, value in require_read_context(ctx).scan(_child_scan_options(site)).items():
+    for key, value in (
+        require_read_context(ctx).scan(_child_scan_options(site, ctx, reverse=reverse)).items()
+    ):
         yield get_node_info(key, ctx, raw_value=value)
 
 
@@ -437,6 +473,8 @@ def iter_children(
     site: site_.Site,
     ctx: StorageContextType,
     validate: bool = False,
+    *,
+    reverse: bool = False,
 ) -> Generator[tuple[site_.SiteSegment, NodeInfo], None, None]:
     """Iterate over direct children with their info.
 
@@ -444,6 +482,7 @@ def iter_children(
         site: Container site
         ctx: Storage context (transaction, snapshot or write batch)
         validate: If True, validate site is a container (default False)
+        reverse: If True, yield in reverse insertion order (default False)
 
     Yields:
         Tuples of (child_key, NodeInfo)
@@ -456,7 +495,9 @@ def iter_children(
     if validate:
         validate_is_container(site, ctx)
 
-    for key, value in require_read_context(ctx).scan(_child_scan_options(site)).items():
+    for key, value in (
+        require_read_context(ctx).scan(_child_scan_options(site, ctx, reverse=reverse)).items()
+    ):
         yield (key[-1], get_node_info(key, ctx, raw_value=value))
 
 

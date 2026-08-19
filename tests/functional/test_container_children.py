@@ -510,6 +510,85 @@ def test_iter_children_basic(tx: TransactionProtocol) -> None:
             assert info.structure == ContainerStructure(2)
 
 
+def test_iter_children_reverse_empty(tx: TransactionProtocol) -> None:
+    """Reverse iteration over an empty container yields nothing."""
+    create_container(
+        ("users",),
+        ContainerStructure(1),
+        ContainerProtocol.MUTABLE,
+        tx,
+        ensure_healthy_parents=False,
+    )
+
+    assert list(iter_children(("users",), tx, reverse=True)) == []
+
+
+def test_iter_children_reverse_mirrors_forward(tx: TransactionProtocol) -> None:
+    """Reverse yields exactly the forward sequence, backwards."""
+    create_container(
+        ("users",),
+        ContainerStructure(1),
+        ContainerProtocol.MUTABLE,
+        tx,
+        ensure_healthy_parents=False,
+    )
+    for key in ("alice", "bob", "charlie"):
+        put_child_primitive(("users",), key, {"name": key}, tx)
+    create_child_container(
+        ("users",),
+        "posts",
+        ContainerStructure(2),
+        ContainerProtocol.MUTABLE,
+        tx,
+    )
+
+    forward = list(iter_children(("users",), tx))
+    reverse = list(iter_children(("users",), tx, reverse=True))
+
+    assert reverse == list(reversed(forward))
+
+
+def test_iter_child_keys_reverse(tx: TransactionProtocol) -> None:
+    """iter_child_keys(reverse=True) mirrors the forward key order."""
+    create_container(
+        ("users",),
+        ContainerStructure(1),
+        ContainerProtocol.MUTABLE,
+        tx,
+        ensure_healthy_parents=False,
+    )
+    for key in ("a", "b", "c", "d"):
+        put_child_primitive(("users",), key, key, tx)
+
+    forward = list(iter_child_keys(("users",), tx))
+    reverse = list(iter_child_keys(("users",), tx, reverse=True))
+    assert reverse == list(reversed(forward))
+
+
+def test_iter_children_reverse_isolated_from_siblings(tx: TransactionProtocol) -> None:
+    """Reverse scan stays inside its own site — sibling containers ignored."""
+    create_container(
+        ("users",),
+        ContainerStructure(1),
+        ContainerProtocol.MUTABLE,
+        tx,
+        ensure_healthy_parents=False,
+    )
+    create_container(
+        ("zzz_after",),
+        ContainerStructure(1),
+        ContainerProtocol.MUTABLE,
+        tx,
+        ensure_healthy_parents=False,
+    )
+    put_child_primitive(("zzz_after",), "noise", "ignored", tx)
+    for key in ("alice", "bob"):
+        put_child_primitive(("users",), key, key, tx)
+
+    reverse_keys = [k for k, _ in iter_children(("users",), tx, reverse=True)]
+    assert reverse_keys == ["bob", "alice"]
+
+
 def test_count_children_basic(tx: TransactionProtocol) -> None:
     """Test counting children."""
     create_container(

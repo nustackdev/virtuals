@@ -244,12 +244,13 @@ class Container:
         return container_ops.get_child_type(self.site, key, self.ctx)
 
     def iter_child_keys(
-        self, *, validate: bool = False
+        self, *, validate: bool = False, reverse: bool = False
     ) -> Generator[site_.SiteSegment, None, None]:
         """Iterate over direct child keys.
 
         Args:
             validate: If True, validate this is a container (default False)
+            reverse: If True, yield in reverse insertion order (default False)
 
         Yields:
             Child keys
@@ -259,15 +260,18 @@ class Container:
             ContainerTypeError: If site is not a container (when validate=True)
             StorageInterfaceError: If context doesn't support reads
         """
-        yield from container_ops.iter_child_keys(self.site, self.ctx, validate=validate)
+        yield from container_ops.iter_child_keys(
+            self.site, self.ctx, validate=validate, reverse=reverse
+        )
 
     def iter_children(
-        self, *, validate: bool = False
+        self, *, validate: bool = False, reverse: bool = False
     ) -> Generator[tuple[site_.SiteSegment, NodeInfo], None, None]:
         """Iterate over direct children with their info.
 
         Args:
             validate: If True, validate this is a container (default False)
+            reverse: If True, yield in reverse insertion order (default False)
 
         Yields:
             Tuples of (child_key, NodeInfo)
@@ -277,7 +281,9 @@ class Container:
             ContainerTypeError: If site is not a container (when validate=True)
             StorageInterfaceError: If context doesn't support reads
         """
-        yield from container_ops.iter_children(self.site, self.ctx, validate=validate)
+        yield from container_ops.iter_children(
+            self.site, self.ctx, validate=validate, reverse=reverse
+        )
 
     def count_children(self, *, validate: bool = False) -> int:
         """Count direct children.

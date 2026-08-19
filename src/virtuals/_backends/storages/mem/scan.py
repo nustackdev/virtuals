@@ -64,8 +64,14 @@ class InMemoryScan(ScanProtocol):
         options = self._options
         codec = self._storage.codec
 
-        # Encode start bound for comparison
-        start_str = codec.encode_key(options.start) if options.start is not None else None
+        # Encode start bound for comparison. `start_encoded` wins when set —
+        # lets callers pass codec sentinels like `upper_bound_of_prefix`.
+        if options.start_encoded is not None:
+            start_str = options.start_encoded
+        elif options.start is not None:
+            start_str = codec.encode_key(options.start)
+        else:
+            start_str = None
 
         # Get all encoded keys
         if isinstance(state, TransactionState):

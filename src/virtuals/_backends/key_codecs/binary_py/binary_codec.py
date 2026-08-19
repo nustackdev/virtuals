@@ -325,6 +325,17 @@ class PyBinaryKeyCodec(KeyCodecProtocol[EncodedBinaryKey]):
         # Parts already include terminator after each component
         return b"".join(parts)
 
+    def upper_bound_of_prefix(self, key: Key) -> EncodedBinaryKey:
+        """Return an encoded sentinel that sorts strictly above every child of ``key``.
+
+        Every child key of ``key`` encodes as ``encode(key) + <child-seg>`` where
+        the child segment starts with a type marker byte (``TYPE_INT=0x01`` or
+        ``TYPE_STR=0x02``). Appending ``0xFF`` — the largest possible byte, and
+        strictly greater than any valid segment type marker — yields bytes that
+        share the site prefix and beat every child key in lex order.
+        """
+        return self.encode(key) + b"\xff"
+
     def decode(self, encoded: EncodedBinaryKey) -> Key:
         """Decode binary data back to original tuple key.
 

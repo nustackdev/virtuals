@@ -132,8 +132,15 @@ class RocksDBScan(ScanProtocol):
             raise StorageOperationError(f"Failed to create iterator: {e}") from e
 
         try:
-            # Encode start bound for comparison
-            start_key_encoded = codec.encode_key(options.start) if options.start else b""
+            # Encode start bound for comparison. `start_encoded` (raw bytes)
+            # wins when provided — lets callers pass codec sentinels like
+            # `upper_bound_of_prefix` that can't be spelled as a plain tuple.
+            if options.start_encoded is not None:
+                start_key_encoded = cast("bytes", options.start_encoded)
+            elif options.start:
+                start_key_encoded = codec.encode_key(options.start)
+            else:
+                start_key_encoded = b""
 
             # Seek to start based on direction
             try:

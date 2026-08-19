@@ -255,6 +255,22 @@ class EagerDictView(DictViewBase):
             elif v.node_type == NodeType.CONTAINER:
                 yield k, self._get_child_value(k, node_info=v)
 
+    def _iter_values_reverse(self) -> Generator[object, None, None]:
+        """Efficient single-pass reverse value iteration over storage."""
+        for k, v in self.container.iter_children(validate=False, reverse=True):
+            if v.node_type == NodeType.PRIMITIVE:
+                yield v.primitive_value
+            elif v.node_type == NodeType.CONTAINER:
+                yield self._get_child_value(k, node_info=v)
+
+    def _iter_items_reverse(self) -> Generator[tuple[str | int, object], None, None]:
+        """Efficient single-pass reverse items iteration over storage."""
+        for k, v in self.container.iter_children(validate=False, reverse=True):
+            if v.node_type == NodeType.PRIMITIVE:
+                yield k, v.primitive_value
+            elif v.node_type == NodeType.CONTAINER:
+                yield k, self._get_child_value(k, node_info=v)
+
     def pop(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
         """Remove and return value."""
         try:
@@ -387,6 +403,22 @@ class LazyDictView(DictViewBase):
             elif v.node_type == NodeType.CONTAINER:
                 yield k, self._get_child_view_or_value(k, node_info=v)
 
+    def _iter_values_reverse(self) -> Generator[object, None, None]:
+        """Efficient single-pass reverse value iteration over storage."""
+        for k, v in self.container.iter_children(validate=False, reverse=True):
+            if v.node_type == NodeType.PRIMITIVE:
+                yield v.primitive_value
+            elif v.node_type == NodeType.CONTAINER:
+                yield self._get_child_view_or_value(k, node_info=v)
+
+    def _iter_items_reverse(self) -> Generator[tuple[str | int, object], None, None]:
+        """Efficient single-pass reverse items iteration over storage."""
+        for k, v in self.container.iter_children(validate=False, reverse=True):
+            if v.node_type == NodeType.PRIMITIVE:
+                yield k, v.primitive_value
+            elif v.node_type == NodeType.CONTAINER:
+                yield k, self._get_child_view_or_value(k, node_info=v)
+
     # =========================================================================
     # FACET NAVIGATION
     # =========================================================================
@@ -415,6 +447,9 @@ class _EagerValuesView(ValuesView):
     def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
         yield from self._mapping._iter_values()
 
+    def __reversed__(self) -> Generator[object, None, None]:
+        return _EagerReversedValuesView(self._mapping).__iter__()
+
 
 class _EagerItemsView(ItemsView):
     """Efficient ItemsView — single-pass iteration over storage."""
@@ -423,6 +458,9 @@ class _EagerItemsView(ItemsView):
 
     def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
         yield from self._mapping._iter_items()
+
+    def __reversed__(self) -> Generator[tuple[str | int, object], None, None]:
+        return _EagerReversedItemsView(self._mapping).__iter__()
 
 
 class _LazyValuesView(ValuesView):
@@ -433,6 +471,9 @@ class _LazyValuesView(ValuesView):
     def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
         yield from self._mapping._iter_values()
 
+    def __reversed__(self) -> Generator[object, None, None]:
+        return _LazyReversedValuesView(self._mapping).__iter__()
+
 
 class _LazyItemsView(ItemsView):
     """Efficient ItemsView — single-pass iteration, lazy child access."""
@@ -441,6 +482,45 @@ class _LazyItemsView(ItemsView):
 
     def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
         yield from self._mapping._iter_items()
+
+    def __reversed__(self) -> Generator[tuple[str | int, object], None, None]:
+        return _LazyReversedItemsView(self._mapping).__iter__()
+
+
+class _EagerReversedValuesView(ValuesView):
+    """Reverse-order ValuesView — single-pass reverse iteration over storage."""
+
+    _mapping: EagerDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values_reverse()
+
+
+class _EagerReversedItemsView(ItemsView):
+    """Reverse-order ItemsView — single-pass reverse iteration over storage."""
+
+    _mapping: EagerDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items_reverse()
+
+
+class _LazyReversedValuesView(ValuesView):
+    """Reverse-order ValuesView — single-pass reverse iteration, lazy child access."""
+
+    _mapping: LazyDictView
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_values_reverse()
+
+
+class _LazyReversedItemsView(ItemsView):
+    """Reverse-order ItemsView — single-pass reverse iteration, lazy child access."""
+
+    _mapping: LazyDictView
+
+    def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items_reverse()
 
 
 MutableMapping.register(EagerDictView)

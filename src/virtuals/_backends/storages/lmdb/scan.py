@@ -56,7 +56,10 @@ class LMDBScan(ScanProtocol):
         need_values = iterator_type != _IteratorType.KEYS
 
         start_key_encoded: bytes | None = None
-        if options.start is not None:
+        if options.start_encoded is not None:
+            # Raw pre-encoded bound (e.g. codec.upper_bound_of_prefix output).
+            start_key_encoded = cast("bytes", options.start_encoded)
+        elif options.start is not None:
             try:
                 start_key_encoded = codec.encode_key(options.start)
             except Exception as e:

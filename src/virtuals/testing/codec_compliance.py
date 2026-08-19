@@ -236,6 +236,48 @@ class KeyCodecCompliance:
         with pytest.raises(Exception):
             codec.encode((("nested",),))  # type: ignore
 
+    # ========================================================================
+    # upper_bound_of_prefix Tests
+    # ========================================================================
+
+    def test_upper_bound_str_children(self, codec: KeyCodecProtocolForTest) -> None:
+        """Upper bound sorts strictly above every str child of the same site."""
+        site = ("users",)
+        ub = codec.upper_bound_of_prefix(site)
+        for seg in ("a", "z", "alice", "~~~", "0", "user_9"):
+            child = codec.encode((*site, seg))
+            assert child < ub, f"child {seg!r} not below upper bound"
+
+    def test_upper_bound_int_children(self, codec: KeyCodecProtocolForTest) -> None:
+        """Upper bound sorts strictly above every int child of the same site."""
+        site = ("items", 42)
+        ub = codec.upper_bound_of_prefix(site)
+        for seg in (-1000, -1, 0, 1, 1000):
+            child = codec.encode((*site, seg))
+            assert child < ub, f"child {seg!r} not below upper bound"
+
+    def test_upper_bound_deep_descendants_still_below(
+        self,
+        codec: KeyCodecProtocolForTest,
+    ) -> None:
+        """Descendants at greater depth also sort below the site's upper bound."""
+        site = ("users",)
+        ub = codec.upper_bound_of_prefix(site)
+        for descendant in (
+            ("users", "alice", "profile"),
+            ("users", 99, "profile", "field"),
+            ("users", "zzz", "z", "z"),
+        ):
+            assert codec.encode(descendant) < ub
+
+    def test_upper_bound_shares_site_prefix(self, codec: KeyCodecProtocolForTest) -> None:
+        """Upper bound starts with the encoded site — same prefix range."""
+        site = ("users", 42)
+        encoded_site = codec.encode(site)
+        ub = codec.upper_bound_of_prefix(site)
+        # Cross-type startswith works uniformly for bytes and str.
+        assert ub[: len(encoded_site)] == encoded_site
+
 
 # =============================================================================
 # Value Codec Compliance Tests
