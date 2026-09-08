@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 # ============================================================================
 [project]
 name = "virtuals-py"
-version = "0.1.7"
+version = "0.1.8"
 description = "Virtual Python collections over any storage."
 readme = "README.md"
 license = "Apache-2.0"
@@ -69,25 +69,21 @@ redis = [
     "msgpack>=1.0",
 ]
 
-# Development tools
+# Every storage backend
+all = [
+    "virtuals-py[rocksdb,lmdb,redis]",
+]
+
+# Development tools, including everything the test suite needs
 dev = [
     "ruff>=0.1.0",
     "pre-commit>=3.0.0",
-]
-
-# Testing
-test = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",
     "pytest-timeout>=2.1.0",
     "pytest-benchmark>=4.0.0",
     "hypothesis>=6.0.0",
-]
-
-# All development dependencies
-all = [
-    "virtuals-py[dev,test]",
 ]
 
 # ============================================================================
