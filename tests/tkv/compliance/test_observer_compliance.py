@@ -1,7 +1,7 @@
 """Compliance tests for tkv publisher/observer bundles.
 
 Runs the ObserverCompliance suite against every storage backend that
-supports publishers (InMemory, RocksDB, LMDB, TextDB). The publisher/
+supports publishers (InMemory, RocksDB, LMDB, SQLite, TextDB). The publisher/
 observer implementations under test can be the in-mem pair (default)
 or the Redis pair. This proves the notify/flush contract holds
 uniformly across storage backends.
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 
@@ -20,14 +19,11 @@ from virtuals._backends.publishers.mem import InMemoryPublisher
 from virtuals._backends.storages.lmdb import LMDBStorage
 from virtuals._backends.storages.mem import InMemoryStorage
 from virtuals._backends.storages.rocksdb import RocksDBStorage
+from virtuals._backends.storages.sqlite import SQLiteStorage
 from virtuals._backends.storages.textdb import TextStorage
 from virtuals.codecs import BinaryCodec, NoOpCodec, TextCodec
 from virtuals.testing import ObservableBundle, ObserverCompliance, RegistryCompliance
 from virtuals.tkv.transport import InMemoryTransport
-
-
-if TYPE_CHECKING:
-    pass
 
 
 class TestInMemoryObserverRegistryCompliance(RegistryCompliance):
@@ -91,6 +87,25 @@ class TestLMDBObserverCompliance(ObserverCompliance):
             map_size=64 * 1024 * 1024,
             publisher=publisher,
         )
+        storage.open()
+        yield ObservableBundle(storage=storage, publisher=publisher, observer=observer)
+        storage.close()
+        observer.disconnect()
+        publisher.disconnect()
+
+
+class TestSQLiteObserverCompliance(ObserverCompliance):
+    """ObserverProtocol contract against SQLite storage."""
+
+    @pytest.fixture
+    def bundle(self, tmp_path: Path):
+        codec = BinaryCodec()
+        transport = InMemoryTransport()
+        publisher = InMemoryPublisher(transport)
+        publisher.connect()
+        observer = InMemoryObserver(transport)
+        observer.connect()
+        storage = SQLiteStorage(path=tmp_path / "test.sqlite", codec=codec, publisher=publisher)
         storage.open()
         yield ObservableBundle(storage=storage, publisher=publisher, observer=observer)
         storage.close()

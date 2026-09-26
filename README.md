@@ -70,7 +70,7 @@ pip install virtuals-py[rocksdb]  # with RocksDB backend
 
 - **Virtual collections**: Work with dicts, lists, sets over any KV backend
 - **Tuple keys**: Natural hierarchical addressing with lexicographic ordering
-- **Backend agnostic**: Works with any ordered KV store (RocksDB, LMDB, in-memory)
+- **Backend agnostic**: Works with any ordered KV store (RocksDB, LMDB, SQLite, in-memory)
 - **Observable**: Watch for changes at any level of the hierarchy
 - **Transactional**: Full ACID support when the backend provides it
 - **Lazy**: Nothing materializes until accessed
