@@ -84,7 +84,11 @@ class ChildObservableBase(AddressMappingBase[A]):
     """
 
     def on_child_change(self, address: A) -> SubscriptionOptions:
-        """Build subscription options for a specific child and its subtree.
+        """Build subscription options for a specific child, not its subtree.
+
+        Matches writes at the child's own key only. A compound child (a dict
+        or shape stored as a subtree) changing deeper needs
+        ``on_descendants_change``.
 
         Args:
             address: Child address to watch
@@ -105,7 +109,10 @@ class ChildObservableBase(AddressMappingBase[A]):
         )
 
     def on_children_change(self) -> SubscriptionOptions:
-        """Build subscription options for all children.
+        """Build subscription options for all direct children, not their subtrees.
+
+        Matches writes one level below this view only. A compound child
+        changing deeper needs ``on_descendants_change``.
 
         Returns:
             SubscriptionOptions describing the filter shape.
