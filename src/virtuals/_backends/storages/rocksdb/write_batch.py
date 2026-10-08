@@ -138,6 +138,7 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
             raise StorageTransactionError("Write batch already aborted")
 
         batch = self._require_active()
+        self._storage._require_open()
 
         # Write to RocksDB
         try:

@@ -54,6 +54,9 @@ class RocksDBStorage:
 
     Provides persistent key-value storage with transactions, snapshots,
     and optional change notifications via a publisher.
+
+    A transaction, snapshot or scan belongs to one thread: do not share it
+    between threads, and close the storage only once every thread is done.
     """
 
     def __init__(
@@ -210,7 +213,7 @@ class RocksDBStorage:
             self._db = rdbpy.TransactionDB(
                 str(self._path),
                 options,
-                txn_db_options,
+                txn_db_opts=txn_db_options,
             )
         except Exception as e:
             raise StorageError(f"Failed to open RocksDB TransactionDB: {e}") from e
@@ -307,11 +310,11 @@ class RocksDBStorage:
             self._active_write_batches.clear()
             self._active_snapshots.clear()
 
-            # Close database
+            # Close database. Any rdbpy iterator still referenced (e.g. by a
+            # suspended scan generator) is invalidated by rdbpy, not freed.
             if self._db is not None:
                 try:
-                    if not self._is_secondary:
-                        self._db.close()
+                    self._db.close()
                 except Exception as e:
                     raise StorageError(f"Failed to close database: {e}") from e
                 finally:
@@ -546,14 +549,16 @@ class RocksDBStorage:
     def transaction(self) -> Iterator[RocksDBTransaction]:
         """Context manager for a read-write transaction.
 
-        Commits on successful exit, aborts on exception.
+        Commits on successful exit, aborts on any exception (including
+        KeyboardInterrupt, cancellation and GeneratorExit) so row locks are
+        never left held.
         """
         txn = self.begin_transaction()
         try:
             yield txn
             if not txn._committed and not txn._aborted:
                 txn.commit()
-        except Exception:
+        except BaseException:
             try:
                 if not txn._committed and not txn._aborted:
                     txn.abort()
@@ -580,14 +585,14 @@ class RocksDBStorage:
     def batch_write(self) -> Iterator[RocksDBWriteBatch]:
         """Context manager for a write batch.
 
-        Writes on successful exit, aborts on exception.
+        Writes on successful exit, aborts on any exception.
         """
         batch = self.begin_write_batch()
         try:
             yield batch
             if not batch._written and not batch._aborted:
                 batch.write()
-        except Exception:
+        except BaseException:
             try:
                 if not batch._written and not batch._aborted:
                     batch.abort()
