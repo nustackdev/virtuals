@@ -8,9 +8,11 @@ standard library.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from logging import getLogger
 from pathlib import Path
@@ -29,6 +31,7 @@ from .context import is_busy_error
 from .snapshot import SQLiteSnapshot
 from .transaction import SQLiteTransaction
 from .write_batch import SQLiteWriteBatch
+from .write_slot import SQLiteWriteSlot
 
 
 if TYPE_CHECKING:
@@ -49,9 +52,30 @@ logger = getLogger(__name__)
 DEFAULT_BUSY_TIMEOUT = 60.0  # seconds
 DEFAULT_MAX_IDLE_CONNECTIONS = 8
 
+# Poll interval bounds for a coroutine waiting on the writer slot (seconds).
+_SLOT_POLL_MIN = 0.0005
+_SLOT_POLL_MAX = 0.005
+
 Synchronous = Literal["OFF", "NORMAL", "FULL", "EXTRA"]
 
 _SCHEMA = "CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID"
+
+_Owner = tuple[int, "asyncio.Task | None"]
+
+
+_REENTRY_MESSAGE = (
+    "This task or thread already holds the write lock on this SQLite storage; "
+    "a second write transaction here would wait on itself"
+)
+
+
+def _caller() -> _Owner:
+    """Who is asking for the writer slot: this thread, and its running task if any."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:  # no running event loop on this thread
+        task = None
+    return threading.get_ident(), task
 
 
 class SQLiteStorage:
@@ -80,11 +104,17 @@ class SQLiteStorage:
     different threads therefore never share a connection or a lock, a
     snapshot never waits behind a writer, and a context may be begun on
     one thread and finished on another. Writers in this process also take
-    an in-process lock before ``BEGIN IMMEDIATE`` so they hand off to each
-    other directly rather than through SQLite's sleeping busy handler. A
-    thread that already holds the write lock and begins a second write
-    transaction gets ``StorageLockTimeoutError`` at once instead of
-    deadlocking on itself (the single-threaded event-loop case).
+    an in-process writer slot before ``BEGIN IMMEDIATE`` so they hand off
+    to each other directly rather than through SQLite's sleeping busy
+    handler. A sync writer blocks on the slot for up to ``busy_timeout``.
+
+    Coroutines: the slot belongs to a thread and, on an event loop, to the
+    task that took it. Coroutines sharing one loop wait for it with
+    ``areserve_write_slot``, which polls without blocking the loop, and
+    hand the slot to ``begin_transaction(write_slot=...)``. A sync begin
+    on a thread whose own task or loop already holds the slot raises
+    ``StorageLockTimeoutError`` at once instead of waiting: the holder
+    could never run to release it.
     """
 
     def __init__(
@@ -152,7 +182,7 @@ class SQLiteStorage:
         # In-process writer slot. A plain Lock (not RLock): it may be
         # released from a different thread than the one that took it.
         self._write_lock = threading.Lock()
-        self._write_owner: int | None = None
+        self._write_owner: _Owner | None = None
 
         self._active_transactions: set[SQLiteTransaction] = set()
         self._active_write_batches: set[SQLiteWriteBatch] = set()
@@ -339,17 +369,60 @@ class SQLiteStorage:
             self._active_snapshots.add(snapshot)
         return snapshot
 
-    def begin_transaction(self) -> SQLiteTransaction:
-        """Begin read-write transaction, taking the write lock now."""
+    def begin_transaction(self, *, write_slot: SQLiteWriteSlot | None = None) -> SQLiteTransaction:
+        """Begin read-write transaction, taking the write lock now.
+
+        Args:
+            write_slot: A slot from ``areserve_write_slot``. The transaction
+                takes it over instead of acquiring the slot itself, then
+                releases it on commit or abort. None acquires as usual.
+        """
         if self._read_only:
             raise StorageError("Cannot start transaction in read only mode.")
         self._require_open()
 
-        conn = self._begin_write_connection()
+        conn = self._begin_write_connection(write_slot)
         transaction = SQLiteTransaction(self, conn)
         with self._state_lock:
             self._active_transactions.add(transaction)
         return transaction
+
+    async def areserve_write_slot(self) -> SQLiteWriteSlot:
+        """Wait for the writer slot without blocking the event loop.
+
+        Polls the slot with a short, growing sleep between tries, so other
+        coroutines on the loop keep running, including the one that holds
+        it. Waits behind other threads too.
+
+        Returns:
+            The held slot, for ``begin_transaction(write_slot=...)``. Call
+            its ``release`` if no transaction takes it.
+
+        Raises:
+            StorageLockTimeoutError: If this task already holds the slot,
+                or it is not free within ``busy_timeout``.
+        """
+        if self._read_only:
+            raise StorageError("Cannot reserve the write slot in read only mode.")
+        self._require_open()
+        self._check_fork()
+
+        me = _caller()
+        if self._write_owner == me:
+            raise StorageLockTimeoutError(_REENTRY_MESSAGE)
+        lock = self._write_lock
+        deadline = time.monotonic() + max(self._busy_timeout, 0)
+        delay = _SLOT_POLL_MIN
+        while not lock.acquire(blocking=False):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StorageLockTimeoutError(
+                    f"Timed out after {self._busy_timeout}s waiting for the write lock"
+                )
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, _SLOT_POLL_MAX)
+        self._write_owner = me
+        return SQLiteWriteSlot(self, lock)
 
     def begin_write_batch(self) -> SQLiteWriteBatch:
         """Begin write-only batch. Takes no lock until ``write``."""
@@ -467,42 +540,68 @@ class SQLiteStorage:
                 return
         conn.close()
 
-    def _begin_write_connection(self) -> sqlite3.Connection:
+    def _begin_write_connection(
+        self, write_slot: SQLiteWriteSlot | None = None
+    ) -> sqlite3.Connection:
         """Take the writer slot and a connection with ``BEGIN IMMEDIATE`` run.
 
-        On failure nothing is held: the slot and the connection are given
-        back before raising.
+        With ``write_slot`` the slot is already held and is taken over, not
+        acquired. On failure nothing is held: the connection is given back,
+        and the slot is released, or returned to ``write_slot``'s holder.
         """
         self._check_fork()
-        me = threading.get_ident()
-        if self._write_owner == me:
-            raise StorageLockTimeoutError(
-                "This thread already holds the write lock on this SQLite storage; "
-                "a second write transaction here would wait on itself"
-            )
-        if not self._write_lock.acquire(timeout=max(self._busy_timeout, 0)):
-            raise StorageLockTimeoutError(
-                f"Timed out after {self._busy_timeout}s waiting for the write lock"
-            )
-        self._write_owner = me
+        if write_slot is not None:
+            write_slot._take(self)
+        else:
+            self._acquire_write_slot()
+
+        def give_back_slot() -> None:
+            if write_slot is not None:
+                write_slot._give_back()
+            else:
+                self._release_write_slot()
 
         try:
             conn = self._acquire_connection()
         except Exception:
-            self._release_write_slot()
+            give_back_slot()
             raise
 
         try:
             conn.execute("BEGIN IMMEDIATE")
         except Exception as e:
             self._release_connection(conn)
-            self._release_write_slot()
+            give_back_slot()
             if is_busy_error(e):
                 raise StorageLockTimeoutError(
                     f"Timed out after {self._busy_timeout}s waiting for the write lock: {e}"
                 ) from e
             raise StorageError(f"Failed to begin write transaction: {e}") from e
         return conn
+
+    def _acquire_write_slot(self) -> None:
+        """Block for the writer slot, up to ``busy_timeout``.
+
+        Fails at once when the slot is held from this same thread: by this
+        task or thread (a second write transaction would wait on itself),
+        or by another coroutine on this thread's loop, which cannot run to
+        release it while this thread blocks.
+        """
+        me = _caller()
+        owner = self._write_owner
+        if owner is not None and owner[0] == me[0]:
+            if owner == me:
+                raise StorageLockTimeoutError(_REENTRY_MESSAGE)
+            raise StorageLockTimeoutError(
+                "Another task on this thread's event loop holds the write lock on this "
+                "SQLite storage; blocking for it here would stall the loop it needs to "
+                "finish. Wait for the slot with areserve_write_slot instead"
+            )
+        if not self._write_lock.acquire(timeout=max(self._busy_timeout, 0)):
+            raise StorageLockTimeoutError(
+                f"Timed out after {self._busy_timeout}s waiting for the write lock"
+            )
+        self._write_owner = me
 
     def _check_fork(self) -> None:
         """Drop state inherited across a fork.
@@ -522,8 +621,16 @@ class SQLiteStorage:
                 self._write_owner = None
                 self._pid = os.getpid()
 
-    def _release_write_slot(self) -> None:
-        """Release the in-process writer slot."""
+    def _release_write_slot(self, lock: threading.Lock | None = None) -> None:
+        """Release the in-process writer slot.
+
+        Args:
+            lock: The lock the caller acquired, if known. Nothing is
+                released when it is no longer the storage's lock (a fork
+                reset the slot since).
+        """
+        if lock is not None and lock is not self._write_lock:
+            return
         self._write_owner = None
         self._write_lock.release()
 

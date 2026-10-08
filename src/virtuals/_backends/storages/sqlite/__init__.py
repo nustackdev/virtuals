@@ -5,6 +5,7 @@ from .snapshot import SQLiteSnapshot
 from .storage import SQLiteStorage
 from .transaction import SQLiteTransaction
 from .write_batch import SQLiteWriteBatch
+from .write_slot import SQLiteWriteSlot
 
 
 __all__ = [
@@ -13,4 +14,5 @@ __all__ = [
     "SQLiteStorage",
     "SQLiteTransaction",
     "SQLiteWriteBatch",
+    "SQLiteWriteSlot",
 ]

@@ -1,13 +1,14 @@
 """SQLite-specific behaviour beyond the shared StorageProtocol compliance suite.
 
 Covers what compliance cannot: byte ordering against LMDB, paged scans past
-a page boundary, snapshot isolation, the writer lock across threads and
-processes (including a writer killed mid-transaction), read-only opens and
-reopening after close.
+a page boundary, snapshot isolation, the writer lock across threads,
+coroutines and processes (including a writer killed mid-transaction),
+read-only opens and reopening after close.
 """
 
 from __future__ import annotations
 
+import asyncio
 import random
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from virtuals.tkv.types import EMPTY
 
 
 if TYPE_CHECKING:
+    import sqlite3
     from pathlib import Path
 
 
@@ -272,6 +274,242 @@ def test_lock_timeout_between_threads(db_path: Path) -> None:
         t.join(5)
         assert err and isinstance(err[0], StorageLockTimeoutError)
         tx.abort()
+
+
+# =========================================================================
+# Writers: coroutines on one event loop
+# =========================================================================
+
+
+async def _increment(storage: SQLiteStorage, key: tuple, pause: float) -> None:
+    """Read-modify-write ``key`` under a reserved slot, awaiting mid-transaction."""
+    slot = await storage.areserve_write_slot()
+    try:
+        tx = storage.begin_transaction(write_slot=slot)
+        try:
+            cur = tx.get(key)
+            await asyncio.sleep(pause)
+            tx.put(key, str(int(cur) + 1 if cur is not EMPTY else 1).encode())
+        except BaseException:
+            tx.abort()
+            raise
+        tx.commit()
+    finally:
+        slot.release()
+
+
+def test_coroutines_wait_for_each_other(storage: SQLiteStorage) -> None:
+    async def main() -> None:
+        await asyncio.gather(*(_increment(storage, ("n",), 0.01) for _ in range(8)))
+
+    asyncio.run(main())
+    with storage.snapshot() as snap:
+        assert int(snap.get(("n",))) == 8
+
+
+def test_coroutine_holding_slot_across_await_blocks_peer_until_commit(
+    storage: SQLiteStorage,
+) -> None:
+    order: list[str] = []
+
+    async def a() -> None:
+        slot = await storage.areserve_write_slot()
+        tx = storage.begin_transaction(write_slot=slot)
+        tx.put(("a",), b"1")
+        order.append("a holds")
+        await asyncio.sleep(0.05)
+        order.append("a commits")
+        tx.commit()
+        slot.release()  # no-op: the transaction owned the slot
+
+    async def b() -> None:
+        await asyncio.sleep(0.01)
+        slot = await storage.areserve_write_slot()
+        order.append("b holds")
+        with storage.begin_transaction(write_slot=slot) as tx:
+            assert tx.get(("a",)) == b"1"
+            tx.put(("b",), b"2")
+
+    async def main() -> None:
+        await asyncio.gather(a(), b())
+
+    asyncio.run(main())
+    assert order == ["a holds", "a commits", "b holds"]
+    with storage.snapshot() as snap:
+        assert snap.get(("a",)) == b"1"
+        assert snap.get(("b",)) == b"2"
+
+
+def test_same_task_second_writer_fails_fast(storage: SQLiteStorage) -> None:
+    async def main() -> None:
+        slot = await storage.areserve_write_slot()
+        tx = storage.begin_transaction(write_slot=slot)
+        t0 = time.monotonic()
+        with pytest.raises(StorageLockTimeoutError, match="wait on itself"):
+            await storage.areserve_write_slot()
+        with pytest.raises(StorageLockTimeoutError, match="wait on itself"):
+            storage.begin_transaction()
+        with pytest.raises(StorageLockTimeoutError, match="wait on itself"):
+            with storage.batch_write() as batch:
+                batch.put(("x",), b"1")
+        assert time.monotonic() - t0 < 0.5
+        tx.abort()
+        storage.begin_transaction().commit()  # slot released by the abort
+
+    asyncio.run(main())
+
+
+def test_sync_begin_behind_loop_peer_fails_fast(storage: SQLiteStorage) -> None:
+    """A sync begin on the loop thread never blocks behind a coroutine there."""
+
+    async def holder(ready: asyncio.Event, done: asyncio.Event) -> None:
+        slot = await storage.areserve_write_slot()
+        ready.set()
+        await done.wait()
+        slot.release()
+
+    async def main() -> None:
+        ready, done = asyncio.Event(), asyncio.Event()
+        task = asyncio.create_task(holder(ready, done))
+        await ready.wait()
+        t0 = time.monotonic()
+        with pytest.raises(StorageLockTimeoutError, match="areserve_write_slot"):
+            storage.begin_transaction()
+        assert time.monotonic() - t0 < 0.5
+        done.set()
+        await task
+
+    asyncio.run(main())
+    storage.begin_transaction().commit()
+
+
+def test_unused_slot_is_released(storage: SQLiteStorage) -> None:
+    async def main() -> None:
+        slot = await storage.areserve_write_slot()
+        assert slot.held
+        slot.release()
+        slot.release()  # idempotent
+        assert not slot.held
+        with pytest.raises(StorageError):
+            storage.begin_transaction(write_slot=slot)
+
+    asyncio.run(main())
+    storage.begin_transaction().commit()
+
+
+def test_failed_begin_returns_slot_to_holder(storage: SQLiteStorage) -> None:
+    async def main() -> None:
+        slot = await storage.areserve_write_slot()
+        real = storage._acquire_connection
+
+        def broken() -> sqlite3.Connection:
+            raise StorageError("no connection")
+
+        storage._acquire_connection = broken  # type: ignore[method-assign]
+        try:
+            with pytest.raises(StorageError, match="no connection"):
+                storage.begin_transaction(write_slot=slot)
+        finally:
+            storage._acquire_connection = real  # type: ignore[method-assign]
+        assert slot.held
+        storage.begin_transaction(write_slot=slot).commit()
+        assert not slot.held
+
+    asyncio.run(main())
+    storage.begin_transaction().commit()
+
+
+def test_async_waiter_times_out_without_blocking_loop(db_path: Path) -> None:
+    with SQLiteStorage(path=db_path, codec=BinaryCodec(), busy_timeout=0.2) as s:
+
+        async def main() -> int:
+            held = await s.areserve_write_slot()
+            ticks = 0
+            stop = asyncio.Event()
+
+            async def ticker() -> None:
+                nonlocal ticks
+                while not stop.is_set():
+                    ticks += 1
+                    await asyncio.sleep(0.005)
+
+            tick_task = asyncio.create_task(ticker())
+
+            async def waiter() -> None:
+                await s.areserve_write_slot()
+
+            t0 = time.monotonic()
+            with pytest.raises(StorageLockTimeoutError, match="Timed out"):
+                await asyncio.create_task(waiter())
+            elapsed = time.monotonic() - t0
+            stop.set()
+            await tick_task
+            held.release()
+            assert 0.15 < elapsed < 1.0
+            return ticks
+
+        assert asyncio.run(main()) >= 10
+
+
+def test_async_waiter_cancelled_holds_nothing(storage: SQLiteStorage) -> None:
+    async def main() -> None:
+        held = await storage.areserve_write_slot()
+
+        async def waiter() -> None:
+            await storage.areserve_write_slot()
+
+        task = asyncio.create_task(waiter())
+        await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        held.release()
+        (await storage.areserve_write_slot()).release()
+
+    asyncio.run(main())
+
+
+def test_coroutines_and_threads_share_the_slot(storage: SQLiteStorage) -> None:
+    n_threads, n_coros, rounds = 4, 4, 20
+
+    def thread_work() -> None:
+        for _ in range(rounds):
+            with storage.transaction() as tx:
+                cur = tx.get(("n",))
+                time.sleep(0.0005)
+                tx.put(("n",), str(int(cur) + 1 if cur is not EMPTY else 1).encode())
+
+    async def coro_work() -> None:
+        for _ in range(rounds):
+            await _increment(storage, ("n",), 0.0005)
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(
+            *(loop.run_in_executor(None, thread_work) for _ in range(n_threads)),
+            *(coro_work() for _ in range(n_coros)),
+        )
+
+    asyncio.run(main())
+    with storage.snapshot() as snap:
+        assert int(snap.get(("n",))) == (n_threads + n_coros) * rounds
+
+
+def test_slot_taken_on_loop_finished_on_thread(storage: SQLiteStorage) -> None:
+    async def main() -> None:
+        slot = await storage.areserve_write_slot()
+
+        def work() -> None:
+            with storage.begin_transaction(write_slot=slot) as tx:
+                tx.put(("k",), b"v")
+
+        await asyncio.to_thread(work)
+        slot.release()
+
+    asyncio.run(main())
+    with storage.snapshot() as snap:
+        assert snap.get(("k",)) == b"v"
+    storage.begin_transaction().commit()
 
 
 # =========================================================================
