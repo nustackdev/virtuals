@@ -9,8 +9,6 @@ Tests:
 from typing import ClassVar
 
 from virtuals.collections import (
-    is_addable,
-    is_appendable,
     is_assignable,
     is_child_observable,
     is_clearable,
@@ -18,13 +16,9 @@ from virtuals.collections import (
     is_convertible,
     is_deletable,
     is_descendants_observable,
-    is_discardable,
     is_initializable,
-    is_insertable,
     is_nestable,
     is_observable,
-    is_poppable,
-    is_removable,
     is_sizeable,
     is_subscriptable,
 )
@@ -131,72 +125,6 @@ class ClearableView(ViewBase):
     CONTAINER_CLS: ClassVar[type | None] = None
 
     def clear(self) -> None:
-        pass
-
-
-class AppendableView(ViewBase):
-    """View implementing Appendable protocol."""
-
-    STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(10)
-    PROTOCOL: ClassVar[ContainerProtocol] = ContainerProtocol.MUTABLE
-    CONTAINER_CLS: ClassVar[type | None] = None
-
-    def append(self, value: object) -> None:
-        pass
-
-
-class InsertableView(ViewBase):
-    """View implementing Insertable protocol."""
-
-    STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(11)
-    PROTOCOL: ClassVar[ContainerProtocol] = ContainerProtocol.MUTABLE
-    CONTAINER_CLS: ClassVar[type | None] = None
-
-    def insert(self, index: int, value: object) -> None:
-        pass
-
-
-class PoppableView(ViewBase):
-    """View implementing Poppable protocol."""
-
-    STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(12)
-    PROTOCOL: ClassVar[ContainerProtocol] = ContainerProtocol.MUTABLE
-    CONTAINER_CLS: ClassVar[type | None] = None
-
-    def pop(self, index: int = -1) -> object | Empty:
-        return EMPTY
-
-
-class AddableView(ViewBase):
-    """View implementing Addable protocol."""
-
-    STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(13)
-    PROTOCOL: ClassVar[ContainerProtocol] = ContainerProtocol.MUTABLE
-    CONTAINER_CLS: ClassVar[type | None] = None
-
-    def add(self, value: object) -> None:
-        pass
-
-
-class RemovableView(ViewBase):
-    """View implementing Removable protocol."""
-
-    STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(14)
-    PROTOCOL: ClassVar[ContainerProtocol] = ContainerProtocol.MUTABLE
-    CONTAINER_CLS: ClassVar[type | None] = None
-
-    def remove(self, value: object) -> None:
-        pass
-
-
-class DiscardableView(ViewBase):
-    """View implementing Discardable protocol."""
-
-    STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(15)
-    PROTOCOL: ClassVar[ContainerProtocol] = ContainerProtocol.MUTABLE
-    CONTAINER_CLS: ClassVar[type | None] = None
-
-    def discard(self, value: object) -> None:
         pass
 
 
@@ -321,66 +249,6 @@ class TestMutationCapabilities:
         view = MinimalView.__new__(MinimalView)
         assert is_clearable(view) is False
 
-    def test_is_appendable_true(self) -> None:
-        """Test is_appendable returns True for Appendable view."""
-        view = AppendableView.__new__(AppendableView)
-        assert is_appendable(view) is True
-
-    def test_is_appendable_false(self) -> None:
-        """Test is_appendable returns False for non-Appendable view."""
-        view = MinimalView.__new__(MinimalView)
-        assert is_appendable(view) is False
-
-    def test_is_insertable_true(self) -> None:
-        """Test is_insertable returns True for Insertable view."""
-        view = InsertableView.__new__(InsertableView)
-        assert is_insertable(view) is True
-
-    def test_is_insertable_false(self) -> None:
-        """Test is_insertable returns False for non-Insertable view."""
-        view = MinimalView.__new__(MinimalView)
-        assert is_insertable(view) is False
-
-    def test_is_poppable_true(self) -> None:
-        """Test is_poppable returns True for Poppable view."""
-        view = PoppableView.__new__(PoppableView)
-        assert is_poppable(view) is True
-
-    def test_is_poppable_false(self) -> None:
-        """Test is_poppable returns False for non-Poppable view."""
-        view = MinimalView.__new__(MinimalView)
-        assert is_poppable(view) is False
-
-    def test_is_addable_true(self) -> None:
-        """Test is_addable returns True for Addable view."""
-        view = AddableView.__new__(AddableView)
-        assert is_addable(view) is True
-
-    def test_is_addable_false(self) -> None:
-        """Test is_addable returns False for non-Addable view."""
-        view = MinimalView.__new__(MinimalView)
-        assert is_addable(view) is False
-
-    def test_is_removable_true(self) -> None:
-        """Test is_removable returns True for Removable view."""
-        view = RemovableView.__new__(RemovableView)
-        assert is_removable(view) is True
-
-    def test_is_removable_false(self) -> None:
-        """Test is_removable returns False for non-Removable view."""
-        view = MinimalView.__new__(MinimalView)
-        assert is_removable(view) is False
-
-    def test_is_discardable_true(self) -> None:
-        """Test is_discardable returns True for Discardable view."""
-        view = DiscardableView.__new__(DiscardableView)
-        assert is_discardable(view) is True
-
-    def test_is_discardable_false(self) -> None:
-        """Test is_discardable returns False for non-Discardable view."""
-        view = MinimalView.__new__(MinimalView)
-        assert is_discardable(view) is False
-
 
 # =============================================================================
 # NAVIGATION CAPABILITY TESTS
@@ -419,12 +287,6 @@ class TestTypeGuardsOnNonViews:
         assert is_sizeable(None) is False
         assert is_deletable(None) is False
         assert is_clearable(None) is False
-        assert is_appendable(None) is False
-        assert is_insertable(None) is False
-        assert is_poppable(None) is False
-        assert is_addable(None) is False
-        assert is_removable(None) is False
-        assert is_discardable(None) is False
         assert is_nestable(None) is False
         assert is_observable(None) is False
         assert is_child_observable(None) is False
