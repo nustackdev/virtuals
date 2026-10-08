@@ -6,6 +6,8 @@ using pytest parametrization.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -50,7 +52,7 @@ def safe_key(draw: st.DrawFn) -> Key:
                         whitelist_categories=("Lu", "Ll", "Nd"),
                         blacklist_characters=".[]",
                     ),
-                    min_size=1,
+                    min_size=0,
                     max_size=50,
                 ),
                 # Integers: StringKeyCodec has smallest range
@@ -61,6 +63,46 @@ def safe_key(draw: st.DrawFn) -> Key:
         )
     )
     return tuple(components)
+
+
+@st.composite
+def binary_key(draw: st.DrawFn) -> Key:
+    """Generate any key the binary codecs accept: any string (empty, NUL, astral), int64."""
+    components = draw(
+        st.lists(
+            st.one_of(
+                st.text(
+                    alphabet=st.one_of(
+                        st.sampled_from(["\x00", "\x01", "\x7f", "a", "b", "\uffff"]),
+                        st.characters(blacklist_categories=("Cs",)),
+                    ),
+                    max_size=6,
+                ),
+                st.integers(min_value=-(2**63), max_value=2**63 - 1),
+            ),
+            min_size=1,
+            max_size=5,
+        )
+    )
+    return tuple(components)
+
+
+BINARY_CODECS = [
+    pytest.param(BinaryKeyCodec(), id="binary"),
+    pytest.param(PyBinaryKeyCodec(), id="pybinary"),
+]
+
+
+def _python_order(k1: Key, k2: Key) -> int | None:
+    """-1/0/1 per Python tuple ordering, None when the tuples are incomparable."""
+    try:
+        return (k1 > k2) - (k1 < k2)
+    except TypeError:
+        return None
+
+
+def _byte_order(e1: bytes, e2: bytes) -> int:
+    return (e1 > e2) - (e1 < e2)
 
 
 # ============================================================================
@@ -727,3 +769,169 @@ class TestOrderingStress:
         sorted_keys = sorted(keys)
         encoded = [codec.encode(k) for k in sorted_keys]
         assert encoded == sorted(encoded)
+
+
+# ============================================================================
+# Empty Strings and Backward Compatibility (binary codecs)
+# ============================================================================
+
+
+class TestBinaryCodecBackwardCompat:
+    """Every key legal before empty strings were allowed encodes byte-for-byte as before.
+
+    The golden file was generated with the released virtuals-binary-codec 0.1.1
+    from a seeded corpus (NUL bytes, astral and BMP edge characters, int64
+    bounds, mixed keys). Existing on-disk data must stay valid.
+    """
+
+    GOLDEN = json.loads((Path(__file__).parent / "binary_codec_golden.json").read_text())
+
+    @pytest.mark.parametrize("codec", BINARY_CODECS)
+    def test_encodings_unchanged(self, codec: KeyCodecProtocol) -> None:
+        assert len(self.GOLDEN) > 400
+        for entry in self.GOLDEN:
+            key = tuple(entry["key"])
+            assert codec.encode(key).hex() == entry["hex"], key
+            assert codec.decode(bytes.fromhex(entry["hex"])) == key
+
+
+class TestBinaryCodecEmptyStrings:
+    """The empty string is a legal key component in both binary codecs."""
+
+    @pytest.mark.parametrize("codec", BINARY_CODECS)
+    def test_encoding_bytes(self, codec: KeyCodecProtocol) -> None:
+        """The empty string is TYPE_STR + TERMINATOR."""
+        assert codec.encode(("",)) == b"\x02\x00"
+        assert codec.encode(("a", "")) == b"\x02a\x00\x02\x00"
+        assert codec.encode(("", 0)) == b"\x02\x00\x01\x80" + b"\x00" * 7 + b"\x00"
+
+    @pytest.mark.parametrize("codec", BINARY_CODECS)
+    def test_roundtrip_every_position(self, codec: KeyCodecProtocol) -> None:
+        """The empty string round-trips at every position, next to NULs, ints and strings."""
+        neighbours = ["", "\x00", "\x00\x00", "a", "\xff", 0, -1, 2**63 - 1]
+        for n in range(1, 4):
+            for pos in range(n):
+                for other in neighbours:
+                    key = tuple("" if i == pos else other for i in range(n))
+                    assert codec.decode(codec.encode(key)) == key
+
+    @pytest.mark.parametrize("codec", BINARY_CODECS)
+    def test_no_ambiguity_with_escapes(self, codec: KeyCodecProtocol) -> None:
+        """Keys that differ only around empty strings and NULs encode differently."""
+        keys = [
+            ("",),
+            ("", ""),
+            ("\x00",),
+            ("", "\x00"),
+            ("\x00", ""),
+            ("\x00\x00",),
+            ("", 0),
+            (0, ""),
+            ("", "", ""),
+        ]
+        encoded = [codec.encode(k) for k in keys]
+        assert len(set(encoded)) == len(keys)
+        for k, e in zip(keys, encoded, strict=True):
+            assert codec.decode(e) == k
+
+    @pytest.mark.parametrize("codec", BINARY_CODECS)
+    def test_ordering_mixed(self, codec: KeyCodecProtocol) -> None:
+        """Encoded order matches Python tuple order with empty components."""
+        keys = [
+            ("",),
+            ("", ""),
+            ("", "", "a"),
+            ("", "a"),
+            ("", "\x00"),
+            ("\x00",),
+            ("\x00", ""),
+            ("a",),
+            ("a", ""),
+            ("a", "", "x"),
+            ("a", "\x00"),
+            ("a", "b"),
+            ("a\x00",),
+            ("aa",),
+            ("b",),
+        ]
+        assert sorted(keys, key=codec.encode) == sorted(keys)
+
+    @pytest.mark.parametrize("codec", BINARY_CODECS)
+    def test_int_before_empty_string(self, codec: KeyCodecProtocol) -> None:
+        """Type markers still decide: every int sorts before the empty string."""
+        assert codec.encode(("a", 2**63 - 1)) < codec.encode(("a", ""))
+        assert codec.encode(("a", "")) < codec.encode(("a", "\x00"))
+
+    @pytest.mark.parametrize("codec", BINARY_CODECS)
+    @given(s=st.text(min_size=1, alphabet=st.characters(blacklist_categories=("Cs",))))
+    @settings(max_examples=200)
+    def test_empty_sorts_first(self, codec: KeyCodecProtocol, s: str) -> None:
+        """The empty string sorts before every other string, with or without a tail."""
+        assert codec.encode(("",)) < codec.encode((s,))
+        assert codec.encode(("", s)) < codec.encode((s,))
+        assert codec.encode(("x", "", "zzz")) < codec.encode(("x", s))
+
+    @pytest.mark.parametrize("codec", BINARY_CODECS)
+    @given(k1=binary_key(), k2=binary_key())
+    @settings(max_examples=500)
+    def test_order_matches_python(self, codec: KeyCodecProtocol, k1: Key, k2: Key) -> None:
+        """For any comparable keys, byte order equals Python tuple order."""
+        expected = _python_order(k1, k2)
+        assume(expected is not None)
+        assert _byte_order(codec.encode(k1), codec.encode(k2)) == expected
+
+    @pytest.mark.parametrize("codec", BINARY_CODECS)
+    @given(key=binary_key())
+    @settings(max_examples=300)
+    def test_roundtrip_any_key(self, codec: KeyCodecProtocol, key: Key) -> None:
+        assert codec.decode(codec.encode(key)) == key
+
+    @pytest.mark.parametrize("codec", BINARY_CODECS)
+    def test_upper_bound_of_prefix_with_empty(self, codec: KeyCodecProtocol) -> None:
+        """Prefix ("a",) includes ("a", "") and its children, excludes ("b",)."""
+        lo, hi = codec.encode(("a",)), codec.upper_bound_of_prefix(("a",))
+        for inside in [("a",), ("a", ""), ("a", "", ""), ("a", "", 5), ("a", "\x00"), ("a", 0)]:
+            assert lo <= codec.encode(inside) < hi, inside
+        for outside in [("b",), ("",), ("a\x00",), ("aa",), ("a\x00", "")]:
+            assert not (lo <= codec.encode(outside) < hi), outside
+
+        lo, hi = codec.encode(("",)), codec.upper_bound_of_prefix(("",))
+        for inside in [("",), ("", ""), ("", "x"), ("", 0), ("", "\x00")]:
+            assert lo <= codec.encode(inside) < hi, inside
+        for outside in [("\x00",), ("\x00", ""), ("a",), (0,)]:
+            assert not (lo <= codec.encode(outside) < hi), outside
+
+    @pytest.mark.parametrize("codec", BINARY_CODECS)
+    @given(prefix=binary_key(), key=binary_key())
+    @settings(max_examples=500)
+    def test_prefix_range_is_exact(self, codec: KeyCodecProtocol, prefix: Key, key: Key) -> None:
+        """A key is in [encode(p), upper_bound_of_prefix(p)) exactly when p is a prefix of it."""
+        lo, hi = codec.encode(prefix), codec.upper_bound_of_prefix(prefix)
+        inside = lo <= codec.encode(key) < hi
+        assert inside == (key[: len(prefix)] == prefix)
+
+    @given(key=binary_key())
+    @settings(max_examples=300)
+    def test_cython_and_python_identical(self, key: Key) -> None:
+        """Cython and Python codecs produce identical bytes and cross-decode."""
+        cy, py = BinaryKeyCodec(), PyBinaryKeyCodec()
+        encoded = cy.encode(key)
+        assert encoded == py.encode(key)
+        assert py.decode(encoded) == key
+        assert cy.decode(encoded) == key
+        assert cy.upper_bound_of_prefix(key) == py.upper_bound_of_prefix(key)
+
+
+class TestEmptyStringAcrossCodecs:
+    """Every codec, and the composite codecs built on them, accept empty strings."""
+
+    @pytest.mark.parametrize("key", [("",), ("a", ""), ("", 1, ""), ("", "a")])
+    def test_roundtrip(self, codec: KeyCodecProtocol, key: Key) -> None:
+        assert codec.decode(codec.encode(key)) == key
+
+    def test_composite_codecs_agree(self) -> None:
+        from virtuals.codecs import BinaryCodec, NoOpCodec, TextCodec
+
+        for composite in (NoOpCodec(), BinaryCodec(), TextCodec()):
+            for key in [("",), ("/", ""), ("", 0, "x")]:
+                assert composite.decode_key(composite.encode_key(key)) == key

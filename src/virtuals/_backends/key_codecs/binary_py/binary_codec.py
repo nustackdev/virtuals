@@ -33,7 +33,6 @@ _INT64_BIAS: Final[int] = 2**63  # Bias for offset binary encoding
 
 # Constants for validation
 MAX_STRING_LENGTH: Final[int] = 10 * 1024 * 1024  # 10MB
-MIN_STRING_LENGTH: Final[int] = 1  # No empty strings allowed
 
 # Pattern for valid string components (printable ASCII + common Unicode)
 # This ensures human readability and avoids problematic characters
@@ -98,16 +97,14 @@ def validate_string_component(value: str, index: int) -> None:
     Raises:
         StringConstraintError: If string violates constraints
     """
-    if len(value) < MIN_STRING_LENGTH:
-        raise StringConstraintError(f"Empty string at index {index} not allowed")
-
     if len(value) > MAX_STRING_LENGTH:
         raise StringConstraintError(
             f"String at index {index} too long: {len(value)} chars (max {MAX_STRING_LENGTH})"
         )
 
-    # Check for valid characters (human-readable constraint)
-    if not VALID_STRING_PATTERN.match(value):
+    # Check for valid characters (human-readable constraint). The empty
+    # string is legal.
+    if value and not VALID_STRING_PATTERN.match(value):
         raise StringConstraintError(
             f"String at index {index} contains invalid characters. "
             f"Only printable ASCII and common Unicode characters are allowed."
@@ -262,6 +259,9 @@ class PyBinaryKeyCodec(KeyCodecProtocol[EncodedBinaryKey]):
     - Terminator is bare 0x00 (not escaped)
     - This ensures shorter strings sort before longer strings with same prefix:
       e.g., ('0',) < ('00',) because 0x00 < any printable character
+    - The empty string encodes as TYPE_STR + TERMINATOR (0x02 0x00) and sorts
+      before every other string. It is unambiguous: a terminator is followed
+      by a type marker or the end of the key, never by the escape byte 0xFF
 
     Encoding format:
     - Each component: TYPE_MARKER + ENCODED_VALUE + TERMINATOR

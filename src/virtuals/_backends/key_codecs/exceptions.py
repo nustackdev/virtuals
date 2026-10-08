@@ -50,7 +50,7 @@ class IntegerOverflowError(EncodeError):
     - String codec: uint16 range (0 to 65535) for human readability
     """
 
-    def __init__(  # noqa: D107
+    def __init__(
         self,
         value: int | None = None,
         min_value: int | None = None,
@@ -71,7 +71,6 @@ class StringConstraintError(EncodeError):
     """Raised when a string violates codec-specific constraints.
 
     This can occur due to:
-    - Empty strings (not allowed in keys)
     - Strings exceeding maximum length
     - Invalid characters for specific codecs
     """

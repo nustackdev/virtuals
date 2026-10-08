@@ -11,7 +11,7 @@
 ### Kept (Critical Boundaries)
 
 - ✓ Integer overflow/underflow checks (int64 range: -2^63 to 2^63-1)
-- ✓ String length bounds (min: 1 byte, max: 10MB)
+- ✓ String length bound (max: 10MB; the empty string is legal)
 - ✓ Empty tuple rejection
 - ✓ Type checking (only int and str allowed)
 - ✓ UTF-8 decode error handling

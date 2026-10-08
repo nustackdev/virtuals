@@ -132,6 +132,11 @@ cdef class BinaryKeyCodec:
     - Null bytes in content: 0x00 -> 0x00 0xFF (escaped)
     - Terminator is bare 0x00 (not escaped)
     - This ensures shorter strings sort before longer strings with same prefix
+
+    Empty strings:
+    - "" encodes as 0x02 0x00 and sorts before every other string
+    - Unambiguous: a terminator is followed by a type marker (0x01/0x02) or
+      the end of the key, never by the escape byte 0xFF
     """
 
     def encode(self, tuple key):
@@ -180,9 +185,9 @@ cdef class BinaryKeyCodec:
                 str_data = <const unsigned char*>PyBytes_AS_STRING(str_bytes)
                 str_len = PyBytes_GET_SIZE(str_bytes)
 
-                # Check string length bounds
-                if str_len == 0:
-                    raise EncodeError(f"Empty string at index {i} not allowed")
+                # Check string length bound. The empty string is legal: it
+                # encodes as TYPE_STR + TERMINATOR and sorts before every
+                # other string.
                 if str_len > MAX_STRING_LENGTH:
                     raise EncodeError(
                         f"String at index {i} too long: {str_len} bytes "
