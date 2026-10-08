@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 # ============================================================================
 [project]
 name = "virtuals-py"
-version = "0.1.9"
+version = "0.1.10"
 description = "Virtual Python collections over any storage."
 readme = "README.md"
 license = "Apache-2.0"
@@ -46,7 +46,7 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "attrs",
-    "virtuals-binary-codec>=0.1.1",
+    "virtuals-binary-codec>=0.1.2",
     "kh57",
     "typing-extensions>=4.7.0",
 ]
@@ -62,7 +62,7 @@ Changelog = "https://github.com/nustackdev/virtuals/releases"
 virtuals-binary-codec = { path = "lib/binary-codec", editable = true }
 
 [project.optional-dependencies]
-rocksdb = ["rdbpython"]
+rocksdb = ["rdbpython>=0.2.7"]
 lmdb = ["lmdb"]
 redis = [
     "redis>=5.0",
