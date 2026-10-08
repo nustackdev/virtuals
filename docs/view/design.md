@@ -185,6 +185,35 @@ view = DictView.open_at(
 
 Navigation preserves registry context. Child views use parent's registry.
 
+Every child view also keeps a reference to the view it was opened from
+(`view.parent`, `None` for a root). Opening children is pure navigation and
+builds that chain in memory without touching storage.
+
+## Child Creation
+
+The container layer never creates parents. Children are created through
+their parent view:
+
+```python
+rows = root.ensure_child("rows", DictView)   # open, create if missing
+row = rows.ensure_child("r1", DictView)
+```
+
+- `ensure_child(address, view)` is idempotent: it opens an existing child,
+  or creates a missing one at the site the parent's layout picks (indexed
+  dicts put children under `__data__/`), runs its internal layout, then
+  calls the parent's `_on_child_created(address)` once.
+- `ensure_created()` on a missing child view asks its parent to create it,
+  recursively up the chain. Only a root creates itself.
+- `_on_child_created` is where a view keeps its own books: `DictView`,
+  `FlatDictView`, `SetView`, `FrozenSetView` and `Kh57View` bump `__len__`,
+  `IndexedDictView` and `LogIndexedDictView` record the key. Positional
+  views (lists, tuples, bytearrays) and live-counting views (`LightDictView`)
+  leave it alone. A new primitive child fires the same hook.
+- Unsafe primitive writes skip the hook: a new key written that way is not
+  counted or indexed. `view.rebuild_bookkeeping()` rebuilds counters and
+  indexes from storage for a view and its whole subtree.
+
 ## Naming Conventions
 
 ### Nouns

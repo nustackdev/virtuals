@@ -39,7 +39,6 @@ def test_node_exists_container(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     assert node_exists(("users",), tx)
@@ -52,7 +51,6 @@ def test_node_exists_primitive(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "name", "Alice", tx)
 
@@ -76,7 +74,6 @@ def test_get_node_type_container(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     assert get_node_type(("users",), tx) == NodeType.CONTAINER
@@ -89,7 +86,6 @@ def test_get_node_type_primitive(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "name", "Alice", tx)
 
@@ -103,7 +99,6 @@ def test_get_node_type_various_primitives(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     # Different primitive types
@@ -144,7 +139,6 @@ def test_get_node_info_container(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     info = get_node_info(("users",), tx)
@@ -163,7 +157,6 @@ def test_get_node_info_primitive(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "name", "Alice", tx)
 
@@ -184,21 +177,18 @@ def test_get_node_info_various_container_protocols(tx: TransactionProtocol) -> N
         ContainerStructure(1),
         ContainerProtocol.NONE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("c2",),
         ContainerStructure(2),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("c3",),
         ContainerStructure(3),
         ContainerProtocol.MUTABLE | ContainerProtocol.SIZED,
         tx,
-        ensure_healthy_parents=False,
     )
 
     info1 = get_node_info(("c1",), tx)
@@ -238,14 +228,12 @@ def test_gather_parent_info_all_exist(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("a", "b"),
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     parent_info = gather_parent_info(("a", "b", "c"), tx)
@@ -288,7 +276,6 @@ def test_gather_parent_info_partially_missing(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     parent_info = gather_parent_info(("a", "b", "c"), tx)
@@ -310,7 +297,6 @@ def test_gather_parent_info_malformed_parent(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("a",), "b", "wrong", tx)
 
@@ -332,28 +318,24 @@ def test_gather_parent_info_deep_hierarchy(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("a", "b"),
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("a", "b", "c"),
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("a", "b", "c", "d"),
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     parent_info = gather_parent_info(("a", "b", "c", "d", "e"), tx)
@@ -377,7 +359,6 @@ def test_gather_parent_info_multiple_malformed(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("root",), "a", "wrong1", tx)
 
@@ -401,7 +382,6 @@ def test_node_operations_after_deletion(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     # Verify it exists
@@ -427,7 +407,6 @@ def test_node_operations_consistency(tx: TransactionProtocol) -> None:
         ContainerStructure(5),
         ContainerProtocol.MUTABLE | ContainerProtocol.SIZED,
         tx,
-        ensure_healthy_parents=False,
     )
 
     # All operations should agree

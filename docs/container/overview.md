@@ -185,7 +185,7 @@ Container enforces rules that Storage doesn't:
 # Storage: allows this
 tx.put(("a", "b", "c"), "value")  # No parent check
 
-# Container: creates parents or raises
+# Container: raises if the parent is missing, never creates parents
 container.set_value(("a", "b", "c"), "value")
 ```
 

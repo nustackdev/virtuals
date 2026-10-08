@@ -260,7 +260,7 @@ parent_info.all_healthy  # bool
 
 ```python
 # Lifecycle
-created = create_container(path, structure, protocol, ctx, create_parents=True)
+create_container(path, structure, protocol, ctx)  # parent must exist, creates one node
 deleted = delete_container(path, ctx, recursive=True)
 count = delete_subtree(path, ctx)
 
@@ -281,11 +281,11 @@ clear_children(path, ctx)
 descendants = list_descendants(path, ctx, max_depth=None)
 for child_path, node_type in walk_tree(path, ctx):
     process(child_path, node_type)
-
-# Parent management
-created_paths = create_parents(path, structure, protocol, ctx)
-created_paths = ensure_parents(path, structure, protocol, ctx)
 ```
+
+The container layer never creates parents. Missing ancestors are created by
+views: a parent view creates its child (`View.ensure_child`), so every level
+gets its own view type and the parent can keep its bookkeeping.
 
 ## Usage Examples
 
@@ -347,12 +347,7 @@ with storage.transaction() as tx:
 
     if not parent_info.all_exist:
         print(f"Missing parents: {parent_info.missing_paths}")
-        # Create missing parents
-        tree.create_parents(
-            ("users", "alice", "posts"),
-            ContainerStructure(1),
-            ContainerProtocol.MUTABLE
-        )
+        # Create them through views (View.ensure_child), never here
 
     if not parent_info.all_healthy:
         print(f"Malformed parents: {parent_info.malformed_paths}")
@@ -481,7 +476,7 @@ container.ensure_exists()
 
 **New API**:
 ```python
-create_container(path, structure, protocol, tx, create_parents=True)
+create_container(path, structure, protocol, tx)
 # or
 tree = Tree(ctx=tx)
 tree.create_container(path, structure, protocol)

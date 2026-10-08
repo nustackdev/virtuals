@@ -46,19 +46,15 @@ from .exceptions import (
 from .marker import create_marker, is_marker
 from .node_ops import get_node_info, get_node_type
 from .types import (
-    DEFAULT_PARENT_PROTOCOL,
-    DEFAULT_PARENT_STRUCTURE,
     ContainerProtocol,
     ContainerStructure,
     NodeInfo,
     NodeType,
 )
 from .validation_ops import (
-    gather_parent_info,
     validate_compatible,
     validate_is_container,
     validate_is_primitive,
-    validate_parents_healthy,
 )
 
 
@@ -74,7 +70,6 @@ __all__ = [
     "count_children",
     "create_child_container",
     "create_container",
-    "create_parents",
     "delete_child",
     "delete_child_primitive_unsafe",
     "delete_container",
@@ -108,11 +103,16 @@ def create_container(
     protocol: ContainerProtocol,
     ctx: StorageContextType,
     *,
-    default_parent_structure: ContainerStructure = DEFAULT_PARENT_STRUCTURE,
-    default_parent_protocol: ContainerProtocol = DEFAULT_PARENT_PROTOCOL,
-    ensure_healthy_parents: bool = True,
+    validate_parent: bool = True,
+    node_info: NodeInfo | None = None,
 ) -> None:
     """Create container at site.
+
+    Creates exactly one node. The parent must already exist as a container;
+    the container layer never creates parents. Missing ancestors are the
+    caller's job, normally a parent view creating its child
+    (``View.ensure_child``), so every level is stamped with its own view
+    type and the parent view can keep its bookkeeping.
 
     Idempotent: silent if container already exists with compatible type.
 
@@ -121,13 +121,15 @@ def create_container(
         structure: Container structure ID
         protocol: Container protocol flags
         ctx: Storage context (transaction)
-        default_parent_structure: Container structure for parent containers
-        default_parent_protocol: Container protocol for parent containers
-        ensure_healthy_parents: Validate parents chain, create non-existent parents
+        validate_parent: If True, validate the parent is a container
+            (default True). Set to False only when the caller has already
+            ensured the parent exists. Ignored for the data root, which
+            has no parent.
+        node_info: Prefetched node info for site (optional)
 
     Raises:
         ContainerExistsError: If exists with incompatible type
-        ContainerNotFoundError: If parents missing and ensure_healthy_parents=False
+        ContainerNotFoundError: If the parent is missing (when validate_parent=True)
         ContainerTypeError: If type conflicts prevent creation
         StorageInterfaceError: If context doesn't support required operations
 
@@ -137,18 +139,17 @@ def create_container(
         ...     ContainerStructure,
         ...     ContainerProtocol,
         ... )
-        >>> # Create a root container with parents auto-created
+        >>> create_container(("/",), ContainerStructure(1), ContainerProtocol.MUTABLE, tx)
         >>> create_container(
-        ...     ("users", "alice"),
-        ...     ContainerStructure(1),
-        ...     ContainerProtocol.MUTABLE,
-        ...     tx,
-        ...     ensure_healthy_parents=True,
+        ...     ("/", "users"), ContainerStructure(1), ContainerProtocol.MUTABLE, tx
         ... )
-        >>> # Container at ("users",) is auto-created as parent
+        >>> # Raises ContainerNotFoundError: ("/", "teams") does not exist
+        >>> create_container(
+        ...     ("/", "teams", "core"), ContainerStructure(1), ContainerProtocol.MUTABLE, tx
+        ... )
     """
     # Check if already exists
-    node_info = get_node_info(site, ctx)
+    node_info = get_node_info(site, ctx) if node_info is None else node_info
 
     # Validate type consistency if node already exists
     if node_info.exists:
@@ -177,21 +178,9 @@ def create_container(
             )
             raise ContainerExistsError(f"Container exists with incompatible type: {site}") from None
 
-    # Ensure parents chain is healthy
-    if ensure_healthy_parents:
-        parent_info = gather_parent_info(site, ctx)
-
-        # Validate existing parents are healthy
-        validate_parents_healthy(site, ctx, parent_info=parent_info)
-
-        # Create missing parents
-        if parent_info.missing_sites:
-            create_parents(
-                site,
-                default_parent_structure,
-                default_parent_protocol,
-                ctx,
-            )
+    # Parent must exist: the container layer creates exactly one node
+    if validate_parent and len(site) > 1:
+        validate_is_container(site[:-1], ctx)
 
     # Create container
     marker = create_marker(structure, protocol)
@@ -560,11 +549,8 @@ def create_child_container(
         ContainerTypeError: If parent is not a container (when validate=True)
         StorageInterfaceError: If context doesn't support required operations
     """
-    if validate:
-        validate_is_container(parent_site, ctx)
-
     child_site = (*parent_site, key)
-    create_container(child_site, structure, protocol, ctx, ensure_healthy_parents=False)
+    create_container(child_site, structure, protocol, ctx, validate_parent=validate)
 
 
 def put_child_primitive(
@@ -930,54 +916,3 @@ def walk_descendants(
     for key, value in rctx.scan(scan_opts).items():
         node_type = NodeType.CONTAINER if is_marker(value) else NodeType.PRIMITIVE
         yield (key, node_type)
-
-
-# ============================================================================
-# PARENT MANAGEMENT OPERATIONS
-# ============================================================================
-
-
-def create_parents(
-    site: site_.Site,
-    default_structure: ContainerStructure,
-    default_protocol: ContainerProtocol,
-    ctx: StorageContextType,
-) -> None:
-    """Create all missing parents.
-
-    Creates parent containers for the given site using the specified
-    default structure and protocol. Only creates parents that are missing;
-    existing parents are left unchanged.
-
-    Idempotent: silent if all parents already exist.
-
-    Args:
-        site: Target site
-        default_structure: Structure ID for created parents
-        default_protocol: Protocol flags for created parents
-        ctx: Storage context (transaction)
-
-    Raises:
-        ContainerTypeError: If existing parents have malformed data
-        StorageInterfaceError: If context doesn't support required operations
-    """
-    wctx = require_write_context(ctx)
-
-    parent_info = gather_parent_info(site, ctx)
-
-    validate_parents_healthy(site, ctx, parent_info=parent_info)
-
-    if not parent_info.missing_sites:
-        return
-
-    for missing_site in parent_info.missing_sites:
-        marker = create_marker(default_structure, default_protocol)
-        wctx.put(missing_site, marker)
-
-    logger.debug(
-        "Missing parents created",
-        extra={
-            "target_site": site,
-            "created_sites": parent_info.missing_sites,
-        },
-    )

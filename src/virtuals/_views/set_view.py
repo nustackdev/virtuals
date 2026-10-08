@@ -13,7 +13,7 @@ from virtuals.view import (
     ChildNestedSetBase,
     ChildObservableBase,
     ChildPrimitiveSetBase,
-    MetadataBasedChildrenCountBase,
+    KeyedChildrenCountBase,
     ObservableBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
@@ -42,7 +42,7 @@ __all__ = ["SetView"]
 class SetView(
     ObservableBase,
     ChildObservableBase[object],
-    MetadataBasedChildrenCountBase,
+    KeyedChildrenCountBase,
     ChildNestedSetBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
@@ -101,12 +101,8 @@ class SetView(
         Args:
             value: Value to add
         """
-        key = self._make_key(value)
-        is_new = not self.container.exists_child(key)
-        self._set_child_value(key, value)
-        # Update length metadata if new value
-        if is_new:
-            self._increment_length()
+        # A new value is counted via _on_child_created
+        self._set_child_value(self._make_key(value), value)
 
     def remove(self, value: object) -> None:
         """Remove value from set.
@@ -243,16 +239,9 @@ class SetView(
         """
         self.clear()
 
-        # Batch store and update length once at end
-        count = 0
+        # Each new member is counted via _on_child_created
         for item in value:
-            key = self._make_key(item)
-            if not self.container.exists_child(key):
-                self._set_child_value(key, item)
-                count += 1
-
-        # Set final length metadata
-        self._set_length(count)
+            self._set_child_value(self._make_key(item), item)
 
 
 MutableSet.register(SetView)

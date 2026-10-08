@@ -144,17 +144,17 @@ class Navigator(Generic[ViewT]):
     ) -> View:
         """Write-side sibling of ``open_at_path``.
 
-        Walks the path and calls ``ensure_created()`` at each level, so every
-        intermediate container is stamped with its declared view type's
-        marker (and its ``_ensure_internal_layout`` hook runs). This is the
-        entry point ref-write code uses so that custom-layout views along a
-        path (``LogIndexedDictView``, ``IndexedDictView``, etc.) never get
-        auto-created with the default marker by the container layer's
-        view-blind parent-fill.
+        Walks the path and has each parent view create its missing child
+        (``ensure_child``), so every intermediate container is stamped with
+        its declared view type's marker, its ``_ensure_internal_layout``
+        hook runs, and the parent records the new child in its own
+        bookkeeping (``DictView`` length, indexed dict keys). The container
+        layer never creates parents, so this is the entry point ref-write
+        code uses for deep writes.
 
         Fast path: single existence probe on the deepest site. If already
-        present, skips the walk (invariant: prior walks through this helper
-        stamped every ancestor correctly).
+        present, skips the walk (every ancestor of an existing container
+        exists).
 
         Requires a write-capable context.
 

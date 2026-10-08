@@ -45,7 +45,6 @@ from .container_ops import (
     count_children,
     create_child_container,
     create_container,
-    create_parents,
     delete_child,
     delete_child_primitive_unsafe,
     delete_container,
@@ -128,8 +127,6 @@ from .node_ops import (
 # Types and Data Structures
 # ============================================================================
 from .types import (
-    DEFAULT_PARENT_PROTOCOL,
-    DEFAULT_PARENT_STRUCTURE,
     ContainerProtocol,
     ContainerStructure,
     NodeInfo,
@@ -165,8 +162,6 @@ __all__ = [  # noqa: RUF022
     "NodeInfo",
     "ParentInfo",
     "ParentChainInfo",
-    "DEFAULT_PARENT_STRUCTURE",
-    "DEFAULT_PARENT_PROTOCOL",
     # Exceptions
     "ContainerError",
     "ContainerNotFoundError",
@@ -220,7 +215,6 @@ __all__ = [  # noqa: RUF022
     "iter_descendants",
     "move_child_subtree",
     "walk_descendants",
-    "create_parents",
     # Metadata operations
     "put_metadata",
     "get_metadata",

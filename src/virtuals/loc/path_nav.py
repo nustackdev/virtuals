@@ -186,9 +186,14 @@ def navigate_view(
 ) -> View:
     """Navigate ViewPath to reach target View.
 
-    When all segments have static addresses (``is_address_static`` returns
-    True), skips intermediate View/Container allocation and builds the final
-    site tuple directly.
+    Pure navigation, no storage writes. Every level is opened as a view
+    whose ``parent`` is the level above, so the returned view always knows
+    its full parent chain (a later write through it creates missing
+    ancestors through their parents).
+
+    When segments have static addresses (``is_address_static`` returns
+    True), skips ``open_child`` and its address normalization, building
+    each level's site directly.
 
     Args:
         start_view: Starting view
@@ -212,17 +217,17 @@ def navigate_view(
             break
         static_end += 1
 
-    # Fast-path the static prefix: build site directly, one View at the end
+    # Fast-path the static prefix: build sites directly, no normalization.
+    # Still one View per level (pure allocation) so the parent chain holds.
     current_view = start_view
     if static_end > 0:
         from virtuals.container import Container
 
-        site = start_view.container.site
-        for address, _ in path[:static_end]:
-            site = (*site, address)
-        pivot_type = path[static_end - 1][1]
-        container = Container(ctx=start_view.container.ctx, site=site)
-        current_view = pivot_type(container, start_view.registry)
+        ctx = start_view.container.ctx
+        registry = start_view.registry
+        for address, view_type in path[:static_end]:
+            container = Container(ctx=ctx, site=(*current_view.container.site, address))
+            current_view = view_type(container, registry, parent=current_view)  # type: ignore[call-arg]
 
     # Slow-path the remaining dynamic segments
     for address, expected_type in path[static_end:]:
@@ -239,36 +244,27 @@ def navigate_and_ensure(
 
     Ensures every level is materialized with its declared view type.
 
-    Sibling of ``navigate_view`` for the write path. Same walk shape; the
-    difference is that at each step this calls ``ensure_created()`` on the
-    child view -- stamping the container's marker with the DECLARED view
-    type's structure and running the view's ``_ensure_internal_layout``
-    hook (e.g. building ``__keys__/`` + ``__data__/`` sub-containers on
-    log/indexed dict views).
+    Sibling of ``navigate_view`` for the write path. Every missing level
+    is created by its parent view (``ensure_child``): stamped with the
+    DECLARED view type's structure, its ``_ensure_internal_layout`` hook
+    run (e.g. building ``__keys__/`` + ``__data__/`` sub-containers on
+    log/indexed dict views), and recorded by the parent's
+    ``_on_child_created`` (a ``DictView`` bumps its length, an indexed
+    dict records the key).
 
-    Why this exists: the container-layer auto-parent-creation
-    (``ensure_healthy_parents=True`` inside ``Container.create``) is
-    view-blind and stamps a hardcoded default structure at each missing
-    ancestor. When a ref writes a leaf like ``blocks[100].committed``, the
-    leaf's own ``ensure_created`` would auto-create ``/blocks`` with the
-    default marker, silently -- so a later operation that opens
-    ``/blocks`` as its DECLARED ``LogIndexedDictView`` (structure 15) hits
-    a marker mismatch and raises ``ContainerExistsError``. Routing writes
-    through this walk guarantees every ancestor is stamped with its
-    declared type before any leaf write, so the invariant "any container
-    reachable via a ref-write path has been ensured with its declared view
-    type" holds by construction.
+    The container layer never creates parents, so this walk (or a write
+    through any view opened by ``navigate_view``, which delegates to its
+    parent chain the same way) is how deep writes into never-touched
+    storage get their ancestors.
 
-    Fast path: one existence probe on the deepest site in ``path``. If it
-    already exists, every ancestor exists too (invariant maintained by
-    prior walks through this same helper), so the walk is skipped and the
-    view is opened directly. Hot-path cost is a single storage read --
-    same as today's leaf-existence check in ``ensure_created``.
+    Fast path: navigate in memory (``navigate_view``, no storage writes),
+    then one existence probe on the leaf. If it exists, every ancestor
+    exists too (the container layer never creates orphans), so the view is
+    returned as-is. Hot-path cost on static paths is a single storage read.
 
-    Cold path: walk root -> leaf via ``open_child_view`` (pure navigation,
-    zero storage), calling ``ensure_created`` at each level. Views whose
-    markers already match short-circuit inside ``Container.create``, so
-    ancestor levels are cheap.
+    Cold path: walk root -> leaf with ``ensure_child`` at each level.
+    Existing levels only validate their marker; missing ones are created
+    through their parent.
 
     Args:
         start_view: Starting view (usually a Navigator root).
@@ -280,34 +276,20 @@ def navigate_and_ensure(
     Returns:
         The view at the end of the path, guaranteed materialized.
     """
-    from virtuals.container import Container
-    from virtuals.container.node_ops import node_exists
-
     if not path:
         start_view.ensure_created()
         return start_view
 
-    # Fast path: if the deepest container already exists, ancestors are
-    # already correct (invariant from prior walks). Skip the walk.
-    leaf_site = start_view.container.site
-    for address, _ in path:
-        leaf_site = (*leaf_site, address)
-    if node_exists(leaf_site, start_view.container.ctx):
-        # Open the view at the final segment's declared class without
-        # re-walking. This mirrors the fast-path in ``navigate_view``.
-        leaf_view_type = path[-1][1]
-        container = Container(ctx=start_view.container.ctx, site=leaf_site)
-        return leaf_view_type(container, start_view.registry)
+    # Fast path: the leaf exists, so its ancestors do too. One probe.
+    leaf_view = navigate_view(start_view, path)
+    if leaf_view.container.exists():
+        return leaf_view
 
-    # Cold path: walk with ensure at each level. ``open_child_view`` is
-    # pure navigation; ``ensure_created`` on each level does one
-    # ``get_node_info`` (silent return if the marker already matches) or
-    # stamps + runs the view's ``_ensure_internal_layout`` hook.
+    # Cold path: each parent creates its missing child.
     start_view.ensure_created()
     current_view = start_view
     for address, expected_type in path:
-        current_view = open_child_view(current_view, address, expected_type)
-        current_view.ensure_created()
+        current_view = current_view.ensure_child(address, expected_type)  # type: ignore[attr-defined]
     return current_view
 
 

@@ -23,7 +23,6 @@ from virtuals.loc import DATA_ROOT
 
 from . import container_ops, meta_ops, node_ops, validation_ops
 from .exceptions import ContainerInvalidSiteError
-from .types import DEFAULT_PARENT_PROTOCOL, DEFAULT_PARENT_STRUCTURE
 
 
 if TYPE_CHECKING:
@@ -62,7 +61,7 @@ class Container:
         - All child operations validate parent existence
         - Type safety: can't replace containers with primitives
         - No stale data: always queries storage
-        - Parent chain validation on creation
+        - Parent existence validation on creation
 
     All mutations are silent (return None) and idempotent.
     """
@@ -85,15 +84,16 @@ class Container:
         structure: ContainerStructure,
         protocol: ContainerProtocol,
         *,
-        default_parent_structure: ContainerStructure = DEFAULT_PARENT_STRUCTURE,
-        default_parent_protocol: ContainerProtocol = DEFAULT_PARENT_PROTOCOL,
-        ensure_healthy_parents: bool = True,
+        validate_parent: bool = True,
+        node_info: NodeInfo | None = None,
     ) -> Container:
         """Create new container at site and return Container instance.
 
         Creates a container in storage and returns a Container instance
-        pointing to it. By default, automatically creates any missing
-        parent containers.
+        pointing to it. Creates exactly one node: the parent must already
+        exist as a container, missing parents are never auto-created.
+        Views create their children through the parent view
+        (``View.ensure_child``) so every level gets its own view type.
 
         Idempotent: silent if container already exists with compatible type.
 
@@ -102,17 +102,17 @@ class Container:
             ctx: Storage context (must support writes)
             structure: Container structure ID (for View reconstruction)
             protocol: Container protocol flags (behavior hints)
-            default_parent_structure: Container structure for parent containers
-            default_parent_protocol: Container protocol for parent containers
-            ensure_healthy_parents: Validate parents chain, create non-existent parents
+            validate_parent: If True, validate the parent is a container
+                (default True). Ignored for the data root.
+            node_info: Prefetched node info for site (optional)
 
         Returns:
             Container instance pointing to the container
 
         Raises:
             ContainerExistsError: If container exists with incompatible type
-            ContainerNotFoundError: If ensure_healthy_parents=False and parents missing
-            ContainerParentMalformedError: If parent chain has corrupted data
+            ContainerNotFoundError: If the parent is missing (when validate_parent=True)
+            ContainerTypeError: If the parent is not a container
             StorageInterfaceError: If context doesn't support writes
         """
         if not site or site[0] != DATA_ROOT:
@@ -125,9 +125,8 @@ class Container:
             structure,
             protocol,
             ctx,
-            default_parent_structure=default_parent_structure,
-            default_parent_protocol=default_parent_protocol,
-            ensure_healthy_parents=ensure_healthy_parents,
+            validate_parent=validate_parent,
+            node_info=node_info,
         )
 
         return cls(ctx=ctx, site=site)

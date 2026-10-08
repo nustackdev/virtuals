@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import heapq
 from collections.abc import ItemsView, KeysView, ValuesView
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, ClassVar
 
 from kh57 import kh57
 from kh57 import sample as kh57_sample
@@ -40,15 +40,15 @@ from kh57 import sample as kh57_sample
 from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType, node_ops
 from virtuals.tkv.filter import LengthFilter, PrefixFilter
 from virtuals.tkv.storage import StorageScanOptions
-from virtuals.types import EMPTY, Empty, Value
+from virtuals.types import EMPTY, Empty
 from virtuals.view import (
     ChildNavigationBase,
     ChildNestedGetBase,
     ChildNestedSetBase,
     ChildObservableBase,
     ChildPrimitiveSetBase,
+    KeyedChildrenCountBase,
     LazyChildReadBase,
-    MetadataBasedChildrenCountBase,
     ObservableBase,
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
@@ -155,7 +155,7 @@ class _Kh57ContainerBackend:
 class Kh57ViewBase(
     ObservableBase,
     ChildObservableBase[int],
-    MetadataBasedChildrenCountBase,
+    KeyedChildrenCountBase,
     ChildNavigationBase[int],
     ChildNestedGetBase,
     ChildNestedSetBase,
@@ -212,13 +212,11 @@ class Kh57ViewBase(
         :meth:`set_child_container_as`) pass it explicitly.
         """
         self.ensure_created()
-        is_new = not self.container.exists_child(encoded)
+        # A new child is counted via _on_child_created
         if self.registry.is_container_type(value):
             self._populate_child_container(encoded, value, view_class=view_class)
         else:
-            self.container.put_child_primitive(encoded, cast("Value", value))
-        if is_new:
-            self._increment_length()
+            self._put_child_primitive(encoded, value)
 
     def set_child_container_as(
         self,
@@ -293,7 +291,7 @@ class Kh57ViewBase(
         if info.structure is None:
             raise ValueError(f"Child container at {encoded} has no structure ID")
         view_class = self.registry.get_view_for_structure(info.structure)
-        child_view = view_class(container=child_container, registry=self.registry)
+        child_view = view_class(container=child_container, registry=self.registry, parent=self)
         if not isinstance(child_view, Convertible):
             raise TypeError(f"Child view {view_class.__name__} does not support extraction")
         return child_view.extract()
@@ -305,7 +303,7 @@ class Kh57ViewBase(
         if info.structure is None:
             raise ValueError(f"Child container at {encoded} has no structure ID")
         view_class = self.registry.get_view_for_structure(info.structure)
-        return view_class(container=child_container, registry=self.registry)
+        return view_class(container=child_container, registry=self.registry, parent=self)
 
     # -- Membership -------------------------------------------------------
 
@@ -352,16 +350,11 @@ class Kh57ViewBase(
         self.ensure_created()
         if replace and len(self) > 0:
             self.clear()
-        count = len(self)
+        # Each new key is counted via _on_child_created
         for key, val in value.items():
             if not isinstance(key, int) or key < 0:
                 raise TypeError(f"Kh57View keys must be non-negative int, got {key!r}")
-            encoded = kh57(key)
-            is_new = not self.container.exists_child(encoded)
-            self._set_child_value(encoded, val)
-            if is_new:
-                count += 1
-        self._set_length(count)
+            self._set_child_value(kh57(key), val)
 
     # -- Iteration in original int order ---------------------------------
 
@@ -466,7 +459,7 @@ class Kh57ViewBase(
         encoded = kh57(address)
         child_site = (*self.container.site, encoded)
         child_container = Container(ctx=self.container.ctx, site=child_site)
-        return view(child_container, self.registry)
+        return view(child_container, self.registry, parent=self)
 
 
 # =============================================================================
@@ -539,7 +532,7 @@ class EagerKh57View(Kh57ViewBase):
     @property
     def lazy(self) -> LazyKh57View:
         """Switch to lazy facet — reads return child Views."""
-        return LazyKh57View(container=self.container, registry=self.registry)
+        return LazyKh57View(container=self.container, registry=self.registry, parent=self.parent)
 
     @property
     def eager(self) -> EagerKh57View:
@@ -593,7 +586,7 @@ class LazyKh57View(Kh57ViewBase):
     @property
     def eager(self) -> EagerKh57View:
         """Switch to eager facet — reads return extracted values."""
-        return EagerKh57View(container=self.container, registry=self.registry)
+        return EagerKh57View(container=self.container, registry=self.registry, parent=self.parent)
 
     @property
     def lazy(self) -> LazyKh57View:

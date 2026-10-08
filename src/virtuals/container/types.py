@@ -18,8 +18,6 @@ if TYPE_CHECKING:
 
 
 __all__ = [
-    "DEFAULT_PARENT_PROTOCOL",
-    "DEFAULT_PARENT_STRUCTURE",
     "ContainerProtocol",
     "ContainerStructure",
     "NodeInfo",
@@ -164,9 +162,3 @@ class ContainerProtocol(IntFlag):
             parts.append("MUTABLE")
 
         return "|".join(parts)
-
-
-# Constants
-
-DEFAULT_PARENT_STRUCTURE = ContainerStructure(0)
-DEFAULT_PARENT_PROTOCOL = ContainerProtocol.NONE

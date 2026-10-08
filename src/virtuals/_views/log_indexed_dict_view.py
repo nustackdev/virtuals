@@ -139,6 +139,10 @@ class LogIndexedDictViewBase(
             site=(*self.container.site, _DATA),
         )
 
+    def _children_container(self) -> Container:
+        """Children live under ``__data__/``."""
+        return self._data_container()
+
     def _keys_container(self) -> Container:
         """Container for the append-only log key index."""
         return Container(
@@ -173,6 +177,33 @@ class LogIndexedDictViewBase(
         kc = self._keys_container()
         kc.put_child_primitive(log_key, actual_key)
         return log_key
+
+    # -- Bookkeeping -------------------------------------------------------
+
+    def _on_child_created(self, address: str | int) -> None:
+        """Log every new child's key into ``__keys__/``, exactly once."""
+        self._append_log_key(address)
+
+    def _rebuild_bookkeeping(self) -> None:
+        """Rebuild the ``__keys__/`` log from the children in ``__data__/``.
+
+        Keeps the first log entry of every key that still holds data, drops
+        stale and repeated entries, then logs keys the index never recorded
+        in storage scan order.
+        """
+        self._ensure_internal_layout()
+        data_keys = list(self._data_container().iter_child_keys(validate=False))
+        present = set(data_keys)
+        kc = self._keys_container()
+        seen: set[str | int] = set()
+        for log_key, actual_key in list(self._scan_log_keys()):
+            if actual_key in present and actual_key not in seen:
+                seen.add(actual_key)
+            else:
+                kc.delete_child(log_key)
+        for key in data_keys:
+            if key not in seen:
+                self._append_log_key(key)  # type: ignore[arg-type]
 
     # -- Observability overrides -------------------------------------------
     # LogIndexedDictView stores data under `__data__/` and log keys under
@@ -396,30 +427,8 @@ class LogIndexedDictViewBase(
     # -- Mutations ---------------------------------------------------------
 
     def __setitem__(self, address: str | int, value: object) -> None:
-        self.ensure_created()
-        dc = self._data_container()
-        is_new = not dc.exists_child(address)
-        # Write to __data__
-        if self.registry.is_container_type(value):
-            from virtuals.collections import Initializable
-
-            value_type = value.__class__
-            view_class = self.registry.get_view_for_type(value_type)
-            structure_id = view_class.get_structure()
-            protocol_hints = view_class.get_protocol()
-            child_container = dc.create_child_container(
-                address,
-                structure=ContainerStructure(structure_id),
-                protocol=protocol_hints,
-            )
-            child_view = view_class(container=child_container, registry=self.registry)
-            if not isinstance(child_view, Initializable):
-                raise TypeError(f"Child view {view_class.__name__} does not support initialization")
-            child_view.store(value)
-        else:
-            dc.put_child_primitive(address, cast("Value", value))
-        if is_new:
-            self._append_log_key(address)
+        """Set value under ``__data__/``. A new key is logged via ``_on_child_created``."""
+        self._set_child_value(address, value)
 
     def set_primitive(self, address: str | int, value: object) -> None:
         """Store a compound value as a single primitive blob.
@@ -429,11 +438,7 @@ class LogIndexedDictViewBase(
         granularity (e.g., storing a list or dict as a single key).
         """
         self.ensure_created()
-        dc = self._data_container()
-        is_new = not dc.exists_child(address)
-        dc.put_child_primitive(address, cast("Value", value))
-        if is_new:
-            self._append_log_key(address)
+        self._put_child_primitive(address, value)
 
     def __delitem__(self, address: str | int) -> None:
         # No ensure_created here: deletes must not materialize the view as
@@ -470,24 +475,8 @@ class LogIndexedDictViewBase(
         that carry ``view_type=view_class`` in their slot payload and know
         the child layout up front.
         """
-        from virtuals.collections import Initializable
-
         self.ensure_created()
-        dc = self._data_container()
-        is_new = not dc.exists_child(address)
-        structure_id = view_class.get_structure()
-        protocol_hints = view_class.get_protocol()
-        child_container = dc.create_child_container(
-            address,
-            structure=ContainerStructure(structure_id),
-            protocol=protocol_hints,
-        )
-        child_view = view_class(container=child_container, registry=self.registry)
-        if not isinstance(child_view, Initializable):
-            raise TypeError(f"Child view {view_class.__name__} does not support initialization")
-        child_view.store(value)
-        if is_new:
-            self._append_log_key(address)
+        self._populate_child_container(address, value, view_class=view_class)
 
     def append(self, value: object) -> str:
         """Append value under a freshly generated unique log key.
@@ -514,29 +503,9 @@ class LogIndexedDictViewBase(
         if replace and any(True for _ in self._scan_log_keys()):
             self.clear()
 
-        dc = self._data_container()
+        # Each new key is logged via _on_child_created, in insertion order
         for key, val in value.items():
-            if self.registry.is_container_type(val):
-                from virtuals.collections import Initializable
-
-                value_type = val.__class__
-                view_class = self.registry.get_view_for_type(value_type)
-                structure_id = view_class.get_structure()
-                protocol_hints = view_class.get_protocol()
-                child_container = dc.create_child_container(
-                    key,
-                    structure=ContainerStructure(structure_id),
-                    protocol=protocol_hints,
-                )
-                child_view = view_class(container=child_container, registry=self.registry)
-                if not isinstance(child_view, Initializable):
-                    raise TypeError(
-                        f"Child view {view_class.__name__} does not support initialization"
-                    )
-                child_view.store(val)
-            else:
-                dc.put_child_primitive(key, cast("Value", val))
-            self._append_log_key(key)
+            self._set_child_value(key, val)
 
     # -- Navigation --------------------------------------------------------
 
@@ -546,7 +515,7 @@ class LogIndexedDictViewBase(
         dc = self._data_container()
         child_site = (*dc.site, normalized)
         child_container = Container(ctx=dc.ctx, site=child_site)
-        return view(child_container, self.registry)
+        return view(child_container, self.registry, parent=self)
 
     # -- Internal read helpers ---------------------------------------------
 
@@ -569,7 +538,7 @@ class LogIndexedDictViewBase(
         if node_info.structure is None:  # type: ignore[union-attr]
             raise ValueError(f"Child container '{address}' has no structure ID")
         view_class = self.registry.get_view_for_structure(node_info.structure)  # type: ignore[union-attr]
-        child_view = view_class(container=child_container, registry=self.registry)
+        child_view = view_class(container=child_container, registry=self.registry, parent=self)
         if not isinstance(child_view, Convertible):
             raise TypeError(f"Child view {view_class.__name__} does not support extraction")
         return child_view.extract()
@@ -581,7 +550,7 @@ class LogIndexedDictViewBase(
         if node_info.structure is None:  # type: ignore[union-attr]
             raise ValueError(f"Child container '{address}' has no structure ID")
         view_class = self.registry.get_view_for_structure(node_info.structure)  # type: ignore[union-attr]
-        return view_class(container=child_container, registry=self.registry)
+        return view_class(container=child_container, registry=self.registry, parent=self)
 
 
 # =============================================================================
@@ -673,7 +642,9 @@ class EagerLogIndexedDictView(LogIndexedDictViewBase):
 
     @property
     def lazy(self) -> LazyLogIndexedDictView:
-        return LazyLogIndexedDictView(container=self.container, registry=self.registry)
+        return LazyLogIndexedDictView(
+            container=self.container, registry=self.registry, parent=self.parent
+        )
 
     @property
     def eager(self) -> EagerLogIndexedDictView:
@@ -759,7 +730,9 @@ class LazyLogIndexedDictView(LogIndexedDictViewBase):
 
     @property
     def eager(self) -> EagerLogIndexedDictView:
-        return EagerLogIndexedDictView(container=self.container, registry=self.registry)
+        return EagerLogIndexedDictView(
+            container=self.container, registry=self.registry, parent=self.parent
+        )
 
     @property
     def lazy(self) -> LazyLogIndexedDictView:

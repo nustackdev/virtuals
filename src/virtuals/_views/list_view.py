@@ -301,7 +301,7 @@ class EagerListView(ListViewBase):
     @property
     def lazy(self) -> LazyListView:
         """Switch to lazy facet — reads return child Views."""
-        return LazyListView(container=self.container, registry=self.registry)
+        return LazyListView(container=self.container, registry=self.registry, parent=self.parent)
 
     @property
     def eager(self) -> EagerListView:
@@ -406,7 +406,7 @@ class LazyListView(ListViewBase):
     @property
     def eager(self) -> EagerListView:
         """Switch to eager facet — reads return extracted values."""
-        return EagerListView(container=self.container, registry=self.registry)
+        return EagerListView(container=self.container, registry=self.registry, parent=self.parent)
 
     @property
     def lazy(self) -> LazyListView:

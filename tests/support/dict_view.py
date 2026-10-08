@@ -69,11 +69,6 @@ class DictView(
     CONTAINER_CLS: ClassVar[type] = dict
 
     @classmethod
-    def get_default_parent_view(cls) -> type[View] | None:
-        """Returns DictView as default parent view."""
-        return cls
-
-    @classmethod
     def get_available_views(cls) -> tuple[type[View], ...]:
         """Returns DictView as available view."""
         return (cls,)

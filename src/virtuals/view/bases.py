@@ -13,8 +13,8 @@ from __future__ import annotations
 from logging import getLogger
 from typing import TYPE_CHECKING, Generic, TypeVar, cast
 
-from virtuals.container import Container, ContainerStructure, NodeType, node_ops
-from virtuals.types import Empty, Value, is_empty
+from virtuals.container import Container, NodeType, node_ops
+from virtuals.types import Empty, is_empty
 
 
 if TYPE_CHECKING:
@@ -100,6 +100,29 @@ class MetadataBasedChildrenCountBase:
         count = sum(1 for _ in self.container.iter_child_keys())
         self._set_length(count)
 
+    def _rebuild_bookkeeping(self) -> None:
+        """Rebuild the ``__len__`` counter from a live count of children."""
+        self._update_count()
+
+
+class KeyedChildrenCountBase(MetadataBasedChildrenCountBase):
+    """Metadata count for keyed views: every new child counts once.
+
+    A key comes into being when a child is created, by this view's own
+    writes or by the system creating it through this view, so the count
+    follows ``_on_child_created``. Positional views keep the plain base:
+    their length is an index bound, set by their own append/insert/pop.
+
+    Example:
+        >>> class MyView(KeyedChildrenCountBase, View):
+        ...     def add_item(self, address: str, value: int):
+        ...         self._set_child_value(address, value)  # counted by the hook
+    """
+
+    def _on_child_created(self, address: site_.SiteSegment) -> None:
+        """Count every new child, however it was created."""
+        self._increment_length()
+
 
 class LiveChildrenCountBase:
     """Base for views that count children on-the-fly.
@@ -173,7 +196,8 @@ class ChildNavigationBase(AddressMappingBase[A]):
         """Open child view at address.
 
         Pure navigation — does not write to storage. Container markers
-        are created lazily by write operations via _ensure_created().
+        are created lazily by write operations via ensure_created(), which
+        routes through this view (the child's parent).
 
         Args:
             address: Child container address (will be normalized)
@@ -188,7 +212,7 @@ class ChildNavigationBase(AddressMappingBase[A]):
         normalized_address = self.normalize_address(address)
         child_site = (*self.container.site, normalized_address)
         child_container = Container(ctx=self.container.ctx, site=child_site)
-        return view(child_container, self.registry)
+        return view(child_container, self.registry, parent=self)  # type: ignore[call-arg]
 
 
 class ChildNestedGetBase:
@@ -288,7 +312,7 @@ class ChildNestedGetBase:
 
         # Find appropriate view
         view_class = self.registry.get_view_for_structure(child_info.structure)
-        child_view = view_class(container=child_container, registry=self.registry)
+        child_view = view_class(container=child_container, registry=self.registry, parent=self)  # type: ignore[call-arg]
 
         # Extract if supported
         if not isinstance(child_view, Convertible):
@@ -367,7 +391,7 @@ class LazyChildReadBase:
             raise ValueError(f"Child container '{address}' has no structure ID")
 
         view_class = self.registry.get_view_for_structure(node_info.structure)
-        return view_class(container=child_container, registry=self.registry)
+        return view_class(container=child_container, registry=self.registry, parent=self)  # type: ignore[call-arg]
 
 
 class ChildNestedSetBase:
@@ -396,7 +420,9 @@ class ChildNestedSetBase:
         Automatically populates nested containers using registry.
 
         Calls ensure_created() to lazily materialize the container marker
-        before any write operation.
+        before any write operation. A new child, container or primitive,
+        fires ``_on_child_created`` exactly once, so callers do no
+        bookkeeping of their own.
 
         Args:
             address: Child address
@@ -408,7 +434,7 @@ class ChildNestedSetBase:
             self._populate_child_container(address, value)
         else:
             # Primitive value - store directly
-            self.container.put_child_primitive(address, cast("Value", value))
+            self._put_child_primitive(address, value)  # type: ignore[attr-defined]
 
     def _populate_child_container(
         self,
@@ -417,6 +443,10 @@ class ChildNestedSetBase:
         view_class: type[View] | None = None,
     ) -> None:
         """Populate child container from Python value.
+
+        The child is created through this view (``_ensure_child_view``), so a
+        new child fires ``_on_child_created`` once. Caller must have ensured
+        this view exists.
 
         Args:
             address: Child address
@@ -437,7 +467,6 @@ class ChildNestedSetBase:
         if view_class is None:
             view_class = self.registry.get_view_for_type(value.__class__)
         structure_id = view_class.get_structure()
-        protocol_hints = view_class.get_protocol()
 
         logger.debug(
             "Populating child container",
@@ -450,15 +479,11 @@ class ChildNestedSetBase:
             },
         )
 
-        # Create child container
-        child_container = self.container.create_child_container(
-            address,
-            structure=ContainerStructure(structure_id),
-            protocol=protocol_hints,
-        )
-
-        # Create view and populate
-        child_view = view_class(container=child_container, registry=self.registry)
+        # Create child container through this view
+        children = self._children_container()  # type: ignore[attr-defined]
+        child_container = Container(ctx=children.ctx, site=(*children.site, address))
+        child_view = view_class(container=child_container, registry=self.registry, parent=self)  # type: ignore[call-arg]
+        self._ensure_child_view(child_view)  # type: ignore[attr-defined]
 
         # Store if supported
         if not isinstance(child_view, Initializable):
@@ -489,14 +514,15 @@ class ChildPrimitiveSetBase:
 
         Materializes the container chain via ensure_created(), then writes
         the primitive value. Parent validation is skipped (already ensured),
-        but child type is still checked.
+        but child type is still checked. A new key fires
+        ``_on_child_created``.
 
         Args:
             address: Child address
             value: Primitive value to store
         """
         self.ensure_created()  # type: ignore[attr-defined]
-        self.container.put_child_primitive(address, cast("Value", value), validate_parent=False)
+        self._put_child_primitive(address, value)  # type: ignore[attr-defined]
 
 
 class PrimitiveOpsBase:
@@ -519,18 +545,19 @@ class PrimitiveOpsBase:
 
     def _primitive_read(self, address: site_.SiteSegment) -> object:
         """Read a value stored as a single primitive blob."""
-        child_site = (*self.container.site, address)
-        return self.container.ctx.get(child_site)  # type: ignore
+        children = self._children_container()  # type: ignore[attr-defined]
+        return children.ctx.get((*children.site, address))
 
     def _primitive_write(self, address: site_.SiteSegment, value: object) -> None:
         """Write a value as a single primitive blob.
 
         Ensures the container chain exists, then stores the value directly
         as a single key-value pair regardless of the value's structure.
+        Goes through the view's child bookkeeping, so a new key is counted
+        or indexed like any other child.
         """
         self.ensure_created()  # type: ignore[attr-defined]
-        child_site = (*self.container.site, address)
-        self.container.ctx.put(child_site, value)  # type: ignore
+        self._put_child_primitive(address, value)  # type: ignore[attr-defined]
 
 
 class UnsafePrimitiveOpsBase:
@@ -552,6 +579,14 @@ class UnsafePrimitiveOpsBase:
     - The container chain exists (e.g. via InitCmd / ensure_created)
     - Children are primitives (no nested containers)
 
+    No parent bookkeeping: these bypass ``_on_child_created`` and write at
+    the view's own container site. A NEW key written this way is not
+    counted or indexed by views that keep counts or indexes (``DictView``
+    ``__len__``, ``FlatDictView``, indexed dicts' ``__keys__``), so ``len()``
+    and key iteration can miss it. Overwriting existing keys, or views that
+    count live (``LightDictView``), are unaffected. ``rebuild_bookkeeping``
+    repairs counts after the fact.
+
     Methods:
         _unsafe_primitive_read(address)                        — ctx.get()
         _unsafe_primitive_write(address, ensure_exists=False)  — ctx.put()
@@ -572,6 +607,9 @@ class UnsafePrimitiveOpsBase:
     ) -> None:
         """Write primitive child — single ctx.put() call.
 
+        Does no parent bookkeeping: a new key is not counted or indexed by
+        views that keep counts or indexes (see class docstring).
+
         Args:
             address: Child address
             value: Primitive value to store
@@ -585,7 +623,11 @@ class UnsafePrimitiveOpsBase:
         self.container.ctx.put(child_site, value)  # type: ignore
 
     def _unsafe_primitive_delete(self, address: site_.SiteSegment) -> None:
-        """Delete primitive child — single ctx.delete() call."""
+        """Delete primitive child — single ctx.delete() call.
+
+        Does no parent bookkeeping: views that keep counts or indexes still
+        list the deleted key (see class docstring).
+        """
         child_site = (*self.container.site, address)
         self.container.ctx.delete(child_site)  # type: ignore
 

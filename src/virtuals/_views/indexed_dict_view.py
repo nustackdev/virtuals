@@ -26,7 +26,7 @@ from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType
-from virtuals.types import EMPTY, Empty, Value
+from virtuals.types import EMPTY, Empty
 from virtuals.view import (
     ChildNavigationBase,
     ChildNestedGetBase,
@@ -111,8 +111,16 @@ class IndexedDictViewBase(
             site=(*self.container.site, _DATA),
         )
 
+    def _children_container(self) -> Container:
+        """Children live under ``__data__/``."""
+        return self._data_container()
+
     def _keys_view(self) -> FlatListView:
-        """FlatListView over ``__keys__/`` child container."""
+        """FlatListView over ``__keys__/`` child container.
+
+        Opened without a parent: ``__keys__/`` is internal layout owned by
+        ``_ensure_internal_layout``, not a child of this dict.
+        """
         container = Container(
             ctx=self.container.ctx,
             site=(*self.container.site, _KEYS),
@@ -148,29 +156,41 @@ class IndexedDictViewBase(
         return self._data_container().exists_child(obj)
 
     def __iter__(self) -> Generator[str | int, None, None]:
-        self._ensure_keys_synced()
         yield from self._keys_view()
 
     def key_at(self, idx: int) -> str | int:
         """Get key at index — single O(1) read from __keys__ FlatListView."""
         return self._keys_view()[idx]
 
-    def _ensure_keys_synced(self) -> None:
-        """Sync __keys__ from __data__ if empty."""
-        kv = self._keys_view()
-        if len(kv) == 0:
-            dc = self._data_container()
-            if dc.exists():
-                data_keys = list(dc.iter_child_keys(validate=False))
-                if data_keys:
-                    self.ensure_created()
-                    kv = self._keys_view()
-                    kv.store(data_keys)
-
     def keys(self) -> KeysView[str | int]:
         """Get all keys as a set-like view."""
-        self._ensure_keys_synced()
         return KeysView(self)  # type: ignore[arg-type]
+
+    # -- Bookkeeping ---------------------------------------------------------
+
+    def _on_child_created(self, address: str | int) -> None:
+        """Record every new child's key in ``__keys__/``, in creation order."""
+        self._keys_view().append(address)
+
+    def _rebuild_bookkeeping(self) -> None:
+        """Rebuild ``__keys__/`` from the children in ``__data__/``.
+
+        Keeps the recorded order for keys that still hold data, drops stale
+        and repeated entries, then appends keys the index never recorded in
+        storage scan order.
+        """
+        self._ensure_internal_layout()
+        data_keys = list(self._data_container().iter_child_keys(validate=False))
+        present = set(data_keys)
+        kv = self._keys_view()
+        keys: list[str | int] = []
+        seen: set[str | int] = set()
+        for key in kv:
+            if key in present and key not in seen:
+                keys.append(key)  # type: ignore[arg-type]
+                seen.add(key)  # type: ignore[arg-type]
+        keys.extend(key for key in data_keys if key not in seen)  # type: ignore[misc]
+        kv.store(keys)
 
     def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
         try:
@@ -181,30 +201,8 @@ class IndexedDictViewBase(
     # -- Mutations (same for both facets) -----------------------------------
 
     def __setitem__(self, address: str | int, value: object) -> None:
-        self.ensure_created()
-        dc = self._data_container()
-        is_new = not dc.exists_child(address)
-        # Write to __data__
-        if self.registry.is_container_type(value):
-            from virtuals.collections import Initializable
-
-            value_type = value.__class__
-            view_class = self.registry.get_view_for_type(value_type)
-            structure_id = view_class.get_structure()
-            protocol_hints = view_class.get_protocol()
-            child_container = dc.create_child_container(
-                address,
-                structure=ContainerStructure(structure_id),
-                protocol=protocol_hints,
-            )
-            child_view = view_class(container=child_container, registry=self.registry)
-            if not isinstance(child_view, Initializable):
-                raise TypeError(f"Child view {view_class.__name__} does not support initialization")
-            child_view.store(value)
-        else:
-            dc.put_child_primitive(address, cast("Value", value))
-        if is_new:
-            self._keys_view().append(address)
+        """Set value under ``__data__/``. A new key is recorded via ``_on_child_created``."""
+        self._set_child_value(address, value)
 
     def set_child_container_as(
         self,
@@ -219,24 +217,8 @@ class IndexedDictViewBase(
         dispatching by Python value type. Used by Refs that carry
         ``view_type=view_class`` in their slot payload.
         """
-        from virtuals.collections import Initializable
-
         self.ensure_created()
-        dc = self._data_container()
-        is_new = not dc.exists_child(address)
-        structure_id = view_class.get_structure()
-        protocol_hints = view_class.get_protocol()
-        child_container = dc.create_child_container(
-            address,
-            structure=ContainerStructure(structure_id),
-            protocol=protocol_hints,
-        )
-        child_view = view_class(container=child_container, registry=self.registry)
-        if not isinstance(child_view, Initializable):
-            raise TypeError(f"Child view {view_class.__name__} does not support initialization")
-        child_view.store(value)
-        if is_new:
-            self._keys_view().append(address)
+        self._populate_child_container(address, value, view_class=view_class)
 
     def __delitem__(self, address: str | int) -> None:
         # No ensure_created here: deletes must not materialize the view as
@@ -270,32 +252,9 @@ class IndexedDictViewBase(
         if replace and len(self) > 0:
             self.clear()
 
-        keys: list[str | int] = []
-        dc = self._data_container()
+        # Each new key is recorded via _on_child_created, in insertion order
         for key, val in value.items():
-            if self.registry.is_container_type(val):
-                from virtuals.collections import Initializable
-
-                value_type = val.__class__
-                view_class = self.registry.get_view_for_type(value_type)
-                structure_id = view_class.get_structure()
-                protocol_hints = view_class.get_protocol()
-                child_container = dc.create_child_container(
-                    key,
-                    structure=ContainerStructure(structure_id),
-                    protocol=protocol_hints,
-                )
-                child_view = view_class(container=child_container, registry=self.registry)
-                if not isinstance(child_view, Initializable):
-                    raise TypeError(
-                        f"Child view {view_class.__name__} does not support initialization"
-                    )
-                child_view.store(val)
-            else:
-                dc.put_child_primitive(key, cast("Value", val))
-            keys.append(key)
-
-        self._keys_view().store(keys)
+            self._set_child_value(key, val)
 
     # -- Navigation --------------------------------------------------------
 
@@ -305,7 +264,7 @@ class IndexedDictViewBase(
         dc = self._data_container()
         child_site = (*dc.site, normalized)
         child_container = Container(ctx=dc.ctx, site=child_site)
-        return view(child_container, self.registry)
+        return view(child_container, self.registry, parent=self)
 
     # -- Internal read helpers ---------------------------------------------
 
@@ -334,7 +293,7 @@ class IndexedDictViewBase(
         if node_info.structure is None:  # type: ignore[union-attr]
             raise ValueError(f"Child container '{address}' has no structure ID")
         view_class = self.registry.get_view_for_structure(node_info.structure)  # type: ignore[union-attr]
-        child_view = view_class(container=child_container, registry=self.registry)
+        child_view = view_class(container=child_container, registry=self.registry, parent=self)
         if not isinstance(child_view, Convertible):
             raise TypeError(f"Child view {view_class.__name__} does not support extraction")
         return child_view.extract()
@@ -347,7 +306,7 @@ class IndexedDictViewBase(
         if node_info.structure is None:  # type: ignore[union-attr]
             raise ValueError(f"Child container '{address}' has no structure ID")
         view_class = self.registry.get_view_for_structure(node_info.structure)  # type: ignore[union-attr]
-        return view_class(container=child_container, registry=self.registry)
+        return view_class(container=child_container, registry=self.registry, parent=self)
 
     # -- Ordered key iteration --------------------------------------------
     #
@@ -468,7 +427,9 @@ class EagerIndexedDictView(IndexedDictViewBase):
     @property
     def lazy(self) -> LazyIndexedDictView:
         """Switch to lazy facet — reads return child Views."""
-        return LazyIndexedDictView(container=self.container, registry=self.registry)
+        return LazyIndexedDictView(
+            container=self.container, registry=self.registry, parent=self.parent
+        )
 
     @property
     def eager(self) -> EagerIndexedDictView:
@@ -556,7 +517,9 @@ class LazyIndexedDictView(IndexedDictViewBase):
     @property
     def eager(self) -> EagerIndexedDictView:
         """Switch to eager facet — reads return extracted values."""
-        return EagerIndexedDictView(container=self.container, registry=self.registry)
+        return EagerIndexedDictView(
+            container=self.container, registry=self.registry, parent=self.parent
+        )
 
     @property
     def lazy(self) -> LazyIndexedDictView:

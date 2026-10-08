@@ -12,7 +12,7 @@ from virtuals.types import is_empty
 from virtuals.view import (
     ChildNestedSetBase,
     ChildPrimitiveSetBase,
-    MetadataBasedChildrenCountBase,
+    KeyedChildrenCountBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
 )
@@ -35,7 +35,7 @@ __all__ = ["FrozenSetView"]
 
 
 class FrozenSetView(
-    MetadataBasedChildrenCountBase,
+    KeyedChildrenCountBase,
     ChildNestedSetBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
@@ -184,12 +184,9 @@ class FrozenSetView(
         self.container.clear_children()
         self._set_length(0)
 
-        count = 0
+        # Each new member is counted via _on_child_created
         for item in value:
-            key = self._make_key(item)
-            self._set_child_value(key, item)
-            count += 1
-        self._set_length(count)
+            self._set_child_value(self._make_key(item), item)
 
 
 SetABC.register(FrozenSetView)

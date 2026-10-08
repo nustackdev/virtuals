@@ -44,7 +44,6 @@ def test_exists_child_nonexistent(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     assert not exists_child(("users",), "alice", tx)
@@ -57,7 +56,6 @@ def test_exists_child_primitive(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "alice", {"name": "Alice"}, tx)
 
@@ -71,7 +69,6 @@ def test_exists_child_container(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_child_container(
         ("users",),
@@ -91,7 +88,6 @@ def test_get_child_type_nonexistent(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     assert get_child_type(("users",), "alice", tx) == NodeType.NOT_FOUND
@@ -104,7 +100,6 @@ def test_get_child_type_primitive(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "name", "Alice", tx)
 
@@ -118,7 +113,6 @@ def test_get_child_type_container(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_child_container(
         ("users",),
@@ -143,7 +137,6 @@ def test_put_child_primitive_basic(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     put_child_primitive(("users",), "name", "Alice", tx)
@@ -159,7 +152,6 @@ def test_put_child_primitive_various_types(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     put_child_primitive(("data",), "string", "hello", tx)
@@ -187,7 +179,6 @@ def test_put_child_primitive_update(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     put_child_primitive(("users",), "name", "Alice", tx)
@@ -205,7 +196,6 @@ def test_put_child_primitive_over_container_raises(tx: TransactionProtocol) -> N
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_child_container(
         ("users",),
@@ -232,7 +222,6 @@ def test_put_child_primitive_parent_not_container_raises(tx: TransactionProtocol
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("data",), "value", 42, tx)
 
@@ -247,7 +236,6 @@ def test_get_child_primitive_basic(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "name", "Alice", tx)
 
@@ -263,7 +251,6 @@ def test_get_child_primitive_nonexistent(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     value = get_child_primitive(("users",), "name", tx)
@@ -278,7 +265,6 @@ def test_get_child_primitive_container_raises(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_child_container(
         ("users",),
@@ -304,7 +290,6 @@ def test_create_child_container_basic(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     create_child_container(
@@ -326,7 +311,6 @@ def test_create_child_container_idempotent(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     create_child_container(
@@ -368,7 +352,6 @@ def test_create_child_container_parent_not_container_raises(tx: TransactionProto
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("data",), "value", 42, tx)
 
@@ -394,7 +377,6 @@ def test_iter_child_keys_empty(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     keys = list(iter_child_keys(("users",), tx))
@@ -409,7 +391,6 @@ def test_iter_child_keys_basic(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "alice", {"name": "Alice"}, tx)
     put_child_primitive(("users",), "bob", {"name": "Bob"}, tx)
@@ -426,7 +407,6 @@ def test_iter_child_keys_mixed(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "alice", {"name": "Alice"}, tx)
     create_child_container(
@@ -455,7 +435,6 @@ def test_iter_child_keys_parent_not_container_raises(tx: TransactionProtocol) ->
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("data",), "value", 42, tx)
 
@@ -470,7 +449,6 @@ def test_iter_children_empty(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     children = list(iter_children(("users",), tx))
@@ -485,7 +463,6 @@ def test_iter_children_basic(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "alice", {"name": "Alice"}, tx)
     create_child_container(
@@ -517,7 +494,6 @@ def test_iter_children_reverse_empty(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     assert list(iter_children(("users",), tx, reverse=True)) == []
@@ -530,7 +506,6 @@ def test_iter_children_reverse_mirrors_forward(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     for key in ("alice", "bob", "charlie"):
         put_child_primitive(("users",), key, {"name": key}, tx)
@@ -555,7 +530,6 @@ def test_iter_child_keys_reverse(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     for key in ("a", "b", "c", "d"):
         put_child_primitive(("users",), key, key, tx)
@@ -572,14 +546,12 @@ def test_iter_children_reverse_isolated_from_siblings(tx: TransactionProtocol) -
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("zzz_after",),
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("zzz_after",), "noise", "ignored", tx)
     for key in ("alice", "bob"):
@@ -596,7 +568,6 @@ def test_count_children_basic(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     assert count_children(("users",), tx) == 0
@@ -620,7 +591,6 @@ def test_delete_child_primitive(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "alice", {"name": "Alice"}, tx)
 
@@ -636,7 +606,6 @@ def test_delete_child_container(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_child_container(
         ("users",),
@@ -660,7 +629,6 @@ def test_delete_child_nonexistent(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     # Should not raise - silent operation
@@ -680,7 +648,6 @@ def test_delete_child_parent_not_container_raises(tx: TransactionProtocol) -> No
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("data",), "value", 42, tx)
 
@@ -700,7 +667,6 @@ def test_clear_children_basic(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "alice", {"name": "Alice"}, tx)
     put_child_primitive(("users",), "bob", {"name": "Bob"}, tx)
@@ -717,7 +683,6 @@ def test_clear_children_empty(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     # Should be silent (idempotent)
@@ -733,7 +698,6 @@ def test_clear_children_mixed(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "alice", {"name": "Alice"}, tx)
     create_child_container(
@@ -756,7 +720,6 @@ def test_clear_children_preserves_container(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "alice", {"name": "Alice"}, tx)
 
@@ -779,7 +742,6 @@ def test_child_operations_preserve_siblings(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "alice", {"name": "Alice"}, tx)
     put_child_primitive(("users",), "bob", {"name": "Bob"}, tx)
@@ -801,7 +763,6 @@ def test_child_operations_various_key_types(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     # String keys
@@ -817,13 +778,14 @@ def test_child_operations_various_key_types(tx: TransactionProtocol) -> None:
 
 def test_deep_nesting_child_operations(tx: TransactionProtocol) -> None:
     """Test child operations work correctly with deep nesting."""
-    create_container(
-        ("a", "b", "c", "d"),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=True,
-    )
+    # The container layer never creates parents: build the chain level by level
+    for depth in range(1, 5):
+        create_container(
+            ("a", "b", "c", "d")[:depth],
+            ContainerStructure(1),
+            ContainerProtocol.MUTABLE,
+            tx,
+        )
 
     # Add child to deeply nested container
     put_child_primitive(("a", "b", "c", "d"), "value", "test", tx)
@@ -843,7 +805,6 @@ def test_child_operations_interleaved(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     # Add children

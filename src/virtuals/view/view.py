@@ -32,12 +32,8 @@ class View(Protocol):
     Attributes:
         container: Container instance for storage operations
         registry: Registry for nested view creation
+        parent: View this view was opened from (None for a root)
     """
-
-    @classmethod
-    def get_default_parent_view(cls) -> type[View] | None:
-        """Returns view used to create missing parents."""
-        ...
 
     @classmethod
     def get_structure(cls) -> ContainerStructure:
@@ -65,6 +61,11 @@ class View(Protocol):
         """
         ...
 
-    def __init__(self, container: Container, registry: ViewRegistry) -> None:
-        """Initializes a new View with given container and registry."""
+    def __init__(
+        self,
+        container: Container,
+        registry: ViewRegistry,
+        parent: View | None = None,
+    ) -> None:
+        """Initializes a new View with given container, registry and parent view."""
         pass

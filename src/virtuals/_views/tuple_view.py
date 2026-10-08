@@ -222,7 +222,7 @@ class TupleView(
         normalized = self.normalize_address(address)
         child_site = key_.join_segment(self.container.site, normalized)
         child_container = Container(ctx=self.container.ctx, site=child_site)
-        return view(child_container, self.registry)
+        return view(child_container, self.registry, parent=self)
 
 
 Sequence.register(TupleView)

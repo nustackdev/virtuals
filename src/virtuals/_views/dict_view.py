@@ -25,8 +25,8 @@ from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
     DescendantsObservableBase,
+    KeyedChildrenCountBase,
     LazyChildReadBase,
-    MetadataBasedChildrenCountBase,
     ObservableBase,
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
@@ -69,7 +69,7 @@ class DictViewBase(
     ObservableBase,
     ChildObservableBase[str | int],
     DescendantsObservableBase,
-    MetadataBasedChildrenCountBase,
+    KeyedChildrenCountBase,
     ChildNavigationBase[str | int],
     ChildNestedGetBase,
     ChildNestedSetBase,
@@ -128,11 +128,8 @@ class DictViewBase(
     # =========================================================================
 
     def __setitem__(self, address: str | int, value: object) -> None:
-        """Set value for key."""
-        is_new = not self.container.exists_child(address)
+        """Set value for key. A new key is counted via ``_on_child_created``."""
         self._set_child_value(address, value)
-        if is_new:
-            self._increment_length()
 
     def __delitem__(self, address: str | int) -> None:
         """Delete key. Raises KeyError if not found."""
@@ -169,12 +166,9 @@ class DictViewBase(
             if current_len > 0:
                 self.clear()
 
-        count = 0
+        # Each new key is counted via _on_child_created
         for key, val in value.items():
             self._set_child_value(key, val)
-            count += 1
-
-        self._set_length(count)
 
     def set_child_container_as(
         self,
@@ -191,11 +185,8 @@ class DictViewBase(
         so non-default layouts (``Kh57View``, ``IndexedDictView``, …) round-
         trip correctly.
         """
-        is_new = not self.container.exists_child(address)
         self.ensure_created()
         self._populate_child_container(address, value, view_class=view_class)
-        if is_new:
-            self._increment_length()
 
 
 # =============================================================================
@@ -293,7 +284,7 @@ class EagerDictView(DictViewBase):
     @property
     def lazy(self) -> LazyDictView:
         """Switch to lazy facet — reads return child Views."""
-        return LazyDictView(container=self.container, registry=self.registry)
+        return LazyDictView(container=self.container, registry=self.registry, parent=self.parent)
 
     @property
     def eager(self) -> EagerDictView:
@@ -426,7 +417,7 @@ class LazyDictView(DictViewBase):
     @property
     def eager(self) -> EagerDictView:
         """Switch to eager facet — reads return extracted values."""
-        return EagerDictView(container=self.container, registry=self.registry)
+        return EagerDictView(container=self.container, registry=self.registry, parent=self.parent)
 
     @property
     def lazy(self) -> LazyDictView:

@@ -7,8 +7,6 @@ from unittest.mock import Mock
 import pytest
 
 from virtuals.container import (
-    DEFAULT_PARENT_PROTOCOL,
-    DEFAULT_PARENT_STRUCTURE,
     ContainerProtocol,
     ContainerStructure,
     NodeInfo,
@@ -435,11 +433,6 @@ class TestContainerStructure:
         assert struct1 <= struct2
         assert struct2 >= struct1
 
-    def test_container_structure_default_constant(self) -> None:
-        """Test DEFAULT_PARENT_STRUCTURE constant."""
-        assert DEFAULT_PARENT_STRUCTURE == 0
-        assert isinstance(DEFAULT_PARENT_STRUCTURE, int)
-
 
 # ========================================================
 # ContainerProtocol Tests
@@ -502,11 +495,6 @@ class TestContainerProtocol:
         """Test multiple flags combined."""
         combined = ContainerProtocol.MUTABLE | ContainerProtocol.SIZED | ContainerProtocol.INDEXED
         assert combined == 7  # 1 | 2 | 4 = 7
-
-    def test_container_protocol_default_constant(self) -> None:
-        """Test DEFAULT_PARENT_PROTOCOL constant."""
-        assert DEFAULT_PARENT_PROTOCOL == ContainerProtocol.NONE
-        assert DEFAULT_PARENT_PROTOCOL == 0
 
     def test_container_protocol_in_condition(self) -> None:
         """Test checking flag presence."""

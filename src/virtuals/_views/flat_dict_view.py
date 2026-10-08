@@ -16,7 +16,7 @@ from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import EMPTY, Empty, Value, is_empty
 from virtuals.view import (
     ChildPrimitiveSetBase,
-    MetadataBasedChildrenCountBase,
+    KeyedChildrenCountBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
 )
@@ -33,7 +33,7 @@ __all__ = [
 
 
 class FlatDictView(
-    MetadataBasedChildrenCountBase,
+    KeyedChildrenCountBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
@@ -93,10 +93,8 @@ class FlatDictView(
             value: Primitive value to store
         """
         self.ensure_created()
-        is_new = not self.container.exists_child(key)
-        self.container.put_child_primitive(key, value)
-        if is_new:
-            self._increment_length()
+        # A new key is counted via _on_child_created
+        self._put_child_primitive(key, value)
 
     def __delitem__(self, key: str | int) -> None:
         """Delete key.

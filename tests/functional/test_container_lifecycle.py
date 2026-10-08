@@ -4,18 +4,18 @@ Tests container creation, deletion, and descendant operations:
 - create_container() - creating containers with parent validation
 - delete_container() - deleting containers
 - delete_descendants() - recursive deletion
-- create_parents() - automatic parent creation
+- the container layer never creates parents
 """
 
 import pytest
 
 from virtuals.container import (
     ContainerExistsError,
+    ContainerNotFoundError,
     ContainerProtocol,
     ContainerStructure,
     ContainerTypeError,
     create_container,
-    create_parents,
     delete_container,
     delete_descendants,
     get_node_info,
@@ -39,7 +39,6 @@ def test_create_container_basic(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     assert node_exists(("users",), tx)
@@ -57,7 +56,6 @@ def test_create_container_idempotent_compatible(tx: TransactionProtocol) -> None
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     # Second call should be silent (idempotent)
     create_container(
@@ -65,7 +63,6 @@ def test_create_container_idempotent_compatible(tx: TransactionProtocol) -> None
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     # Should still exist with same type
@@ -81,7 +78,6 @@ def test_create_container_incompatible_type_raises(tx: TransactionProtocol) -> N
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     with pytest.raises(ContainerExistsError):
@@ -90,7 +86,6 @@ def test_create_container_incompatible_type_raises(tx: TransactionProtocol) -> N
             ContainerStructure(2),  # Different structure
             ContainerProtocol.MUTABLE,
             tx,
-            ensure_healthy_parents=False,
         )
 
 
@@ -101,7 +96,6 @@ def test_create_container_over_primitive_raises(tx: TransactionProtocol) -> None
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("data",), "value", 42, tx)
 
@@ -111,7 +105,6 @@ def test_create_container_over_primitive_raises(tx: TransactionProtocol) -> None
             ContainerStructure(1),
             ContainerProtocol.MUTABLE,
             tx,
-            ensure_healthy_parents=False,
         )
 
 
@@ -122,28 +115,24 @@ def test_create_container_various_protocols(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.NONE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("c2",),
         ContainerStructure(2),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("c3",),
         ContainerStructure(3),
         ContainerProtocol.MUTABLE | ContainerProtocol.SIZED,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("c4",),
         ContainerStructure(4),
         ContainerProtocol.MUTABLE | ContainerProtocol.SIZED | ContainerProtocol.INDEXED,
         tx,
-        ensure_healthy_parents=False,
     )
 
     # Verify all created with correct protocols
@@ -163,191 +152,85 @@ def test_create_container_various_protocols(tx: TransactionProtocol) -> None:
 # ============================================================================
 
 
-def test_create_container_with_ensure_healthy_parents(tx: TransactionProtocol) -> None:
-    """Test creating container with automatic parent creation."""
-    create_container(
-        ("a", "b", "c"),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=True,
-    )
-
-    # Verify target exists
-    assert node_exists(("a", "b", "c"), tx)
-
-    # Verify parents were created
-    assert node_exists(("a",), tx)
-    assert node_exists(("a", "b"), tx)
-    assert get_node_type(("a",), tx) == NodeType.CONTAINER
-    assert get_node_type(("a", "b"), tx) == NodeType.CONTAINER
+def _create_chain(site: tuple, tx: TransactionProtocol) -> None:
+    """Create every level of site, root first (the container layer creates one node)."""
+    for depth in range(1, len(site) + 1):
+        create_container(site[:depth], ContainerStructure(1), ContainerProtocol.MUTABLE, tx)
 
 
-def test_create_container_without_ensure_healthy_parents_missing(
-    tx: TransactionProtocol,
-) -> None:
-    """Test creating container without parent validation allows missing parents."""
-    # When ensure_healthy_parents=False, creation is allowed even without parents
-    create_container(
-        ("a", "b", "c"),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=False,
-    )
-
-    assert node_exists(("a", "b", "c"), tx)
-    # Parents don't exist
-    assert not node_exists(("a",), tx)
-    assert not node_exists(("a", "b"), tx)
-
-
-def test_create_container_malformed_parent_raises(tx: TransactionProtocol) -> None:
-    """Test creating container with malformed parent raises error."""
-    # Create a primitive where parent should be
-    create_container(
-        ("a",),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=False,
-    )
-    put_child_primitive(("a",), "b", "wrong", tx)
-
-    with pytest.raises(ContainerTypeError):  # ContainerParentMalformedError is subclass
+def test_create_container_missing_parent_raises(tx: TransactionProtocol) -> None:
+    """Test creating container under a missing parent raises, creating nothing."""
+    with pytest.raises(ContainerNotFoundError):
         create_container(
             ("a", "b", "c"),
             ContainerStructure(1),
             ContainerProtocol.MUTABLE,
             tx,
-            ensure_healthy_parents=True,
         )
 
-
-def test_create_container_with_custom_parent_defaults(tx: TransactionProtocol) -> None:
-    """Test creating container with custom parent structure and protocol."""
-    create_container(
-        ("a", "b", "c"),
-        ContainerStructure(5),
-        ContainerProtocol.MUTABLE | ContainerProtocol.SIZED,
-        tx,
-        ensure_healthy_parents=True,
-        default_parent_structure=ContainerStructure(10),
-        default_parent_protocol=ContainerProtocol.MUTABLE | ContainerProtocol.INDEXED,
-    )
-
-    # Target should have its specified type
-    target_info = get_node_info(("a", "b", "c"), tx)
-    assert target_info.structure == ContainerStructure(5)
-    assert target_info.protocol == ContainerProtocol.MUTABLE | ContainerProtocol.SIZED
-
-    # Parents should have default type
-    parent_a_info = get_node_info(("a",), tx)
-    assert parent_a_info.structure == ContainerStructure(10)
-    assert parent_a_info.protocol == ContainerProtocol.MUTABLE | ContainerProtocol.INDEXED
-
-    parent_b_info = get_node_info(("a", "b"), tx)
-    assert parent_b_info.structure == ContainerStructure(10)
-    assert parent_b_info.protocol == ContainerProtocol.MUTABLE | ContainerProtocol.INDEXED
+    # No parents were auto-created, and no orphan target either
+    assert not node_exists(("a",), tx)
+    assert not node_exists(("a", "b"), tx)
+    assert not node_exists(("a", "b", "c"), tx)
 
 
-# ============================================================================
-# CREATE PARENTS TESTS
-# ============================================================================
+def test_create_container_partial_chain_raises(tx: TransactionProtocol) -> None:
+    """Test a missing immediate parent raises even when higher ancestors exist."""
+    _create_chain(("a",), tx)
 
-
-def test_create_parents_all_missing(tx: TransactionProtocol) -> None:
-    """Test create_parents creates all missing parents."""
-    create_parents(
-        ("a", "b", "c"),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-    )
-
-    # Verify parents exist
-    assert node_exists(("a",), tx)
-    assert node_exists(("a", "b"), tx)
-
-
-def test_create_parents_partially_missing(tx: TransactionProtocol) -> None:
-    """Test create_parents only creates missing parents."""
-    # Create first parent manually
-    create_container(
-        ("a",),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=False,
-    )
-
-    create_parents(
-        ("a", "b", "c"),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-    )
-
-    # Both should exist now
-    assert node_exists(("a",), tx)
-    assert node_exists(("a", "b"), tx)
-
-
-def test_create_parents_all_exist(tx: TransactionProtocol) -> None:
-    """Test create_parents is silent when all parents exist."""
-    create_container(
-        ("a",),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=False,
-    )
-    create_container(
-        ("a", "b"),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=False,
-    )
-
-    # Should not raise - silent operation
-    create_parents(
-        ("a", "b", "c"),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-    )
-
-
-def test_create_parents_malformed_raises(tx: TransactionProtocol) -> None:
-    """Test create_parents raises when parent is malformed."""
-    create_container(
-        ("a",),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=False,
-    )
-    put_child_primitive(("a",), "b", "wrong", tx)
-
-    with pytest.raises(ContainerTypeError):  # ContainerParentMalformedError is subclass
-        create_parents(
+    with pytest.raises(ContainerNotFoundError):
+        create_container(
             ("a", "b", "c"),
             ContainerStructure(1),
             ContainerProtocol.MUTABLE,
             tx,
         )
 
+    assert not node_exists(("a", "b"), tx)
 
-def test_create_parents_root_level(tx: TransactionProtocol) -> None:
-    """Test create_parents for root-level site is silent."""
-    # Should not raise - silent operation (no parents to create)
-    create_parents(
-        ("users",),
+
+def test_create_container_existing_parent(tx: TransactionProtocol) -> None:
+    """Test creating container one level at a time succeeds."""
+    _create_chain(("a", "b", "c"), tx)
+
+    assert get_node_type(("a",), tx) == NodeType.CONTAINER
+    assert get_node_type(("a", "b"), tx) == NodeType.CONTAINER
+    assert get_node_type(("a", "b", "c"), tx) == NodeType.CONTAINER
+
+
+def test_create_container_without_parent_validation(tx: TransactionProtocol) -> None:
+    """Test validate_parent=False leaves the parent to the caller."""
+    create_container(
+        ("a", "b", "c"),
+        ContainerStructure(1),
+        ContainerProtocol.MUTABLE,
+        tx,
+        validate_parent=False,
+    )
+
+    assert node_exists(("a", "b", "c"), tx)
+    # Parents are still never created
+    assert not node_exists(("a",), tx)
+    assert not node_exists(("a", "b"), tx)
+
+
+def test_create_container_primitive_parent_raises(tx: TransactionProtocol) -> None:
+    """Test creating container under a primitive raises error."""
+    create_container(
+        ("a",),
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
     )
+    put_child_primitive(("a",), "b", "wrong", tx)
+
+    with pytest.raises(ContainerTypeError):
+        create_container(
+            ("a", "b", "c"),
+            ContainerStructure(1),
+            ContainerProtocol.MUTABLE,
+            tx,
+        )
 
 
 # ============================================================================
@@ -362,7 +245,6 @@ def test_delete_container_basic(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     delete_container(("users",), tx)
@@ -383,7 +265,6 @@ def test_delete_container_primitive_raises(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("data",), "value", 42, tx)
 
@@ -398,7 +279,6 @@ def test_delete_container_with_children(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "alice", {"name": "Alice"}, tx)
     put_child_primitive(("users",), "bob", {"name": "Bob"}, tx)
@@ -412,13 +292,7 @@ def test_delete_container_with_children(tx: TransactionProtocol) -> None:
 
 def test_delete_container_deep_hierarchy(tx: TransactionProtocol) -> None:
     """Test deleting container with deep nested children."""
-    create_container(
-        ("a", "b", "c", "d"),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=True,
-    )
+    _create_chain(("a", "b", "c", "d"), tx)
     put_child_primitive(("a", "b", "c", "d"), "value", "test", tx)
 
     # Delete intermediate container
@@ -443,7 +317,6 @@ def test_delete_descendants_basic(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     delete_descendants(("users",), tx)
@@ -458,7 +331,6 @@ def test_delete_descendants_with_children(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("users",), "alice", {"name": "Alice"}, tx)
     put_child_primitive(("users",), "bob", {"name": "Bob"}, tx)
@@ -473,13 +345,7 @@ def test_delete_descendants_with_children(tx: TransactionProtocol) -> None:
 def test_delete_descendants_deep_hierarchy(tx: TransactionProtocol) -> None:
     """Test delete_descendants with deeply nested structure."""
     # Create: users -> alice -> profile -> settings
-    create_container(
-        ("users", "alice", "profile", "settings"),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=True,
-    )
+    _create_chain(("users", "alice", "profile", "settings"), tx)
     put_child_primitive(("users", "alice", "profile", "settings"), "theme", "dark", tx)
 
     delete_descendants(("users", "alice"), tx)
@@ -495,7 +361,6 @@ def test_delete_descendants_mixed_children(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     # Add primitive children
@@ -508,7 +373,6 @@ def test_delete_descendants_mixed_children(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     put_child_primitive(("root", "c1"), "nested", "value", tx)
 
@@ -536,7 +400,6 @@ def test_create_delete_create_cycle(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     assert node_exists(("users",), tx)
 
@@ -550,7 +413,6 @@ def test_create_delete_create_cycle(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     assert node_exists(("users",), tx)
 
@@ -562,28 +424,24 @@ def test_delete_preserves_siblings(tx: TransactionProtocol) -> None:
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("root", "a"),
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("root", "b"),
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
     create_container(
         ("root", "c"),
         ContainerStructure(1),
         ContainerProtocol.MUTABLE,
         tx,
-        ensure_healthy_parents=False,
     )
 
     # Delete one child
@@ -599,30 +457,18 @@ def test_delete_preserves_siblings(tx: TransactionProtocol) -> None:
 def test_parent_validation_integration(tx: TransactionProtocol) -> None:
     """Test parent validation works correctly in complex scenarios."""
     # Create partial hierarchy
-    create_container(
-        ("a",),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=False,
-    )
-    create_container(
-        ("a", "b"),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=False,
-    )
+    _create_chain(("a", "b"), tx)
 
-    # Create deep child with ensure_healthy_parents=True
-    # Should succeed because existing parents are healthy
-    create_container(
-        ("a", "b", "c", "d"),
-        ContainerStructure(1),
-        ContainerProtocol.MUTABLE,
-        tx,
-        ensure_healthy_parents=True,
-    )
+    # Two levels below the deepest existing container: the gap is not filled
+    with pytest.raises(ContainerNotFoundError):
+        create_container(
+            ("a", "b", "c", "d"),
+            ContainerStructure(1),
+            ContainerProtocol.MUTABLE,
+            tx,
+        )
+    assert not node_exists(("a", "b", "c"), tx)
 
-    assert node_exists(("a", "b", "c"), tx)  # Missing parent was created
+    # One level at a time succeeds
+    _create_chain(("a", "b", "c", "d"), tx)
     assert node_exists(("a", "b", "c", "d"), tx)
