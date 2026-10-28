@@ -7,7 +7,9 @@ Owns:
 - PUBLISH of the control channel (`{prefix}:subs:changed`) after every
   HSET / HDEL, so cluster publishers refresh their caches.
 - The listener thread that owns `self._pubsub` and dispatches inbound
-  notif messages via `_dispatch_incoming(keys)`.
+  notif messages via `_dispatch_incoming(keys)`. It sleeps in one
+  `select()` on the pubsub socket and a local wake socketpair, so a
+  sub/unsub queued from another thread is sent at once, not on a timer.
 - A cleanup thread that periodically sweeps the registry HASH: for every
   entry with zero cluster subscribers (PUBSUB NUMSUB), HDEL + PUBLISH.
 
@@ -31,6 +33,8 @@ from __future__ import annotations
 
 import json
 import queue
+import select
+import socket
 import threading
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
@@ -71,8 +75,10 @@ __all__ = [
 # Default HASH cleanup sweep interval (seconds). Lazy; correctness never hurts.
 DEFAULT_CLEANUP_INTERVAL_SECONDS: float = 30.0
 
-# Pubsub polling timeout (seconds).
-_PUBSUB_POLL_TIMEOUT: float = 0.05
+# Longest the listener sleeps with nothing to do (seconds). Every real event,
+# an inbound message or a queued command, wakes it sooner; this only bounds a
+# missed wake.
+_LISTENER_IDLE_SECONDS: float = 1.0
 
 
 class RedisObserver(ObserverBase):
@@ -108,6 +114,9 @@ class RedisObserver(ObserverBase):
         self._control_cmd_queue: (
             queue.Queue[tuple[str, str | None, threading.Event | None]] | None
         ) = None
+        # Local socketpair: a byte on `_wake_w` wakes the listener's select().
+        self._wake_r: socket.socket | None = None
+        self._wake_w: socket.socket | None = None
 
     # -- Channel / key helpers ------------------------------------------------
 
@@ -132,6 +141,9 @@ class RedisObserver(ObserverBase):
 
         self._obs_stop_event.clear()
         self._control_cmd_queue = queue.Queue()
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
+        self._wake_w.setblocking(False)
 
         self._listener_thread = threading.Thread(
             target=self._listener_loop,
@@ -162,12 +174,19 @@ class RedisObserver(ObserverBase):
                 self._control_cmd_queue.put_nowait(("shutdown", None, None))
             except queue.Full:
                 pass
+        self._wake_listener()
 
         for t in (self._listener_thread, self._cleanup_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=2.0)
         self._listener_thread = None
         self._cleanup_thread = None
+
+        for sock in (self._wake_r, self._wake_w):
+            if sock is not None:
+                sock.close()
+        self._wake_r = None
+        self._wake_w = None
 
         if self._pubsub is not None:
             try:
@@ -252,10 +271,46 @@ class RedisObserver(ObserverBase):
         except queue.Full:
             logger.warning("pubsub cmd queue full; dropping %s(%s)", action, channel)
             return
+        self._wake_listener()
         if ack is not None:
             ack.wait(timeout=1.0)
 
+    def _wake_listener(self) -> None:
+        """Ring the listener's wake socket. A full buffer means a wake is already pending."""
+        try:
+            if self._wake_w is not None:
+                self._wake_w.send(b"\0")
+        except (BlockingIOError, OSError):
+            pass
+
     # -- Listener thread ------------------------------------------------------
+
+    def _wait_for_work(self) -> None:
+        """Sleep until the pubsub socket is readable or the wake socket rings.
+
+        Called only once redis-py's own buffer is drained (`get_message`
+        returned None), so a readable socket is the only way a message can be
+        waiting. With nothing subscribed `get_message` reads nothing, so only
+        the wake socket is watched. After a drop there is no socket: return at
+        once so `get_message` gets to reconnect.
+        """
+        wake = self._wake_r
+        if wake is None:
+            return
+        watched = [wake]
+        conn = self._pubsub.connection
+        if conn is not None and self._pubsub.subscribed:
+            sock = conn._sock  # redis-py has no public accessor
+            if sock is None:
+                return
+            watched.append(sock)
+        ready, _, _ = select.select(watched, [], [], _LISTENER_IDLE_SECONDS)
+        if wake in ready:
+            try:
+                while wake.recv(4096):
+                    pass
+            except (BlockingIOError, OSError):
+                pass
 
     def _listener_loop(self) -> None:
         """Owns `self._pubsub`; drains cmd queue; polls messages; fans out notifs."""
@@ -284,15 +339,19 @@ class RedisObserver(ObserverBase):
             if drained_shutdown or self._obs_stop_event.is_set():
                 return
 
-            # 2. Poll for one message.
+            # 2. Take one message if redis-py has one, else sleep until there is
+            #    one or a command is queued.
             try:
-                msg = self._pubsub.get_message(timeout=_PUBSUB_POLL_TIMEOUT)
+                msg = self._pubsub.get_message(timeout=0)
+                if msg is None:
+                    self._wait_for_work()
+                    continue
             except Exception as e:
                 logger.warning("Listener get_message failed: %s", e)
                 self._obs_stop_event.wait(0.5)
                 continue
 
-            if msg is None or msg.get("type") not in ("message", "pmessage"):
+            if msg.get("type") not in ("message", "pmessage"):
                 continue
 
             channel = msg["channel"]
