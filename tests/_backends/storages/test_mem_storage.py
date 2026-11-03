@@ -917,6 +917,41 @@ def test_writer_waiting_across_close_never_keeps_the_old_slot() -> None:
     s.close()
 
 
+def test_waiter_on_lock_held_by_stale_slot_wakes_on_close() -> None:
+    """close() frees a slot held by a reserved-but-untaken slot, so a blocked writer moves on."""
+    s = InMemoryStorage(codec=NoOpCodec(), busy_timeout=5.0)
+    s.open()
+    slot = asyncio.run(s.areserve_write_slot())  # holds the slot, no transaction takes it
+    outcome: dict = {}
+
+    def waiter() -> None:
+        t0 = time.monotonic()
+        try:
+            s.begin_transaction().abort()
+            outcome["began"] = True
+        except Exception as e:
+            outcome["error"] = type(e)
+        outcome["secs"] = time.monotonic() - t0
+
+    t = threading.Thread(target=waiter)
+    t.start()
+    time.sleep(0.02)
+    s.close()
+    t.join(2)
+    assert not t.is_alive()
+    assert outcome.get("error") is StorageClosedError or outcome.get("began")
+    assert outcome["secs"] < 1.0  # did not wait out busy_timeout
+    s.open()
+    slot.release()  # stale: touches nothing
+    assert not s._write_lock.locked() and s._write_owner is None
+    x = s.begin_transaction()
+    s._busy_timeout = 0.05
+    with pytest.raises(StorageLockTimeoutError):
+        _in_thread(s.begin_transaction)  # the reopened slot is held by exactly one writer
+    x.abort()
+    s.close()
+
+
 def test_async_waiter_across_close_never_clobbers_owner() -> None:
     s = InMemoryStorage(codec=NoOpCodec(), busy_timeout=1.0)
     s.open()
