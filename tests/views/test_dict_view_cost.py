@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 
 POINT_OPS = ("get", "exists", "put", "delete")
+COUNTED_OPS = (*POINT_OPS, "scan")
 SIZES = (10, 1000)
 
 
@@ -70,12 +71,12 @@ def storage(request: pytest.FixtureRequest, tmp_path: Path) -> Generator[Storage
 
 @pytest.fixture
 def counts(storage: StorageProtocol, monkeypatch: pytest.MonkeyPatch) -> Counter:
-    """Live counter of storage ops: ``get``/``exists``/``put``/``delete`` and ``scan_rows``."""
+    """Live counter of storage ops: ``get``/``exists``/``put``/``delete``/``scan`` and ``scan_rows``."""
     counter: Counter = Counter()
 
     with storage.transaction() as tx:
         tx_cls = type(tx)
-    for name in POINT_OPS:
+    for name in COUNTED_OPS:
         original = getattr(tx_cls, name)
 
         def counted(self, *args, _name=name, _original=original, **kwargs):
@@ -185,8 +186,24 @@ def test_dict_set_compound_cost_is_constant(storage, counts):
         )
 
     assert costs[SIZES[0]] == costs[SIZES[-1]], costs
-    # the new child's store() clears its own (empty) site first: one row, its marker
-    assert costs[SIZES[0]]["scan_rows"] <= 1, costs
+    # a child created by the write has nothing to clear: no scan at all
+    assert costs[SIZES[0]]["scan"] == 0, costs
+    assert costs[SIZES[0]]["scan_rows"] == 0, costs
+
+
+def test_dict_set_compound_over_existing_replaces_it(storage, counts):
+    """Overwriting an existing compound entry clears its old subtree first."""
+    _fill(storage, EagerDictView, 10, _compound(3))
+    cost = _measure(
+        storage,
+        counts,
+        lambda root: root.open_child("d", EagerDictView).__setitem__("k5", {"z": 1}),
+    )
+    with storage.transaction() as tx:
+        assert Navigator(storage).root(tx).open_child("d", EagerDictView)["k5"] == {"z": 1}
+    # one child scan over the old entry: marker + 3 fields + seek peeks, nothing wider
+    assert cost["scan"] == 1, cost
+    assert cost["scan_rows"] <= 6, cost
 
 
 # =============================================================================

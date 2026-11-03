@@ -163,7 +163,7 @@ class ViewBase(ABC):
         self._ensure_child_view(child)
         return child
 
-    def _ensure_child_view(self, child: View) -> None:
+    def _ensure_child_view(self, child: View) -> bool:
         """Materialize ``child``, a view this view opened at one of its child sites.
 
         Existing child: validates the marker against the child's view type
@@ -173,6 +173,10 @@ class ViewBase(ABC):
 
         Args:
             child: Child view whose site this view's child layout chose
+
+        Returns:
+            True if the child was created by this call (so it has no
+            content yet), False if it already existed.
         """
         site = child.container.site
         ctx = child.container.ctx
@@ -189,6 +193,7 @@ class ViewBase(ABC):
         child._ensure_internal_layout()  # type: ignore[attr-defined]
         if not info.exists:
             self._on_child_created(site[-1])
+        return not info.exists
 
     def _put_child_primitive(self, address: site_.SiteSegment, value: object) -> None:
         """Write a primitive child, firing ``_on_child_created`` if the key is new.

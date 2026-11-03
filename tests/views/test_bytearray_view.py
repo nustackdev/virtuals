@@ -235,6 +235,12 @@ def test_bytearray_store_replaces_content(bytearray_factory):
     assert data.extract() == bytearray(b"world")
 
 
+def test_bytearray_store_without_replace_appends(bytearray_factory):
+    data = bytearray_factory("data", b"hel")
+    data.store(b"lo", replace=False)
+    assert data.extract() == bytearray(b"hello")
+
+
 def test_bytearray_extract_returns_bytearray(bytearray_factory):
     data = bytearray_factory("data", b"test")
     extracted = data.extract()

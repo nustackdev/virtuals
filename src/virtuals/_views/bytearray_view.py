@@ -249,20 +249,22 @@ class ByteArrayView(
         """
         return bytearray(self)
 
-    def store(self, value: Iterable[int]) -> None:
+    def store(self, value: Iterable[int], *, replace: bool = True) -> None:
         """Store bytearray contents.
 
         Args:
             value: Bytes or bytearray to store
-            replace: If True, clear existing content first
+            replace: If True, clear existing content first; if False, append
         """
         self.ensure_created()
-        self.clear()
-
-        count = 0
-        for index, byte in enumerate(value):
-            self.container.put_child_primitive(index, byte)
-            count = index + 1
+        if replace:
+            self.clear()
+            count = 0
+        else:
+            count = len(self)
+        for byte in value:
+            self.container.put_child_primitive(count, byte)
+            count += 1
         self._set_length(count)
 
 

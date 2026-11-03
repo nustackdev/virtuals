@@ -199,6 +199,16 @@ def test_list_store_replaces_content(list_factory):
     assert items.extract() == [4, 5, 6, 7]
 
 
+def test_list_store_without_replace_appends(list_factory):
+    """store(replace=False) appends after the existing items."""
+    items = list_factory("items", [1, 2, 3])
+
+    items.store([4, 5], replace=False)
+
+    assert len(items) == 5
+    assert items.extract() == [1, 2, 3, 4, 5]
+
+
 def test_list_extract_full(list_factory):
     """Test extract() returns full list."""
     items = list_factory("items", [10, 20, 30, 40, 50])
