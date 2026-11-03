@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import multiprocessing as mp
 import threading
@@ -297,3 +298,88 @@ def _quiet_abort(txn) -> None:
         return
     with contextlib.suppress(Exception):
         txn.abort()
+
+
+@pytest.mark.timeout(10)
+def test_s1_nested_batch_write_raises_distinct_error(storage):
+    """A write batch on the same storage inside an open write txn raises StorageNestedTransactionError."""
+    if NestedError is None:
+        pytest.fail("virtuals.tkv.storage.exceptions has no StorageNestedTransactionError")
+    outer = storage.begin_transaction()
+    try:
+        outer.put(K, 1)
+        with pytest.raises(NestedError):
+            with storage.batch_write() as b:
+                b.put(K, 2)
+    finally:
+        _quiet_abort(outer)
+
+
+class Interrupt(BaseException):
+    """Not an Exception: stands in for KeyboardInterrupt, SystemExit and the like."""
+
+
+FREE_BUDGET = 0.2  # seconds the next writer may take once the interrupted one is gone
+FREE_LOCK_TIMEOUT = 1.0  # bounds a writer stuck behind a leaked lock
+
+
+def _interrupt_by_cancel(open_writer) -> None:
+    async def main() -> None:
+        entered = asyncio.Event()
+
+        async def holder() -> None:
+            with open_writer() as w:
+                w.put(K, 1)
+                entered.set()
+                await asyncio.sleep(10)
+
+        task = asyncio.create_task(holder())
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+
+
+def _interrupt_by_base_exception(open_writer) -> None:
+    with pytest.raises(Interrupt):
+        with open_writer() as w:
+            w.put(K, 1)
+            raise Interrupt
+
+
+def _timed_write(storage) -> float:
+    t0 = time.monotonic()
+    with storage.transaction() as t:
+        t.put(K, 2)
+    return time.monotonic() - t0
+
+
+@pytest.mark.parametrize("kind", ["transaction", "batch_write"])
+@pytest.mark.parametrize(
+    "interrupt",
+    [_interrupt_by_cancel, _interrupt_by_base_exception],
+    ids=["cancelled", "base_exception"],
+)
+@pytest.mark.timeout(15)
+def test_s1_interrupted_writer_frees_storage(backend, tmp_path, kind, interrupt):
+    """A writer cancelled or hit by a BaseException inside its block leaves the storage writable.
+
+    Its write does not land, and the next writer, on another thread and then
+    on this one, begins and commits within FREE_BUDGET.
+    """
+    storage = backend.make(tmp_path, lock_timeout=FREE_LOCK_TIMEOUT)
+    storage.open()
+    try:
+        put_committed(storage, {K: 0})
+        interrupt(getattr(storage, kind))
+        assert _read(storage, K) == 0, "interrupted write landed"
+        other = run_threads(lambda: _timed_write(storage), timeout=FREE_LOCK_TIMEOUT + 5)[0]
+        same = _timed_write(storage)
+        assert _read(storage, K) == 2
+        slow = {n: f"{t * 1000:.0f}ms" for n, t in (("other thread", other), ("same thread", same))}
+        assert other < FREE_BUDGET and same < FREE_BUDGET, f"next writer took {slow}"
+    finally:
+        with contextlib.suppress(Exception):
+            storage.close()
