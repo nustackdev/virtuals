@@ -111,8 +111,11 @@ class ChildObservableBase(AddressMappingBase[A]):
     def on_children_change(self) -> SubscriptionOptions:
         """Build subscription options for all direct children, not their subtrees.
 
-        Matches writes one level below this view only. A compound child
-        changing deeper needs ``on_descendants_change``.
+        Matches writes one level below this view only: it names the set of
+        children (membership and primitive values), not any one child's
+        value, so unlike ``on_child_change`` it does not cover subtrees. A
+        compound child changing deeper needs ``on_child_change(address)`` or
+        ``on_descendants_change``.
 
         Returns:
             SubscriptionOptions describing the filter shape.

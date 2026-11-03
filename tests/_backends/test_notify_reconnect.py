@@ -526,3 +526,46 @@ def test_connection_drop_resync_through_storage(server, tmp_path, how):
     clients = probe.client_list()
     assert len(clients) == 1, [c.get("name") or c.get("cmd") for c in clients]
     probe.close()
+
+
+def test_client_kill_ungated_recovers_with_one_wake_per_sub(server):
+    """r1 as a test: the real path with nothing held. redis-py reconnects at
+    once, the re-registration lands, each sub gets exactly one keyless wake,
+    nothing non-matching is ever delivered, keyed delivery resumes."""
+    from virtuals._backends.observers.redis_pubsub import RedisObserver
+    from virtuals._backends.publishers.redis_pubsub import RedisPublisher
+    from virtuals.tkv.filter import PrefixFilter, WildcardFilter
+    from virtuals.tkv.observer import SubscriptionOptions
+
+    probe = redis.from_url(server.url)
+    obs = RedisObserver(redis_url=server.url, channel_prefix="r1")
+    obs.connect()
+    pub = RedisPublisher(redis_url=server.url, channel_prefix="r1", publish_retry_seconds=1.0)
+    pub.connect()
+    got_a: list = []
+    got_w: list = []
+    try:
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("a",)))).bind(got_a.append)
+        obs.subscribe(SubscriptionOptions(filter=WildcardFilter(pattern=("w", "*", "x")))).bind(
+            got_w.append
+        )
+        pub.notify([("a", 1), ("w", 1, "x"), ("b", 1), ("w", 1, "y")])
+        pub.flush(2)
+        assert _wait_until(lambda: got_a == [("a", 1)] and got_w == [("w", 1, "x")])
+
+        assert probe.client_kill_filter(_type="pubsub") >= 1
+        for i in range(50):
+            pub.notify([("a", "gap", i), ("b", "gap", i), ("w", i, "x"), ("w", i, "y")])
+        pub.flush(2)
+        assert _wait_until(lambda: None in got_a and None in got_w, 10.0), (got_a, got_w)
+        time.sleep(0.3)
+        pub.notify([("a", 2), ("b", 2), ("w", 2, "x"), ("w", 2, "y"), ("c",)])
+        pub.flush(2)
+        assert _wait_until(lambda: got_a[-1] == ("a", 2) and got_w[-1] == ("w", 2, "x"), 2.0)
+        assert got_a.count(None) == 1 and got_w.count(None) == 1
+        assert all(k is None or k[0] == "a" for k in got_a), got_a
+        assert all(k is None or (len(k) == 3 and k[0] == "w" and k[2] == "x") for k in got_w), got_w
+    finally:
+        pub.disconnect()
+        obs.disconnect()
+        probe.close()
