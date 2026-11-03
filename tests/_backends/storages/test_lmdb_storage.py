@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests._backends.storages import _write_slot_cases as cases
 from virtuals._backends.storages.lmdb import LMDBStorage, LMDBWriteSlot
 from virtuals.codecs import BinaryCodec
 from virtuals.tkv.storage import StorageLockTimeoutError, StorageNestedTransactionError
@@ -221,3 +222,30 @@ def test_snapshot_does_not_wait_for_writer(storage: LMDBStorage) -> None:
     tx.commit()
     th.join(5)
     assert queued_done.is_set()
+
+
+# =========================================================================
+# Writer slot: cancellation, handoff, fork, racing close
+# =========================================================================
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("ctx", ["transaction", "batch_write"])
+def test_cancel_inside_block_releases_slot(storage: LMDBStorage, ctx: str) -> None:
+    cases.cancel_inside_block(storage, ctx)
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("ctx", ["transaction", "batch_write"])
+def test_keyboard_interrupt_inside_block_releases_slot(storage: LMDBStorage, ctx: str) -> None:
+    cases.keyboard_interrupt_inside_block(storage, ctx)
+
+
+@pytest.mark.timeout(10)
+def test_cancel_while_reserving_holds_nothing(storage: LMDBStorage) -> None:
+    cases.cancel_while_reserving(storage)
+
+
+@pytest.mark.timeout(10)
+def test_cancel_between_reserve_and_begin_releases_slot(storage: LMDBStorage) -> None:
+    cases.cancel_between_reserve_and_begin(storage)

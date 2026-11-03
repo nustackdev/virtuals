@@ -378,13 +378,17 @@ class LMDBStorage:
 
     @contextmanager
     def transaction(self) -> Iterator[LMDBTransaction]:
-        """Context manager for a read-write transaction."""
+        """Context manager for a read-write transaction.
+
+        Aborts on any exception out of the block, including cancellation
+        and KeyboardInterrupt, so the writer slot is never stranded.
+        """
         txn = self.begin_transaction()
         try:
             yield txn
             if not txn._committed and not txn._aborted:
                 txn.commit()
-        except Exception:
+        except BaseException:
             try:
                 if not txn._committed and not txn._aborted:
                     txn.abort()
@@ -406,13 +410,17 @@ class LMDBStorage:
 
     @contextmanager
     def batch_write(self) -> Iterator[LMDBWriteBatch]:
-        """Context manager for a write batch."""
+        """Context manager for a write batch.
+
+        Aborts on any exception out of the block, including cancellation
+        and KeyboardInterrupt, so the writer slot is never stranded.
+        """
         batch = self.begin_write_batch()
         try:
             yield batch
             if not batch._written and not batch._aborted:
                 batch.write()
-        except Exception:
+        except BaseException:
             try:
                 if not batch._written and not batch._aborted:
                     batch.abort()
