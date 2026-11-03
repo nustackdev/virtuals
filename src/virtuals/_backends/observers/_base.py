@@ -20,7 +20,10 @@ before it waits, so the worker runs no receiver past the one it is in: once
 disconnect() has returned no callback starts, and the old worker is alive
 only for as long as that one callback. The worker holds the observer only
 weakly between batches, so an observer dropped without disconnect() is
-collected and its worker exits.
+collected and its worker exits. An explicit disconnect() drops the wakes
+still queued and closes every subscription (none survives it), so a reader
+that reconnects subscribes again and re-reads; "resync on reconnect" in
+the contract is about a transport reconnect inside a live observer.
 
 Memory. A batch is at most `DISPATCH_BATCH_MAX` keys, so what one observer
 holds is bounded by its dispatch queue, the batch in hand, and whatever the
@@ -246,28 +249,30 @@ class ObserverBase:
 
         Closes every subscription first, so the worker calls no receiver
         past the one it is in: nothing queued or in hand is delivered after
-        this returns. Then waits a bounded time for the worker to finish
-        that callback. If it is still running after that, the worker is
-        left to exit on its own (logged at WARNING) and the next connect()
-        refuses until it has.
+        this returns. Wakes still queued at an explicit disconnect are
+        dropped with the subscriptions, which do not survive it (they report
+        closed, bind raises); a subscription made after the next connect()
+        re-reads, so nothing is missed silently. Then waits a bounded time
+        for the worker to finish that callback. If it is still running after
+        that, the worker is left to exit on its own (logged at WARNING) and
+        the next connect() refuses until it has. Called from inside a
+        callback, it does not wait for the worker (that is the caller): the
+        worker exits once the callback returns.
         """
         if not self._connected:
             return
         try:
             _stop_worker(self._dispatch_queue, self._stop_event)
-            registry = self._registry
-            if registry is not None:
-                # Closed here, not through close(): the hooks would queue
-                # unsubscribes on a connection that is going down anyway.
-                for sub in registry.subscriptions():
-                    sub._closed = True
-                    sub._receivers.clear()
+            self._close_all_subscriptions()
             if self._worker_finalizer is not None:
                 self._worker_finalizer.detach()
                 self._worker_finalizer = None
 
             t = self._dispatch_thread
-            if t is not None and t.is_alive():
+            if t is not None and t is threading.current_thread():
+                # Inside a callback: it exits right after this one returns.
+                pass
+            elif t is not None and t.is_alive():
                 t.join(timeout=_WORKER_JOIN_SECONDS)
                 if t.is_alive():
                     logger.warning(
@@ -283,13 +288,34 @@ class ObserverBase:
 
             self._on_disconnect()
         finally:
+            # Not connected first, then a last close pass: a subscribe() that
+            # registered after the first pass sees one or the other.
+            self._connected = False
+            self._close_all_subscriptions()
             if self._registry is not None:
                 self._registry.clear()
                 self._registry = None
-            self._connected = False
+
+    def _close_all_subscriptions(self) -> None:
+        """Mark every registered subscription closed, without the unsubscribe hooks.
+
+        Not through close(): the hooks would queue unsubscribes on a
+        connection that is going down anyway.
+        """
+        registry = self._registry
+        if registry is None:
+            return
+        for sub in registry.subscriptions():
+            sub._closed = True
+            sub._receivers.clear()
 
     def subscribe(self, options: SubscriptionOptions) -> Subscription:
-        """Register a subscription on the local registry and call _on_subscribe hook."""
+        """Register a subscription on the local registry and call _on_subscribe hook.
+
+        Raises ObserverConnectionError when the observer is not connected,
+        or disconnects while the subscription is being set up: the
+        subscription then reports closed, never an open one that cannot fire.
+        """
         self._ensure_connected()
 
         sub = Subscription(_options=options, _observer=self)
@@ -302,7 +328,13 @@ class ObserverBase:
         except Exception:
             # roll back the registry insert so state stays consistent
             registry.remove(sub)
+            sub._closed = True
             raise
+        if not self._connected:
+            registry.remove(sub)
+            sub._closed = True
+            sub._receivers.clear()
+            raise ObserverConnectionError("Observer disconnected while subscribing")
         return sub
 
     def _close_subscription(self, subscription: Subscription) -> None:
@@ -426,6 +458,14 @@ class ObserverBase:
     def _deliver_batch(self, batch: list[Key | _TaggedKey | _Resync]) -> None:
         if not batch:
             return
+        # Every resync wake in hand is consumed here, delivered or not, so
+        # its hash is released first: a later subscription on the same
+        # filter gets its own wake. Released before any receiver runs, so a
+        # drop recorded from now on queues a new wake.
+        with self._resync_lock:
+            for item in batch:
+                if isinstance(item, _Resync):
+                    self._resync_queued.discard(item.filter_hash)
         registry = self._registry
         if registry is None:
             return
@@ -435,10 +475,6 @@ class ObserverBase:
         for item in batch:
             if isinstance(item, _Resync):
                 h = item.filter_hash
-                # Released before the wake runs: a drop recorded from here on
-                # queues its own, since this one may read state from before it.
-                with self._resync_lock:
-                    self._resync_queued.discard(h)
                 woken = [s for s in registry.subscriptions() if s.filter_hash == h]
                 if woken:
                     notifications.append((None, woken))
