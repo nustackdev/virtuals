@@ -8,9 +8,11 @@ standard library.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import threading
+import time
 import weakref
 from contextlib import contextmanager
 from logging import getLogger
@@ -55,6 +57,11 @@ DEFAULT_MAX_IDLE_CONNECTIONS = 8
 Synchronous = Literal["OFF", "NORMAL", "FULL", "EXTRA"]
 
 _SCHEMA = "CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID"
+
+# Poll interval bounds for a coroutine waiting on the cross-process write
+# lock (seconds), same shape as the in-process slot wait.
+_LOCK_POLL_MIN = 0.0005
+_LOCK_POLL_MAX = 0.005
 
 # Connections a forked child inherited. SQLite forbids using a connection in
 # a child, and closing one counts: it would roll back the parent's open
@@ -124,6 +131,10 @@ class SQLiteStorage:
     ``StorageNestedTransactionError``; one whose loop has another task
     holding it raises ``StorageLockTimeoutError``. Both fail at once
     instead of waiting: the holder could never run to release it.
+    ``areserve_write_slot`` also waits for the cross-process file lock
+    without blocking the loop, so a transaction begun with the slot never
+    stalls the loop while another process writes. A plain sync begin
+    waits in SQLite's busy handler, which is what a sync caller asked for.
 
     Multiple processes: open the storage in each process (e.g. with the
     ``spawn`` start method); that is the supported path. Reusing an open
@@ -207,6 +218,9 @@ class SQLiteStorage:
         self._active_transactions: weakref.WeakSet[SQLiteTransaction] = weakref.WeakSet()
         self._active_write_batches: weakref.WeakSet[SQLiteWriteBatch] = weakref.WeakSet()
         self._active_snapshots: weakref.WeakSet[SQLiteSnapshot] = weakref.WeakSet()
+        # Slots reserved and not yet taken by a transaction. Each holds a
+        # begun connection that close() must take back.
+        self._reserved_slots: weakref.WeakSet[SQLiteWriteSlot] = weakref.WeakSet()
         self._opened = False
         self._pid = os.getpid()
         self._forked_during_write = False
@@ -286,10 +300,11 @@ class SQLiteStorage:
     def close(self) -> None:
         """Close database and release all resources.
 
-        Aborts open transactions and batches, closes open snapshots, then
-        closes every pooled connection. The last connection to close (in
-        any process) checkpoints the WAL back into the file. The storage
-        can be opened again afterwards.
+        Aborts open transactions and batches, closes open snapshots, gives
+        back reserved write slots' connections, then closes every pooled
+        connection. The last connection to close (in any process)
+        checkpoints the WAL back into the file. The storage can be opened
+        again afterwards.
 
         A context in use on another thread is ended once its current
         statement finishes (see ``ContextBase``), so close never pulls a
@@ -307,9 +322,11 @@ class SQLiteStorage:
             transactions = list(self._active_transactions)
             snapshots = list(self._active_snapshots)
             write_batches = list(self._active_write_batches)
+            reserved = list(self._reserved_slots)
             self._active_transactions.clear()
             self._active_write_batches.clear()
             self._active_snapshots.clear()
+            self._reserved_slots.clear()
             idle, self._idle = self._idle, []
 
         for transaction in transactions:
@@ -329,6 +346,14 @@ class SQLiteStorage:
                 write_batch.abort()
             except Exception as e:
                 logger.error(f"Write batch abort failed during close: {e}")
+
+        for slot in reserved:
+            # The slot keeps its in-process lock (its holder releases that);
+            # only the begun connection, and with it the file lock, goes.
+            try:
+                slot._drop_conn()
+            except Exception as e:
+                logger.error(f"Write slot release failed during close: {e}")
 
         self._writer.close()  # a reserved slot nobody took does not survive the reopen
 
@@ -424,11 +449,21 @@ class SQLiteStorage:
         return transaction
 
     async def areserve_write_slot(self) -> SQLiteWriteSlot:
-        """Wait for the writer slot without blocking the event loop.
+        """Wait for the write lock without blocking the event loop.
 
-        Polls the slot with a short, growing sleep between tries, so other
-        coroutines on the loop keep running, including the one that holds
-        it. Waits behind other threads too.
+        Two waits, both polled with a short, growing sleep between tries so
+        other coroutines on the loop keep running, including the one that
+        holds the lock: first the in-process writer slot (behind other
+        tasks and threads), then the cross-process file lock, taken with
+        ``BEGIN IMMEDIATE`` on a pooled connection with the busy handler
+        off, so each try returns at once. Both share one ``busy_timeout``
+        deadline. The slot carries the begun connection into
+        ``begin_transaction(write_slot=...)``.
+
+        Cancelled while waiting, it holds nothing: the lock is only ever
+        taken by a non-blocking try, nothing is awaited between taking it
+        and returning, and a cancel in the file lock wait releases the
+        slot and gives the connection back.
 
         Returns:
             The held slot, for ``begin_transaction(write_slot=...)``. Call
@@ -437,16 +472,60 @@ class SQLiteStorage:
         Raises:
             StorageNestedTransactionError: If this task already holds the
                 slot.
-            StorageLockTimeoutError: If it is not free within
-                ``busy_timeout``.
+            StorageLockTimeoutError: If the slot or the file lock is not
+                free within ``busy_timeout``.
         """
         if self._read_only:
             raise StorageError("Cannot reserve the write slot in read only mode.")
         self._require_open()
         self._check_fork()
         self._require_writable_after_fork()
+        deadline = time.monotonic() + max(self._busy_timeout, 0)
         lock = await self._writer.areserve(self._busy_timeout)
-        return SQLiteWriteSlot(self, lock)
+        try:
+            conn = await self._abegin_immediate(deadline)
+        except BaseException:
+            self._writer.release(lock)
+            raise
+        slot = SQLiteWriteSlot(self, lock, conn)
+        with self._state_lock:
+            self._reserved_slots.add(slot)
+        return slot
+
+    async def _abegin_immediate(self, deadline: float) -> sqlite3.Connection:
+        """Take the file write lock on a pooled connection, polling off the loop.
+
+        ``PRAGMA busy_timeout = 0`` makes each ``BEGIN IMMEDIATE`` a single
+        non-blocking attempt (SQLite returns busy at once instead of
+        sleeping in its handler); the wait between attempts is an
+        ``asyncio.sleep``. The connection's busy handler is restored
+        before it goes anywhere, since the pool shares it with sync paths.
+        """
+        conn = self._acquire_connection()
+        try:
+            try:
+                conn.execute("PRAGMA busy_timeout = 0")
+                delay = _LOCK_POLL_MIN
+                while True:
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        return conn
+                    except Exception as e:
+                        if not is_busy_error(e):
+                            raise StorageError(f"Failed to begin write transaction: {e}") from e
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise StorageLockTimeoutError(
+                                f"Timed out after {self._busy_timeout}s waiting for the "
+                                f"write lock: {e}"
+                            ) from e
+                    await asyncio.sleep(min(delay, remaining))
+                    delay = min(delay * 2, _LOCK_POLL_MAX)
+            finally:
+                conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout * 1000)}")
+        except BaseException:
+            self._release_connection(conn)
+            raise
 
     def begin_write_batch(self) -> SQLiteWriteBatch:
         """Begin write-only batch. Takes no lock until ``write``."""
@@ -580,8 +659,11 @@ class SQLiteStorage:
         """Take the writer slot and a connection with ``BEGIN IMMEDIATE`` run.
 
         With ``write_slot`` the slot is already held and is taken over, not
-        acquired. On failure nothing is held: the connection is given back,
-        and the slot is released, or returned to ``write_slot``'s holder.
+        acquired, and its begun connection comes with it, so nothing waits
+        here. Otherwise the slot is acquired and ``BEGIN IMMEDIATE`` waits
+        in SQLite's busy handler for up to ``busy_timeout``. On failure
+        nothing is held: the connection is given back, and the slot is
+        released, or returned to ``write_slot``'s holder.
 
         Returns:
             The connection, and the writer lock held for it (to release by
@@ -591,6 +673,10 @@ class SQLiteStorage:
         self._require_writable_after_fork()
         give_back_slot = self._writer.take(self, write_slot, self._busy_timeout)
         writer_lock = self._writer.lock
+
+        conn = write_slot._detach_conn() if write_slot is not None else None
+        if conn is not None:
+            return conn, writer_lock
 
         try:
             conn = self._acquire_connection()
@@ -618,7 +704,8 @@ class SQLiteStorage:
         opened the storage: the parent's open contexts are marked ended
         without being ended (no ROLLBACK on their connections), every
         inherited connection is parked for the life of the process (see
-        ``_INHERITED_CONNECTIONS``), and the writer slot is reset so a lock held by a
+        ``_INHERITED_CONNECTIONS``), reserved slots lose their connections
+        the same way, and the writer slot is reset so a lock held by a
         parent thread does not wait forever here. If the parent held the
         write lock at the fork, writes on this file are refused from now
         on (see ``_require_writable_after_fork``).
@@ -636,20 +723,27 @@ class SQLiteStorage:
                 *self._active_snapshots,
                 *self._active_write_batches,
             ]
+            reserved = list(self._reserved_slots)
             held_write = bool(
                 self._writer.lock.locked()
                 or self._active_transactions
                 or any(b._conn is not None for b in self._active_write_batches)
+                or reserved
             )
             inherited = list(self._idle)
             for context in contexts:
                 if context._conn is not None:
                     inherited.append(context._conn)
                 context._forget()
+            for slot in reserved:
+                conn = slot._detach_conn()
+                if conn is not None:
+                    inherited.append(conn)
             self._idle = []
             self._active_transactions = weakref.WeakSet()
             self._active_snapshots = weakref.WeakSet()
             self._active_write_batches = weakref.WeakSet()
+            self._reserved_slots = weakref.WeakSet()
             self._writer.reset()
             if held_write:
                 self._forked_during_write = True
