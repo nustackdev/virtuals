@@ -10,6 +10,7 @@ queue on the writer slot without stalling the event loop.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -484,6 +485,106 @@ def test_closed_storage_error_is_not_retryable(tmp_path: Path) -> None:
         with s.transaction() as t:
             t.put(K, 1)
     assert not isinstance(info.value, RETRYABLE)
+
+
+def test_close_refuses_while_a_thread_is_inside_a_call(tmp_path: Path) -> None:
+    """close() during another thread's native call raises and frees nothing.
+
+    It used to abort that thread's transaction under it (a segfault).
+    """
+    s = RocksDBStorage(
+        path=tmp_path / "db",
+        codec=BinaryCodec(),
+        txn_db_options={"transaction_lock_timeout": 1000, "default_lock_timeout": 1000},
+    )
+    s.open()
+    raw = s._db.begin()
+    raw.put(s.codec.encode_key(K), b"raw")  # row lock outside the slot
+    entered = threading.Event()
+    outcome: list = []
+
+    def worker() -> None:
+        t = s.begin_transaction()
+        entered.set()
+        try:
+            t.put(K, 1)  # waits nogil on the row lock
+        except RETRYABLE as e:
+            outcome.append(e)
+        t.abort()
+
+    th = threading.Thread(target=worker, daemon=True)
+    th.start()
+    entered.wait(5)
+    time.sleep(0.2)
+    with pytest.raises(StorageError, match="in use"):
+        s.close()
+    th.join(5)
+    assert outcome and isinstance(outcome[0], StorageLockTimeoutError)
+    raw.rollback()
+    _put(s, {K: 2})
+    assert _read(s, K) == 2
+    s.close()
+
+
+def test_close_wakes_slot_waiter_with_closed_error(tmp_path: Path) -> None:
+    """A sync writer queued on the slot sees a closed storage once close() ends."""
+    s = RocksDBStorage(path=tmp_path / "db", codec=BinaryCodec(), busy_timeout=5.0)
+    s.open()
+    held = s.begin_transaction()
+    errors: list[BaseException] = []
+
+    def waiter() -> None:
+        try:
+            s.begin_transaction()
+        except BaseException as e:
+            errors.append(e)
+
+    th = threading.Thread(target=waiter, daemon=True)
+    th.start()
+    time.sleep(0.05)
+    s.close()
+    th.join(5)
+    assert not th.is_alive()
+    assert held.is_closed
+    assert errors and isinstance(errors[0], StorageClosedError)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_close_in_forked_child_frees_nothing(tmp_path: Path) -> None:
+    """A forked child's close() forgets the parent's handle instead of tearing it down.
+
+    Tearing it down in the child hung (no-WAL memtable flush waits on a
+    background thread only the parent has).
+    """
+    s = RocksDBStorage(path=tmp_path / "db", codec=BinaryCodec(), disable_wal=True)
+    s.open()
+    _put(s, {K: 1})
+    txn = s.begin_transaction()
+    snap = s.begin_snapshot()
+    before = sorted(p.name for p in (tmp_path / "db").iterdir())
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - child
+        code = 1
+        try:
+            s.close()
+            code = 0 if txn.is_closed and snap.is_closed and not s._opened else 2
+        finally:
+            os._exit(code)
+    deadline = time.monotonic() + 10
+    while (done := os.waitpid(pid, os.WNOHANG))[0] == 0 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if done[0] == 0:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+        pytest.fail("close hung in the forked child")
+    assert os.waitstatus_to_exitcode(done[1]) == 0
+    assert sorted(p.name for p in (tmp_path / "db").iterdir()) == before
+    assert snap.get(K) == 1
+    txn.put(K, 2)
+    txn.commit()
+    snap.close()
+    assert _read(s, K) == 2
+    s.close()
 
 
 def test_write_batch_queues_behind_transaction(storage: RocksDBStorage) -> None:

@@ -55,6 +55,13 @@ logger = getLogger(__name__)
 
 DEFAULT_BUSY_TIMEOUT = 60.0  # seconds
 
+# Native handles a forked child inherited and was asked to close. Freeing
+# them there would run rocksdb teardown (a memtable flush, waits on
+# background jobs, lock manager mutexes) against threads and locks that only
+# exist in the parent: it can hang or write into the parent's directory. The
+# child keeps them referenced instead, until it exits.
+_INHERITED_HANDLES: list[Any] = []
+
 RocksDBWriteSlot = WriteSlot
 """Returned by ``RocksDBStorage.areserve_write_slot``; see ``WriteSlot``."""
 
@@ -355,47 +362,79 @@ class RocksDBStorage:
     def close(self) -> None:
         """Close database and release all resources.
 
-        Aborts open transactions and batches (giving back the writer slot),
-        closes open snapshots, then closes the database.
+        Closes the database first: rdbpy refuses while another thread is
+        inside a call on it or on one of its transactions, snapshots or
+        iterators, and then nothing is touched and the storage stays open.
+        Once the database is closed (rdbpy rolls back its transactions and
+        releases its snapshots), open transactions, snapshots and batches
+        are marked ended and the writer slot is given back.
 
         Raises:
-            StorageError: If close fails
+            StorageError: If close fails, e.g. a call is still in flight on
+                another thread
         """
         if not self._opened:
             return
+        if self._pid != os.getpid():
+            self._forget_inherited()
+            return
 
-        for transaction in list(self._active_transactions):
-            try:
-                transaction.abort()
-            except Exception as e:
-                logger.error(f"Transaction abort failed during close: {e}")
-
-        for snapshot in list(self._active_snapshots):
-            try:
-                snapshot.close()
-            except Exception as e:
-                logger.error(f"Snapshot close failed during close: {e}")
-
-        for write_batch in list(self._active_write_batches):
-            try:
-                write_batch.abort()
-            except Exception as e:
-                logger.error(f"Write batch abort failed during close: {e}")
-
-        with self._state_lock:
-            self._active_transactions.clear()
-            self._active_write_batches.clear()
-            self._active_snapshots.clear()
-            db, self._db = self._db, None
-            self._opened = False
-
-        # Close database. Any rdbpy iterator still referenced (e.g. by a
-        # suspended scan generator) is invalidated by rdbpy, not freed.
+        db = self._db
         if db is not None:
             try:
                 db.close()
             except Exception as e:
                 raise StorageError(f"Failed to close database: {e}") from e
+
+        with self._state_lock:
+            transactions = list(self._active_transactions)
+            snapshots = list(self._active_snapshots)
+            write_batches = list(self._active_write_batches)
+            self._active_transactions.clear()
+            self._active_write_batches.clear()
+            self._active_snapshots.clear()
+            self._db = None
+            self._opened = False
+
+        # Native state is gone; these only mark the contexts ended and give
+        # back the writer slot. A waiter woken by that sees a closed storage.
+        for transaction in transactions:
+            try:
+                transaction.abort()
+            except Exception as e:
+                logger.error(f"Transaction abort failed during close: {e}")
+
+        for snapshot in snapshots:
+            try:
+                snapshot.close()
+            except Exception as e:
+                logger.error(f"Snapshot close failed during close: {e}")
+
+        for write_batch in write_batches:
+            try:
+                write_batch.abort()
+            except Exception as e:
+                logger.error(f"Write batch abort failed during close: {e}")
+
+    def _forget_inherited(self) -> None:
+        """Close in a forked child: forget the parent's handles, free nothing native."""
+        with self._state_lock:
+            contexts = [
+                *self._active_transactions,
+                *self._active_snapshots,
+                *self._active_write_batches,
+            ]
+            self._active_transactions.clear()
+            self._active_write_batches.clear()
+            self._active_snapshots.clear()
+            _INHERITED_HANDLES.append((self._db, contexts))
+            self._db = None
+            self._opened = False
+            self._writer.reset()
+        for context in contexts:
+            # Ended without touching its rdbpy handle, which stays referenced.
+            context._holds_write_slot = False
+            context._closed = True
 
     def __enter__(self) -> RocksDBStorage:
         """Enter context manager - open storage."""
