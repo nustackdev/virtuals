@@ -84,7 +84,9 @@ _TXN_OPTION_ALIASES = {
 def _is_lock_file_error(e: BaseException) -> bool:
     """True if an open failed on the directory's LOCK file: it is open elsewhere."""
     text = str(e)
-    return isinstance(e, rdbpy.RocksIOError) and ("LOCK" in text or "lock hold" in text)
+    return isinstance(e, rdbpy.RocksIOError) and (
+        "lock hold" in text or ("LOCK" in text and "Resource temporarily unavailable" in text)
+    )
 
 
 class RocksDBStorage:
@@ -621,7 +623,7 @@ class RocksDBStorage:
             raise StorageError("Cannot start transaction in read only mode.")
         self._require_open()
 
-        give_back_slot = self._writer.take(self, write_slot, self._busy_timeout)
+        lock, give_back_slot = self._writer.take_slot(self, write_slot, self._busy_timeout)
         try:
             db = self._db
             if db is None:
@@ -638,7 +640,7 @@ class RocksDBStorage:
             # A database closed under us is StorageClosedError, not a generic failure.
             raise classify_rdbpy(e, "Failed to begin transaction") from e
 
-        transaction = RocksDBTransaction(self, rdbpy_txn, self._writer.lock)
+        transaction = RocksDBTransaction(self, rdbpy_txn, lock)
         with self._state_lock:
             self._active_transactions.add(transaction)
         return transaction
