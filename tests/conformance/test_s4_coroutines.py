@@ -43,8 +43,8 @@ class LoopWatch:
             raise StalledError
 
 
-async def _begin(backend, storage):
-    if backend.has_write_slot(storage):
+async def _begin(backend, storage, use_slot: bool):
+    if use_slot and backend.has_write_slot(storage):
         slot = await storage.areserve_write_slot()
         try:
             return storage.begin_transaction(write_slot=slot)
@@ -54,10 +54,10 @@ async def _begin(backend, storage):
     return storage.begin_transaction()
 
 
-async def _txn(backend, storage, body, watch: LoopWatch) -> None:
+async def _txn(backend, storage, body, watch: LoopWatch, use_slot: bool) -> None:
     async def attempt() -> None:
         watch.check()
-        t = await _begin(backend, storage)
+        t = await _begin(backend, storage, use_slot)
         try:
             await body(t)
             watch.check()
@@ -70,7 +70,7 @@ async def _txn(backend, storage, body, watch: LoopWatch) -> None:
     await aretrying(attempt)
 
 
-def _run(backend, storage, body, *, stop_on_stall: bool = False):
+def _run(backend, storage, body, *, use_slot: bool, stop_on_stall: bool = False):
     """Run CORO_N coroutines of ``body`` next to a ticker. Return (wall, max loop gap).
 
     With ``stop_on_stall`` the writers stop once the loop has been blocked
@@ -92,7 +92,7 @@ def _run(backend, storage, body, *, stop_on_stall: bool = False):
         t0 = time.perf_counter()
         try:
             results = await asyncio.gather(
-                *(_txn(backend, storage, body, watch) for _ in range(CORO_N)),
+                *(_txn(backend, storage, body, watch, use_slot) for _ in range(CORO_N)),
                 return_exceptions=True,
             )
         finally:
@@ -109,8 +109,15 @@ def _run(backend, storage, body, *, stop_on_stall: bool = False):
     return asyncio.run(main())
 
 
+# "slot": writers wait in areserve_write_slot where the backend has it.
+# "plain": writers call begin_transaction directly and retry RETRYABLE, even
+# where a slot exists, so a sync begin that blocks the loop shows up.
+USE_SLOT = pytest.mark.parametrize("use_slot", [True, False], ids=["slot", "plain"])
+
+
+@USE_SLOT
 @pytest.mark.timeout(20)
-def test_s4_coroutine_writers_serialize(backend, storage):
+def test_s4_coroutine_writers_serialize(backend, storage, use_slot):
     """N coroutines doing read, await, write each land their increment, in bounded time."""
     put_committed(storage, {K: 0})
 
@@ -119,14 +126,15 @@ def test_s4_coroutine_writers_serialize(backend, storage):
         await asyncio.sleep(STEP)
         t.put(K, v + 1)
 
-    wall, _ = _run(backend, storage, body)
+    wall, _ = _run(backend, storage, body, use_slot=use_slot)
     with storage.snapshot() as s:
         assert s.get(K) == CORO_N
     assert wall < WALL * CORO_N / 10, f"{CORO_N} writers took {wall:.2f}s"
 
 
+@USE_SLOT
 @pytest.mark.timeout(20)
-def test_s4_coroutine_writers_do_not_block_loop(backend, storage):
+def test_s4_coroutine_writers_do_not_block_loop(backend, storage, use_slot):
     """While coroutine writers hold a write across an await, the event loop keeps running.
 
     Each writer writes first and then awaits before commit, so a backend that
@@ -138,6 +146,6 @@ def test_s4_coroutine_writers_do_not_block_loop(backend, storage):
         t.put(K, t.get(K) + 1)
         await asyncio.sleep(STEP)
 
-    wall, gap = _run(backend, storage, body, stop_on_stall=True)
+    wall, gap = _run(backend, storage, body, use_slot=use_slot, stop_on_stall=True)
     assert gap < MAX_GAP, f"event loop blocked for {gap * 1000:.0f}ms"
     assert wall < WALL * CORO_N / 10, f"{CORO_N} writers took {wall:.2f}s"

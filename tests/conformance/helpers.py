@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from collections import Counter
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from virtuals.codecs import BinaryKeyCodec
@@ -165,3 +166,32 @@ class CountingCodec(Codec):
 
     def touched(self) -> int:
         return self.c["encode_key"] + self.c["decode_key"]
+
+
+# Cross-process contention worker for section 3. Module level so spawn can import it.
+def proc_contend(
+    backend: str, root: str, out: str, lock_timeout: float, hold: float, rounds: int, start: Any
+) -> None:
+    import json
+
+    from tests.conformance.backends import BACKENDS
+
+    key = ("counter",)
+    st = BACKENDS[backend].make(root, lock_timeout=lock_timeout)
+    st.open()
+    errors: list[list] = []
+    commits = 0
+    try:
+        start.wait(30)
+        for _ in range(rounds):
+            try:
+                with st.transaction() as t:
+                    v = t.get(key)
+                    t.put(key, v + 1)
+                    time.sleep(hold)
+                commits += 1
+            except Exception as e:
+                errors.append([type(e).__name__, isinstance(e, RETRYABLE), str(e)[:80]])
+    finally:
+        st.close()
+    Path(out).write_text(json.dumps({"errors": errors, "commits": commits}))
