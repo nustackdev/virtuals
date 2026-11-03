@@ -1500,3 +1500,111 @@ def test_sync_begin_on_loop_behind_peer_process_is_capped(holder, tmp_path: Path
             tx.put(("mine",), b"1")
     finally:
         st.close()
+
+
+# =========================================================================
+# Round 2: dead readers pin pages (B5), the reader table is finite (B6)
+# =========================================================================
+
+
+def _hold_snapshot(root: str, started, map_size: int) -> None:
+    """Spawn target: open a snapshot and stay inside it until killed."""
+    st = _open(root, map_size=map_size)
+    snap = st.begin_snapshot()
+    snap.get(("big", 0))
+    started.set()
+    time.sleep(60)
+
+
+def _reader_rows(st: LMDBStorage) -> int:
+    """Reader slots in use on the environment (the first line is a header)."""
+    return len(st._env.readers().strip().splitlines()) - 1
+
+
+@pytest.mark.timeout(90)
+def test_dead_reader_is_swept_at_write_begin_and_on_map_full(ctx, tmp_path: Path) -> None:
+    """A peer killed inside a snapshot stops pinning pages: swept at write begin, and on MapFull."""
+    map_size = 4 * 1024 * 1024
+    st = _open(str(tmp_path), busy_timeout=2.0, map_size=map_size, sync=False, metasync=False)
+    big = b"x" * 200_000
+
+    def kill_peer_inside_snapshot() -> None:
+        started = ctx.Event()
+        p = ctx.Process(target=_hold_snapshot, args=(str(tmp_path), started, map_size))
+        p.start()
+        assert started.wait(20)
+        p.kill()
+        p.join(10)
+        assert _reader_rows(st) == 1  # the slot stays registered
+
+    try:
+        with st.transaction() as tx:
+            tx.put(("big", 0), big)
+
+        # 1. The throttled check at write begin clears it before anything fills up.
+        kill_peer_inside_snapshot()
+        st._last_reader_check = 0.0
+        with st.transaction() as tx:
+            tx.put(("big", 1), big)
+        assert _reader_rows(st) == 0
+
+        # 2. Throttle off: the map fills behind the dead reader. A write-only
+        # transaction sweeps and retries once, transparently.
+        kill_peer_inside_snapshot()
+        st._last_reader_check = float("inf")
+        sweeps: list[int] = []
+        original = st._sweep_dead_readers
+
+        def counting() -> int:
+            sweeps.append(1)
+            return original()
+
+        st._sweep_dead_readers = counting  # type: ignore[method-assign]
+        try:
+            for i in range(40):
+                with st.transaction() as tx:
+                    tx.put(("big", i % 4), big)
+        finally:
+            del st._sweep_dead_readers
+        assert sweeps, "the map never filled: the test's sizes need adjusting"
+        assert _reader_rows(st) == 0
+
+        # 3. A begun transaction (it read first) gets the retryable error once; the retry lands.
+        kill_peer_inside_snapshot()
+        st._last_reader_check = float("inf")
+        retried = 0
+        for i in range(40):
+            tx = st.begin_transaction()
+            try:
+                tx.get(("big", 0))
+                tx.put(("big", i % 4), big)
+                tx.commit()
+            except StorageLockTimeoutError as e:
+                assert "dead process" in str(e)
+                tx.abort()
+                retried += 1
+        assert retried == 1, retried
+        assert _reader_rows(st) == 0
+        with st.snapshot() as snap:
+            assert snap.get(("big", 3)) == big
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(20)
+def test_full_reader_table_is_retryable(tmp_path: Path) -> None:
+    """The 127th (here 9th) snapshot across every process is a retryable error naming max_readers."""
+    from virtuals._backends.storages.lmdb.storage import DEFAULT_MAX_READERS
+
+    assert DEFAULT_MAX_READERS >= 1024
+    st = _open(str(tmp_path), max_readers=8)
+    snaps = [st.begin_snapshot() for _ in range(8)]
+    try:
+        with pytest.raises(StorageLockTimeoutError, match="max_readers"):
+            st.begin_snapshot()
+        snaps.pop().close()
+        snaps.append(st.begin_snapshot())  # a slot came back
+    finally:
+        for snap in snaps:
+            snap.close()
+        st.close()

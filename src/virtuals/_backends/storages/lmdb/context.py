@@ -27,6 +27,8 @@ import threading
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
 
+import lmdb
+
 from virtuals.tkv.storage import (
     ScanProtocol,
     StorageClosedError,
@@ -322,6 +324,14 @@ class WriteOperationsMixin:
                 txn = self._require_active()
                 try:
                     txn.put(encoded_key, encoded_value)
+                except lmdb.MapFullError as e:
+                    # The transaction is dead either way (LMDB flags it on
+                    # a failed allocation); retryable when a dead reader's
+                    # slot was what pinned the map full.
+                    retry = self._storage._after_map_full(f"put key {key}")
+                    if retry is not None:
+                        raise retry from e
+                    raise StorageOperationError(f"Failed to put key {key}: {e}") from e
                 except Exception as e:
                     raise StorageOperationError(f"Failed to put key {key}: {e}") from e
 
@@ -347,6 +357,11 @@ class WriteOperationsMixin:
                 txn = self._require_active()
                 try:
                     existed = txn.delete(encoded_key)
+                except lmdb.MapFullError as e:
+                    retry = self._storage._after_map_full(f"delete key {key}")
+                    if retry is not None:
+                        raise retry from e
+                    raise StorageOperationError(f"Failed to delete key {key}: {e}") from e
                 except Exception as e:
                     raise StorageOperationError(f"Failed to delete key {key}: {e}") from e
 
