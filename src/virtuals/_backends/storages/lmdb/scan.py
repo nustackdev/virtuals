@@ -81,7 +81,6 @@ class LMDBScan(ScanProtocol):
             while True:
                 try:
                     encoded_key = cursor.key()
-                    encoded_value = cursor.value() if need_values else None
                 except Exception as e:
                     raise StorageOperationError(f"Failed to read cursor: {e}") from e
 
@@ -111,11 +110,13 @@ class LMDBScan(ScanProtocol):
                     break
 
                 value = None
-                if need_values and encoded_value is not None:
+                if need_values:
+                    # Read the value only for a row that is yielded: skipped
+                    # and filtered rows cost a key, not a copy of the value.
                     try:
-                        value = codec.decode_value(encoded_value)
+                        value = codec.decode_value(cursor.value())
                     except Exception as e:
-                        raise StorageOperationError(f"Failed to decode value: {e}") from e
+                        raise StorageOperationError(f"Failed to read value: {e}") from e
 
                 if iterator_type == _IteratorType.KEYS:
                     yield key
