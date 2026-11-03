@@ -23,7 +23,7 @@ Races are forced, not hoped for. In lost update a pause sits between each read a
 ## layout
 
 - `backends.py`: one spec per backend (factory into a tmp dir, process model, writer slot check)
-- `known_failures.py`: the xfail table, one row per (case, backend)
+- `known_failures.py`: the xfail table, one row per (case, backend), or per (case, backend-param) for one parametrization
 - `helpers.py`: knobs, `RETRYABLE`, retry loops, thread runner, cross-process workers, `CountingCodec`
 - `test_s<N>_*.py`: cases, named by contract section (`test_s5_writer_slot.py` spans sections 1 and 4: the writer slot across drops, loop threads, close and nesting)
 
@@ -51,6 +51,8 @@ Races are forced, not hoped for. In lost update a pause sits between each read a
 | `test_s3_contention_raises_only_retryable` | 3 | in-process writers aborted by conflict or busy raise only conflict or lock timeout |
 | `test_s3_cross_process_contention_raises_retryable` | 3, 4 | writer processes past a 10ms lock timeout get the backend's own busy signal, and only as a retryable class (multi-process backends only) |
 | `test_s3_closed_storage_error_not_retryable` | 3 | a write to a closed storage raises a non-retryable `StorageError` |
+| `test_s3_scan_after_context_close_raises_closed` | 3 | a scan resumed after its snapshot or transaction closed raises `StorageClosedError`, never a buffered row |
+| `test_s3_scan_after_storage_close_raises_closed` | 3 | same after the storage closed |
 | `test_s4_coroutine_writers_serialize` | 4 | N coroutines doing read, await, write all land, in bounded time |
 | `test_s4_coroutine_writers_do_not_block_loop` | 4 | writers holding a write across an await never block the loop for 200ms |
 | `test_s1_dropped_transaction_frees_slot` | 1 | a txn dropped without commit or abort (other thread, then same thread) does not hold the slot once collected: the next writer lands within 200ms |
@@ -58,6 +60,8 @@ Races are forced, not hoped for. In lost update a pause sits between each read a
 | `test_s4_sync_begin_on_loop_thread_is_bounded` | 4 | a sync `begin_transaction` or `batch.write` from a coroutine while a thread holds the slot gives up within 300ms with the retryable lock timeout, loop gap under 200ms |
 | `test_s4_late_release_after_close_and_reopen_frees_nothing` | 4 | close and reopen while a commit is about to give the slot back, a new writer takes the fresh slot: the old release neither frees it nor raises |
 | `test_s4_reserved_slot_does_not_survive_close` | 4 | a slot reserved and never taken is gone after close and reopen: the next writer lands within 200ms, the stale slot is refused with a non-retryable error |
+| `test_s4_cross_process_lock_wait_does_not_block_loop` | 4 | a slot writer waiting for a write lock held by another process never blocks the loop for 200ms (multi-process backends only) |
+| `test_s4_close_during_in_flight_call_never_crashes` | 4 | close() racing a thread inside a call on a txn or snapshot (20 rounds in a faulthandler subprocess) never crashes: close waits or refuses, the worker finishes or gets a `StorageError` |
 | `test_s7_storage_delete_is_point_delete` | 7 | `txn.delete` of one key handles one key inside the backend at 10 and 1000 siblings |
 | `test_s7_storage_delete_time_flat` | 7 | median `txn.delete` time grows under 10x from 100 to 10k siblings |
 | `test_s7_view_dict_delete_is_point_delete` | 7 | deleting one dict view key handles as many keys at 10 as at 1000 siblings |
@@ -78,8 +82,11 @@ Strict xfails: an unexpected pass fails the run, so delete the row in the commit
 | nested transaction, nested batch write | rocksdb, mem | lane K, lane D |
 | repeatable read, never torn, binds at open (get, scan), commit atomic to snapshots | rocksdb, mem | lane K, lane D |
 | cross-process contention | lmdb | lmdb writer slot follow-up: a cross-process writer waits inside lmdb unbounded (contract section 4) |
-| late release after close and reopen frees nothing | sqlite, lmdb | fixed in P3 (sqlite), P1 (lmdb): contexts release the slot without lock identity |
-| dropped transaction frees slot | sqlite, lmdb | P3 (sqlite), P1 (lmdb): strong active set and no transaction finalizer, so a dropped txn holds the slot until close |
+| late release after close and reopen frees nothing | lmdb | P1 (lmdb): contexts release the slot without lock identity |
+| dropped transaction frees slot | lmdb | P1 (lmdb): strong active set and no transaction finalizer, so a dropped txn holds the slot until close |
+| cross-process lock wait does not block loop | lmdb | P1 lmdb: begin with a slot waits inside lmdb on the loop (audit 06 F7) |
+| close during in-flight call never crashes | lmdb (both), mem (txn) | P1 lmdb: segfault (audit 06 F2); P2 mem: raw KeyError (audit 06 F11) |
+| scan after context close, scan after storage close | lmdb, mem | P1 lmdb: `StorageOperationError`; P2 mem: yields the buffered page (audit 06 F10) |
 | coroutine writers serialize (slot, plain) | rocksdb, mem | lane K, lane D |
 | coroutine writers do not block loop (slot, plain) | rocksdb | lane K |
 | view dict delete is point delete | all | lane B |

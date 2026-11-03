@@ -195,3 +195,19 @@ def proc_contend(
     finally:
         st.close()
     Path(out).write_text(json.dumps({"errors": errors, "commits": commits}))
+
+
+# Cross-process lock holder for section 4. Module level so spawn can import it.
+def proc_hold_write(backend: str, root: str, hold: float, held: Any) -> None:
+    """Open the storage, hold a write transaction ``hold`` seconds, commit."""
+    from tests.conformance.backends import BACKENDS
+
+    st = BACKENDS[backend].make(root)
+    st.open()
+    try:
+        with st.transaction() as t:
+            t.put(("held",), 1)
+            held.set()
+            time.sleep(hold)
+    finally:
+        st.close()
