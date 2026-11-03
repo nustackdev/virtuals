@@ -9,6 +9,7 @@ standard library.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import os
 import sqlite3
 import threading
@@ -775,7 +776,20 @@ class SQLiteStorage:
 
     @staticmethod
     def _park_inherited(conns: list[sqlite3.Connection]) -> None:
-        """Keep inherited connections alive, untouched, for the life of the process."""
+        """Keep inherited connections alive, untouched, for the life of the process.
+
+        Past interpreter shutdown too: at a normal exit (end of script,
+        ``sys.exit``) module globals are cleared and a parked connection
+        would be deallocated, which runs ``sqlite3_close`` and with it the
+        rollback of the parent's open transaction in the shared WAL index.
+        That corrupts the file the parent is still writing (seen as
+        "database disk image is malformed" after the parent's commit). An
+        extra reference the interpreter never gives back makes the
+        connection immortal, so only process exit frees it, and the kernel
+        then just drops the descriptors without touching the file.
+        """
+        for conn in conns:
+            ctypes.pythonapi.Py_IncRef(ctypes.py_object(conn))
         _INHERITED_CONNECTIONS.extend(conns)
 
     def _release_write_slot(self, lock: threading.Lock | None = None) -> None:
