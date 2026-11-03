@@ -46,6 +46,13 @@ class _TaggedKey:
     filter_hash: str
 
 
+@dataclass(frozen=True, slots=True)
+class _Resync:
+    """A keyless resync wake for every local subscription on one filter hash."""
+
+    filter_hash: str
+
+
 logger = getLogger(__name__)
 
 
@@ -174,22 +181,41 @@ class ObserverBase:
         """
         if not self._connected:
             return
-        q = self._dispatch_queue
         for k in keys:
-            item = k if filter_hash is None else _TaggedKey(k, filter_hash)
+            if not self._enqueue(k if filter_hash is None else _TaggedKey(k, filter_hash)):
+                return
+
+    def _dispatch_resync(self, filter_hash: str) -> None:
+        """Queue one keyless resync wake for every local sub on `filter_hash`.
+
+        A transport calls this when it may have missed changes for that hash
+        (after a reconnect, once the hash is routed again). Each matching
+        subscription's receivers get `None` in place of a key, meaning
+        "re-read the state you watch". Queued behind keys already received,
+        so the wake follows them.
+        """
+        if self._connected:
+            self._enqueue(_Resync(filter_hash))
+
+    def _enqueue(self, item: object) -> bool:
+        """Put `item` on the dispatch queue, blocking while full.
+
+        Returns False when the observer stopped while blocked (item dropped).
+        """
+        q = self._dispatch_queue
+        try:
+            q.put_nowait(item)
+            return True
+        except queue.Full:
+            pass
+        while True:
             try:
-                q.put_nowait(item)
-                continue
+                q.put(item, timeout=_PUT_POLL_SECONDS)
+                return True
             except queue.Full:
-                pass
-            while True:
-                try:
-                    q.put(item, timeout=_PUT_POLL_SECONDS)
-                    break
-                except queue.Full:
-                    if self._stop_event.is_set() or not self._connected:
-                        logger.warning("Observer stopping; dropping undelivered keys")
-                        return
+                if self._stop_event.is_set() or not self._connected:
+                    logger.warning("Observer stopping; dropping undelivered keys")
+                    return False
 
     def flush(self, timeout: float = 1.0) -> None:
         """Wait for the dispatch queue to drain. Test helper."""
@@ -207,7 +233,7 @@ class ObserverBase:
             except queue.Empty:
                 continue
 
-            batch: list[Key | _TaggedKey] = []
+            batch: list[Key | _TaggedKey | _Resync] = []
             while True:
                 if item is _STOP_MARKER:
                     self._deliver_batch(batch)
@@ -225,7 +251,7 @@ class ObserverBase:
 
             self._deliver_batch(batch)
 
-    def _deliver_batch(self, batch: list[Key | _TaggedKey]) -> None:
+    def _deliver_batch(self, batch: list[Key | _TaggedKey | _Resync]) -> None:
         if not batch:
             return
         registry = self._registry
@@ -233,8 +259,14 @@ class ObserverBase:
             return
         if len(registry) == 0:
             return
-        notifications: list[tuple[Key, list[Subscription]]] = []
+        notifications: list[tuple[Key | None, list[Subscription]]] = []
         for item in batch:
+            if isinstance(item, _Resync):
+                h = item.filter_hash
+                woken = [s for s in registry.subscriptions() if s.filter_hash == h]
+                if woken:
+                    notifications.append((None, woken))
+                continue
             if isinstance(item, _TaggedKey):
                 key = item.key
                 h = item.filter_hash

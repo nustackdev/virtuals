@@ -21,9 +21,11 @@ subscribe() in that window waits for the re-registration (or raises on
 timeout) instead of returning early. Writes committed while the connection
 is down, or before the re-registration lands, are NOT delivered (a restarted
 server lost the index; a dropped connection misses the PUBLISH). The observer
-logs a WARNING when this starts and an INFO per re-registered hash. Callbacks
-get no synthetic wake (an event flow is promised the key of a real change);
-level flows catch up at their next scheduled re-check.
+logs a WARNING when this starts and an INFO per re-registered hash. Once a
+hash is re-registered, every local subscription on it gets one keyless resync
+wake (its receivers are called with None), so a level flow re-reads and
+recovers the writes it missed. Event flows must treat None as a re-read or
+skip it.
 
 Subscribing from inside a callback. Callbacks run on the dispatch worker. The
 listener blocks while the dispatch queue is full (backpressure), and while it
@@ -516,8 +518,8 @@ class RedisObserver(ObserverBase):
         if reset:
             logger.warning(
                 "Redis observer pubsub connection %s: %d subscribed filter hash(es) not "
-                "routed until re-registered; writes in this window are not delivered "
-                "(level flows catch up at their next re-check)",
+                "routed until re-registered; writes in this window are not delivered, "
+                "subscribers get a keyless resync wake once re-registered",
                 why,
                 reset,
             )
@@ -669,6 +671,9 @@ class RedisObserver(ObserverBase):
                     self._register_hash(h, entries)
                     logger.info("Re-registered filter hash %s after reconnect", h)
                     self._mark_ready(h, gen)
+                    # Routed again: wake each local sub once so it re-reads
+                    # whatever was written while the hash was not routed.
+                    self._dispatch_resync(h)
                     break
                 except Exception as e:
                     logger.warning("Re-register of hash %s failed, retrying: %s", h, e)

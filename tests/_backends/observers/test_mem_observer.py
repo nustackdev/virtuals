@@ -91,3 +91,24 @@ def test_last_sub_close_leaves_observer_listener_registered():
 
     # After disconnect the transport listener is gone.
     assert t._listeners == []
+
+
+def test_resync_wakes_each_sub_on_the_hash_once_after_queued_keys():
+    """A keyless resync wake reaches every sub on that filter hash, behind earlier keys."""
+    t = InMemoryTransport()
+    with InMemoryObserver(t) as obs:
+        a: list = []
+        a2: list = []
+        b: list = []
+        sa = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("a",))))
+        sa.bind(a.append)
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("a",)))).bind(a2.append)
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("b",)))).bind(b.append)
+
+        obs._dispatch_incoming([("a", 1)], filter_hash=sa.filter_hash)
+        obs._dispatch_resync(sa.filter_hash)
+        obs.flush(timeout=1.0)
+
+        assert a == [("a", 1), None]
+        assert a2 == [("a", 1), None]
+        assert b == []

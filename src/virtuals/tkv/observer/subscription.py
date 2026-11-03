@@ -166,13 +166,14 @@ class Subscription:
             self._receivers.clear()
             self._observer._close_subscription(self)
 
-    def notify(self, key: Key) -> Generator[Exception, None, None]:
+    def notify(self, key: Key | None) -> Generator[Exception, None, None]:
         """Notify all bound receivers of a key change.
 
         This is called internally by the observer when a matching key changes.
 
         Args:
-            key: Key that changed.
+            key: Key that changed, or None for a keyless resync wake (changes
+                may have been missed; re-read the watched state).
 
         Yields:
             Exceptions raised by receivers (for error handling).
