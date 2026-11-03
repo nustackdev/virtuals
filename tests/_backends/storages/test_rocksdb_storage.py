@@ -21,8 +21,6 @@ import pytest
 
 from tests._backends.storages import _write_slot_cases as cases
 from virtuals._backends.storages.rocksdb import RocksDBStorage
-from virtuals._backends.storages.rocksdb.snapshot import RocksDBSnapshot
-from virtuals._backends.storages.rocksdb.transaction import RocksDBTransaction
 from virtuals.codecs import BinaryCodec
 from virtuals.tkv import StorageScanOptions
 from virtuals.tkv.filter import PrefixFilter
@@ -544,15 +542,9 @@ def test_delete_of_absent_key_notifies_from_txn_and_batch_alike(tmp_path: Path) 
     assert pub.batches == [{("absent", 1)}, {("absent", 2)}]
 
 
-def test_exists_reads_the_key_only(storage: RocksDBStorage, monkeypatch) -> None:
-    """exists never fetches the value, and sees a transaction's own pending writes."""
+def test_exists_sees_the_context_view(storage: RocksDBStorage) -> None:
+    """exists answers from the context's view: a snapshot's, or a transaction's with its pending writes."""
     _fill(storage, KEYS)
-
-    def boom(self, encoded_key):
-        raise AssertionError("exists fetched the value")
-
-    monkeypatch.setattr(RocksDBSnapshot, "_get_raw", boom)
-    monkeypatch.setattr(RocksDBTransaction, "_get_raw", boom)
     with storage.snapshot() as snap:
         assert snap.exists(("a", 0))
         assert not snap.exists(("a", 0, "below"))  # a longer key with this prefix is not it

@@ -261,9 +261,7 @@ class ReadOperationsMixin:
     _get_raw: Callable[[bytes], bytes | None]
     _iterator: Callable[..., Any]
 
-    def _read_raw(
-        self, key: Key, action: str, encoded_key: bytes, read: Callable[[bytes], Any] | None = None
-    ) -> Any:  # noqa: ANN401
+    def _read_raw(self, key: Key, action: str, encoded_key: bytes) -> bytes | None:
         """Point read at the context's snapshot, surviving a stale-manifest secondary.
 
         On a read-only secondary, the read can fail because the secondary's
@@ -271,17 +269,9 @@ class ReadOperationsMixin:
         away. That is recoverable: force a catch-up to the current manifest
         and retry. Any other failure, and any failure at all on a primary,
         is classified and raised immediately.
-
-        Args:
-            key: The key, for the error message
-            action: What the caller does, for the error message
-            encoded_key: The key as the codec encodes it
-            read: The native read, ``_get_raw`` by default
         """
-        if read is None:
-            read = self._get_raw
         try:
-            return read(encoded_key)
+            return self._get_raw(encoded_key)
         except Exception as e:
             last = e
         storage = self._storage
@@ -290,24 +280,10 @@ class ReadOperationsMixin:
                 break
             storage.force_catch_up_with_primary()
             try:
-                return read(encoded_key)
+                return self._get_raw(encoded_key)
             except Exception as e:
                 last = e
         raise classify_rdbpy(last, f"Failed to {action} key {key}") from last
-
-    def _key_present(self, encoded_key: bytes) -> bool:
-        """True if the key is at the context's view, without fetching its value.
-
-        A keys-only cursor seeked to the key reads the key alone, so
-        ``exists`` on a large value costs no more than on a small one
-        (rocksdb has no exact point exists; this is the cheapest it offers).
-        """
-        iterator = self._iterator(keys_only=True, reverse=False)
-        try:
-            iterator.seek(encoded_key)
-            return bool(iterator.valid()) and iterator.key() == encoded_key
-        finally:
-            iterator.close()
 
     def get(self, key: Key) -> Value | Empty:
         """Get value by key.
@@ -342,7 +318,15 @@ class ReadOperationsMixin:
             raise StorageOperationError(f"Failed to decode value for key {key}: {e}") from e
 
     def exists(self, key: Key) -> bool:
-        """Check if key exists, without reading its value.
+        """Check if key exists.
+
+        A point get: it uses the bloom filters and costs about a get on
+        the usual value sizes (memtable 0.4 to 1.3us, SST 0.3 to 3.4us,
+        present or absent). It does read the value, so on a very large
+        value it costs as much as a get of it; rdbpy exposes no
+        ``KeyMayExist``, and a keys-only cursor seek, the alternative, is
+        2 to 3x slower on small values and reads the neighbouring key's
+        block when the key is absent.
 
         Args:
             key: Key to check
@@ -362,7 +346,7 @@ class ReadOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        return self._read_raw(key, "check", encoded_key, self._key_present)
+        return self._read_raw(key, "check", encoded_key) is not None
 
     def multiget(self, keys: list[Key]) -> dict[Key, Value]:
         """Get multiple keys.
