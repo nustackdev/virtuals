@@ -146,10 +146,7 @@ class InMemoryStorage:
 
     Attributes:
         codec: Codec for key and value encoding. Views read it directly.
-        process_model: ``"single"``: one process owns the data.
     """
-
-    process_model = "single"
 
     def __init__(
         self,

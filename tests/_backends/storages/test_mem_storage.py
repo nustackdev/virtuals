@@ -380,10 +380,6 @@ def test_lock_timeout_between_threads_is_retryable() -> None:
         _in_thread(lambda: s.begin_transaction().abort())
 
 
-def test_process_model_declared(storage: InMemoryStorage) -> None:
-    assert storage.process_model == "single"
-
-
 # =========================================================================
 # Writer slot: threads and coroutines
 # =========================================================================
