@@ -7,6 +7,7 @@ MVCC snapshots, and optional change notifications via a publisher.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import os
 import threading
 import time
@@ -14,7 +15,7 @@ import weakref
 from contextlib import contextmanager
 from logging import getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, overload
 
 from virtuals.tkv.storage import (
     SnapshotProtocol,
@@ -83,27 +84,37 @@ class LMDBWriteSlot(WriteSlot):
 
     # ``__weakref__`` so ``_reserved_slots`` can hold it weakly; allowed here
     # only because ``WriteSlot`` declares slots without one.
-    __slots__ = ("__weakref__", "_lmdb_txn")
+    __slots__ = ("__weakref__", "_lmdb_txn", "_pid")
 
     def __init__(self, storage: LMDBStorage, lock: threading.Lock, lmdb_txn: Any) -> None:  # noqa: ANN401
         """Initialize a held slot carrying a begun LMDB write transaction."""
         super().__init__(storage, lock)
         self._lmdb_txn: Any | None = lmdb_txn
+        self._pid = os.getpid()
 
     def release(self) -> None:
-        """Give the slot back, aborting its transaction, if no transaction took it."""
+        """Give the slot back, aborting its transaction, if no transaction took it.
+
+        In a forked child the slot is the parent's: its transaction is
+        left to the parent and the inherited gate is not touched (the
+        child's ``_check_fork`` has or will have reset both).
+        """
         if self._state != "held":
             return
         self._state = "released"
+        if os.getpid() != self._pid:
+            self._storage._check_fork()  # type: ignore[attr-defined]
+            return
         self._storage._release_reserved(self)  # type: ignore[attr-defined]
 
     def __del__(self) -> None:
         """Last resort: give back a held slot that became unreachable unreleased.
 
         The abort is queued, never waited for (see ``WriterThread.try_fire``).
+        Inherited across a fork, the slot is left alone.
         """
         try:
-            if self._state == "held":
+            if self._state == "held" and os.getpid() == self._pid:
                 self._state = "released"
                 self._storage._release_reserved(self, finalizing=True)  # type: ignore[attr-defined]
         except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
@@ -113,11 +124,42 @@ class LMDBWriteSlot(WriteSlot):
 # Storages with locks to replace in a forked child (see ``_after_fork_in_child``).
 _storages: weakref.WeakSet[LMDBStorage] = weakref.WeakSet()
 
+# py-lmdb objects inherited across a fork, kept alive for the life of the
+# child (see ``_park_inherited``).
+_INHERITED: list[Any] = []
+
+
+def _park_inherited(objects: list[Any]) -> None:
+    """Keep inherited environments and transactions alive, untouched, for good.
+
+    Deallocating an inherited py-lmdb transaction runs ``mdb_txn_abort``
+    and an environment ``mdb_env_close``; both write to the lock file the
+    parent still uses, clearing its reader slots (a snapshot it holds
+    loses the pages it reads: a torn read there) and, for the environment,
+    sometimes hanging the child. An extra reference the interpreter never
+    gives back makes them immortal, past interpreter shutdown too (a
+    normal exit clears module globals), so only process exit frees them,
+    which touches nothing shared.
+    """
+    for obj in objects:
+        ctypes.pythonapi.Py_IncRef(ctypes.py_object(obj))
+    _INHERITED.extend(objects)
+
 
 def _after_fork_in_child() -> None:
-    """Fresh locks in the child: a parent thread may hold the inherited ones forever."""
+    """Fresh locks in the child, then forget what the parent had open.
+
+    Runs before any user code in the child (``register_at_fork``). A
+    parent thread may hold the inherited locks forever, so they are
+    replaced first; then ``_check_fork`` parks every inherited handle
+    before anything could end or collect one.
+    """
     for storage in list(_storages):
         storage._reset_locks_after_fork()
+        try:
+            storage._check_fork()
+        except Exception as e:  # retried lazily by the next storage call
+            logger.error(f"LMDB fork handling in the child failed: {e}")
 
 
 if hasattr(os, "register_at_fork"):
@@ -181,7 +223,12 @@ class LMDBStorage:
     can misjudge them. If the parent held a write transaction or the
     writer slot at the fork, LMDB's writer state in the child is unusable
     and py-lmdb cannot reopen the same files there, so every write in the
-    child raises a non-retryable ``StorageError`` saying so.
+    child raises a non-retryable ``StorageError`` saying so. Whatever the
+    parent had open at the fork (snapshots, transactions, reserved slots)
+    is closed in the child without touching LMDB, and the inherited
+    environment is never closed there, ``close()`` included: both would
+    clear the parent's reader slots in the shared lock file. A child that
+    needs a clean close opens its own storage.
 
     The environment must live on a local filesystem, as LMDB requires (its
     lock file is shared memory and its data file is mmapped); the gate is
@@ -195,6 +242,8 @@ class LMDBStorage:
     LMDB only allows while this process has no open snapshot or
     transaction; otherwise it raises ``StorageError`` asking to close them.
     """
+
+    process_model: ClassVar[Literal["single", "multi"]] = "multi"
 
     def __init__(
         self,
@@ -280,6 +329,7 @@ class LMDBStorage:
         self._live_writes: set[Any] = set()
         self._opened = False
         self._pid = os.getpid()
+        self._forked = False  # inherited across a fork: the env is the parent's
         self._forked_during_write = False
         self._last_reader_check = 0.0
         _storages.add(self)
@@ -344,6 +394,7 @@ class LMDBStorage:
             self._writer_thread.start()
 
             self._pid = os.getpid()
+            self._forked = False
             self._forked_during_write = False
             self._opened = True
 
@@ -408,9 +459,30 @@ class LMDBStorage:
         with self._env_lock:
             if self._pid == os.getpid():
                 return
+            self._forked = True
             self._forked_during_write = bool(
                 self._writer.lock.locked() or self._active_transactions or self._reserved_slots
             )
+            # The parent's contexts are forgotten, not ended, and their
+            # handles parked: ending or collecting one here would write to
+            # the parent's reader slots and writer mutex in the lock file.
+            inherited: list[Any] = [*self._live_writes]
+            if self._env is not None:
+                inherited.append(self._env)
+            for context in [
+                *self._active_transactions,
+                *self._active_snapshots,
+                *self._active_write_batches,
+            ]:
+                handle = context._forget()
+                if handle is not None:
+                    inherited.append(handle)
+            for slot in self._reserved_slots:
+                handle, slot._lmdb_txn = slot._lmdb_txn, None
+                slot._state = "released"
+                if handle is not None:
+                    inherited.append(handle)
+            _park_inherited(inherited)
             self._active_transactions = weakref.WeakSet()
             self._active_write_batches = weakref.WeakSet()
             self._active_snapshots = weakref.WeakSet()
@@ -510,9 +582,11 @@ class LMDBStorage:
             env, self._env = self._env, None
             if env is None:
                 return
-            if self._forked_during_write:
-                # Closing an environment inherited mid-write can hang in
-                # LMDB; drop it instead (py-lmdb frees nothing inherited).
+            if self._forked:
+                # An inherited environment is never closed: mdb_env_close
+                # clears the reader slots of its pid, the parent's, and
+                # can hang the child. It was parked in _check_fork; the
+                # child's own contexts were ended above as usual.
                 return
             if not stopped:
                 logger.error(
