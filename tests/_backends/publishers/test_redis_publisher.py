@@ -204,7 +204,10 @@ def test_base_splits_batches_into_chunks():
 
 
 @pytest.mark.redis
-def test_chunks_at_most_1000_keys_per_call(redis_url, prefix, sub):
+def test_chunks_at_most_max_keys_per_call(redis_url, prefix, sub):
+    from virtuals._backends.publishers.redis_pubsub import MAX_KEYS_PER_CALL
+
+    assert MAX_KEYS_PER_CALL == 250
     h = sub.reg(PassAll())
     pub = _make_publisher(redis_url, prefix)
     sizes: list[int] = []
@@ -221,8 +224,8 @@ def test_chunks_at_most_1000_keys_per_call(redis_url, prefix, sub):
         msgs = sub.read()
     finally:
         pub.disconnect()
-    assert sum(sizes) == 2500 and max(sizes) <= 1000 and len(sizes) >= 3
-    assert all(m[0] == h and len(m[1]["keys"]) <= 1000 for m in msgs)
+    assert sum(sizes) == 2500 and max(sizes) <= MAX_KEYS_PER_CALL and len(sizes) >= 10
+    assert all(m[0] == h and len(m[1]["keys"]) <= MAX_KEYS_PER_CALL for m in msgs)
     assert [k for _, p in msgs for k in p["keys"]] == [[i] for i in range(2500)]
 
 
