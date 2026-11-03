@@ -8,6 +8,8 @@ collection. Hooks run on mem with the in-memory transport.
 from __future__ import annotations
 
 import random
+import threading
+import time
 from collections import Counter
 from collections.abc import ItemsView, KeysView, ValuesView
 from typing import ClassVar
@@ -30,6 +32,7 @@ from virtuals.storages.lmdb import LMDBStorage
 from virtuals.storages.mem import InMemoryStorage
 from virtuals.storages.rocksdb import RocksDBStorage
 from virtuals.storages.sqlite import SQLiteStorage
+from virtuals.tkv.storage import StorageLockTimeoutError, StorageTransactionConflictError
 from virtuals.tkv.transport import InMemoryTransport
 
 
@@ -956,11 +959,11 @@ def test_order_row_without_data_is_skipped_by_items(fdict):
 # ============================================================================
 
 
-def test_two_writers_inserting_between_same_neighbours(fdict):
-    """Both writers read the neighbours of the gap, then both write.
-
-    This is the interleaving ``insert_before`` goes through, replayed by
-    hand: neighbour lookup for both, then placement for both.
+def test_replayed_interleaving_at_same_gap_gives_unique_keys(fdict):
+    """The interleaving ``insert_before`` goes through, replayed by hand in
+    one transaction: neighbour lookup for both writers, then placement for
+    both. Proves key uniqueness, not isolation; the thread cases below
+    run real writers.
     """
     view = fdict("lst", {"a": 1, "b": 2})
     ref_okey = view.position("b")
@@ -987,7 +990,8 @@ def test_two_writers_inserting_between_same_neighbours(fdict):
     _assert_consistent(view)
 
 
-def test_two_writers_appending(fdict):
+def test_replayed_interleaving_appending_gives_unique_keys(fdict):
+    """Same replay for ``append``: both read the last row, then both place."""
     view = fdict("lst", {"a": 1})
     last_x = view._edge(last=True)
     last_y = view._edge(last=True)
@@ -999,6 +1003,121 @@ def test_two_writers_appending(fdict):
     assert view.first() == "a"
     assert set(list(view)[1:]) == {"x", "y"}
     _assert_consistent(view)
+
+
+def _run_writers(*targets, timeout=30.0):
+    """Run each target on its own thread; re-raise the first error."""
+    errors: list[BaseException] = []
+
+    def wrap(fn):
+        try:
+            fn()
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=wrap, args=(fn,)) for fn in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout)
+    assert not any(t.is_alive() for t in threads), "writer thread stalled"
+    if errors:
+        raise errors[0]
+
+
+def _retrying(fn, attempts=200):
+    for _ in range(attempts):
+        try:
+            return fn()
+        except (StorageTransactionConflictError, StorageLockTimeoutError):
+            time.sleep(0.001)
+    raise AssertionError("still conflicting")
+
+
+@pytest.fixture(params=("sqlite", "lmdb"))
+def shared_storage(request, tmp_path):
+    storage = _open_storage(request.param, tmp_path)
+    try:
+        yield storage
+    finally:
+        storage.close()
+
+
+def _writer(storage, barrier, op):
+    def body():
+        barrier.wait(timeout=5)
+        with storage.transaction() as tx:
+            view = Navigator(storage).root(tx).open_child("lst", EagerFractionalIndexedDictView)
+            op(view)
+
+    return lambda: _retrying(body)
+
+
+def test_two_writer_threads_inserting_at_the_same_gap(shared_storage):
+    """Two transactions on two threads insert before the same neighbour.
+
+    The backend serializes them (one waits at begin or retries on
+    conflict); both land, keys are unique, order and index agree.
+    """
+    storage = shared_storage
+    with storage.transaction() as tx:
+        Navigator(storage).root(tx).open_child("lst", EagerFractionalIndexedDictView).store(
+            {"a": 1, "b": 2}
+        )
+    for round_ in range(5):
+        barrier = threading.Barrier(2)
+        x, y = f"x{round_}", f"y{round_}"
+        _run_writers(
+            _writer(storage, barrier, lambda v, k=x: v.insert_before("b", k, 10)),
+            _writer(storage, barrier, lambda v, k=y: v.insert_before("b", k, 20)),
+        )
+        with storage.snapshot() as snap:
+            view = Navigator(storage).root(snap).open_child("lst", EagerFractionalIndexedDictView)
+            order = list(view)
+            assert order[0] == "a"
+            assert order[-1] == "b"
+            assert {x, y} <= set(order[1:-1])
+            assert view[x] == 10
+            assert view[y] == 20
+            assert len(view) == 2 + 2 * (round_ + 1)
+            _assert_consistent(view)
+
+
+def test_two_writer_threads_appending(shared_storage):
+    storage = shared_storage
+    with storage.transaction() as tx:
+        Navigator(storage).root(tx).open_child("lst", EagerFractionalIndexedDictView).store(
+            {"a": 1}
+        )
+    barrier = threading.Barrier(2)
+    _run_writers(
+        _writer(storage, barrier, lambda v: v.append("x", 10)),
+        _writer(storage, barrier, lambda v: v.append("y", 20)),
+    )
+    with storage.snapshot() as snap:
+        view = Navigator(storage).root(snap).open_child("lst", EagerFractionalIndexedDictView)
+        assert view.first() == "a"
+        assert set(list(view)[1:]) == {"x", "y"}
+        assert len(view) == 3
+        _assert_consistent(view)
+
+
+def test_two_writer_threads_moving_and_deleting(shared_storage):
+    """One writer moves a key while the other deletes its neighbour."""
+    storage = shared_storage
+    with storage.transaction() as tx:
+        Navigator(storage).root(tx).open_child("lst", EagerFractionalIndexedDictView).store(
+            {"a": 1, "b": 2, "c": 3, "d": 4}
+        )
+    barrier = threading.Barrier(2)
+    _run_writers(
+        _writer(storage, barrier, lambda v: v.move_before("d", "a")),
+        _writer(storage, barrier, lambda v: v.__delitem__("b")),
+    )
+    with storage.snapshot() as snap:
+        view = Navigator(storage).root(snap).open_child("lst", EagerFractionalIndexedDictView)
+        assert list(view) == ["d", "a", "c"]
+        _assert_consistent(view)
 
 
 # ============================================================================
