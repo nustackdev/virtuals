@@ -48,8 +48,15 @@ class LMDBScan(ScanProtocol):
         self._options = options
 
     def _iterate_impl(self, iterator_type: _IteratorType) -> Generator[object, None, None]:
-        """Core iteration implementation."""
-        txn = self._context._require_active()
+        """Core iteration implementation.
+
+        Every cursor call runs under the context's call lock, released
+        across yields, so ``close()`` from another thread can end the
+        context between two rows and never under a cursor call. The next
+        step then raises ``StorageClosedError``.
+        """
+        context = self._context
+        lock = context._call_lock
         codec = self._storage.codec
         options = self._options
 
@@ -65,58 +72,27 @@ class LMDBScan(ScanProtocol):
             except Exception as e:
                 raise StorageOperationError(f"Failed to encode start key: {e}") from e
 
-        try:
-            cursor = txn.cursor()
-        except Exception as e:
-            raise StorageOperationError(f"Failed to create cursor: {e}") from e
+        with lock:
+            txn = context._require_active()
+            try:
+                cursor = txn.cursor()
+            except Exception as e:
+                raise StorageOperationError(f"Failed to create cursor: {e}") from e
 
         try:
-            positioned = self._seek(cursor, options, start_key_encoded)
-            if not positioned:
-                return
-
+            with lock:
+                positioned = self._seek(cursor, options, start_key_encoded)
             count = 0
-            max_depth = options.max_depth
-
-            while True:
-                try:
-                    encoded_key = cursor.key()
-                except Exception as e:
-                    raise StorageOperationError(f"Failed to read cursor: {e}") from e
-
-                if not encoded_key:
+            limit = options.limit
+            while positioned:
+                if limit is not None and count >= limit:
                     break
-
-                try:
-                    key = codec.decode_key(encoded_key)
-                except Exception as e:
-                    raise StorageOperationError(f"Failed to decode key: {e}") from e
-
-                if options.break_filter is not None and not options.break_filter.matches(key):
+                with lock:
+                    context._require_active()
+                    row = self._next_row(cursor, options, codec, need_values)
+                if row is None:
                     break
-
-                if max_depth is not None and len(key) > max_depth:
-                    # Below the walked depth: one seek over the whole subtree.
-                    if not self._seek(cursor, options, options.skip_bound(codec, key)):
-                        break
-                    continue
-
-                if options.filter is not None and not options.filter.matches(key):
-                    if not self._advance(cursor, options.reverse):
-                        break
-                    continue
-
-                if options.limit is not None and count >= options.limit:
-                    break
-
-                value = None
-                if need_values:
-                    # Read the value only for a row that is yielded: skipped
-                    # and filtered rows cost a key, not a copy of the value.
-                    try:
-                        value = codec.decode_value(cursor.value())
-                    except Exception as e:
-                        raise StorageOperationError(f"Failed to read value: {e}") from e
+                key, value = row
 
                 if iterator_type == _IteratorType.KEYS:
                     yield key
@@ -126,19 +102,69 @@ class LMDBScan(ScanProtocol):
                     yield (key, value)
 
                 count += 1
-
-                if not self._advance(cursor, options.reverse):
-                    break
+                with lock:
+                    context._require_active()
+                    positioned = self._advance(cursor, options.reverse)
         finally:
-            try:
-                cursor.close()
-            except Exception as e:
-                # Cursor close is best-effort; the transaction owning it will
-                # release the cursor when it ends. Log and move on so the
-                # underlying scan error (if any) is what propagates.
-                import logging
+            # Best effort: the transaction frees its cursors when it ends.
+            # Non-blocking, since a generator may be finalized while this
+            # thread holds the lock (a collection inside a call).
+            if lock.acquire(blocking=False):
+                try:
+                    cursor.close()
+                except Exception as e:
+                    import logging
 
-                logging.getLogger(__name__).debug("LMDB cursor close failed: %s", e)
+                    logging.getLogger(__name__).debug("LMDB cursor close failed: %s", e)
+                finally:
+                    lock.release()
+
+    def _next_row(
+        self, cursor: object, options: StorageScanOptions, codec: object, need_values: bool
+    ) -> tuple[Key, Value | None] | None:
+        """From the cursor's position, find the next row to yield; None when done.
+
+        Rows below ``max_depth`` are skipped with one seek over the subtree,
+        filtered rows are stepped over, and a ``break_filter`` miss ends the
+        scan. Leaves the cursor on the returned row.
+        """
+        while True:
+            try:
+                encoded_key = cursor.key()  # type: ignore[attr-defined]
+            except Exception as e:
+                raise StorageOperationError(f"Failed to read cursor: {e}") from e
+
+            if not encoded_key:
+                return None
+
+            try:
+                key = codec.decode_key(encoded_key)  # type: ignore[attr-defined]
+            except Exception as e:
+                raise StorageOperationError(f"Failed to decode key: {e}") from e
+
+            if options.break_filter is not None and not options.break_filter.matches(key):
+                return None
+
+            if options.max_depth is not None and len(key) > options.max_depth:
+                # Below the walked depth: one seek over the whole subtree.
+                if not self._seek(cursor, options, options.skip_bound(codec, key)):
+                    return None
+                continue
+
+            if options.filter is not None and not options.filter.matches(key):
+                if not self._advance(cursor, options.reverse):
+                    return None
+                continue
+
+            value = None
+            if need_values:
+                # Read the value only for a row that is yielded: skipped
+                # and filtered rows cost a key, not a copy of the value.
+                try:
+                    value = codec.decode_value(cursor.value())  # type: ignore[attr-defined]
+                except Exception as e:
+                    raise StorageOperationError(f"Failed to read value: {e}") from e
+            return key, value
 
     @staticmethod
     def _seek(cursor: object, options: StorageScanOptions, start_key_encoded: bytes | None) -> bool:

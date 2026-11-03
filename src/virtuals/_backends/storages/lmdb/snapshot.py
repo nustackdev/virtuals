@@ -37,21 +37,28 @@ class LMDBSnapshot(ContextBase, ReadOperationsMixin):
         return False
 
     def close(self) -> None:
-        """Close snapshot and release resources."""
-        if self._closed:
-            return
+        """Close snapshot and release its reader slot.
 
-        if self._lmdb_txn is not None:
+        Safe from any thread: a close racing the owner's call waits for
+        that call, then ends the read transaction. Read transactions have
+        no thread affinity in LMDB, so no writer thread is involved.
+        """
+        with self._call_lock:
+            if self._closed:
+                return
+            txn = self._lmdb_txn
+            failure: Exception | None = None
             try:
-                self._lmdb_txn.abort()
+                if txn is not None:
+                    txn.abort()
             except Exception as e:
-                raise StorageError(f"Failed to close snapshot: {e}") from e
+                failure = e
             finally:
                 self._mark_closed()
-                self._storage._untrack_snapshot(self)
-        else:
-            self._mark_closed()
-            self._storage._untrack_snapshot(self)
+
+        self._storage._untrack_snapshot(self)
+        if failure is not None:
+            raise StorageError(f"Failed to close snapshot: {failure}") from failure
 
     def __enter__(self) -> LMDBSnapshot:
         """Enter context manager."""

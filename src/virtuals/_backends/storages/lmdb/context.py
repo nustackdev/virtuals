@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,16 @@ if TYPE_CHECKING:
 _SLOT_FLAG_LOCK = threading.Lock()
 
 
+def _after_fork_in_child() -> None:
+    """A fresh flag lock in the child: a parent thread may hold the inherited one."""
+    global _SLOT_FLAG_LOCK
+    _SLOT_FLAG_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
 __all__ = [
     "ContextBase",
     "ReadOperationsMixin",
@@ -36,9 +47,23 @@ class ContextBase:
     """Base class for LMDB transaction/snapshot contexts.
 
     Wraps an lmdb.Transaction handle and tracks open/closed state.
+
+    Every call into the handle runs under ``_call_lock``, one call at a
+    time per context, and so does ending it. ``close()`` may abort a
+    context from another thread: it then waits for the owner's call in
+    flight instead of freeing the handle under it, and the owner's next
+    call sees a closed context. The lock is never held across a scan's
+    yields, so a scanning owner never keeps close() waiting.
     """
 
-    __slots__ = ("_closed", "_ending", "_holds_write_slot", "_lmdb_txn", "_storage")
+    __slots__ = (
+        "__weakref__",
+        "_call_lock",
+        "_closed",
+        "_holds_write_slot",
+        "_lmdb_txn",
+        "_storage",
+    )
 
     def __init__(
         self,
@@ -59,7 +84,7 @@ class ContextBase:
         self._lmdb_txn: Any | None = lmdb_txn
         self._holds_write_slot = holds_write_slot
         self._closed = False
-        self._ending = False
+        self._call_lock = threading.Lock()
 
     @property
     def storage(self) -> LMDBStorage:
@@ -77,20 +102,6 @@ class ContextBase:
         if self._lmdb_txn is None:
             raise StorageClosedError("Context handle is invalid")
         return self._lmdb_txn
-
-    def _claim_end(self) -> bool:
-        """Claim the right to commit or abort; False if a racing call has it.
-
-        close() may abort a context from another thread while its owner
-        commits it. Only the first claim ends the LMDB transaction, so the
-        context never reports both outcomes, and LMDB never sees one write
-        transaction committed and aborted at once.
-        """
-        with _SLOT_FLAG_LOCK:
-            if self._ending:
-                return False
-            self._ending = True
-            return True
 
     def _mark_closed(self) -> None:
         """Mark context as closed, clear handle, and give back the writer slot."""
@@ -119,6 +130,7 @@ class ReadOperationsMixin:
 
     # Type hints for mixed-in attributes
     _storage: LMDBStorage
+    _call_lock: threading.Lock
     _require_active: Any  # Method from ContextBase
 
     def get(self, key: Key) -> Value | Empty:
@@ -130,7 +142,6 @@ class ReadOperationsMixin:
         Returns:
             Value at key, or EMPTY if key not found.
         """
-        txn = self._require_active()
         codec = self._storage.codec
 
         try:
@@ -138,10 +149,12 @@ class ReadOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        try:
-            encoded_value = txn.get(encoded_key)
-        except Exception as e:
-            raise StorageOperationError(f"Failed to get key {key}: {e}") from e
+        with self._call_lock:
+            txn = self._require_active()
+            try:
+                encoded_value = txn.get(encoded_key)
+            except Exception as e:
+                raise StorageOperationError(f"Failed to get key {key}: {e}") from e
 
         if encoded_value is None:
             return EMPTY
@@ -153,7 +166,6 @@ class ReadOperationsMixin:
 
     def exists(self, key: Key) -> bool:
         """Check if key exists."""
-        txn = self._require_active()
         codec = self._storage.codec
 
         try:
@@ -161,10 +173,12 @@ class ReadOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        try:
-            return txn.get(encoded_key) is not None
-        except Exception as e:
-            raise StorageOperationError(f"Failed to check key {key}: {e}") from e
+        with self._call_lock:
+            txn = self._require_active()
+            try:
+                return txn.get(encoded_key) is not None
+            except Exception as e:
+                raise StorageOperationError(f"Failed to check key {key}: {e}") from e
 
     def multiget(self, keys: list[Key]) -> dict[Key, Value]:
         """Get multiple keys.
@@ -195,12 +209,12 @@ class WriteOperationsMixin:
 
     # Type hints for mixed-in attributes
     _storage: LMDBStorage
+    _call_lock: threading.Lock
     _require_active: Any  # Method from ContextBase
     _modified_keys: set[Key]  # Initialized in __init__
 
     def put(self, key: Key, value: Value) -> None:
         """Put key-value pair."""
-        txn = self._require_active()
         codec = self._storage.codec
 
         try:
@@ -209,16 +223,17 @@ class WriteOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key/value for {key}: {e}") from e
 
-        try:
-            txn.put(encoded_key, encoded_value)
-        except Exception as e:
-            raise StorageOperationError(f"Failed to put key {key}: {e}") from e
+        with self._call_lock:
+            txn = self._require_active()
+            try:
+                txn.put(encoded_key, encoded_value)
+            except Exception as e:
+                raise StorageOperationError(f"Failed to put key {key}: {e}") from e
 
         self._modified_keys.add(key)
 
     def delete(self, key: Key) -> None:
         """Delete key (idempotent; no-op on missing key)."""
-        txn = self._require_active()
         codec = self._storage.codec
 
         try:
@@ -226,10 +241,12 @@ class WriteOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        try:
-            existed = txn.delete(encoded_key)
-        except Exception as e:
-            raise StorageOperationError(f"Failed to delete key {key}: {e}") from e
+        with self._call_lock:
+            txn = self._require_active()
+            try:
+                existed = txn.delete(encoded_key)
+            except Exception as e:
+                raise StorageOperationError(f"Failed to delete key {key}: {e}") from e
 
         if existed:
             self._modified_keys.add(key)
