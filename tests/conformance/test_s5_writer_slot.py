@@ -16,13 +16,14 @@ import time
 import pytest
 
 from tests.conformance.helpers import RETRYABLE
-from virtuals.tkv.storage import StorageError, StorageLockTimeoutError
+from virtuals.tkv.storage import (
+    StorageError,
+    StorageLockTimeoutError,
+    StorageNestedTransactionError,
+)
 
 
-try:
-    from virtuals.tkv.storage import StorageNestedTransactionError as NestedError
-except ImportError:  # pragma: no cover
-    NestedError = None  # type: ignore[assignment,misc]
+NestedError = StorageNestedTransactionError
 
 
 K = ("slot",)
@@ -46,6 +47,25 @@ def _write(storage, value) -> float:
     with storage.transaction() as t:
         t.put(K, value)
     return time.perf_counter() - t0
+
+
+def _in_thread(fn, timeout: float = 5.0):
+    """Run ``fn`` on a thread, join it, return its result (or raise its error)."""
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["result"] = fn()
+        except BaseException as e:
+            box["error"] = e
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join(timeout)
+    assert not t.is_alive(), "thread did not finish"
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
 
 
 @pytest.mark.timeout(10)
@@ -194,3 +214,62 @@ def test_s4_reserved_slot_does_not_survive_close(quick):
     asyncio.run(main())
     with quick.snapshot() as s:
         assert s.get(K) == 2
+
+
+@pytest.mark.timeout(10)
+def test_s4_late_release_after_close_and_reopen_frees_nothing(quick):
+    """close() and reopen while a commit is in flight: the old holder's late release touches nothing.
+
+    The commit has claimed its end and is about to give the slot back when
+    another thread closes the storage, reopens it, and a new writer takes
+    the fresh slot. The old release lands afterwards: it must neither free
+    that writer's slot nor raise. Holders release by lock identity.
+    """
+    holder_ready, holder_go = threading.Event(), threading.Event()
+    holder_errors: list[BaseException] = []
+
+    def new_holder() -> None:  # a write transaction begun, held and ended on its own thread
+        try:
+            tx = quick.begin_transaction()
+            holder_ready.set()
+            holder_go.wait(5)
+            tx.abort()
+        except BaseException as e:
+            holder_errors.append(e)
+            holder_ready.set()
+
+    holder = threading.Thread(target=new_holder)
+    release = quick._release_write_slot
+    fired = []
+
+    def interleaved(lock=None) -> None:
+        if not fired:
+            fired.append(True)
+            _in_thread(lambda: (quick.close(), quick.open()))
+            holder.start()
+            assert holder_ready.wait(5)
+        release(lock)
+
+    quick._release_write_slot = interleaved
+    old = quick.begin_transaction()
+    old.put(K, 1)
+    try:
+        old.commit()  # its release lands after the reopen and the new holder's begin
+    finally:
+        del quick._release_write_slot
+        if not holder.is_alive() and not fired:
+            holder_go.set()
+    try:
+        assert fired and not holder_errors, holder_errors
+        assert quick._writer.lock.locked()  # the new holder still holds the slot
+        busy, quick._busy_timeout = quick._busy_timeout, 0.2
+        try:
+            with pytest.raises(StorageLockTimeoutError):
+                _in_thread(quick.begin_transaction)  # and it is exclusive
+        finally:
+            quick._busy_timeout = busy
+    finally:
+        holder_go.set()
+        holder.join(5)
+    assert not holder_errors, holder_errors
+    assert _write(quick, 2) < FREE_BUDGET

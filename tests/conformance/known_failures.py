@@ -27,4 +27,8 @@ KNOWN_FAILURES: dict[str, dict[str, tuple[bool, str]]] = {
         "sqlite": (True, DROPPED_TXN.format(owner="P3 sqlite")),
         "lmdb": (True, DROPPED_TXN.format(owner="P1 lmdb")),
     },
+    "test_s4_late_release_after_close_and_reopen_frees_nothing": {
+        "sqlite": (True, "fixed in P3, release by identity"),
+        "lmdb": (True, "fixed in P1, release by identity"),
+    },
 }
