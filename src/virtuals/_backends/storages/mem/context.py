@@ -19,7 +19,6 @@ from virtuals.tkv.storage import (
 )
 from virtuals.tkv.types import EMPTY, Empty
 
-from .sorted_keys import SortedKeys
 from .store import ABSENT, DELETED, Encoded, Entry, Marker
 
 
@@ -55,6 +54,19 @@ class ContextBase:
         """Raise ``StorageClosedError`` if the context is closed."""
         if self._closed:
             raise StorageClosedError("Context is closed")
+
+    def _claim_end(self) -> bool:
+        """Flip to closed exactly once. True for the caller that gets to end the context.
+
+        Commit, abort and ``storage.close`` may race on one context from
+        different threads; whoever claims first finishes it, the others
+        see it closed.
+        """
+        with self._storage._state_lock:
+            if self._closed:
+                return False
+            self._closed = True
+            return True
 
     @property
     def is_closed(self) -> bool:
@@ -131,9 +143,6 @@ class WriteOperationsMixin:
     """Buffered writes: a write set applied as a whole on commit or write.
 
     ``_pending`` maps encoded key to ``(key, value)`` or ``(key, DELETED)``.
-    ``_pending_index`` orders those keys for scans; it is built on the
-    first scan and kept in step from then on, so transactions that never
-    scan pay nothing for it.
     """
 
     __slots__ = ()
@@ -141,7 +150,6 @@ class WriteOperationsMixin:
     _storage: InMemoryStorage
     _require_active: Any
     _pending: dict[Encoded, Entry]
-    _pending_index: SortedKeys[Encoded] | None
     _modified_keys: set[Key]
 
     def put(self, key: Key, value: Value) -> None:
@@ -166,22 +174,5 @@ class WriteOperationsMixin:
         self._stage(enc, key, DELETED)
 
     def _stage(self, enc: Encoded, key: Key, value: object) -> None:
-        """Record one write, keeping the pending index in step when it exists."""
-        pending = self._pending
-        if enc not in pending and self._pending_index is not None:
-            self._pending_index.add(enc)
-        pending[enc] = (key, value)
-
-    def _pending_page(
-        self, bound: Encoded | None, *, inclusive: bool, reverse: bool, n: int, stop: Encoded | None
-    ) -> list[tuple[Any, Any]]:
-        """One page of the write set as a scan overlay: entries, or ABSENT for deletes."""
-        index = self._pending_index
-        if index is None:
-            index = self._pending_index = SortedKeys(self._pending)
-        pending = self._pending
-        out: list[tuple[Any, Any]] = []
-        for enc in index.page(bound, inclusive=inclusive, reverse=reverse, n=n, stop=stop):
-            entry = pending[enc]
-            out.append((enc, ABSENT if entry[1] is DELETED else entry))
-        return out
+        """Record one write in the write set."""
+        self._pending[enc] = (key, value)

@@ -2,9 +2,12 @@
 
 Pages through the context's view by re-seeking from the last key of the
 previous page, so no cursor is held over the index while other threads
-commit or while the caller writes through the same transaction. Pages
-start small and double, so a short prefix scan reads little past its end
-and a long one pays few seeks. A top-level ``PrefixFilter`` break filter
+commit or while the caller writes through the same transaction. A write
+made through the transaction during a scan is seen once the scan seeks
+past the page it has already fetched; rows of that page are yielded as
+fetched. Callers should not rely on either outcome. Pages start small
+and double, so a short prefix scan reads little past its end and a long
+one pays few seeks. A top-level ``PrefixFilter`` break filter
 is pushed down as a range stop, exactly as the SQLite adapter does.
 """
 
@@ -113,9 +116,13 @@ class InMemoryScan(ScanProtocol):
         count = 0
         while True:
             context._require_active()
-            rows, cover, done = context._page(
-                bound, inclusive=inclusive, reverse=reverse, n=page, stop=stop
-            )
+            try:
+                rows, cover, done = context._page(
+                    bound, inclusive=inclusive, reverse=reverse, n=page, stop=stop
+                )
+            except TypeError as e:
+                # A start_encoded of the wrong type cannot be ordered against the keys.
+                raise StorageOperationError(f"Failed to scan: {e}") from e
             skip_to = None
             for _, (key, encoded) in rows:
                 if break_filter is not None and not break_filter.matches(key):
