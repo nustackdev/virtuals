@@ -6,6 +6,7 @@ point-in-time snapshots, and optional change notifications via a publisher.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
@@ -366,6 +367,7 @@ class RocksDBStorage:
         creates = not self._read_only and self._options_dict.get(
             "create_if_missing", self._create_if_missing
         )
+        existed = creates or self._path.exists()
         if creates:
             try:
                 self._path.mkdir(parents=True, exist_ok=True)
@@ -377,12 +379,21 @@ class RocksDBStorage:
         options = self._build_options()
 
         # Open in appropriate mode
-        if self._is_secondary:
-            self._open_secondary_db(options)
-        elif self._read_only:
-            self._open_read_only_db(options)
-        else:
-            self._open_transaction_db(options)
+        try:
+            if self._is_secondary:
+                self._open_secondary_db(options)
+            elif self._read_only:
+                self._open_read_only_db(options)
+            else:
+                self._open_transaction_db(options)
+        except StorageError:
+            if not existed:
+                # rocksdb makes the directory before it finds no database
+                # in it; an empty one left behind would be adopted silently
+                # by the next read-write open.
+                with contextlib.suppress(OSError):
+                    self._path.rmdir()
+            raise
 
         with self._state_lock:
             self._pid = os.getpid()
