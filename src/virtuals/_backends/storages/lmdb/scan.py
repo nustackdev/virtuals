@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum, auto
+from logging import getLogger
 from typing import TYPE_CHECKING, cast
 
 from virtuals.tkv.storage import (
@@ -22,6 +23,9 @@ if TYPE_CHECKING:
 
 
 __all__ = ["LMDBScan"]
+
+
+logger = getLogger(__name__)
 
 
 class _IteratorType(Enum):
@@ -113,9 +117,7 @@ class LMDBScan(ScanProtocol):
                 try:
                     cursor.close()
                 except Exception as e:
-                    import logging
-
-                    logging.getLogger(__name__).debug("LMDB cursor close failed: %s", e)
+                    logger.debug("LMDB cursor close failed: %s", e)
                 finally:
                     lock.release()
 

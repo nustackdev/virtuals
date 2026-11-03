@@ -1,4 +1,17 @@
-"""Base context classes and operation mixins for LMDB storage."""
+"""Base context classes and operation mixins for LMDB storage.
+
+Thread affinity. LMDB documents that a write transaction and its cursors
+belong to one thread. In liblmdb 0.9.36 (py-lmdb 3.0.0, which opens every
+environment with MDB_NOTLS) the only thread-bound state of a write
+transaction is the writer mutex, taken in begin and released in commit or
+abort; ``put``, ``get``, ``del`` and cursor calls read and write the
+transaction's own memory with no per-thread lookup. So begin, commit and
+abort run on the storage's writer thread, and the data calls run on the
+caller's thread, serialized per context by ``_call_lock``, with the future
+handoffs giving the needed happens-before. Re-check this against liblmdb
+on any bump (``mdb_txn_renew0``, ``mdb_txn_end``, and that no data path
+touches ``me_txkey``-style thread-local state for write transactions).
+"""
 
 from __future__ import annotations
 
@@ -140,8 +153,11 @@ class ContextBase:
         holds, self._holds_write_slot = self._holds_write_slot, False
         logger.warning(f"LMDB {what} dropped without commit or abort; aborting it")
         try:
-            if txn is not None:
-                self._storage._end_write(txn, commit=False)
+            # Bounded, and skipped when the writer thread is gone or the
+            # interpreter is exiting: a wait there would never end, and
+            # process exit frees LMDB's writer lock and the gate anyway.
+            if txn is not None and not self._storage._end_write_from_finalizer(txn):
+                logger.debug(f"LMDB {what} finalizer did not reach the writer thread")
         finally:
             if holds:
                 self._storage._release_write_slot(self._write_lock)
