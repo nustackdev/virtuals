@@ -494,3 +494,99 @@ def test_flush_honours_its_timeout_on_a_full_dispatch_queue():
         hold.set()
         obs.disconnect()
         pub.disconnect()
+
+
+# =============================================================================
+# review B1: a resync wake that finds no subscription releases its hash
+# =============================================================================
+
+
+def test_resync_delivered_to_an_empty_registry_does_not_block_the_next_one():
+    """Every subscription closes before a pending wake is delivered; a later
+    subscription on the same filter still gets a keyless wake on the next request."""
+    tr, pub, obs = _pair()
+    hold = threading.Event()
+    try:
+        blk = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("x",))))
+        blk.bind(lambda k: hold.wait(10))
+        pub.notify([("x", 0)])
+        pub.flush(5)
+        assert _wait_until(lambda: obs._dispatch_queue.qsize() == 0)  # worker inside blk
+        s1 = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("a",))))
+        tr.resync()  # wakes queued for hash(a) and hash(x)
+        s1.close()
+        blk.close()  # registry empty before the batch is delivered
+        hold.set()
+        obs.flush(5)
+        assert _wait_until(lambda: not obs._resync_queued), obs._resync_queued
+        got: list = []
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("a",)))).bind(got.append)
+        tr.resync()
+        obs.flush(5)
+        assert _wait_until(lambda: got == [None]), got
+    finally:
+        hold.set()
+        obs.disconnect()
+        pub.disconnect()
+
+
+# =============================================================================
+# review m1: disconnect() from inside a callback still runs the hook
+# =============================================================================
+
+
+def test_disconnect_from_inside_a_callback_runs_the_disconnect_hook():
+    tr, pub, obs = _pair()
+    err: list = []
+    try:
+
+        def cb(key):
+            try:
+                obs.disconnect()
+            except BaseException as e:  # the test records whatever escapes
+                err.append(repr(e))
+
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("a",)))).bind(cb)
+        worker = obs._dispatch_thread
+        pub.notify([("a", 1)])
+        pub.flush(5)
+        assert _wait_until(lambda: not obs._connected)
+        assert err == []
+        assert tr._listeners == [], "the transport listener was left registered"
+        assert _wait_until(lambda: not worker.is_alive())
+        obs.connect()
+        got: list = []
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("a",)))).bind(got.append)
+        pub.notify([("a", 2)])
+        pub.flush(5)
+        assert _wait_until(lambda: got == [("a", 2)])
+    finally:
+        obs.disconnect()
+        pub.disconnect()
+
+
+# =============================================================================
+# review n1: subscribe() racing disconnect() never returns an open dead subscription
+# =============================================================================
+
+
+def test_subscribe_during_disconnect_raises_and_reports_closed(monkeypatch):
+    _, pub, obs = _pair()
+    seen: list = []
+    real = obs._on_subscribe
+
+    def hook(sub):
+        real(sub)
+        seen.append(sub)
+        obs.disconnect()  # the race: disconnect lands after the registry insert
+
+    monkeypatch.setattr(obs, "_on_subscribe", hook)
+    try:
+        with pytest.raises(ObserverConnectionError, match="disconnected"):
+            obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("a",))))
+        assert len(seen) == 1 and seen[0].is_closed
+        with pytest.raises(ValueError, match="closed"):
+            seen[0].bind(lambda k: None)
+    finally:
+        obs.disconnect()
+        pub.disconnect()
