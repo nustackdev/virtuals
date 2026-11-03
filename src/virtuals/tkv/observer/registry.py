@@ -25,7 +25,7 @@ from ..filter import (
 
 
 if TYPE_CHECKING:
-    from ..types import Key, KeySegment
+    from ..types import Key
     from .subscription import Subscription
 
 
@@ -42,7 +42,7 @@ class SubscriptionRegistry:
     - Prefix index: prefix tuple -> list of subscriptions
     - Suffix index: suffix tuple -> list of subscriptions
     - Length index: length -> list of subscriptions
-    - Wildcard index: (length, fixed_positions) -> list of subscriptions
+    - Wildcard index: (length, fixed positions) -> fixed values -> subscriptions
     - All subscriptions set for cleanup
 
     When a key is modified, the registry efficiently finds matching
@@ -70,11 +70,13 @@ class SubscriptionRegistry:
     )
 
     # Index for wildcard patterns (for WildcardFilter)
-    # Maps (length, signature_hash) -> set of subscriptions
-    # Signature is a frozenset of (position, value) for non-wildcard positions
-    _wildcard_index: dict[tuple[int, frozenset], set[Subscription]] = field(
-        default_factory=lambda: defaultdict(set), init=False
+    # Maps (length, fixed positions) -> {fixed values -> set of subscriptions},
+    # plus length -> {fixed positions: refcount} so match does one dict
+    # lookup per signature of the key's length.
+    _wildcard_index: dict[tuple[int, tuple[int, ...]], dict[Key, set[Subscription]]] = field(
+        default_factory=dict, init=False
     )
+    _wildcard_sigs: dict[int, dict[tuple[int, ...], int]] = field(default_factory=dict, init=False)
 
     # Index for composite filters (subscriptions with multiple filters)
     # These are indexed by their "primary" filter and verified on match
@@ -120,8 +122,14 @@ class SubscriptionRegistry:
             self._length_index[filt.length].add(subscription)
 
         elif isinstance(filt, WildcardFilter):
-            signature = self._wildcard_signature(filt.pattern)
-            self._wildcard_index[(len(filt.pattern), signature)].add(subscription)
+            n = len(filt.pattern)
+            positions, values = self._wildcard_signature(filt.pattern)
+            by_values = self._wildcard_index.get((n, positions))
+            if by_values is None:
+                by_values = self._wildcard_index[(n, positions)] = {}
+                sigs = self._wildcard_sigs.setdefault(n, {})
+                sigs[positions] = sigs.get(positions, 0) + 1
+            by_values.setdefault(values, set()).add(subscription)
 
         elif isinstance(filt, And):
             self._composite_subscriptions.add(subscription)
@@ -175,11 +183,22 @@ class SubscriptionRegistry:
                 del self._length_index[filt.length]
 
         elif isinstance(filt, WildcardFilter):
-            signature = self._wildcard_signature(filt.pattern)
-            idx_key = (len(filt.pattern), signature)
-            self._wildcard_index[idx_key].discard(subscription)
-            if not self._wildcard_index[idx_key]:
-                del self._wildcard_index[idx_key]
+            n = len(filt.pattern)
+            positions, values = self._wildcard_signature(filt.pattern)
+            by_values = self._wildcard_index.get((n, positions))
+            if by_values is None:
+                return
+            subs = by_values.get(values)
+            if subs is not None:
+                subs.discard(subscription)
+                if not subs:
+                    del by_values[values]
+            if not by_values:
+                del self._wildcard_index[(n, positions)]
+                sigs = self._wildcard_sigs[n]
+                del sigs[positions]
+                if not sigs:
+                    del self._wildcard_sigs[n]
 
         elif isinstance(filt, And):
             self._composite_subscriptions.discard(subscription)
@@ -215,8 +234,8 @@ class SubscriptionRegistry:
                 if prefix in self._prefix_index:
                     matches.update(self._prefix_index[prefix])
 
-            # Match suffix filters: check all suffixes of the key
-            for i in range(len(key)):
+            # Match suffix filters: check all suffixes of the key (including empty)
+            for i in range(len(key) + 1):
                 suffix = key[i:]
                 if suffix in self._suffix_index:
                     matches.update(self._suffix_index[suffix])
@@ -225,15 +244,17 @@ class SubscriptionRegistry:
             if len(key) in self._length_index:
                 matches.update(self._length_index[len(key)])
 
-            # Match wildcard filters of same length
+            # Match wildcard filters: one lookup per fixed-position signature
+            # of this key length (candidates are verified below)
             key_len = len(key)
-            for idx_key, subs in self._wildcard_index.items():
-                pattern_len, _ = idx_key
-                if pattern_len == key_len:
-                    # Verify each subscription's wildcard pattern matches
-                    for sub in subs:
-                        if sub.filter.matches(key):
-                            matches.add(sub)
+            sigs = self._wildcard_sigs.get(key_len)
+            if sigs:
+                for positions in sigs:
+                    subs = self._wildcard_index[(key_len, positions)].get(
+                        tuple(key[p] for p in positions)
+                    )
+                    if subs:
+                        matches.update(subs)
 
             # Check unindexed subscriptions (custom filters) - must verify all
             for sub in self._unindexed_subscriptions:
@@ -255,25 +276,23 @@ class SubscriptionRegistry:
             self._suffix_index.clear()
             self._length_index.clear()
             self._wildcard_index.clear()
+            self._wildcard_sigs.clear()
             self._composite_subscriptions.clear()
             self._unindexed_subscriptions.clear()
             self._all_subscriptions.clear()
 
     @staticmethod
-    def _wildcard_signature(pattern: Key) -> frozenset[tuple[int, KeySegment]]:
-        """Compute signature for a wildcard pattern.
-
-        The signature is a frozenset of (position, value) pairs for
-        all non-wildcard positions. This allows efficient grouping
-        of patterns with the same fixed positions.
+    def _wildcard_signature(pattern: Key) -> tuple[tuple[int, ...], Key]:
+        """Fixed positions and their values for a wildcard pattern.
 
         Args:
             pattern: Wildcard pattern.
 
         Returns:
-            Frozenset of (position, value) for non-wildcard segments.
+            (positions, values) of the non-wildcard segments, in position order.
         """
-        return frozenset((i, seg) for i, seg in enumerate(pattern) if seg != WILDCARD)
+        positions = tuple(i for i, seg in enumerate(pattern) if seg != WILDCARD)
+        return positions, tuple(pattern[i] for i in positions)
 
     def __len__(self) -> int:
         """Return number of subscriptions in the registry."""

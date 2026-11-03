@@ -59,6 +59,7 @@ class Subscription:
     _observer: ObserverProtocol
     _receivers: list[SubscriptionCallback] = field(default_factory=list, init=False)
     _closed: bool = field(default=False, init=False)
+    _filter_hash: str | None = field(default=None, init=False, repr=False)
 
     def __hash__(self) -> int:
         """Return hash based on object identity."""
@@ -73,6 +74,16 @@ class Subscription:
     def filter(self) -> Filter:
         """Get subscription filter."""
         return self._options.filter
+
+    @property
+    def filter_hash(self) -> str:
+        """Stable hash of the canonical filter (cached; filters are immutable)."""
+        h = self._filter_hash
+        if h is None:
+            from ..filter import filter_hash
+
+            h = self._filter_hash = filter_hash(self._options.filter)
+        return h
 
     @property
     def receivers(self) -> tuple[SubscriptionCallback, ...]:
