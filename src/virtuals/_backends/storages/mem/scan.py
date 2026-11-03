@@ -5,7 +5,9 @@ previous page, so no cursor is held over the index while other threads
 commit or while the caller writes through the same transaction. A write
 made through the transaction during a scan is seen once the scan seeks
 past the page it has already fetched; rows of that page are yielded as
-fetched. Callers should not rely on either outcome. Pages start small
+fetched. Callers should not rely on either outcome. A scan resumed after
+its context ended raises ``StorageClosedError`` before every row, so a
+page fetched before the end is never handed out after it. Pages start small
 and double, so a short prefix scan reads little past its end and a long
 one pays few seeks. A top-level ``PrefixFilter`` break filter
 is pushed down as a range stop, exactly as the SQLite adapter does.
@@ -19,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 from virtuals.tkv.filter import PrefixFilter
 from virtuals.tkv.storage import (
     ScanProtocol,
+    StorageClosedError,
     StorageOperationError,
     StorageScanOptions,
 )
@@ -125,6 +128,10 @@ class InMemoryScan(ScanProtocol):
                 raise StorageOperationError(f"Failed to scan: {e}") from e
             skip_to = None
             for _, (key, encoded) in rows:
+                # The page is already fetched; a context closed since (its
+                # end, or the storage's close) must not hand its rows out.
+                if context._closed:
+                    raise StorageClosedError("Scan used after its context ended")
                 if break_filter is not None and not break_filter.matches(key):
                     return
                 if max_depth is not None and len(key) > max_depth:

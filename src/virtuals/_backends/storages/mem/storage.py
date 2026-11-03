@@ -26,7 +26,7 @@ import threading
 import weakref
 from contextlib import contextmanager
 from logging import getLogger
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, ClassVar, Literal, overload
 
 from virtuals.tkv.storage import (
     SnapshotProtocol,
@@ -136,6 +136,9 @@ class InMemoryStorage:
         codec: Codec for key and value encoding. Views read it directly.
     """
 
+    process_model: ClassVar[Literal["single", "multi"]] = "single"
+    """Contract section 4: nothing is shared across processes."""
+
     def __init__(
         self,
         codec: CodecProtocol,
@@ -201,9 +204,16 @@ class InMemoryStorage:
             return
 
         with self._state_lock:
+            # Closed from here on: a context begun on another thread that
+            # has not registered yet finds the storage closed and ends
+            # itself, instead of landing in a set this close never sees.
+            self._opened = False
             transactions = list(self._active_transactions)
             snapshots = list(self._active_snapshots)
             batches = list(self._active_write_batches)
+            self._active_transactions.clear()
+            self._active_snapshots.clear()
+            self._active_write_batches.clear()
         for txn in transactions:
             try:
                 txn.abort()
@@ -220,11 +230,6 @@ class InMemoryStorage:
             except Exception as e:
                 logger.error(f"Failed to abort write batch during close: {e}")
 
-        with self._state_lock:
-            self._active_transactions.clear()
-            self._active_snapshots.clear()
-            self._active_write_batches.clear()
-            self._opened = False
         self._writer.close()
         self._store.reset()
 
@@ -274,10 +279,18 @@ class InMemoryStorage:
     def begin_snapshot(self) -> InMemorySnapshot:
         """Begin a read-only snapshot pinned at this moment."""
         self._require_open()
-        snapshot = InMemorySnapshot(self, self._store.pin())
+        token = self._store.pin()
         with self._state_lock:
-            self._active_snapshots.add(snapshot)
-        return snapshot
+            # Open, and the store the pin was taken on is still the one in
+            # use: a close (and maybe a reopen) between the pin and here
+            # did not see this snapshot, so it must not stay open over the
+            # reopened store.
+            if self._opened and token[0] == self._store.generation:
+                snapshot = InMemorySnapshot(self, token)
+                self._active_snapshots.add(snapshot)
+                return snapshot
+        self._store.unpin(token)  # ignored by a store reset since, as it must be
+        raise StorageClosedError("Storage was closed while beginning the snapshot")
 
     def begin_transaction(
         self, *, write_slot: InMemoryWriteSlot | None = None
@@ -295,8 +308,14 @@ class InMemoryStorage:
 
         lock, give_back_slot = self._writer.take_slot(self, write_slot, self._busy_timeout)
         try:
-            transaction = InMemoryTransaction(self, lock)
             with self._state_lock:
+                # A close since the take replaced the slot (and released the
+                # lock taken here on this caller's behalf): a transaction
+                # registered now would run in the reopened storage with no
+                # slot held.
+                if not self._opened or lock is not self._writer.lock:
+                    raise StorageClosedError("Storage was closed while beginning the transaction")
+                transaction = InMemoryTransaction(self, lock)
                 self._active_transactions.add(transaction)
         except BaseException:
             give_back_slot()
