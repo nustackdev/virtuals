@@ -359,6 +359,8 @@ def _child_scan_options(
 
     Returns StorageScanOptions with PrefixFilter (break on prefix mismatch)
     and LengthFilter (only direct children, not deeper descendants).
+    ``max_depth`` makes the backend seek over each child's subtree instead
+    of walking it, so the scan costs O(children), not O(descendants).
 
     Forward (default): ``start=site`` — every child key sorts ``> site``
     encoded, so seek lands at the first child.
@@ -382,11 +384,13 @@ def _child_scan_options(
             reverse=True,
             break_filter=prefix,
             filter=prefix & child_len,
+            max_depth=len(site) + 1,
         )
     return StorageScanOptions(
         start=site,
         break_filter=prefix,
         filter=prefix & child_len,
+        max_depth=len(site) + 1,
     )
 
 

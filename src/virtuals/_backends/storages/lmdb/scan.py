@@ -76,6 +76,7 @@ class LMDBScan(ScanProtocol):
                 return
 
             count = 0
+            max_depth = options.max_depth
 
             while True:
                 try:
@@ -94,6 +95,12 @@ class LMDBScan(ScanProtocol):
 
                 if options.break_filter is not None and not options.break_filter.matches(key):
                     break
+
+                if max_depth is not None and len(key) > max_depth:
+                    # Below the walked depth: one seek over the whole subtree.
+                    if not self._seek(cursor, options, options.skip_bound(codec, key)):
+                        break
+                    continue
 
                 if options.filter is not None and not options.filter.matches(key):
                     if not self._advance(cursor, options.reverse):

@@ -29,6 +29,8 @@ __all__ = ["SQLiteScan"]
 # past its range, doubles up to the cap so a long scan pays few re-seeks.
 _FIRST_PAGE = 32
 _MAX_PAGE = 1024
+# Page after a `max_depth` skip: the next child is normally the first row.
+_SEEK_PAGE = 4
 
 
 class _IteratorType(Enum):
@@ -104,62 +106,68 @@ class SQLiteScan(ScanProtocol):
                 far = None
         return start, far
 
-    def _pages(self, need_values: bool) -> Generator[list[tuple], None, None]:
-        """Yield pages of raw ``(k,)`` or ``(k, v)`` rows in scan order."""
-        options = self._options
-        reverse = options.reverse
-        cols = "k, v" if need_values else "k"
-        order = "DESC" if reverse else "ASC"
-        # First page is inclusive of `start`; later pages exclude the last key.
-        first_op, next_op, far_op = ("<=", "<", ">=") if reverse else (">=", ">", "<")
+    def _fetch_page(
+        self,
+        cols: str,
+        order: str,
+        bound: object | None,
+        op: str,
+        far: object | None,
+        far_op: str,
+        page: int,
+    ) -> list[tuple]:
+        """Fetch one page of raw ``(k,)`` or ``(k, v)`` rows in scan order."""
+        conn = self._context._require_active()
+        where: list[str] = []
+        params: list[object] = []
+        if bound is not None:
+            where.append(f"k {op} ?")
+            params.append(bound)
+        if far is not None:
+            where.append(f"k {far_op} ?")
+            params.append(far)
+        sql = f"SELECT {cols} FROM kv"  # noqa: S608 (fixed fragments, values bound)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY k {order} LIMIT ?"
+        params.append(page)
 
-        start, far = self._encoded_bounds()
-
-        page = _FIRST_PAGE
-        if options.limit is not None and options.filter is None:
-            page = max(1, min(page, options.limit))
-
-        bound = start
-        op = first_op
-        while True:
-            conn = self._context._require_active()
-            where: list[str] = []
-            params: list[object] = []
-            if bound is not None:
-                where.append(f"k {op} ?")
-                params.append(bound)
-            if far is not None:
-                where.append(f"k {far_op} ?")
-                params.append(far)
-            sql = f"SELECT {cols} FROM kv"  # noqa: S608 (fixed fragments, values bound)
-            if where:
-                sql += " WHERE " + " AND ".join(where)
-            sql += f" ORDER BY k {order} LIMIT ?"
-            params.append(page)
-
-            try:
-                rows = conn.execute(sql, params).fetchall()
-            except Exception as e:
-                raise StorageOperationError(f"Failed to scan: {e}") from e
-
-            if not rows:
-                return
-            yield rows
-            if len(rows) < page:
-                return
-            bound = rows[-1][0]
-            op = next_op
-            page = min(page * 2, _MAX_PAGE)
+        try:
+            return conn.execute(sql, params).fetchall()
+        except Exception as e:
+            raise StorageOperationError(f"Failed to scan: {e}") from e
 
     def _iterate_impl(self, iterator_type: _IteratorType) -> Generator[object, None, None]:
-        """Core iteration implementation."""
+        """Core iteration implementation.
+
+        Pages by key. A ``max_depth`` skip drops the rest of the current
+        page and re-seeks with an inclusive bound at the skip target, on a
+        small page since the next useful row is usually right there.
+        """
         self._context._require_active()
         codec = self._storage.codec
         options = self._options
         need_values = iterator_type != _IteratorType.KEYS
+        max_depth = options.max_depth
+
+        cols = "k, v" if need_values else "k"
+        order = "DESC" if options.reverse else "ASC"
+        # First page is inclusive of `start`; later pages exclude the last key.
+        first_op, next_op, far_op = ("<=", "<", ">=") if options.reverse else (">=", ">", "<")
+
+        bound, far = self._encoded_bounds()
+        op = first_op
+        page = _FIRST_PAGE
+        if options.limit is not None and options.filter is None:
+            page = max(1, min(page, options.limit))
 
         count = 0
-        for rows in self._pages(need_values):
+        while True:
+            rows = self._fetch_page(cols, order, bound, op, far, far_op, page)
+            if not rows:
+                return
+
+            skipped = False
             for row in rows:
                 try:
                     key = codec.decode_key(row[0])
@@ -168,6 +176,14 @@ class SQLiteScan(ScanProtocol):
 
                 if options.break_filter is not None and not options.break_filter.matches(key):
                     return
+
+                if max_depth is not None and len(key) > max_depth:
+                    # Below the walked depth: re-seek past the whole subtree.
+                    bound = options.skip_bound(codec, key)
+                    op = first_op
+                    page = _SEEK_PAGE
+                    skipped = True
+                    break
 
                 if options.filter is not None and not options.filter.matches(key):
                     continue
@@ -190,6 +206,14 @@ class SQLiteScan(ScanProtocol):
                     yield (key, value)
 
                 count += 1
+
+            if skipped:
+                continue
+            if len(rows) < page:
+                return
+            bound = rows[-1][0]
+            op = next_op
+            page = min(page * 2, _MAX_PAGE)
 
     def keys(self) -> Generator[Key, None, None]:
         """Iterate over keys only."""
