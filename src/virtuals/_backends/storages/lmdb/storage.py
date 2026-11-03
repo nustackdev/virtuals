@@ -967,12 +967,7 @@ class LMDBStorage:
         except StorageLockTimeoutError:
             if not on_loop:
                 raise
-            raise StorageLockTimeoutError(
-                f"Timed out after {timeout}s waiting for the write lock held by another "
-                f"process, on an event loop thread, where a sync begin waits at most "
-                f"{LOOP_THREAD_WAIT_CAP}s so the loop is not stalled. Wait for the slot "
-                "with areserve_write_slot instead"
-            ) from None
+            raise self._writer.loop_cap_timeout("the write lock held by another process") from None
         finally:
             self._writer_thread._unstamp_soft(stamp)
         self._gate_held = True
