@@ -86,16 +86,24 @@ class SQLiteWriteSlot(WriteSlot):
         is closed outright instead of being returned to the pool (SQLite
         rolls the begun transaction back on close), or parked in a forked
         child. The in-process lock is then released by identity as usual.
+
+        In a forked child the slot is the parent's: the connection is
+        parked and the writer lock is left alone. Releasing it before the
+        child's first storage call ran ``_check_fork`` would make the
+        inherited lock read as free, so the child would not learn that the
+        parent held the file's write lock at the fork.
         """
         try:
             if getattr(self, "_state", "released") != "held":
                 return
             conn = self._detach_conn()
-            if conn is not None:
-                if os.getpid() != self._pid:
+            if os.getpid() != self._pid:
+                self._state = "released"
+                if conn is not None:
                     self._storage._park_inherited([conn])  # type: ignore[attr-defined]
-                else:
-                    conn.close()
+                return
+            if conn is not None:
+                conn.close()
             self.release()
         except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
             pass
@@ -104,14 +112,15 @@ class SQLiteWriteSlot(WriteSlot):
         """Hand the slot to a transaction being begun on ``storage``.
 
         Refuses a stale slot: one whose lock is no longer the storage's
-        writer lock because a fork reset the slot since it was reserved.
-        Its connection is the parent's and must not be used here.
+        writer lock because the storage was closed, or the process forked,
+        since it was reserved. Its begun connection is given back (or, in
+        a forked child, parked: it is the parent's) before the refusal.
         """
         if self._state == "held" and self._lock is not self._storage._writer.lock:  # type: ignore[attr-defined]
             self._state = "released"
             self._drop_conn()
             raise StorageError(
-                "Write slot is stale: the storage's writer slot was reset since it was "
-                "reserved (the process forked). Reserve a new one"
+                "Write slot is stale: the storage was closed (or the process forked) after "
+                "it was reserved. Reserve a new one"
             )
         super()._take(storage)

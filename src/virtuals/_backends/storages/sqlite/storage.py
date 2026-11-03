@@ -18,7 +18,7 @@ import weakref
 from contextlib import contextmanager
 from logging import getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, ClassVar, Literal, overload
 
 from virtuals.tkv.storage import (
     SnapshotProtocol,
@@ -29,7 +29,7 @@ from virtuals.tkv.storage import (
     WriteBatchProtocol,
 )
 
-from .._write_slot import WriterLock
+from .._write_slot import LOOP_THREAD_WAIT_CAP, WriterLock
 from .context import is_busy_error
 from .snapshot import SQLiteSnapshot
 from .transaction import SQLiteTransaction
@@ -135,7 +135,12 @@ class SQLiteStorage:
     ``areserve_write_slot`` also waits for the cross-process file lock
     without blocking the loop, so a transaction begun with the slot never
     stalls the loop while another process writes. A plain sync begin
-    waits in SQLite's busy handler, which is what a sync caller asked for.
+    waits in SQLite's busy handler for up to ``busy_timeout``, which is
+    what a sync caller asked for, except on an event loop thread: there
+    the wait for the in-process slot and the wait for the file lock are
+    each capped at ``LOOP_THREAD_WAIT_CAP`` and surfaced as the retryable
+    ``StorageLockTimeoutError`` (contract section 4), whoever holds the
+    lock, a thread or another process.
 
     Multiple processes: open the storage in each process (e.g. with the
     ``spawn`` start method); that is the supported path. Reusing an open
@@ -149,6 +154,9 @@ class SQLiteStorage:
     write in the child, on this storage or any other opened on the same
     file, raises a non-retryable ``StorageError`` saying so.
     """
+
+    process_model: ClassVar[Literal["single", "multi"]] = "multi"
+    """Contract section 4: several processes open the same file directly."""
 
     def __init__(
         self,
@@ -703,16 +711,35 @@ class SQLiteStorage:
             give_back_slot()
             raise
 
+        # On an event loop thread the file lock wait is capped like the slot
+        # wait: SQLite's busy handler sleeps for the whole busy_timeout
+        # otherwise, with the loop stalled behind it (contract section 4).
+        on_loop = asyncio._get_running_loop() is not None
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            if on_loop:
+                conn.execute(f"PRAGMA busy_timeout = {int(LOOP_THREAD_WAIT_CAP * 1000)}")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            finally:
+                if on_loop:
+                    conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout * 1000)}")
         except Exception as e:
             self._release_connection(conn)
             give_back_slot()
             if is_busy_error(e):
+                if on_loop:
+                    raise self._writer.loop_cap_timeout("the database's write lock") from e
                 raise StorageLockTimeoutError(
                     f"Timed out after {self._busy_timeout}s waiting for the write lock: {e}"
                 ) from e
             raise StorageError(f"Failed to begin write transaction: {e}") from e
+        if writer_lock is not self._writer.lock:
+            # close() ran while BEGIN IMMEDIATE waited in the busy handler and
+            # released the slot on this caller's behalf; a reopen since may
+            # have handed the fresh slot to someone else. This transaction
+            # would run without a slot, so it does not start.
+            self._release_connection(conn)
+            raise StorageClosedError("Storage was closed while beginning the transaction")
         return conn, writer_lock
 
     def _check_fork(self) -> None:

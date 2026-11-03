@@ -218,3 +218,68 @@ def test_s4_cross_process_lock_wait_does_not_block_loop(multi_process, tmp_path)
             assert s.get(K) == 1 and s.get(("held",)) == 1
     finally:
         storage.close()
+
+
+XP_HOLD_LONG = 1.0
+LOOP_CAP_BUDGET = 0.3  # a loop-thread sync begin must give up well inside this
+
+
+@pytest.mark.timeout(30)
+def test_s4_cross_process_sync_begin_on_loop_is_bounded(multi_process, tmp_path):
+    """Another process holds the write lock: a sync begin or batch write from a coroutine gives up fast.
+
+    Contract section 4: a wait on the loop is bounded and surfaced. The
+    in-process cap must cover the cross-process lock too, or the same
+    call stalls the loop for the whole busy_timeout whenever the holder
+    is a peer process. Multi-process backends only.
+    """
+    import multiprocessing as mp
+
+    from tests.conformance.helpers import proc_hold_write
+    from virtuals.tkv.storage import StorageLockTimeoutError
+
+    storage = multi_process.make(tmp_path, lock_timeout=5.0)
+    storage.open()
+    try:
+        ctx = mp.get_context("spawn")
+        held = ctx.Event()
+        proc = ctx.Process(
+            target=proc_hold_write, args=(multi_process.name, str(tmp_path), XP_HOLD_LONG, held)
+        )
+        proc.start()
+        assert held.wait(30), "holder process never took the lock"
+
+        async def main():
+            watch = LoopWatch(stop_on_stall=False)
+            stop = asyncio.Event()
+
+            async def ticker() -> None:
+                while not stop.is_set():
+                    await asyncio.sleep(TICK)
+                    watch.mark()
+
+            tick = asyncio.create_task(ticker())
+            await asyncio.sleep(TICK)
+            watch.mark()
+            t0 = time.perf_counter()
+            try:
+                with pytest.raises(StorageLockTimeoutError) as info:
+                    storage.begin_transaction()
+                with pytest.raises(StorageLockTimeoutError):
+                    b = storage.begin_write_batch()
+                    b.put(K, 1)
+                    b.write()
+                waited = time.perf_counter() - t0
+                watch.check()
+            finally:
+                stop.set()
+                await tick
+            return waited, watch.gap, str(info.value)
+
+        waited, gap, message = asyncio.run(main())
+        proc.join(10)
+        assert waited < 2 * LOOP_CAP_BUDGET, f"sync begins on the loop waited {waited:.3f}s"
+        assert gap < MAX_GAP, f"loop blocked {gap * 1000:.0f}ms behind a peer process"
+        assert "areserve_write_slot" in message
+    finally:
+        storage.close()
