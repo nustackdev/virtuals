@@ -12,7 +12,7 @@ from virtuals.tkv.storage import (
     StorageScanOptions,
 )
 
-from .context import classify_rdbpy, is_missing_file_error
+from .context import ScanHandle, classify_rdbpy, is_missing_file_error
 
 
 # Bounded restarts when a secondary scan touches an SST the primary
@@ -124,7 +124,9 @@ class RocksDBScan(ScanProtocol):
 
         The rdbpy iterator lives only as long as the context: committing,
         aborting or closing the context (or the storage) invalidates it, and
-        resuming the scan after that raises `StorageClosedError`.
+        resuming the scan after that raises `StorageClosedError`. The
+        context closes the iterators of its live scans when it ends, so a
+        suspended scan does not pin the iterator's files until collected.
 
         Args:
             iterator_type: Type of iteration (keys/values/items)
@@ -155,6 +157,8 @@ class RocksDBScan(ScanProtocol):
             iterator = context._iterator(keys_only=not need_values, reverse=options.reverse)  # type: ignore[attr-defined]
         except Exception as e:
             raise classify_rdbpy(e, "Failed to create iterator") from e
+        handle = ScanHandle(iterator)  # lives in this frame: the registry forgets it with the scan
+        context._register_scan(handle)
 
         try:
             self._seek(iterator, options.reverse, start_key_encoded)
@@ -218,7 +222,7 @@ class RocksDBScan(ScanProtocol):
 
                     count += 1
         finally:
-            iterator.close()
+            handle.close()
 
     @staticmethod
     def _seek(iterator: Any, reverse: bool, start_key_encoded: bytes | None) -> None:  # noqa: ANN401
@@ -258,9 +262,7 @@ class RocksDBScan(ScanProtocol):
         Raises:
             StorageOperationError: If iteration fails
         """
-        return cast(
-            "Generator[Key, None, None]", self._iterate_impl(iterator_type=_IteratorType.KEYS)
-        )
+        return cast("Generator[Key, None, None]", self._iterate_impl(_IteratorType.KEYS))
 
     def values(self) -> Generator[Value, None, None]:
         """Iterate over values only.
@@ -271,9 +273,7 @@ class RocksDBScan(ScanProtocol):
         Raises:
             StorageOperationError: If iteration fails
         """
-        return cast(
-            "Generator[Value, None, None]", self._iterate_impl(iterator_type=_IteratorType.VALUES)
-        )
+        return cast("Generator[Value, None, None]", self._iterate_impl(_IteratorType.VALUES))
 
     def items(self) -> Generator[tuple[Key, Value], None, None]:
         """Iterate over (key, value) tuples.
@@ -285,6 +285,5 @@ class RocksDBScan(ScanProtocol):
             StorageOperationError: If iteration fails
         """
         return cast(
-            "Generator[tuple[Key, Value], None, None]",
-            self._iterate_impl(iterator_type=_IteratorType.ITEMS),
+            "Generator[tuple[Key, Value], None, None]", self._iterate_impl(_IteratorType.ITEMS)
         )
