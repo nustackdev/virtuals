@@ -346,11 +346,17 @@ def test_subscribe_behind_hundreds_of_backlog_messages_returns_fast(redis_url, p
 # =============================================================================
 
 
-def test_listener_outliving_disconnect_blocks_the_next_connect(redis_url, prefix, caplog):
+def test_listener_outliving_disconnect_blocks_the_next_connect(
+    redis_url, prefix, caplog, monkeypatch
+):
     import logging
 
+    from virtuals._backends.observers import redis_pubsub as redis_pubsub_mod
     from virtuals._backends.observers.redis_pubsub import RedisObserver
 
+    # The join constant is read at call time; both disconnect() and the
+    # refused connect() join the stuck thread once, so keep each short.
+    monkeypatch.setattr(redis_pubsub_mod, "_THREAD_JOIN_SECONDS", 0.2)
     obs = RedisObserver(redis_url=redis_url, channel_prefix=prefix)
     obs.connect()
     block = threading.Event()
@@ -362,6 +368,7 @@ def test_listener_outliving_disconnect_blocks_the_next_connect(redis_url, prefix
         return False
 
     obs._listener_step = stuck
+    obs._wake_listener()  # out of its idle wait, into the stub at once
     assert entered.wait(3)
     old = obs._listener_thread
     caplog.set_level(logging.WARNING, logger="virtuals._backends.observers.redis_pubsub")
