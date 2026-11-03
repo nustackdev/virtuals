@@ -20,9 +20,38 @@ stored head, tail or length: ``first``/``last`` are one seek each and
 
 Placement is relative (``before=``/``after=`` an id), never by index.
 
+Key length. Inserting again and again at one gap grows the key about one
+char per four inserts, and LMDB rejects storage keys above 511 bytes
+(the encoded site plus the order key). So a fresh key longer than
+``MAX_KEY_LENGTH`` (128) triggers a window respace: up to
+``RESPACE_WINDOW`` (16) rows on each side of the gap get fresh, evenly
+spread keys between the rows just outside the window. That is a bounded
+rewrite (about 100 key touches at 16) and keeps the op constant-cost. If
+the outer rows leave no room for short keys the window widens once (x4),
+and as a last resort the whole collection is respaced (``respace()``,
+O(n)); in practice that needs long keys crammed on both sides of the gap.
+A respace never changes the relative order.
+
 Observability: ``on_change`` covers ``__data__`` and ``__order__`` (a
 reorder is a change); ``on_children_change`` watches ``__order__/*`` and
-fires on add, delete and move.
+fires on add, delete and move. A respacing insert also fires both for
+every rewritten row (one delete and one put per row) as if those ids had
+moved, though their relative order is unchanged.
+
+Partial states. An insert writes ``__pos__``, then the value, then
+``__order__``, so a failed value write leaves no order row: the id is
+``in`` the view and counted by ``len`` but not iterated; ``append`` (or
+``del``) repairs it. ``items``, ``values`` and ``extract`` skip order rows
+whose data is missing; ``iter`` and ``keys`` do not check (one scan, no
+gets). Setting an id that has data but no position appends it.
+``rebuild_bookkeeping()`` repairs everything in O(n).
+
+Concurrency. Two writers inserting at the same gap get distinct keys
+(random tail) and both land in the gap. The mem backend has no write
+conflicts, so two transactions inserting the same id there both commit
+and the second ``__pos__`` write wins (last-writer-wins, two order rows
+for one id until ``rebuild_bookkeeping()``); sqlite and rocksdb reject
+the second writer.
 """
 
 from __future__ import annotations
@@ -50,7 +79,11 @@ from virtuals.view import (
     ViewBase,
 )
 
-from .fractional_index import DEFAULT_SUFFIX_LENGTH, generate_suffixed_key_between
+from .fractional_index import (
+    DEFAULT_SUFFIX_LENGTH,
+    generate_n_suffixed_keys_between,
+    generate_suffixed_key_between,
+)
 
 
 if TYPE_CHECKING:
@@ -101,6 +134,12 @@ class FractionalIndexedDictViewBase(
     STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(17)
     PROTOCOL: ClassVar[ContainerProtocol] = ContainerProtocol.MAPPING | ContainerProtocol.MUTABLE
     SUFFIX_LENGTH: ClassVar[int] = DEFAULT_SUFFIX_LENGTH
+    MAX_KEY_LENGTH: ClassVar[int] = 128
+    """A fresh order key longer than this triggers a window respace."""
+    RESPACE_WINDOW: ClassVar[int] = 16
+    """Rows rewritten on each side of the gap by a window respace."""
+    RESPACE_TARGET: ClassVar[int] = 64
+    """Longest key a window respace may produce before it widens or falls back."""
 
     @classmethod
     def is_address_static(cls, address: object) -> bool:
@@ -212,15 +251,73 @@ class FractionalIndexedDictViewBase(
             return row
         return None
 
-    def _place(self, address: Address, prev: str | None, nxt: str | None) -> str:
-        """Give ``address`` a fresh order key between ``prev`` and ``nxt``. Two puts."""
+    def _allot(self, prev: str | None, nxt: str | None) -> str:
+        """Fresh order key for the gap between ``prev`` and ``nxt``.
+
+        No storage touch unless the key passes ``MAX_KEY_LENGTH``; then the
+        rows around the gap are respaced first (``_respace_around``) and the
+        key comes from the respaced window.
+        """
         okey = generate_suffixed_key_between(prev, nxt, suffix_length=self.SUFFIX_LENGTH)
-        self._order_container().put_child_primitive(
-            okey, address, validate=False, validate_parent=False
-        )
+        if len(okey) <= self.MAX_KEY_LENGTH:
+            return okey
+        return self._respace_around(prev, nxt)
+
+    def _respace_around(self, prev: str | None, nxt: str | None) -> str:
+        """Rewrite a bounded window of rows around the gap, return the gap's key.
+
+        Window: ``prev`` and up to ``RESPACE_WINDOW - 1`` rows below it, and
+        ``nxt`` and up to ``RESPACE_WINDOW - 1`` rows above it (two seeks).
+        The rows just outside the window bound the fresh keys. If the fresh
+        keys would still pass ``RESPACE_TARGET`` the window widens four
+        times, then the whole collection is respaced. Relative order never
+        changes; every rewritten row is one order delete, one order put and
+        one pos put.
+        """
+        window = self.RESPACE_WINDOW
+        for k in (window, 4 * window, None):
+            limit = None if k is None else k + 1
+            below = (
+                []
+                if prev is None
+                else list(self._scan_order(start=prev, reverse=True, limit=limit))
+            )
+            above = [] if nxt is None else list(self._scan_order(start=nxt, limit=limit))
+            lo = hi = None
+            if k is not None and len(below) > k:
+                lo, below = below[k][0], below[:k]
+            if k is not None and len(above) > k:
+                hi, above = above[k][0], above[:k]
+            below.reverse()
+            keys = generate_n_suffixed_keys_between(
+                lo, hi, len(below) + 1 + len(above), suffix_length=self.SUFFIX_LENGTH
+            )
+            if k is None or max(len(key) for key in keys) <= self.RESPACE_TARGET:
+                break
+        oc = self._order_container()
+        for okey, _address in (*below, *above):
+            oc.delete_child_primitive_unsafe(okey)
+        fresh = iter(keys)
+        for _okey, address in below:
+            self._index(address, next(fresh))
+        gap_key = next(fresh)
+        for _okey, address in above:
+            self._index(address, next(fresh))
+        return gap_key
+
+    def _index(self, address: Address, okey: str) -> None:
+        """Record ``address`` at ``okey``: one ``__pos__`` put, one ``__order__`` put."""
         self._pos_container().put_child_primitive(
             address, okey, validate=False, validate_parent=False
         )
+        self._order_container().put_child_primitive(
+            okey, address, validate=False, validate_parent=False
+        )
+
+    def _place(self, address: Address, prev: str | None, nxt: str | None) -> str:
+        """Give ``address`` (whose data exists) a fresh key between ``prev`` and ``nxt``."""
+        okey = self._allot(prev, nxt)
+        self._index(address, okey)
         return okey
 
     def _relocate(self, address: Address, okey: str, prev: str | None, nxt: str | None) -> str:
@@ -240,8 +337,8 @@ class FractionalIndexedDictViewBase(
     def _on_child_created(self, address: Address) -> None:
         """A new child with no position yet is appended.
 
-        Inserts write ``__pos__`` and ``__order__`` before the data, so
-        the hook sees the position and leaves it alone.
+        Inserts write ``__pos__`` before the data, so the hook sees the
+        position and leaves it alone.
         """
         if not is_empty(self._position_or_empty(address)):
             return
@@ -278,19 +375,18 @@ class FractionalIndexedDictViewBase(
                 self._place(address, None if last is None else last[0], None)
 
     def respace(self) -> None:
-        """Rewrite every order key evenly spaced. O(n), for long keys."""
+        """Rewrite every order key short and evenly spaced. O(n), order kept."""
         rows = list(self._scan_order())
         if not rows:
             return
         oc = self._order_container()
-        pc = self._pos_container()
         for okey, _address in rows:
             oc.delete_child_primitive_unsafe(okey)
-        prev: str | None = None
-        for _okey, address in rows:
-            prev = generate_suffixed_key_between(prev, None, suffix_length=self.SUFFIX_LENGTH)
-            oc.put_child_primitive(prev, address, validate=False, validate_parent=False)
-            pc.put_child_primitive(address, prev, validate=False, validate_parent=False)
+        keys = generate_n_suffixed_keys_between(
+            None, None, len(rows), suffix_length=self.SUFFIX_LENGTH
+        )
+        for (_okey, address), okey in zip(rows, keys, strict=True):
+            self._index(address, okey)
 
     # -- Observability overrides -------------------------------------------
     # Data lives under `__data__/` and order under `__order__/`, so the
@@ -386,7 +482,7 @@ class FractionalIndexedDictViewBase(
         """``(order key, id)`` rows in order."""
         return self._scan_order(reverse=reverse)
 
-    def get(self, address: Address, default: object | Empty = EMPTY) -> object | Empty:
+    def get(self, address: Address, default: object = None) -> object:
         try:
             return self[address]  # type: ignore[index]
         except KeyError:
@@ -395,8 +491,15 @@ class FractionalIndexedDictViewBase(
     # -- Mutations ---------------------------------------------------------
 
     def __setitem__(self, address: Address, value: object) -> None:
-        """Set the value. A new id is appended, an existing id keeps its place."""
+        """Set the value. A new id is appended, an existing id keeps its place.
+
+        An id that has data but no position (a bypass write, or a delete
+        that stopped half way) is appended too: one extra pos get.
+        """
         self._set_child_value(address, value)
+        if is_empty(self._position_or_empty(address)):
+            last = self._edge(last=True)
+            self._place(address, None if last is None else last[0], None)
 
     def set_primitive(self, address: Address, value: object) -> None:
         """Store a compound value as one primitive blob (no decomposition)."""
@@ -409,10 +512,24 @@ class FractionalIndexedDictViewBase(
         self._populate_child_container(address, value, view_class=view_class)
 
     def _insert(self, address: Address, value: object, prev: str | None, nxt: str | None) -> None:
-        if not is_empty(self._position_or_empty(address)):
+        """Position, then value, then order row, so a failed value write is not iterated.
+
+        A position whose order row is missing (an earlier insert whose value
+        write failed) is stale and gets overwritten rather than refused.
+        """
+        stale = self._position_or_empty(address)
+        if not is_empty(stale) and not is_empty(
+            self._order_container().get_child_primitive_unsafe(cast("str", stale))
+        ):
             raise ValueError(f"{address!r} is already in the collection")
-        self._place(address, prev, nxt)
+        okey = self._allot(prev, nxt)
+        self._pos_container().put_child_primitive(
+            address, okey, validate=False, validate_parent=False
+        )
         self._write_value(address, value)
+        self._order_container().put_child_primitive(
+            okey, address, validate=False, validate_parent=False
+        )
 
     def append(self, address: Address, value: object = True) -> None:
         """Add ``address`` at the end. Raises ValueError if it is present."""
@@ -428,15 +545,15 @@ class FractionalIndexedDictViewBase(
 
     def insert_before(self, ref: Address, address: Address, value: object = True) -> None:
         """Add ``address`` directly before ``ref``. KeyError if ``ref`` is absent."""
-        self.ensure_created()
         ref_okey = self._require_position(ref)
+        self.ensure_created()
         prev = self._neighbour(ref_okey, before=True)
         self._insert(address, value, None if prev is None else prev[0], ref_okey)
 
     def insert_after(self, ref: Address, address: Address, value: object = True) -> None:
         """Add ``address`` directly after ``ref``. KeyError if ``ref`` is absent."""
-        self.ensure_created()
         ref_okey = self._require_position(ref)
+        self.ensure_created()
         nxt = self._neighbour(ref_okey, before=False)
         self._insert(address, value, ref_okey, None if nxt is None else nxt[0])
 
@@ -522,7 +639,7 @@ class FractionalIndexedDictViewBase(
             self.clear()
         items = value.items() if hasattr(value, "items") else ((k, True) for k in value)
         for key, val in items:
-            self._set_child_value(key, val)
+            self[key] = val
 
     # -- Navigation --------------------------------------------------------
 
@@ -566,9 +683,15 @@ class FractionalIndexedDictViewBase(
     def _iter_items(
         self, *, reverse: bool = False
     ) -> Generator[tuple[Address, object], None, None]:
-        """Single-pass ``(id, value)`` iteration in collection order."""
+        """Single-pass ``(id, value)`` iteration in collection order.
+
+        Order rows whose data is missing (a bypass delete) are skipped.
+        """
         for _okey, address in self._scan_order(reverse=reverse):
-            node_info, is_container = self._read_child(address)
+            try:
+                node_info, is_container = self._read_child(address)
+            except KeyError:
+                continue
             if not is_container:
                 yield address, node_info.primitive_value  # type: ignore[attr-defined]
             else:
