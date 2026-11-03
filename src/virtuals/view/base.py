@@ -19,6 +19,7 @@ from virtuals.container import (
     ContainerTypeError,
     NodeType,
     node_ops,
+    reject_empty_value,
 )
 
 from .exceptions import ViewRegistryError
@@ -194,6 +195,15 @@ class ViewBase(ABC):
         if not info.exists:
             self._on_child_created(site[-1])
         return not info.exists
+
+    def _reject_empty(self, address: site_.SiteSegment, value: object) -> None:
+        """Raise ValueError if ``value`` is EMPTY, before anything is written.
+
+        EMPTY is the absent sentinel and is never stored. Every write path
+        checks here before ``ensure_created`` so a rejected write leaves an
+        absent view absent.
+        """
+        reject_empty_value((*self._children_container().site, address), value)
 
     def _put_child_primitive(self, address: site_.SiteSegment, value: object) -> None:
         """Write a primitive child, firing ``_on_child_created`` if the key is new.

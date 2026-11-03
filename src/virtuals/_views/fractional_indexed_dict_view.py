@@ -527,6 +527,7 @@ class FractionalIndexedDictViewBase(
 
     def set_primitive(self, address: Address, value: object) -> None:
         """Store a compound value as one primitive blob (no decomposition)."""
+        self._reject_empty(address, value)
         self.ensure_created()
         self._put_child_primitive(address, value)
 
@@ -562,12 +563,14 @@ class FractionalIndexedDictViewBase(
 
     def append(self, address: Address, value: object = True) -> None:
         """Add ``address`` at the end. Raises ValueError if it is present."""
+        self._reject_empty(address, value)
         self.ensure_created()
         last = self._edge(last=True)
         self._insert(address, value, None if last is None else last[0], None)
 
     def prepend(self, address: Address, value: object = True) -> None:
         """Add ``address`` at the start. Raises ValueError if it is present."""
+        self._reject_empty(address, value)
         self.ensure_created()
         first = self._edge(last=False)
         self._insert(address, value, None, None if first is None else first[0])
@@ -575,6 +578,7 @@ class FractionalIndexedDictViewBase(
     def insert_before(self, ref: Address, address: Address, value: object = True) -> None:
         """Add ``address`` directly before ``ref``. KeyError if ``ref`` is absent."""
         ref_okey = self._require_position(ref)
+        self._reject_empty(address, value)
         self.ensure_created()
         prev = self._neighbour(ref_okey, before=True)
         self._insert(address, value, None if prev is None else prev[0], ref_okey)
@@ -582,6 +586,7 @@ class FractionalIndexedDictViewBase(
     def insert_after(self, ref: Address, address: Address, value: object = True) -> None:
         """Add ``address`` directly after ``ref``. KeyError if ``ref`` is absent."""
         ref_okey = self._require_position(ref)
+        self._reject_empty(address, value)
         self.ensure_created()
         nxt = self._neighbour(ref_okey, before=False)
         self._insert(address, value, ref_okey, None if nxt is None else nxt[0])

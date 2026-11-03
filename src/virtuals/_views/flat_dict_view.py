@@ -92,6 +92,7 @@ class FlatDictView(
             key: Key to set
             value: Primitive value to store
         """
+        self._reject_empty(key, value)
         self.ensure_created()
         self._put_child_primitive(key, value)
 

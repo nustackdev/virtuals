@@ -474,6 +474,7 @@ class LogIndexedDictViewBase(
         it would normally be decomposed into sub-keys. Use for controlled
         granularity (e.g., storing a list or dict as a single key).
         """
+        self._reject_empty(address, value)
         self.ensure_created()
         self._put_child_primitive(address, value)
 

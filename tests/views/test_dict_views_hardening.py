@@ -28,6 +28,7 @@ from virtuals._views import (
     LightDictView,
 )
 from virtuals.navigator import Navigator
+from virtuals.types import EMPTY
 
 
 NESTED_VIEWS = (
@@ -140,3 +141,98 @@ def test_delete_missing_key_cost_is_constant_and_writes_nothing(costed, view_cls
         assert cost["put"] == 0 and cost["delete"] == 0, (present, cost)
         assert cost["scan"] == 0, (present, cost)
         assert cost["get"] + cost["exists"] <= 3, (present, cost)
+
+
+# ============================================================================
+# EMPTY IS NEVER STORED (contract 6, V6)
+# ============================================================================
+
+
+def _rows_under(view):
+    """Every storage row under the view's site, as decoded keys."""
+    from virtuals.tkv.filter import PrefixFilter
+    from virtuals.tkv.storage import StorageScanOptions
+
+    site = view.container.site
+    prefix = PrefixFilter(prefix=site)
+    opts = StorageScanOptions(start=site, break_filter=prefix, filter=prefix)
+    return [k for k, _ in view.container.ctx.scan(opts).items()]
+
+
+@pytest.mark.parametrize("view_cls", DICT_VIEWS)
+def test_set_empty_raises_and_stores_nothing(root, view_cls):
+    view = root.open_child("d", view_cls)
+    view[_key(view_cls, 1)] = 1
+    rows = _rows_under(view)
+    with pytest.raises(ValueError, match="EMPTY"):
+        view[_key(view_cls, 2)] = EMPTY
+    assert _rows_under(view) == rows
+    assert len(view) == 1
+    assert list(view) == [_key(view_cls, 1)]
+    assert _key(view_cls, 2) not in view
+    assert list(view.items()) == [(_key(view_cls, 1), 1)]
+
+
+@pytest.mark.parametrize("view_cls", DICT_VIEWS)
+def test_set_empty_on_absent_view_leaves_it_absent(root, view_cls):
+    view = root.open_child("absent", view_cls)
+    with pytest.raises(ValueError, match="EMPTY"):
+        view[_key(view_cls, 1)] = EMPTY
+    assert not view.container.exists()
+
+
+@pytest.mark.parametrize("view_cls", DICT_VIEWS)
+def test_store_and_update_with_empty_raise(root, view_cls):
+    view = root.open_child("d", view_cls)
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.store({_key(view_cls, 1): 1, _key(view_cls, 2): EMPTY})
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.update({_key(view_cls, 3): EMPTY})
+    assert _key(view_cls, 2) not in view
+    assert _key(view_cls, 3) not in view
+
+
+@pytest.mark.parametrize("view_cls", NESTED_VIEWS)
+def test_nested_empty_raises(root, view_cls):
+    """EMPTY inside a compound value is rejected at the leaf."""
+    view = root.open_child("d", view_cls)
+    with pytest.raises(ValueError, match="EMPTY"):
+        view["a"] = {"x": 1, "y": {"z": EMPTY}}
+    with pytest.raises(ValueError, match="EMPTY"):
+        view["b"] = [1, EMPTY]
+
+
+@pytest.mark.parametrize("view_cls", (EagerLogIndexedDictView, EagerFractionalIndexedDictView))
+def test_set_primitive_empty_raises(root, view_cls):
+    view = root.open_child("d", view_cls)
+    view.store({"a": 1})
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.set_primitive("e", EMPTY)
+    assert list(view) == ["a"]
+    assert len(view) == 1
+
+
+def test_fractional_insert_empty_leaves_no_trace(root):
+    view = root.open_child("lst", EagerFractionalIndexedDictView)
+    view.store({"a": 1})
+    for op in (
+        lambda: view.append("e", EMPTY),
+        lambda: view.prepend("e", EMPTY),
+        lambda: view.insert_after("a", "e", EMPTY),
+    ):
+        with pytest.raises(ValueError, match="EMPTY"):
+            op()
+        assert "e" not in view
+        assert len(view) == 1
+        assert list(view) == ["a"]
+        assert view.get("e", "dflt") == "dflt"
+
+
+def test_container_put_child_primitive_rejects_empty(root):
+    view = root.open_child("d", EagerDictView)
+    view["a"] = 1
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.container.put_child_primitive("e", EMPTY)
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.container.put_child_primitive("e", EMPTY, validate=False, validate_parent=False)
+    assert list(view) == ["a"]
