@@ -7,8 +7,9 @@ move at most one sublist's worth of pointers, and a seek is two bisects.
 Membership is not answered here; the storage's dict does that in O(1).
 
 Only the operations the storage needs are provided: ``add`` of a key known
-to be absent, ``discard``, ``first``/``last``, and ``page``, which returns
-up to ``n`` keys from a bound in either direction. Scans page by re-seeking
+to be absent, ``discard``, and ``page``, which returns up to ``n`` keys
+from a bound in either direction (first and last are a page of one).
+Iteration in order is kept for tests and debugging. Scans page by re-seeking
 from the last key they emitted, so no iterator is ever held open across
 a mutation.
 """
@@ -54,20 +55,6 @@ class SortedKeys(Generic[K]):
     def __iter__(self) -> Iterator[K]:
         for sub in self._lists:
             yield from sub
-
-    def __contains__(self, key: object) -> bool:
-        pos, idx = self._locate_left(key)  # type: ignore[arg-type]
-        return (
-            pos < len(self._lists) and idx < len(self._lists[pos]) and self._lists[pos][idx] == key
-        )
-
-    def first(self) -> K | None:
-        """Smallest key, or None when empty."""
-        return self._lists[0][0] if self._lists else None
-
-    def last(self) -> K | None:
-        """Largest key, or None when empty."""
-        return self._lists[-1][-1] if self._lists else None
 
     def add(self, key: K) -> None:
         """Insert ``key``, which must not be present."""

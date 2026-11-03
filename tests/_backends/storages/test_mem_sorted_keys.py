@@ -36,11 +36,10 @@ def small_load(monkeypatch):
 def test_empty():
     sk: SortedKeys[bytes] = SortedKeys()
     assert len(sk) == 0
-    assert sk.first() is None and sk.last() is None
+    assert list(sk) == []
     assert sk.page(None, inclusive=True, reverse=False, n=5) == []
     assert sk.page(b"x", inclusive=True, reverse=True, n=5) == []
     assert not sk.discard(b"x")
-    assert b"x" not in sk
 
 
 def test_bulk_load_matches_sorted():
@@ -49,7 +48,8 @@ def test_bulk_load_matches_sorted():
     sk = SortedKeys(keys)
     assert list(sk) == sorted(keys)
     assert len(sk) == len(keys)
-    assert sk.first() == min(keys) and sk.last() == max(keys)
+    assert sk.page(None, inclusive=True, reverse=False, n=1) == [min(keys)]
+    assert sk.page(None, inclusive=True, reverse=True, n=1) == [max(keys)]
 
 
 @pytest.mark.parametrize("seed", range(5))
@@ -66,14 +66,10 @@ def test_random_adds_and_deletes(seed):
             sk.add(key)
             present.add(key)
         else:
-            assert key in sk
+            assert sk.page(key, inclusive=True, reverse=False, n=1) == [key]
     ref = sorted(present)
     assert list(sk) == ref
     assert len(sk) == len(ref)
-    assert sk.first() == (ref[0] if ref else None)
-    assert sk.last() == (ref[-1] if ref else None)
-    for key in ref[:50]:
-        assert key in sk
     assert all(len(sub) <= 2 * sorted_keys._LOAD for sub in sk._lists)
     assert sk._maxes == [sub[-1] for sub in sk._lists]
 
