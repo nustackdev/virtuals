@@ -285,6 +285,7 @@ class LMDBStorage:
             self._active_transactions.clear()
             self._active_write_batches.clear()
             self._active_snapshots.clear()
+            self._writer.close()  # a reserved slot nobody took does not survive the reopen
 
             if self._env is not None and self._forked_during_write:
                 # Closing an environment inherited mid-write can hang in
