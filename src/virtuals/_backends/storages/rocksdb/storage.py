@@ -1,26 +1,30 @@
 """RocksDB storage backend implementation.
 
-Provides persistent key-value storage with transactions, snapshots,
-and optional change notifications via a publisher.
+Provides persistent key-value storage with serializable transactions,
+point-in-time snapshots, and optional change notifications via a publisher.
 """
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from contextlib import contextmanager
 from logging import getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, overload
 
 from virtuals.tkv.storage import (
     SnapshotProtocol,
     StorageClosedError,
     StorageError,
+    StorageTransactionError,
     TransactionProtocol,
     WriteBatchProtocol,
 )
 
+from .._write_slot import WriterLock, WriteSlot
+from .context import classify_rdbpy
 from .snapshot import RocksDBSnapshot
 from .transaction import RocksDBTransaction
 from .write_batch import RocksDBWriteBatch
@@ -43,21 +47,69 @@ except ImportError as e:
     ) from e
 
 
-__all__ = ["RocksDBStorage"]
+__all__ = ["RocksDBStorage", "RocksDBWriteSlot"]
 
 
 logger = getLogger(__name__)
 
 
+DEFAULT_BUSY_TIMEOUT = 60.0  # seconds
+
+RocksDBWriteSlot = WriteSlot
+"""Returned by ``RocksDBStorage.areserve_write_slot``; see ``WriteSlot``."""
+
+# Keys of the ``txn_db_options`` dict, as rdbpy.TransactionDB spells them,
+# plus the names rdbpy 0.2 used (values in milliseconds either way).
+_TXN_DB_OPTION_ALIASES = {
+    "transaction_lock_timeout": "lock_timeout_ms",
+    "default_lock_timeout": "default_lock_timeout_ms",
+}
+# Keys of the ``txn_options`` dict, as rdbpy ``TransactionDB.begin`` spells
+# them, plus the rdbpy 0.2 names.
+_TXN_OPTION_ALIASES = {
+    "lock_timeout": "lock_timeout_ms",
+    "expiration": "expiration_ms",
+}
+
+
 class RocksDBStorage:
     """RocksDB storage implementation conforming to StorageProtocol.
 
-    Provides persistent key-value storage with transactions, snapshots,
-    and optional change notifications via a publisher.
+    The serial variant: one writer at a time per storage, real snapshots
+    for every read.
+
+    Transactions: a write transaction holds the storage's in-process writer
+    slot from begin until commit or abort. With one writer at a time and
+    every read inside the transaction at its own begin snapshot (merged
+    with its pending writes), committed transactions are serializable,
+    scans included: no lost update, write skew or phantom is possible.
+    Underneath, a pessimistic rocksdb transaction with snapshot validation
+    turns any writer that bypassed the slot into a retryable conflict.
+
+    Snapshots: a rocksdb DB snapshot, taken when the Snapshot begins, pins
+    every get and scan in it. They never wait on a writer.
+
+    Coroutines: the slot belongs to a thread and, on an event loop, to the
+    task that took it. Coroutines sharing one loop wait for it with
+    ``areserve_write_slot``, which polls without blocking the loop, and
+    hand it to ``begin_transaction(write_slot=...)``. A second writer from
+    the task or thread that already holds the slot raises
+    ``StorageNestedTransactionError``; a sync begin while another task on
+    the same loop holds it raises ``StorageLockTimeoutError`` at once. A
+    sync writer on another thread blocks for up to ``busy_timeout``.
+    Write batches take the slot for the duration of ``write``.
+
+    Process model: single-process. RocksDB locks its directory, so one
+    process opens a storage read-write; others open it as a read-only
+    secondary (``read_only=True, secondary_path=...``) or go through the
+    owning process. A storage handle must not be used in a forked child.
 
     A transaction, snapshot or scan belongs to one thread: do not share it
     between threads, and close the storage only once every thread is done.
     """
+
+    process_model: ClassVar[Literal["single", "multi"]] = "single"
+    """Contract section 4: one process opens the storage read-write."""
 
     def __init__(
         self,
@@ -75,6 +127,7 @@ class RocksDBStorage:
         create_if_missing: bool = True,
         sync_writes: bool = False,
         disable_wal: bool = False,
+        busy_timeout: float = DEFAULT_BUSY_TIMEOUT,
     ) -> None:
         """Initialize RocksDB storage.
 
@@ -91,12 +144,21 @@ class RocksDBStorage:
                 older than this. Set to 0 to catch up on every snapshot, or
                 None to never catch up (callers drive freshness manually).
             wal_path: Optional separate WAL directory
-            options: RocksDB options dict
-            txn_db_options: TransactionDB options dict
-            txn_options: Transaction options dict
+            options: ``rdbpy.Options`` kwargs. ``block_cache_mb`` (an int)
+                and ``block_table`` (a dict of block table kwargs) are also
+                accepted and folded in.
+            txn_db_options: ``rdbpy.TransactionDB`` kwargs: ``lock_timeout_ms``,
+                ``default_lock_timeout_ms``, ``max_num_locks``, ``num_stripes``,
+                ``max_num_deadlocks``. Row locks only matter for a writer that
+                bypassed the writer slot.
+            txn_options: ``rdbpy.TransactionDB.begin`` kwargs: ``lock_timeout_ms``,
+                ``deadlock_detect``, ``deadlock_detect_depth``, ``expiration_ms``.
+                Transactions always begin with a snapshot.
             create_if_missing: Create database if it doesn't exist
-            sync_writes: Sync writes to disk
+            sync_writes: fsync every commit and batch write
             disable_wal: Disable write-ahead log
+            busy_timeout: Seconds a sync writer waits for the writer slot
+                before ``StorageLockTimeoutError``.
         """
         # Core dependencies
         self._codec = codec
@@ -128,14 +190,18 @@ class RocksDBStorage:
         self._create_if_missing = create_if_missing
         self._sync_writes = sync_writes
         self._disable_wal = disable_wal
+        self._busy_timeout = busy_timeout
+        self._begin_kwargs = self._build_begin_kwargs()
 
         # State
         self._db: rdbpy.TransactionDB | rdbpy.DB | None = None
-        self._db_lock = threading.RLock()
+        self._state_lock = threading.Lock()
+        self._writer = WriterLock("RocksDB")
         self._active_transactions: set[RocksDBTransaction] = set()
         self._active_write_batches: set[RocksDBWriteBatch] = set()
         self._active_snapshots: set[RocksDBSnapshot] = set()
         self._opened = False
+        self._pid = os.getpid()
 
     @property
     def read_only(self) -> bool:
@@ -147,19 +213,17 @@ class RocksDBStorage:
         """Get codec for key/value encoding."""
         return self._codec
 
+    @property
+    def path(self) -> Path:
+        """The database directory."""
+        return self._path
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
 
     def _build_options(self) -> rdbpy.Options:
         """Build RocksDB options from configuration.
-
-        Recognized non-rocksdb keys in options dict:
-          block_table: dict of kwargs for rdbpy.BlockBasedTableFactory
-            (e.g. cache_index_and_filter_blocks, pin_l0_filter_and_index_blocks_in_cache,
-            partition_filters, format_version, ...)
-          block_cache_mb: int — convenience, builds a shared LRU and passes it as
-            block_cache into BlockBasedTableFactory
 
         Returns:
             Configured Options object
@@ -172,26 +236,32 @@ class RocksDBStorage:
             options_dict["create_if_missing"] = self._create_if_missing
 
         block_table_kwargs = options_dict.pop("block_table", None)
+        if block_table_kwargs:
+            options_dict.update(block_table_kwargs)
         block_cache_mb = options_dict.pop("block_cache_mb", None)
+        if block_cache_mb is not None and "block_cache_size" not in options_dict:
+            options_dict["block_cache_size"] = int(block_cache_mb) * 1024 * 1024
+
+        if self._wal_path is not None:
+            options_dict["wal_dir"] = str(self._wal_path)
 
         try:
-            options = rdbpy.Options(**options_dict)
+            return rdbpy.Options(**options_dict)
         except Exception as e:
             raise StorageError(f"Invalid RocksDB options: {e}") from e
 
-        if block_table_kwargs is not None or block_cache_mb is not None:
-            tf_kwargs = dict(block_table_kwargs or {})
-            if block_cache_mb is not None and "block_cache" not in tf_kwargs:
-                tf_kwargs["block_cache"] = rdbpy.PyLRUCache(int(block_cache_mb) * 1024 * 1024)
-            try:
-                options.table_factory = rdbpy.BlockBasedTableFactory(**tf_kwargs)
-            except Exception as e:
-                raise StorageError(f"Invalid block-table options: {e}") from e
+    def _build_txn_db_kwargs(self) -> dict[str, Any]:
+        """Translate ``txn_db_options`` into ``rdbpy.TransactionDB`` kwargs."""
+        return {_TXN_DB_OPTION_ALIASES.get(k, k): v for k, v in self._txn_db_options_dict.items()}
 
-        if self._wal_path is not None:
-            options.wal_dir = str(self._wal_path)
-
-        return options
+    def _build_begin_kwargs(self) -> dict[str, Any]:
+        """Translate ``txn_options`` into ``TransactionDB.begin`` kwargs."""
+        kwargs = {_TXN_OPTION_ALIASES.get(k, k): v for k, v in self._txn_options_dict.items()}
+        kwargs.pop("set_snapshot", None)  # always on
+        kwargs["set_snapshot"] = True
+        kwargs["sync"] = self._sync_writes
+        kwargs["disable_wal"] = self._disable_wal
+        return kwargs
 
     def _open_transaction_db(self, options: rdbpy.Options) -> None:
         """Open database as TransactionDB for read-write access.
@@ -202,21 +272,26 @@ class RocksDBStorage:
         Raises:
             StorageError: If database cannot be opened
         """
-        txn_db_options = None
-        if self._txn_db_options_dict:
-            try:
-                txn_db_options = rdbpy.TransactionDBOptions(**self._txn_db_options_dict)
-            except Exception as e:
-                raise StorageError(f"Invalid TransactionDB options: {e}") from e
-
         try:
-            self._db = rdbpy.TransactionDB(
-                str(self._path),
-                options,
-                txn_db_opts=txn_db_options,
-            )
+            self._db = rdbpy.TransactionDB(str(self._path), options, **self._build_txn_db_kwargs())
+        except TypeError as e:
+            raise StorageError(f"Invalid TransactionDB options: {e}") from e
         except Exception as e:
             raise StorageError(f"Failed to open RocksDB TransactionDB: {e}") from e
+
+    def _open_read_only_db(self, options: rdbpy.Options) -> None:
+        """Open an existing database read-only (no secondary instance).
+
+        Args:
+            options: RocksDB options
+
+        Raises:
+            StorageError: If database cannot be opened
+        """
+        try:
+            self._db = rdbpy.DB(str(self._path), options, read_only=True)
+        except Exception as e:
+            raise StorageError(f"Failed to open RocksDB read-only: {e}") from e
 
     def _open_secondary_db(self, options: rdbpy.Options) -> None:
         """Open database as secondary for parallel reads.
@@ -255,27 +330,33 @@ class RocksDBStorage:
         if self._opened:
             return
 
-        with self._db_lock:
-            # Create directories
-            try:
-                self._path.mkdir(parents=True, exist_ok=True)
-                if self._wal_path is not None:
-                    self._wal_path.mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                raise StorageError(f"Failed to create database directories: {e}") from e
+        # Create directories
+        try:
+            self._path.mkdir(parents=True, exist_ok=True)
+            if self._wal_path is not None:
+                self._wal_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            raise StorageError(f"Failed to create database directories: {e}") from e
 
-            options = self._build_options()
+        options = self._build_options()
 
-            # Open in appropriate mode
-            if self._is_secondary:
-                self._open_secondary_db(options)
-            else:
-                self._open_transaction_db(options)
+        # Open in appropriate mode
+        if self._is_secondary:
+            self._open_secondary_db(options)
+        elif self._read_only:
+            self._open_read_only_db(options)
+        else:
+            self._open_transaction_db(options)
 
+        with self._state_lock:
+            self._pid = os.getpid()
             self._opened = True
 
     def close(self) -> None:
         """Close database and release all resources.
+
+        Aborts open transactions and batches (giving back the writer slot),
+        closes open snapshots, then closes the database.
 
         Raises:
             StorageError: If close fails
@@ -283,44 +364,38 @@ class RocksDBStorage:
         if not self._opened:
             return
 
-        with self._db_lock:
-            # Abort all active transactions
-            for transaction in list(self._active_transactions):
-                try:
-                    transaction.abort()
-                except Exception as e:
-                    logger.error(f"Transaction abort failed during close: {e}")
+        for transaction in list(self._active_transactions):
+            try:
+                transaction.abort()
+            except Exception as e:
+                logger.error(f"Transaction abort failed during close: {e}")
 
-            # Close all active snapshots
-            for snapshot in list(self._active_snapshots):
-                try:
-                    snapshot.close()
-                except Exception as e:
-                    logger.error(f"Snapshot close failed during close: {e}")
+        for snapshot in list(self._active_snapshots):
+            try:
+                snapshot.close()
+            except Exception as e:
+                logger.error(f"Snapshot close failed during close: {e}")
 
-            # Abort all active write batches
-            for write_batch in list(self._active_write_batches):
-                try:
-                    write_batch.abort()
-                except Exception as e:
-                    logger.error(f"Write batch abort failed during close: {e}")
+        for write_batch in list(self._active_write_batches):
+            try:
+                write_batch.abort()
+            except Exception as e:
+                logger.error(f"Write batch abort failed during close: {e}")
 
-            # Clear tracking sets
+        with self._state_lock:
             self._active_transactions.clear()
             self._active_write_batches.clear()
             self._active_snapshots.clear()
-
-            # Close database. Any rdbpy iterator still referenced (e.g. by a
-            # suspended scan generator) is invalidated by rdbpy, not freed.
-            if self._db is not None:
-                try:
-                    self._db.close()
-                except Exception as e:
-                    raise StorageError(f"Failed to close database: {e}") from e
-                finally:
-                    self._db = None
-
+            db, self._db = self._db, None
             self._opened = False
+
+        # Close database. Any rdbpy iterator still referenced (e.g. by a
+        # suspended scan generator) is invalidated by rdbpy, not freed.
+        if db is not None:
+            try:
+                db.close()
+            except Exception as e:
+                raise StorageError(f"Failed to close database: {e}") from e
 
     def __enter__(self) -> RocksDBStorage:
         """Enter context manager - open storage."""
@@ -380,7 +455,7 @@ class RocksDBStorage:
             return self.begin_transaction()
 
     def begin_snapshot(self) -> RocksDBSnapshot:
-        """Begin read-only snapshot.
+        """Begin read-only snapshot, pinned at this moment.
 
         Returns:
             New snapshot instance
@@ -390,168 +465,177 @@ class RocksDBStorage:
             StorageClosedError: If storage is not open
         """
         self._require_open()
+        db = self._db
 
         if self._is_secondary:
-            return self._begin_snapshot_on_secdb()
+            self._catch_up_if_due()
+            rdbpy_snapshot = None  # rocksdb: snapshots not supported in secondary mode
         else:
-            return self._begin_snapshot_on_txdb()
-
-    def _begin_snapshot_on_secdb(self) -> RocksDBSnapshot:
-        """Begin read-only snapshot on a secondary db instance.
-
-        Returns:
-            New snapshot instance
-
-        Raises:
-            StorageError: If snapshot creation fails
-        """
-        self._require_open()
-
-        if not self._is_secondary:
-            raise StorageError("Invalid snapshot creation")
-
-        with self._db_lock:
-            interval = self._secondary_refresh_interval
-            if interval is not None:
-                now = time.monotonic()
-                if now - self._last_catchup_monotonic >= interval:
-                    try:
-                        self._db.try_catch_up_with_primary()
-                    except Exception as e:
-                        raise StorageError(f"Failed to catch up with primary: {e}") from e
-                    self._last_catchup_monotonic = now
-
             try:
-                snapshot = RocksDBSnapshot(self, self._db)
+                rdbpy_snapshot = db.snapshot()
             except Exception as e:
-                raise StorageError(f"Failed to begin snapshot: {e}") from e
+                raise classify_rdbpy(e, "Failed to begin snapshot") from e
+
+        snapshot = RocksDBSnapshot(self, db, rdbpy_snapshot)
+        with self._state_lock:
             self._active_snapshots.add(snapshot)
-            return snapshot
+        return snapshot
+
+    def _catch_up_if_due(self) -> None:
+        """Throttled catch-up of a secondary with the primary, before a snapshot."""
+        interval = self._secondary_refresh_interval
+        if interval is None:
+            return
+        now = time.monotonic()
+        if now - self._last_catchup_monotonic < interval:
+            return
+        try:
+            self._db.try_catch_up_with_primary()
+        except Exception as e:
+            raise StorageError(f"Failed to catch up with primary: {e}") from e
+        self._last_catchup_monotonic = now
 
     def force_catch_up_with_primary(self) -> None:
         """Catch up to the primary's current manifest immediately.
 
-        Unlike the throttled catch-up in `_begin_snapshot_on_secdb`, this
-        bypasses `secondary_refresh_interval`. It exists to recover from a
-        read that hit an SST file the primary compacted away: the secondary
-        is pinned to an old manifest version that still references the
-        deleted file, and catching up to the current manifest drops that
-        reference. No-op on a primary (non-secondary) storage.
+        Unlike the throttled catch-up in `begin_snapshot`, this bypasses
+        `secondary_refresh_interval`. It exists to recover from a read that
+        hit an SST file the primary compacted away: the secondary is pinned
+        to an old manifest version that still references the deleted file,
+        and catching up to the current manifest drops that reference. No-op
+        on a primary (non-secondary) storage.
         """
         if not self._is_secondary:
             return
-        with self._db_lock:
-            try:
-                self._db.try_catch_up_with_primary()
-            except Exception as e:
-                raise StorageError(f"Failed to catch up with primary: {e}") from e
-            self._last_catchup_monotonic = time.monotonic()
-
-    def _begin_snapshot_on_txdb(self) -> RocksDBSnapshot:
-        """Begin read-only snapshot on TransactionDB instance.
-
-        Returns:
-            New snapshot instance
-
-        Raises:
-            StorageError: If snapshot creation fails
-        """
         self._require_open()
+        try:
+            self._db.try_catch_up_with_primary()
+        except Exception as e:
+            raise StorageError(f"Failed to catch up with primary: {e}") from e
+        self._last_catchup_monotonic = time.monotonic()
 
-        if self._is_secondary:
-            raise StorageError("Invalid snapshot creation")
+    def begin_transaction(self, *, write_slot: WriteSlot | None = None) -> RocksDBTransaction:
+        """Begin read-write transaction, taking the writer slot now.
 
-        with self._db_lock:
-            # Create transaction options with snapshot
-            txn_options_dict = dict(self._txn_options_dict)
-            txn_options_dict["set_snapshot"] = True
-
-            try:
-                txn_options = rdbpy.TransactionOptions(**txn_options_dict)
-            except Exception as e:
-                raise StorageError(f"Invalid snapshot options: {e}") from e
-
-            # Begin transaction with snapshot
-            try:
-                rdbpy_txn = self._db.begin_transaction(txn_options)
-                rdbpy_txn.set_snapshot()
-            except Exception as e:
-                raise StorageError(f"Failed to begin snapshot: {e}") from e
-
-            snapshot = RocksDBSnapshot(self, rdbpy_txn)
-            self._active_snapshots.add(snapshot)
-            return snapshot
-
-    def begin_transaction(self) -> RocksDBTransaction:
-        """Begin read-write transaction.
+        Args:
+            write_slot: A slot from ``areserve_write_slot``. The transaction
+                takes it over instead of acquiring the slot itself, then
+                releases it on commit or abort. None acquires as usual.
 
         Returns:
             New transaction instance
 
         Raises:
+            StorageNestedTransactionError: If this task or thread already
+                holds the writer slot
+            StorageLockTimeoutError: If the slot is not free within
+                ``busy_timeout``, or is held by another task on this loop
             StorageError: If transaction creation fails
             StorageClosedError: If storage is not open
         """
         if self._read_only:
             raise StorageError("Cannot start transaction in read only mode.")
-
         self._require_open()
 
-        with self._db_lock:
-            # Create transaction options
-            txn_options = None
-            if self._txn_options_dict:
-                try:
-                    txn_options = rdbpy.TransactionOptions(**self._txn_options_dict)
-                except Exception as e:
-                    raise StorageError(f"Invalid transaction options: {e}") from e
+        give_back_slot = self._writer.take(self, write_slot, self._busy_timeout)
+        try:
+            db = self._db
+            if db is None:
+                raise StorageClosedError("Storage is not open")
+            rdbpy_txn = db.begin(**self._begin_kwargs)
+        except StorageClosedError:
+            give_back_slot()
+            raise
+        except TypeError as e:
+            give_back_slot()
+            raise StorageError(f"Invalid transaction options: {e}") from e
+        except Exception as e:
+            give_back_slot()
+            raise StorageError(f"Failed to begin transaction: {e}") from e
 
-            # Write options (e.g. disable WAL for bulk writes)
-            write_options = None
-            if self._disable_wal:
-                write_options = {"disable_wal": True}
-
-            # Begin transaction
-            try:
-                if txn_options is not None:
-                    rdbpy_txn = self._db.begin_transaction(txn_options, write_options=write_options)
-                else:
-                    rdbpy_txn = self._db.begin_transaction(write_options=write_options)
-            except Exception as e:
-                raise StorageError(f"Failed to begin transaction: {e}") from e
-
-            transaction = RocksDBTransaction(self, rdbpy_txn)
+        transaction = RocksDBTransaction(self, rdbpy_txn)
+        with self._state_lock:
             self._active_transactions.add(transaction)
-            return transaction
+        return transaction
+
+    async def areserve_write_slot(self) -> WriteSlot:
+        """Wait for the writer slot without blocking the event loop.
+
+        Polls the slot with a short, growing sleep between tries, so other
+        coroutines on the loop keep running, including the one that holds
+        it. Waits behind other threads too.
+
+        Returns:
+            The held slot, for ``begin_transaction(write_slot=...)``. Call
+            its ``release`` if no transaction takes it.
+
+        Raises:
+            StorageNestedTransactionError: If this task already holds the
+                slot.
+            StorageLockTimeoutError: If it is not free within
+                ``busy_timeout``.
+        """
+        if self._read_only:
+            raise StorageError("Cannot reserve the write slot in read only mode.")
+        self._require_open()
+        lock = await self._writer.areserve(self._busy_timeout)
+        return RocksDBWriteSlot(self, lock)
 
     def begin_write_batch(self) -> RocksDBWriteBatch:
-        """Begin write-only batch.
+        """Begin write-only batch. Takes the writer slot only in ``write``.
 
         Returns:
             New write batch instance
 
         Raises:
-            StorageOperationError: If batch creation fails
+            StorageError: If batch creation fails in read only mode
             StorageClosedError: If storage is closed
         """
         if self._read_only:
             raise StorageError("Cannot start write batch in read only mode.")
-
         self._require_open()
 
-        with self._db_lock:
-            rdbpy_batch = rdbpy.WriteBatch()
-            write_batch = RocksDBWriteBatch(self, rdbpy_batch)
+        write_batch = RocksDBWriteBatch(self, rdbpy.WriteBatch())
+        with self._state_lock:
             self._active_write_batches.add(write_batch)
-            return write_batch
+        return write_batch
+
+    def _write_batch(self, batch: Any) -> None:  # noqa: ANN401
+        """Apply an rdbpy write batch atomically, under the writer slot.
+
+        Raises:
+            StorageNestedTransactionError: If this task or thread holds a
+                write transaction on the storage
+            StorageLockTimeoutError: If the slot is not free in time, or
+                rocksdb timed out on a row lock
+            StorageTransactionConflictError: If rocksdb refused the write
+            StorageTransactionError: If the write fails otherwise
+        """
+        give_back_slot = self._writer.take(self, None, self._busy_timeout)
+        try:
+            self._require_open()
+            self._db.write(batch, sync=self._sync_writes, disable_wal=self._disable_wal)
+        except StorageError:
+            raise
+        except Exception as e:
+            mapped = classify_rdbpy(e, "Failed to write batch")
+            if isinstance(mapped, (StorageTransactionError, StorageClosedError)):
+                raise mapped from e  # retryable (conflict, lock timeout) or closed
+            raise StorageTransactionError(f"Failed to write batch: {e}") from e
+        finally:
+            give_back_slot()
+
+    def _release_write_slot(self, lock: Any = None) -> None:  # noqa: ANN401
+        """Release the in-process writer slot."""
+        self._writer.release(lock)
 
     @contextmanager
     def transaction(self) -> Iterator[RocksDBTransaction]:
         """Context manager for a read-write transaction.
 
         Commits on successful exit, aborts on any exception (including
-        KeyboardInterrupt, cancellation and GeneratorExit) so row locks are
-        never left held.
+        KeyboardInterrupt, cancellation and GeneratorExit) so the writer
+        slot is never left held.
         """
         txn = self.begin_transaction()
         try:
@@ -619,41 +703,38 @@ class RocksDBStorage:
             except Exception as e:
                 logger.error(f"Publisher notification failed: {e}")
 
-    def _remove_transaction(self, transaction: RocksDBTransaction) -> None:
-        """Remove transaction from active set.
-
-        Args:
-            transaction: Transaction to remove
-        """
-        with self._db_lock:
+    def _untrack_transaction(self, transaction: RocksDBTransaction) -> None:
+        """Remove transaction from active set."""
+        with self._state_lock:
             self._active_transactions.discard(transaction)
 
-    def _remove_snapshot(self, snapshot: RocksDBSnapshot) -> None:
-        """Remove snapshot from active set.
-
-        Args:
-            snapshot: Snapshot to remove
-        """
-        with self._db_lock:
+    def _untrack_snapshot(self, snapshot: RocksDBSnapshot) -> None:
+        """Remove snapshot from active set."""
+        with self._state_lock:
             self._active_snapshots.discard(snapshot)
 
-    def _remove_write_batch(self, write_batch: RocksDBWriteBatch) -> None:
-        """Remove write batch from active set.
-
-        Args:
-            write_batch: Write batch to remove
-        """
-        with self._db_lock:
+    def _untrack_write_batch(self, write_batch: RocksDBWriteBatch) -> None:
+        """Remove write batch from active set."""
+        with self._state_lock:
             self._active_write_batches.discard(write_batch)
 
     def _require_open(self) -> None:
-        """Validate storage is open.
+        """Validate storage is open, in the process that opened it.
 
         Raises:
             StorageClosedError: If storage is not open
+            StorageError: If this is a forked child of the opening process:
+                the rocksdb handle (background threads, directory lock)
+                does not survive a fork, so the child must open its own
         """
         if not self._opened or self._db is None:
             raise StorageClosedError("Storage is not open")
+        if self._pid != os.getpid():
+            raise StorageError(
+                "RocksDB storage was opened in another process; a forked child "
+                "cannot use its handle. RocksDB is single-process: open the "
+                "storage in this process instead"
+            )
 
 
 if TYPE_CHECKING:

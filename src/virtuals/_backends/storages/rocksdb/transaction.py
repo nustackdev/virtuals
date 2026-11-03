@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 from logging import getLogger
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from virtuals.tkv.storage import (
     StorageClosedError,
+    StorageLockTimeoutError,
     StorageTransactionAbortedError,
+    StorageTransactionConflictError,
     StorageTransactionError,
     TransactionProtocol,
 )
 
-from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin
+from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin, classify_rdbpy
 
 
 if TYPE_CHECKING:
@@ -28,31 +30,38 @@ __all__ = ["RocksDBTransaction"]
 
 logger = getLogger(__name__)
 
+# Commit failures that keep their class: the retryable ones, and a handle
+# whose storage closed underneath it. Anything else is a transaction error.
+_RAISE_AS_IS = (StorageTransactionConflictError, StorageLockTimeoutError, StorageClosedError)
+
 
 class RocksDBTransaction(
     ContextBase, ReadOperationsMixin, WriteOperationsMixin, TransactionProtocol
 ):
-    """Read-write transaction implementation.
+    """Read-write transaction backed by a pessimistic rdbpy transaction.
 
-    Provides full read-write access with ACID guarantees.
-    Composed from base context, read operations, write operations,
-    and transaction control.
+    The transaction holds the storage's writer slot from begin until commit
+    or abort, so it is the only writer on the storage while it runs: what
+    it reads cannot move under it, point reads and scans alike. Reads go
+    through the transaction's own snapshot, taken at begin, merged with its
+    pending writes.
+
+    The rocksdb row locks and snapshot validation underneath are a second
+    line of defence: a writer that somehow bypasses the slot surfaces as a
+    retryable conflict or lock timeout, never as a silent lost update.
     """
 
-    __slots__ = ("_aborted", "_committed", "_modified_keys")
+    __slots__ = ("_aborted", "_committed", "_modified_keys", "_rdbpy_txn")
 
-    def __init__(
-        self,
-        storage: RocksDBStorage,
-        rdbpy_txn: object,
-    ) -> None:
+    def __init__(self, storage: RocksDBStorage, rdbpy_txn: Any) -> None:  # noqa: ANN401
         """Initialize transaction.
 
         Args:
             storage: Parent storage instance
-            rdbpy_txn: RocksDB transaction handle
+            rdbpy_txn: rdbpy transaction handle, begun with a snapshot
         """
-        super().__init__(storage, rdbpy_txn)
+        super().__init__(storage, holds_write_slot=True)
+        self._rdbpy_txn: Any | None = rdbpy_txn
         self._modified_keys: set[Key] = set()
         self._committed = False
         self._aborted = False
@@ -62,12 +71,28 @@ class RocksDBTransaction(
         """Always True for transactions."""
         return True
 
+    def _drop_handles(self) -> None:
+        self._rdbpy_txn = None
+
+    def _get_raw(self, encoded_key: bytes) -> bytes | None:
+        """Read at the transaction snapshot, merging pending writes."""
+        return self._rdbpy_txn.get(encoded_key)  # type: ignore[union-attr]
+
+    def _iterator(self, *, keys_only: bool, reverse: bool) -> Any:  # noqa: ANN401
+        """Cursor at the transaction snapshot, merging pending writes."""
+        return self._rdbpy_txn.iterator(keys_only=keys_only, reverse=reverse)  # type: ignore[union-attr]
+
     def commit(self) -> None:
         """Commit all changes in the transaction.
 
         Sends notifications for all modified keys after successful commit.
+        A failed commit ends the transaction (rdbpy rolls it back) and gives
+        back the writer slot.
 
         Raises:
+            StorageTransactionConflictError: If rocksdb refused the commit
+                as a conflict (retryable)
+            StorageLockTimeoutError: If rocksdb timed out on a lock (retryable)
             StorageTransactionError: If commit fails or transaction is invalid
             StorageClosedError: If context is closed
         """
@@ -81,52 +106,47 @@ class RocksDBTransaction(
             logger.error("Cannot commit, transaction already aborted")
             raise StorageTransactionError("Transaction already aborted")
 
-        txn = self._require_active()
-
-        # Commit to RocksDB
+        txn = self._rdbpy_txn
         try:
-            txn.commit()
+            txn.commit()  # type: ignore[union-attr]
         except Exception as e:
+            self._aborted = True
+            self._mark_closed()
+            self._storage._untrack_transaction(self)
             logger.error("Transaction commit failed")
+            mapped = classify_rdbpy(e, "Failed to commit transaction")
+            if isinstance(mapped, _RAISE_AS_IS):
+                raise mapped from e
             raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
 
-        logger.info("Transaction committed")
+        logger.debug("Transaction committed")
 
-        # Mark as committed before notifications
         self._committed = True
         self._mark_closed()
-
-        # Notify observers (batch)
         self._storage._notify_batch(self._modified_keys)
-
-        # Remove from active transactions
-        self._storage._remove_transaction(self)
+        self._storage._untrack_transaction(self)
 
     def abort(self) -> None:
         """Abort transaction and discard all changes.
 
         Raises:
             StorageTransactionAbortedError: If abort fails
-            StorageClosedError: If context is closed
         """
         if self._closed:
-            # Already closed, nothing to do
             logger.debug("Abort called on closed transaction")
             return
 
-        txn = self._require_active()
-
+        txn = self._rdbpy_txn
         try:
-            txn.rollback()
-
-            logger.info("Transaction aborted")
+            txn.rollback()  # type: ignore[union-attr]
+            logger.debug("Transaction aborted")
         except Exception as e:
             logger.error("Transaction abort failed")
             raise StorageTransactionAbortedError(f"Failed to abort transaction: {e}") from e
         finally:
             self._aborted = True
             self._mark_closed()
-            self._storage._remove_transaction(self)
+            self._storage._untrack_transaction(self)
 
     def __enter__(self) -> RocksDBTransaction:
         """Enter context manager."""
@@ -144,12 +164,9 @@ class RocksDBTransaction(
         Otherwise, commit the transaction.
         """
         if exc_type is not None:
-            # Exception occurred - abort
             try:
                 self.abort()
             except Exception:
                 logger.error("Transaction abort failed")
-        else:
-            # No exception - commit if not already done
-            if not self._committed and not self._aborted:
-                self.commit()
+        elif not self._committed and not self._aborted:
+            self.commit()

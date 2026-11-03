@@ -3,7 +3,7 @@
 Covers what compliance cannot: scans that outlive their transaction or the
 storage (a use-after-free in rdbpy before 0.2.7), reverse scans with start
 bounds, secondary instances, TransactionDB options and aborting on
-BaseException.
+BaseException. The kv contract cases live in ``test_rocksdb_contract.py``.
 """
 
 from __future__ import annotations
@@ -170,49 +170,47 @@ def test_reverse_prefix_scan_from_upper_bound(storage: RocksDBStorage) -> None:
 class _CountingIterator:
     def __init__(self, it: Any) -> None:
         self._it = it
-        self.steps = 0
+        self.rows = 0
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._it, name)
 
-    def skip(self) -> None:
-        self.steps += 1
-        self._it.skip()
-
-    def skip_back(self) -> None:
-        self.steps += 1
-        self._it.skip_back()
+    def next_batch(self, n: int) -> list:
+        rows = self._it.next_batch(n)
+        self.rows += len(rows)
+        return rows
 
 
-class _CountingTxn:
-    def __init__(self, txn: Any) -> None:
-        self._txn = txn
+class _CountingDB:
+    def __init__(self, db: Any) -> None:
+        self._db = db
         self.iterators: list[_CountingIterator] = []
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._txn, name)
+        return getattr(self._db, name)
 
-    def iterkeys(self) -> _CountingIterator:
-        it = _CountingIterator(self._txn.iterkeys())
+    def iterator(self, **kwargs: Any) -> _CountingIterator:
+        it = _CountingIterator(self._db.iterator(**kwargs))
         self.iterators.append(it)
         return it
 
 
 def test_reverse_prefix_scan_seeks_instead_of_walking(storage: RocksDBStorage) -> None:
     _fill(storage, KEYS)
-    snap = storage.begin_snapshot()
-    counting = _CountingTxn(snap._rdbpy_txn)
-    snap._rdbpy_txn = counting
-    options = StorageScanOptions(
-        start=("a", 10), reverse=True, break_filter=PrefixFilter(prefix=("a",))
-    )
-    keys = list(snap.scan(options).keys())
-    snap._rdbpy_txn = counting._txn
-    snap.close()
+    counting = _CountingDB(storage._db)
+    storage._db = counting
+    try:
+        options = StorageScanOptions(
+            start=("a", 10), reverse=True, break_filter=PrefixFilter(prefix=("a",))
+        )
+        with storage.snapshot() as snap:
+            keys = list(snap.scan(options).keys())
+    finally:
+        storage._db = counting._db
     assert keys == [("a", i) for i in range(10, -1, -1)]
-    # 11 yielded keys, then one step off the start of the keyspace; no walk
-    # over the 100 keys after the start bound.
-    assert counting.iterators[0].steps == 11
+    # 11 yielded keys from the seek down to the start of the keyspace; no
+    # walk over the 100 keys after the start bound.
+    assert counting.iterators[0].rows == 11
 
 
 # =============================================================================
