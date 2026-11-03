@@ -251,10 +251,12 @@ class LMDBStorage:
         # Slots reserved and not yet taken: each carries a begun write txn
         # that close() must end on the writer thread.
         self._reserved_slots: weakref.WeakSet[LMDBWriteSlot] = weakref.WeakSet()
-        # LMDB write txns begun on the writer thread and not yet taken by a
-        # context or slot. close() ends whatever is still here, so a begin
-        # racing close can never leave a live write txn under env.close().
-        self._pending_begins: set[Any] = set()
+        # Every live LMDB write txn: added by the writer thread's begin job,
+        # removed by the writer thread's end job, nothing else. close()
+        # ends whatever is still here before stopping the thread and
+        # closing the environment, whichever path (context, slot,
+        # finalizer, abandoned begin) lost the race to end it first.
+        self._live_writes: set[Any] = set()
         self._opened = False
         self._pid = os.getpid()
         self._forked_during_write = False
@@ -338,6 +340,8 @@ class LMDBStorage:
         """Replace locks a parent thread may hold at the fork (``register_at_fork``)."""
         self._env_lock = threading.RLock()
         self._writer_thread.forget()
+        if self._gate is not None:
+            self._gate.reset_after_fork()
 
     def _check_fork(self) -> None:
         """Drop writer state inherited across a fork.
@@ -372,7 +376,7 @@ class LMDBStorage:
             self._active_write_batches = weakref.WeakSet()
             self._active_snapshots = weakref.WeakSet()
             self._reserved_slots = weakref.WeakSet()
-            self._pending_begins = set()
+            self._live_writes = set()
             self._writer.reset()
             self._writer_thread.forget()
             self._gate_held = False
@@ -417,10 +421,8 @@ class LMDBStorage:
             transactions = list(self._active_transactions)
             write_batches = list(self._active_write_batches)
             snapshots = list(self._active_snapshots)
-            reserved = [(slot, slot._lmdb_txn) for slot in self._reserved_slots]
-            for slot, _ in reserved:
-                slot._lmdb_txn = None
-            pending, self._pending_begins = self._pending_begins, set()
+            for slot in self._reserved_slots:
+                slot._lmdb_txn = None  # ended below with every other live write
             self._active_transactions.clear()
             self._active_write_batches.clear()
             self._active_snapshots.clear()
@@ -442,17 +444,22 @@ class LMDBStorage:
             except Exception as e:
                 logger.error(f"Write batch abort failed during close: {e}")
 
-        for lmdb_txn in [txn for _, txn in reserved if txn is not None] + list(pending):
-            try:
-                self._writer_thread.run(lmdb_txn.abort)
-            except Exception as e:
-                logger.error(f"Transaction abort failed during close: {e}")
-
         for snapshot in snapshots:
             try:
                 snapshot.close()
             except Exception as e:
                 logger.error(f"Snapshot close failed during close: {e}")
+
+        # Whatever is still live lost a race to its own end (a reserved
+        # slot, a finalizer, an abandoned begin): end it here, on the
+        # writer thread, so env.close() never meets a live write txn.
+        with self._env_lock:
+            live = list(self._live_writes)
+        for lmdb_txn in live:
+            try:
+                self._end_write(lmdb_txn, commit=False)
+            except Exception as e:
+                logger.error(f"Transaction abort failed during close: {e}")
 
         self._writer.close()  # a reserved slot nobody took does not survive the reopen
         stopped = self._writer_thread.stop(self._busy_timeout)
@@ -573,21 +580,30 @@ class LMDBStorage:
             lmdb_txn = env.begin(write=True)
         with self._env_lock:
             if self._opened:
-                self._pending_begins.add(lmdb_txn)
+                self._live_writes.add(lmdb_txn)
                 return lmdb_txn
         lmdb_txn.abort()
         raise StorageClosedError("Storage was closed while beginning the transaction")
 
-    def _take_pending(self, lmdb_txn: Any) -> bool:  # noqa: ANN401
-        """Claim a begun txn for a context or slot. Under ``_env_lock``.
+    def _end_live(self, lmdb_txn: Any, commit: bool) -> None:  # noqa: ANN401
+        """End a live write txn exactly once. Runs on the writer thread.
 
-        False means close() took it (and ends it): the caller must not
-        touch it again.
+        A txn already ended (close() got there first, or a second abort
+        request) is left alone; a commit of one raises.
         """
-        if lmdb_txn in self._pending_begins:
-            self._pending_begins.discard(lmdb_txn)
-            return True
-        return False
+        with self._env_lock:
+            if lmdb_txn not in self._live_writes:
+                if commit:
+                    raise StorageClosedError("Transaction was ended by close()")
+                return
+        try:
+            if commit:
+                lmdb_txn.commit()
+            else:
+                lmdb_txn.abort()
+        finally:
+            with self._env_lock:
+                self._live_writes.discard(lmdb_txn)
 
     def _remap_to_file_size(self) -> None:
         """Adopt the map size a peer grew the file to (``MDB_MAP_RESIZED``).
@@ -670,8 +686,8 @@ class LMDBStorage:
                 self._begin_lmdb_write, timeout=self._busy_timeout, undo=self._abort_abandoned
             )
             with self._env_lock:
-                if not self._take_pending(lmdb_txn):
-                    raise StorageClosedError("Storage is not open")
+                if not self._opened:
+                    raise StorageClosedError("Storage is not open")  # close() ends the txn
                 slot = LMDBWriteSlot(self, lock, lmdb_txn)
                 self._reserved_slots.add(slot)
                 return slot
@@ -726,11 +742,8 @@ class LMDBStorage:
                         raise StorageClosedError(
                             "Write slot was reserved on a storage that has since closed"
                         )
-                elif not self._take_pending(lmdb_txn):
-                    lmdb_txn = None  # close() owns and ends it
-                    raise StorageClosedError("Storage is not open")
                 if not self._opened:
-                    raise StorageClosedError("Storage is not open")
+                    raise StorageClosedError("Storage is not open")  # close() ends the txn
                 context = make(self, lmdb_txn, lock)
                 if isinstance(context, LMDBTransaction):
                     self._active_transactions.add(context)
@@ -740,7 +753,7 @@ class LMDBStorage:
         except BaseException as e:
             if lmdb_txn is not None:
                 try:
-                    self._writer_thread.run(lmdb_txn.abort)
+                    self._end_write(lmdb_txn, commit=False)
                 except Exception as abort_error:
                     logger.error(f"Abort after a failed begin failed: {abort_error}")
             if write_slot is None:
@@ -753,11 +766,13 @@ class LMDBStorage:
             raise
 
     def _abort_abandoned(self, lmdb_txn: Any) -> None:  # noqa: ANN401
-        """End a begin whose requester gave up (runs on the writer thread)."""
-        with self._env_lock:
-            if not self._take_pending(lmdb_txn):
-                return  # close() took it and ends it
-        lmdb_txn.abort()
+        """End a begin whose requester gave up (runs on the writer thread).
+
+        The requester has already given the slot and gate back by then, so
+        a peer may block briefly inside LMDB until this runs; bounded by
+        the one abort.
+        """
+        self._end_live(lmdb_txn, commit=False)
 
     def _end_write(self, lmdb_txn: Any, *, commit: bool) -> None:  # noqa: ANN401
         """Commit or abort an LMDB write transaction on the writer thread.
@@ -765,7 +780,7 @@ class LMDBStorage:
         Called under the context's call lock from any thread. The gate and
         the slot are given back by the context's ``_mark_closed`` after.
         """
-        self._writer_thread.run(lmdb_txn.commit if commit else lmdb_txn.abort)
+        self._writer_thread.run(lambda: self._end_live(lmdb_txn, commit))
 
     def _release_gate(self) -> None:
         if self._gate_held:
@@ -792,16 +807,24 @@ class LMDBStorage:
         if lmdb_txn is not None:
             try:
                 if finalizing:
-                    self._writer_thread.try_run(lmdb_txn.abort, self._busy_timeout)
+                    self._end_write_from_finalizer(lmdb_txn)
                 else:
-                    self._writer_thread.run(lmdb_txn.abort)
+                    self._end_write(lmdb_txn, commit=False)
+            except StorageClosedError:
+                pass  # close() got there first and ended it
             except Exception as e:
                 logger.error(f"Abort of a reserved transaction failed: {e}")
         self._release_write_slot(slot._lock)
 
     def _end_write_from_finalizer(self, lmdb_txn: Any) -> bool:  # noqa: ANN401
-        """Abort a dropped write txn on the writer thread, bounded; False if skipped."""
-        return self._writer_thread.try_run(lmdb_txn.abort, self._busy_timeout)
+        """Abort a dropped write txn on the writer thread, bounded; False if skipped.
+
+        Skipped means the writer thread is gone (close() stopped it after
+        ending every live write itself) or the interpreter is exiting.
+        """
+        return self._writer_thread.try_run(
+            lambda: self._end_live(lmdb_txn, False), self._busy_timeout
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[LMDBTransaction]:

@@ -351,25 +351,37 @@ class WriterGate:
             consumer.set_exception(error)
 
     def close(self) -> None:
-        """Close the lock file, dropping the lock if held, and fail any waiter."""
+        """Close the lock file, dropping the lock if held, fail any waiter, stop the helper."""
         self.wake_waiters(StorageClosedError("Storage was closed while waiting for the write lock"))
         with self._mu:
             fd, self._fd = self._fd, None
             self._generation += 1  # a wait in flight on the old descriptor touches nothing
             self._waiting = False
+            requests, self._requests = self._requests, queue.SimpleQueue()
+            self._thread = None
+        requests.put(None)  # the helper exits after the wait it may be in
         if fd is not None:
-            # A blocking wait still in flight on this descriptor holds its
-            # own reference: the lock it may land goes away with it, and
-            # it is ignored by generation.
+            # A blocking wait still in flight holds its own duplicate of this
+            # descriptor: the lock it may land goes away with that, and it
+            # is ignored by generation.
             os.close(fd)
+
+    def reset_after_fork(self) -> None:
+        """Fresh lock, queue and no helper in a forked child (``register_at_fork``).
+
+        Takes no lock: a parent thread may hold the inherited one forever.
+        The descriptor is replaced by ``reopen_after_fork`` on first use.
+        """
+        self._mu = threading.Lock()
+        self._thread = None
+        self._requests = queue.SimpleQueue()
+        self._waiting = False
+        self._consumer = None
 
     def reopen_after_fork(self) -> None:
         """Replace the inherited descriptor: it shares the parent's lock state."""
         with self._mu:
             fd, self._fd = self._fd, None
-            self._thread = None  # the parent's helper does not exist here
-            self._requests = queue.SimpleQueue()
-            self._mu = threading.Lock()
         if fd is not None:
             # The parent's descriptor keeps the open file description (and any
             # lock on it) alive, so closing this one takes nothing from it.
@@ -402,7 +414,12 @@ class WriterGate:
             return consumer
 
     def _start_wait(self) -> None:
-        """Hand the helper thread a blocking wait for this generation. Under ``_mu``."""
+        """Hand the helper thread a blocking wait for this generation. Under ``_mu``.
+
+        The helper gets its own duplicate of the descriptor (same open file
+        description, so the same lock), never the number: close() may free
+        that number and any later open in the process may reuse it.
+        """
         thread = self._thread
         if thread is None or not thread.is_alive():
             thread = threading.Thread(
@@ -410,29 +427,37 @@ class WriterGate:
             )
             self._thread = thread
             thread.start()
-        self._requests.put((self._fd, self._generation))
+        self._requests.put((os.dup(self._fd), self._generation))
 
     def _serve(self, requests: queue.SimpleQueue) -> None:
         while True:
-            fd, generation = requests.get()
+            request = requests.get()
+            if request is None:
+                return
+            fd, generation = request
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 error: Exception | None = None
             except OSError as e:
                 error = StorageError(f"Failed to take the LMDB writer gate: {e}")
-            with self._mu:
-                if generation != self._generation or fd != self._fd:
-                    continue  # the gate was closed meanwhile: that lock died with its file
-                self._waiting = False
-                consumer, self._consumer = self._consumer, None
-                if consumer is None:
-                    if error is None:
-                        fcntl.flock(fd, fcntl.LOCK_UN)  # nobody wants it any more
-                    continue
-            if error is not None:
-                consumer.set_exception(error)
-            else:
-                consumer.set_result(True)
+            try:
+                with self._mu:
+                    if generation != self._generation:
+                        # The gate was closed meanwhile: closing this last
+                        # duplicate below drops the lock with the file.
+                        continue
+                    self._waiting = False
+                    consumer, self._consumer = self._consumer, None
+                    if consumer is None:
+                        if error is None:
+                            fcntl.flock(fd, fcntl.LOCK_UN)  # nobody wants it any more
+                        continue
+                if error is not None:
+                    consumer.set_exception(error)
+                else:
+                    consumer.set_result(True)
+            finally:
+                os.close(fd)  # the storage's own descriptor keeps a landed lock
 
     def _detach(self, consumer: Future) -> bool:
         """Give up waiting. False if the gate landed on ``consumer`` first (it is ours)."""

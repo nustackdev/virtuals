@@ -112,10 +112,12 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         writer thread. A second abort, or one racing a commit, is a no-op.
         """
         if self._closed:
-            # Unlocked on purpose: the flag only ever turns True, after the
-            # LMDB transaction has ended, so this abort has nothing to do.
-            # close() calls here while the owner may be inside its commit's
-            # slot release; waiting for that lock would wait on close itself.
+            # Unlocked on purpose. The flag only ever turns True, and once it
+            # is set the LMDB transaction has ended, or its end is queued
+            # on the writer thread (a finalizer), and close() ends every
+            # live write itself before closing the environment. close()
+            # calls here while the owner may be inside its commit's slot
+            # release; waiting for that lock would wait on close itself.
             logger.debug("Abort called on closed transaction")
             return
         with self._call_lock:
