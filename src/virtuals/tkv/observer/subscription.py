@@ -177,8 +177,15 @@ class Subscription:
 
         Yields:
             Exceptions raised by receivers (for error handling).
+
+        Iterates a snapshot of the receivers: a receiver that unbinds
+        another one (or itself) mid-wake does not skip or repeat anyone for
+        this wake. A close() from a receiver ends the wake: the remaining
+        receivers are not called.
         """
-        for receiver in self._receivers:
+        for receiver in tuple(self._receivers):
+            if self._closed:
+                return
             try:
                 receiver(key)
             except Exception as e:
