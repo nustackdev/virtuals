@@ -211,6 +211,11 @@ class ListViewBase(
             if child_type == NodeType.PRIMITIVE:
                 child_value = self.container.get_child_primitive(i)
                 self.container.put_child_primitive(i + 1, child_value)
+                if i == address:
+                    # Vacate the slot: a compound value over the stale
+                    # primitive row would trip the kind rule after the
+                    # tail was already shifted.
+                    self.container.delete_child(i)
             elif child_type == NodeType.CONTAINER:
                 self.container.move_child_subtree(i, i + 1)
 
