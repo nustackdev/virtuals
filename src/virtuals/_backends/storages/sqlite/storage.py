@@ -23,6 +23,7 @@ from virtuals.tkv.storage import (
     StorageClosedError,
     StorageError,
     StorageLockTimeoutError,
+    StorageNestedTransactionError,
     TransactionProtocol,
     WriteBatchProtocol,
 )
@@ -112,9 +113,10 @@ class SQLiteStorage:
     task that took it. Coroutines sharing one loop wait for it with
     ``areserve_write_slot``, which polls without blocking the loop, and
     hand the slot to ``begin_transaction(write_slot=...)``. A sync begin
-    on a thread whose own task or loop already holds the slot raises
-    ``StorageLockTimeoutError`` at once instead of waiting: the holder
-    could never run to release it.
+    on a thread whose own task already holds the slot raises
+    ``StorageNestedTransactionError``; one whose loop has another task
+    holding it raises ``StorageLockTimeoutError``. Both fail at once
+    instead of waiting: the holder could never run to release it.
     """
 
     def __init__(
@@ -399,8 +401,10 @@ class SQLiteStorage:
             its ``release`` if no transaction takes it.
 
         Raises:
-            StorageLockTimeoutError: If this task already holds the slot,
-                or it is not free within ``busy_timeout``.
+            StorageNestedTransactionError: If this task already holds the
+                slot.
+            StorageLockTimeoutError: If it is not free within
+                ``busy_timeout``.
         """
         if self._read_only:
             raise StorageError("Cannot reserve the write slot in read only mode.")
@@ -409,7 +413,7 @@ class SQLiteStorage:
 
         me = _caller()
         if self._write_owner == me:
-            raise StorageLockTimeoutError(_REENTRY_MESSAGE)
+            raise StorageNestedTransactionError(_REENTRY_MESSAGE)
         lock = self._write_lock
         deadline = time.monotonic() + max(self._busy_timeout, 0)
         delay = _SLOT_POLL_MIN
@@ -583,15 +587,16 @@ class SQLiteStorage:
         """Block for the writer slot, up to ``busy_timeout``.
 
         Fails at once when the slot is held from this same thread: by this
-        task or thread (a second write transaction would wait on itself),
-        or by another coroutine on this thread's loop, which cannot run to
-        release it while this thread blocks.
+        task or thread with ``StorageNestedTransactionError`` (a second
+        write transaction would wait on itself), or by another coroutine on
+        this thread's loop with ``StorageLockTimeoutError``, since that
+        holder cannot run to release it while this thread blocks.
         """
         me = _caller()
         owner = self._write_owner
         if owner is not None and owner[0] == me[0]:
             if owner == me:
-                raise StorageLockTimeoutError(_REENTRY_MESSAGE)
+                raise StorageNestedTransactionError(_REENTRY_MESSAGE)
             raise StorageLockTimeoutError(
                 "Another task on this thread's event loop holds the write lock on this "
                 "SQLite storage; blocking for it here would stall the loop it needs to "

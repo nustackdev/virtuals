@@ -86,6 +86,17 @@ class StorageLockTimeoutError(StorageTransactionError):
     """
 
 
+class StorageNestedTransactionError(StorageTransactionError):
+    """Write transaction opened inside another on the same storage.
+
+    Raised when a thread or task opens a write transaction (or write
+    batch) on a storage while it already holds one there. The second
+    would wait on the first forever, so this is a programming error: it
+    is raised at once and never retried. Not a subclass of the retryable
+    ``StorageTransactionConflictError`` or ``StorageLockTimeoutError``.
+    """
+
+
 class StorageClosedError(StorageError):
     """Operation attempted on closed resource.
 
@@ -110,6 +121,7 @@ __all__ = [
     "StorageKeyError",
     "StorageLockTimeoutError",
     "StorageLookupError",
+    "StorageNestedTransactionError",
     "StorageOperationError",
     "StorageTransactionAbortedError",
     "StorageTransactionConflictError",
