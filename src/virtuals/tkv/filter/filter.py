@@ -22,6 +22,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from .hints import ALL, RoutingHint, and_hints, or_hints
+
 
 if TYPE_CHECKING:
     from ..types import Key
@@ -108,6 +110,15 @@ class Filter(ABC):
             "Override to_dict() to enable cross-process transport for this filter."
         )
 
+    def routing_hints(self) -> tuple[RoutingHint, ...]:
+        """Coarse routing entries covering at least every key this filter matches.
+
+        Contract: `self.matches(k)` implies `any(h.covers(k) for h in hints)`.
+        `()` means "matches nothing". The default (`ALL`) is safe for custom
+        filters. Call on `canonicalize(f)` so one `filter_hash` gives one hint set.
+        """
+        return ALL
+
     def __and__(self, other: Filter) -> And:
         """Combine with AND logic: self & other."""
         return And(filters=(self, other))
@@ -150,6 +161,10 @@ class PrefixFilter(Filter):
     def to_dict(self) -> dict:
         return {"type": "prefix", "prefix": list(self.prefix)}
 
+    def routing_hints(self) -> tuple[RoutingHint, ...]:
+        """See `Filter.routing_hints`."""
+        return (RoutingHint("prefix", segments=self.prefix),) if self.prefix else ALL
+
 
 @dataclass(frozen=True, slots=True)
 class SuffixFilter(Filter):
@@ -186,6 +201,10 @@ class SuffixFilter(Filter):
     def to_dict(self) -> dict:
         return {"type": "suffix", "suffix": list(self.suffix)}
 
+    def routing_hints(self) -> tuple[RoutingHint, ...]:
+        """See `Filter.routing_hints`."""
+        return (RoutingHint("suffix", segments=self.suffix),) if self.suffix else ALL
+
 
 @dataclass(frozen=True, slots=True)
 class LengthFilter(Filter):
@@ -217,6 +236,10 @@ class LengthFilter(Filter):
 
     def to_dict(self) -> dict:
         return {"type": "length", "length": self.length}
+
+    def routing_hints(self) -> tuple[RoutingHint, ...]:
+        """See `Filter.routing_hints`."""
+        return (RoutingHint("length", length=self.length),) if self.length >= 0 else ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +277,15 @@ class WildcardFilter(Filter):
 
     def to_dict(self) -> dict:
         return {"type": "wildcard", "pattern": list(self.pattern)}
+
+    def routing_hints(self) -> tuple[RoutingHint, ...]:
+        """See `Filter.routing_hints`."""
+        positions = tuple(i for i, p in enumerate(self.pattern) if p != WILDCARD)
+        n = len(self.pattern)
+        if not positions:
+            return (RoutingHint("length", length=n),)
+        segments = tuple(self.pattern[i] for i in positions)
+        return (RoutingHint("wildcard", segments=segments, length=n, positions=positions),)
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +331,10 @@ class And(Filter):
     def to_dict(self) -> dict:
         return {"type": "and", "filters": [f.to_dict() for f in self.filters]}
 
+    def routing_hints(self) -> tuple[RoutingHint, ...]:
+        """See `Filter.routing_hints`."""
+        return and_hints([f.routing_hints() for f in self.filters])
+
 
 @dataclass(frozen=True, slots=True)
 class Or(Filter):
@@ -343,6 +379,10 @@ class Or(Filter):
 
     def to_dict(self) -> dict:
         return {"type": "or", "filters": [f.to_dict() for f in self.filters]}
+
+    def routing_hints(self) -> tuple[RoutingHint, ...]:
+        """See `Filter.routing_hints`."""
+        return or_hints([f.routing_hints() for f in self.filters])
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +439,10 @@ class PassNone(Filter):
 
     def to_dict(self) -> dict:
         return {"type": "pass_none"}
+
+    def routing_hints(self) -> tuple[RoutingHint, ...]:
+        """See `Filter.routing_hints`."""
+        return ()
 
 
 # ---------------------------------------------------------------------------
