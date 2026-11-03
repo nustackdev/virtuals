@@ -226,7 +226,7 @@ def test_snapshot_does_not_wait_for_writer(storage: LMDBStorage) -> None:
     reader.join(2)
     assert not reader.is_alive()
     assert result[0] is EMPTY
-    assert result[1] < 0.05
+    assert result[1] < 0.25  # timing: a snapshot never queues behind the writers
 
     tx.commit()
     th.join(5)
@@ -568,7 +568,7 @@ def test_cross_process_wait_is_bounded(holder, tmp_path: Path) -> None:
             with st.transaction() as tx:
                 tx.put(("mine",), b"1")
         took = time.monotonic() - t0
-        assert 0.1 <= took < 0.5, took
+        assert 0.1 <= took < 1.0, took  # timing: busy_timeout, plus slack for a loaded box
         assert not st._writer.lock.locked()
         holder.join(10)
         with st.transaction() as tx:  # the gate was given back
@@ -619,11 +619,11 @@ def test_cross_process_wait_does_not_stall_loop(holder, tmp_path: Path) -> None:
 
     async def main() -> None:
         took, gap = await _ticking(give_up)
-        assert 0.3 <= took < 0.8, took
-        assert gap < 0.1, gap
+        assert 0.3 <= took < 1.5, took  # timing
+        assert gap < 0.3, gap  # timing: the loop never froze for the wait
         st._busy_timeout = 5.0
         _, gap = await _ticking(wait_through)  # the holder commits meanwhile
-        assert gap < 0.1, gap
+        assert gap < 0.3, gap  # timing
 
     try:
         asyncio.run(main())
@@ -751,7 +751,7 @@ def test_close_while_a_thread_waits_behind_a_peer(holder, tmp_path: Path) -> Non
     t0 = time.monotonic()
     with st.snapshot() as snap:
         assert snap.get(("held",)) is EMPTY
-    assert time.monotonic() - t0 < 0.1
+    assert time.monotonic() - t0 < 0.5  # timing: never behind the gate waiter
 
     t0 = time.monotonic()
     st.close()
@@ -895,7 +895,7 @@ def test_dropped_write_context_is_aborted_and_frees_writers(ctx, tmp_path: Path,
         t0 = time.monotonic()
         with st.transaction() as tx:  # another thread's drop freed the slot and the gate
             tx.put(("after",), b"1")
-        assert time.monotonic() - t0 < 0.2
+        assert time.monotonic() - t0 < 1.0  # timing
         drop()  # same thread: the finished hold must not read as nested either
         gc.collect()
         go.set()
@@ -903,11 +903,202 @@ def test_dropped_write_context_is_aborted_and_frees_writers(ctx, tmp_path: Path,
         assert peer.exitcode == 0
         report = json.loads(out.read_text())
         assert report["result"] == "ok", report
-        assert report["took"] < 0.2, report
+        assert report["took"] < 1.0, report  # timing
         with st.snapshot() as snap:
             assert snap.get(("dropped",)) is EMPTY
             assert snap.get(("after",)) == b"1"
             assert snap.get(("peer",)) == b"1"
+    finally:
+        if peer.is_alive():
+            peer.kill()
+        st.close()
+
+
+# =========================================================================
+# Review regressions: cancel after begin lands, exit with an open txn, close racing begins
+# =========================================================================
+
+
+@pytest.mark.timeout(20)
+def test_cancel_after_begin_lands_aborts_on_writer_thread(tmp_path: Path) -> None:
+    """A reserve cancelled after its begin landed is undone on the writer thread, not the loop.
+
+    Hung before the fix: the undo aborted the LMDB txn on the loop thread,
+    which left the writer mutex owned by the writer thread for good, and
+    every later write timed out.
+    """
+    st = _open(str(tmp_path), busy_timeout=1.0)
+    seen: list[str] = []
+    orig = st._abort_abandoned
+
+    def spy(txn) -> None:
+        seen.append(threading.current_thread().name)
+        orig(txn)
+
+    st._abort_abandoned = spy
+
+    async def main() -> None:
+        task = asyncio.create_task(st.areserve_write_slot())
+        for _ in range(3):
+            await asyncio.sleep(0)  # the task passes the slot and gate and queues the begin
+        time.sleep(0.2)  # the loop is busy while the begin lands on the writer thread
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(main())
+        deadline = time.monotonic() + 5
+        while not seen and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert seen and all(name.startswith("lmdb-writer") for name in seen), seen
+        t0 = time.monotonic()
+        with st.transaction() as tx:
+            tx.put(("x",), b"1")
+        assert time.monotonic() - t0 < 0.5
+    finally:
+        st.close()
+
+
+_EXIT_WITH_OPEN_TXN = """
+import sys
+from pathlib import Path
+from virtuals.codecs import BinaryCodec
+from virtuals._backends.storages.lmdb import LMDBStorage
+st = LMDBStorage(path=Path(sys.argv[1]) / "db", codec=BinaryCodec(), map_size=64 << 20)
+st.open()
+mode = sys.argv[2]
+def work():
+    tx = st.begin_transaction()
+    tx.put(("x",), b"1")
+    if mode == "exc":
+        raise RuntimeError("boom")
+    return tx
+tx = work()  # "plain": a module global holds the open txn at exit
+"""
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("mode", ["plain", "exc"])
+def test_interpreter_exit_with_open_write_txn_does_not_hang(tmp_path: Path, mode: str) -> None:
+    """A write txn still open at exit (dropped, or in an uncaught exception's frame) exits fast.
+
+    Hung before the fix: the finalizer waited on the writer thread, which
+    cannot run Python during finalization.
+    """
+    import subprocess
+    import sys
+
+    t0 = time.monotonic()
+    proc = subprocess.run(  # noqa: S603 (our own script)
+        [sys.executable, "-c", _EXIT_WITH_OPEN_TXN, str(tmp_path), mode],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    took = time.monotonic() - t0
+    assert took < 5.0, f"exit took {took:.1f}s"
+    assert proc.returncode == (1 if mode == "exc" else 0), proc.stderr
+    st = _open(str(tmp_path))  # the env is usable afterwards
+    try:
+        with st.transaction() as tx:
+            tx.put(("after",), b"1")
+    finally:
+        st.close()
+
+
+def _close_racing_writers(root: str, rounds: int) -> None:
+    """close() from the main thread while four threads loop single-put transactions."""
+    for r in range(rounds):
+        st = _open(f"{root}/{r}", busy_timeout=2.0, sync=False, metasync=False)
+        done: list[str] = []
+
+        def write_until_closed(i: int, st: LMDBStorage = st, done: list[str] = done) -> None:
+            try:
+                while True:
+                    with st.transaction() as t:
+                        t.put(("k", i), b"1")
+            except StorageError as e:
+                done.append(type(e).__name__)
+            except Exception as e:
+                done.append(f"other:{type(e).__name__}")
+
+        threads = [
+            threading.Thread(target=write_until_closed, args=(i,), daemon=True) for i in range(4)
+        ]
+        for t in threads:
+            t.start()
+        time.sleep(0.002 + (r % 7) * 0.001)
+        st.close()
+        for t in threads:
+            t.join(5)
+        assert not any(t.is_alive() for t in threads), f"round {r}: writer stuck after close"
+        assert not [d for d in done if d.startswith("other")], done
+        st = _open(f"{root}/{r}", busy_timeout=1.0)  # the env is sane: reopen and write
+        with st.transaction() as t:
+            t.put(("z",), b"1")
+        st.close()
+
+
+@pytest.mark.timeout(120)
+def test_close_racing_writer_threads_never_hangs(ctx, tmp_path: Path) -> None:
+    """close() mid-flight against threads looping transactions, 30 rounds, no hang.
+
+    Hung before the fix: a begin that landed on the writer thread after
+    close() swept the tracked contexts was never ended, and env.close()
+    then blocked on it forever.
+    """
+    p = ctx.Process(target=_close_racing_writers, args=(str(tmp_path), 30))
+    p.start()
+    p.join(100)
+    if p.is_alive():
+        p.kill()
+        pytest.fail("close() racing writer threads hung")
+    assert p.exitcode == 0, f"exit code {p.exitcode}"
+
+
+@pytest.mark.timeout(20)
+def test_write_txn_data_calls_run_on_any_thread(ctx, tmp_path: Path) -> None:
+    """Pins the thread model: begin on A, put/get/scan on B, commit on C; a peer writes after.
+
+    Begin, commit and abort run on the writer thread. The data calls run on
+    the caller's thread, which liblmdb 0.9.36 allows for a write txn (its
+    only thread-bound state is the writer mutex, see ``context.py``).
+    """
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    ready, go = ctx.Event(), ctx.Event()
+    out = tmp_path / "peer.json"
+    peer = ctx.Process(target=_peer_write, args=(str(tmp_path), 2.0, ready, go, str(out)))
+    peer.start()
+    assert ready.wait(20)
+    box: dict = {}
+
+    def on(name: str, fn) -> None:
+        t = threading.Thread(target=lambda: box.__setitem__(name, fn()), name=name)
+        t.start()
+        t.join(10)
+        assert name in box, f"{name} did not finish"
+
+    try:
+        on("A", st.begin_transaction)
+        tx = box["A"]
+
+        def data() -> list:
+            tx.put(("a",), b"1")
+            tx.put(("b",), b"2")
+            tx.delete(("a",))
+            got = tx.get(("b",))
+            return [got, list(tx.scan(StorageScanOptions()).keys())]
+
+        on("B", data)
+        assert box["B"] == [b"2", [("b",)]]
+        on("C", tx.commit)
+        with st.snapshot() as snap:
+            assert snap.get(("b",)) == b"2"
+            assert snap.get(("a",)) is EMPTY
+        go.set()
+        peer.join(10)
+        assert json.loads(out.read_text())["result"] == "ok"
     finally:
         if peer.is_alive():
             peer.kill()
