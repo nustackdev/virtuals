@@ -1457,3 +1457,103 @@ def test_fork_while_this_thread_holds_the_slot_child_writes(storage: InMemorySto
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
     tx.commit()  # the parent's hold was never touched
     assert _get(storage, X) == 2 and _get(storage, Y) is EMPTY
+
+
+# =============================================================================
+# Round 2: contexts racing close, bounded history under a snapshot
+# =============================================================================
+
+
+def test_snapshot_racing_close_and_reopen_does_not_read_the_new_store(storage) -> None:
+    """A snapshot pinned before close() and registered after it is refused, not left open.
+
+    Without the check it would stay open, unseen by close, and read the
+    reopened store (a different generation) through its old sequence.
+    """
+    _put(storage, ("k",), "old")
+    store = storage._store
+    real_pin = store.pin
+    pinned, go = threading.Event(), threading.Event()
+
+    def slow_pin():
+        token = real_pin()
+        pinned.set()
+        go.wait(5)
+        return token
+
+    store.pin = slow_pin
+    box: dict = {}
+
+    def reader() -> None:
+        try:
+            box["snap"] = storage.begin_snapshot()
+        except BaseException as e:
+            box["err"] = e
+
+    th = threading.Thread(target=reader)
+    th.start()
+    assert pinned.wait(5)
+    storage.close()
+    storage.open()
+    del store.pin
+    _put(storage, ("k",), "new")
+    go.set()
+    th.join(5)
+    assert isinstance(box.get("err"), StorageClosedError), box
+    assert not storage._store._pins, "a pin from before the close survived into the new store"
+    assert not storage._active_snapshots
+
+
+def test_transaction_racing_close_and_reopen_does_not_run_slotless(storage) -> None:
+    """A transaction that took the slot before close() and registers after it is refused.
+
+    close() released that slot on its behalf; registered in the reopened
+    storage it would run with no slot held next to the next writer.
+    """
+    from virtuals._backends.storages._write_slot import WriterLock
+
+    real_take = WriterLock.take_slot
+    fired = []
+
+    def take_then_reopen(self, *args, **kwargs):
+        result = real_take(self, *args, **kwargs)
+        if self is storage._writer and not fired:
+            fired.append(True)
+            _in_thread(lambda: (storage.close(), storage.open()))
+        return result
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(WriterLock, "take_slot", take_then_reopen)
+        with pytest.raises(StorageClosedError):
+            storage.begin_transaction()
+    assert fired
+    assert not storage._writer.lock.locked()
+    assert not storage._active_transactions
+    t0 = time.monotonic()
+    _put(storage, ("k",), 1)
+    assert time.monotonic() - t0 < 0.5
+
+
+def test_history_under_one_snapshot_is_bounded_by_keys_not_commits(storage) -> None:
+    """One open snapshot: repeated commits to the same keys keep one version each, not one per commit."""
+    for i in range(10):
+        _put(storage, ("k", i), 0)
+    with storage.snapshot() as snap:
+        for n in range(1, 501):
+            with storage.transaction() as t:
+                for i in range(10):
+                    t.put(("k", i), n)
+        store = storage._store
+        assert len(store._undo_log) == 10, len(store._undo_log)
+        assert all(len(v) == 1 for v in store._history.values())
+        assert all(snap.get(("k", i)) == 0 for i in range(10))
+        # A newer snapshot needs its own version of each key from the next commit on.
+        with storage.snapshot() as later:
+            with storage.transaction() as t:
+                for i in range(10):
+                    t.put(("k", i), -1)
+            assert len(store._undo_log) == 20
+            assert all(later.get(("k", i)) == 500 for i in range(10))
+            assert all(snap.get(("k", i)) == 0 for i in range(10))
+    assert not storage._store._undo_log
+    assert _get(storage, ("k", 3)) == -1

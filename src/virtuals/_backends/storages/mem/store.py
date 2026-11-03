@@ -7,12 +7,18 @@ reader never sees half of it.
 
 Snapshots are multi-version reads over an undo log. A commit sequence
 number advances on every commit; a snapshot pins the sequence it opened
-at. While any snapshot is open, each commit records, per key it touches,
-the value that key had before the commit (or ABSENT). A snapshot pinned at
-``p`` reads a key as the oldest recorded version written by a commit after
-``p``, or the live value when there is none. Nothing is copied on begin,
-and nothing is recorded when no snapshot is open. When the oldest snapshot
-closes, every recorded version no open snapshot can need is dropped.
+at. While any snapshot is open, a commit records, per key it touches, the
+value that key had before the commit (or ABSENT), but only when some open
+snapshot still reads that key live: once a version is recorded for a key
+at commit ``c``, every snapshot pinned before ``c`` reads that version,
+and later commits to the key need not record anything until a snapshot
+pinned at or after ``c`` exists. So history is bounded by the number of
+keys written per open pin, not by the number of commits. A snapshot
+pinned at ``p`` reads a key as the oldest recorded version written by a
+commit after ``p``, or the live value when there is none. Nothing is
+copied on begin, and nothing is recorded when no snapshot is open. When
+the oldest snapshot closes, every recorded version no open snapshot can
+need is dropped.
 
 Scans are served in pages: a page is a slice of the live index merged with
 the overlay that applies (recorded versions for a snapshot, pending writes
@@ -336,7 +342,10 @@ class VersionedStore:
                 self._trim()
             seq = self._seq + 1
             live, index = self._live, self._index
-            record = bool(self._pins)
+            # The newest pin: a key whose last recorded version is older
+            # than it is still read live by that pin, so this commit must
+            # record the value it overwrites. Pins are kept in seq order.
+            newest_pin = next(reversed(self._pins)) if self._pins else None
             history, history_index, log = self._history, self._history_index, self._undo_log
             done: list[tuple[Encoded, Any]] = []  # (enc, previous entry) for undo
             recorded = 0
@@ -354,13 +363,15 @@ class VersionedStore:
                             index.add(enc)  # the only call here that can fail; nothing changed yet
                         live[enc] = (key, value)
                     done.append((enc, old))
-                    if record:
+                    if newest_pin is not None:
                         entries = history.get(enc)
                         if entries is None:
                             history_index.add(enc)  # may raise; must come before the record
                             history[enc] = [(seq, old)]
-                        else:
+                        elif entries[-1][0] <= newest_pin:
                             entries.append((seq, old))
+                        else:
+                            continue  # every open pin already reads an older version
                         log.append((seq, enc))
                         recorded += 1
             except BaseException:
