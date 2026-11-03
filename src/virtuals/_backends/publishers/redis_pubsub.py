@@ -62,8 +62,9 @@ __all__ = [
 
 
 # Keys per nu1_route call. Bounds one server-side script run (valkey is
-# single threaded) and the argument count of one call.
-MAX_KEYS_PER_CALL: int = 1000
+# single threaded, a 250-key call holds it about 3 ms at most) and the
+# argument count of one call.
+MAX_KEYS_PER_CALL: int = 250
 
 
 class RedisPublisher(PublisherBase):
