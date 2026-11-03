@@ -133,20 +133,37 @@ def _watch(pair, f, got: list):
 # =============================================================================
 
 
-def test_s5_wake_follows_the_commit(notifying_storage, pair):
-    """A receiver woken by a change reads that commit or a later one."""
+def test_s5_wake_follows_the_commit(notifying_storage, pair, monkeypatch):
+    """A receiver woken by a change reads that commit or a later one.
+
+    The writer is held inside the publisher's notify() until the wake has
+    been delivered and the receiver has read from its own snapshot. So a
+    notify issued before the commit lands is read as the old value every
+    time, on every backend, not only when the worker happens to win a race.
+    """
     st = notifying_storage
     seen: list = []
+    read = threading.Event()
 
     def on_wake(key):
-        with st.snapshot() as sn:
-            seen.append((key, sn.get(("n", "k"))))
+        if key != ("n", "k"):
+            return
+        with st.snapshot() as sn:  # a reader of its own: never the writer's view
+            seen.append(sn.get(("n", "k")))
+        read.set()
 
     pair.observer.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("n",)))).bind(on_wake)
+    real_notify = pair.publisher.notify
+
+    def notify_and_wait_for_the_reader(keys):
+        real_notify(keys)
+        read.wait(WAKE)
+
+    monkeypatch.setattr(pair.publisher, "notify", notify_and_wait_for_the_reader)
     with st.transaction() as t:
         t.put(("n", "k"), 1)
-    assert _wait_until(lambda: any(k == ("n", "k") for k, _ in seen))
-    assert all(v == 1 for k, v in seen if k == ("n", "k")), seen
+    assert read.is_set(), "no wake for the commit"
+    assert seen == [1], f"the wake read {seen}, not the commit"
 
 
 def test_s5_nothing_on_rollback(notifying_storage, pair):
@@ -223,6 +240,7 @@ def test_s5_subscribe_ready_on_return(notifying_storage, pair):
 
 
 def test_s5_watch_covers_the_subtree(notifying_storage, pair):
+    """A hand-built prefix watch sees every row under the address and no sibling."""
     st = notifying_storage
     got: list = []
     _watch(pair, PrefixFilter(prefix=("t", "a")), got)
@@ -238,6 +256,54 @@ def test_s5_watch_covers_the_subtree(notifying_storage, pair):
     pair.settle()
     time.sleep(QUIET)
     assert ("t", "ab") not in got and ("t",) not in got
+
+
+DICT_VIEWS = ("dict", "log_indexed", "fractional")
+
+
+def _dict_view_class(kind: str):
+    from virtuals._views import (
+        EagerDictView,
+        EagerFractionalIndexedDictView,
+        EagerLogIndexedDictView,
+    )
+
+    return {
+        "dict": EagerDictView,
+        "log_indexed": EagerLogIndexedDictView,
+        "fractional": EagerFractionalIndexedDictView,
+    }[kind]
+
+
+@pytest.mark.parametrize("kind", DICT_VIEWS)
+def test_s5_untyped_child_watch_covers_the_child_subtree(notifying_storage, pair, kind):
+    """The watch a view builds for an untyped child address fires on a write
+    deep inside the compound value stored there, and not on a sibling."""
+    from virtuals._views import EagerDictView
+    from virtuals.navigator import Navigator
+
+    st = notifying_storage
+    cls = _dict_view_class(kind)
+    with st.transaction() as tx:
+        doc = Navigator(st).root(tx).open_child("doc", cls)
+        doc["a"] = {"deep": 1, "deeper": {"still": 2}}
+        doc["ab"] = 3  # a sibling whose name only starts the same
+        options = doc.on_child_change("a")
+    pair.settle()  # the setup writes are delivered before anyone watches
+    got: list = []
+    pair.observer.subscribe(options).bind(got.append)
+
+    with st.transaction() as tx:
+        a = Navigator(st).root(tx).open_child("doc", cls).open_child("a", EagerDictView)
+        a["deep"] = 10
+        a.open_child("deeper", EagerDictView)["still"] = 20
+    assert _wait_until(lambda: any(k[-2:] == ("deeper", "still") for k in got)), got
+    assert any(k[-1] == "deep" for k in got), got
+    with st.transaction() as tx:
+        Navigator(st).root(tx).open_child("doc", cls)["ab"] = 4
+    pair.settle()
+    time.sleep(QUIET)
+    assert all("ab" not in k for k in got), got
 
 
 # =============================================================================
