@@ -1,8 +1,16 @@
-"""The in-process writer slot shared by single-writer storages (SQLite, LMDB).
+"""The in-process writer slot shared by single-writer storages.
 
-Both backends allow one write transaction per database at a time. Writers
-in one process queue on this slot before they reach the backend, so threads
-hand off directly and coroutines wait without blocking their event loop.
+SQLite, LMDB, RocksDB and the in-memory storage allow one write transaction
+per database at a time. Writers in one process queue on this slot before
+they reach the backend, so threads hand off directly and coroutines wait
+without blocking their event loop.
+
+Lifecycle: a storage's ``close()`` calls ``WriterLock.close()``, which
+replaces the slot. Nothing reserved or taken before survives into a
+reopen: a waiter wakes with ``StorageClosedError``, a ``WriteSlot`` from
+before refuses to be taken, and a late release from an old holder touches
+nothing. A forked child calls ``reset()`` instead, which replaces every
+lock without touching the inherited ones.
 """
 
 from __future__ import annotations
@@ -15,6 +23,7 @@ import weakref
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from virtuals.tkv.storage import (
+    StorageClosedError,
     StorageError,
     StorageLockTimeoutError,
     StorageNestedTransactionError,
@@ -25,12 +34,19 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-__all__ = ["WriteSlot", "WriterLock"]
+__all__ = ["LOOP_THREAD_WAIT_CAP", "WriteSlot", "WriterLock"]
 
 
 # Poll interval bounds for a coroutine waiting on the writer slot (seconds).
 _SLOT_POLL_MIN = 0.0005
 _SLOT_POLL_MAX = 0.005
+
+# The most a sync ``acquire`` on an event loop thread blocks for a slot a
+# thread holds (seconds). Long enough to absorb a short transaction on the
+# other thread, short enough that the loop is not stalled in practice.
+LOOP_THREAD_WAIT_CAP = 0.05
+
+_CLOSED_WHILE_WAITING = "Storage was closed while waiting for the write lock"
 
 _Owner = tuple[int, "weakref.ref[asyncio.Task] | None"]
 
@@ -78,6 +94,8 @@ def _caller() -> _Owner:
 
 
 class _SlotStorage(Protocol):
+    _writer: WriterLock
+
     def _release_write_slot(self, lock: threading.Lock | None = None) -> None: ...
 
 
@@ -96,9 +114,13 @@ class WriterLock:
     ``run_in_executor`` runs jobs in the worker's own context, so a
     transaction begun by a plain ``acquire`` in such a job and left open
     after it returns marks that worker until it ends.
+
+    The owner record and the lock move together under ``_guard``, so a
+    ``close`` racing an acquire or a release never leaves an owner on a
+    free lock or a holder on a lock that is no longer the slot.
     """
 
-    __slots__ = ("_hold", "_label", "_lock", "_owner")
+    __slots__ = ("_guard", "_hold", "_label", "_lock", "_owner")
 
     def __init__(self, label: str) -> None:
         """Initialize a free slot.
@@ -107,20 +129,48 @@ class WriterLock:
             label: Backend name used in error messages, e.g. ``"SQLite"``.
         """
         self._label = label
+        # Reentrant: a finalizer that releases a slot may run inside one of
+        # these sections, on the same thread, when a collection is triggered
+        # there.
+        self._guard = threading.RLock()
         self._lock = threading.Lock()
         self._owner: _Owner | None = None
         self._hold: _Hold | None = None
 
     @property
     def lock(self) -> threading.Lock:
-        """The current underlying lock (replaced by ``reset``)."""
+        """The current underlying lock (replaced by ``close`` and ``reset``)."""
         return self._lock
 
     def reset(self) -> None:
-        """Forget any holder, e.g. in a forked child where it can never release."""
+        """Forget any holder, e.g. in a forked child where it can never release.
+
+        Takes no lock: the inherited ones may be held by threads that do
+        not exist in this process. Every lock is replaced.
+        """
+        self._guard = threading.RLock()
         self._lock = threading.Lock()
         self._owner = None
         self._hold = None
+
+    def close(self) -> None:
+        """Replace the slot, so nothing reserved or taken before survives a reopen.
+
+        Called by the storage's ``close`` after it ended its contexts. A
+        recorded holder still there (a reserved slot no transaction took, or
+        a context finishing on another thread) loses the slot: its lock is
+        released here on its behalf, so a writer blocked on it wakes at
+        once instead of waiting out ``busy_timeout``, and the holder's own
+        release is a no-op from now on. Whoever acquires the old lock sees
+        it is not the slot any more and raises ``StorageClosedError``.
+        """
+        with self._guard:
+            old, self._lock = self._lock, threading.Lock()
+            had_owner = self._owner is not None
+            self._owner = None
+            self._hold = None
+            if had_owner:
+                old.release()
 
     def _is_nested(self, me: _Owner) -> bool:
         """True if ``me`` can never get the slot because it already holds it.
@@ -137,12 +187,20 @@ class WriterLock:
             return False
         return me[1] is None or owner[1] == me[1] or (owner[1] is None and owner[0] == me[0])
 
-    def _held_by(self, me: _Owner) -> None:
-        """Record ``me`` as the owner of a fresh hold, marked in this context."""
+    def _held_by(self, me: _Owner, lock: threading.Lock) -> bool:
+        """Record ``me`` as the owner of a fresh hold on ``lock``, marked in this context.
+
+        Returns False, recording nothing, when ``lock`` is no longer the
+        slot: ``close`` replaced it while the caller waited on it.
+        """
         hold = _Hold(self)
-        self._owner = me
-        self._hold = hold
+        with self._guard:
+            if lock is not self._lock:
+                return False
+            self._owner = me
+            self._hold = hold
         _mark_held(hold)
+        return True
 
     def _nested(self) -> StorageNestedTransactionError:
         return StorageNestedTransactionError(
@@ -150,8 +208,21 @@ class WriterLock:
             "storage; a second write transaction here would wait on itself"
         )
 
-    def _timed_out(self, timeout: float) -> StorageLockTimeoutError:
-        return StorageLockTimeoutError(f"Timed out after {timeout}s waiting for the write lock")
+    def _timed_out(self, timeout: float, *, on_loop: bool = False) -> StorageLockTimeoutError:
+        message = f"Timed out after {timeout}s waiting for the write lock"
+        if on_loop:
+            message += (
+                f" on an event loop thread, where a sync begin waits at most "
+                f"{LOOP_THREAD_WAIT_CAP}s so the loop is not stalled. Wait for the slot "
+                "with areserve_write_slot instead"
+            )
+        owner = self._owner
+        if owner is not None and owner[1] is not None and owner[1]() is None:
+            message += (
+                "; the slot is held by a task that has ended without releasing it "
+                "(a reserved slot that no transaction took and nothing released)"
+            )
+        return StorageLockTimeoutError(message)
 
     def acquire(self, timeout: float) -> None:
         """Block for the slot, up to ``timeout`` seconds.
@@ -160,21 +231,38 @@ class WriterLock:
         below the current holder (see ``_is_nested``), and with
         ``StorageLockTimeoutError`` when another task on this thread's loop
         holds it, since that holder cannot run to release it while this
-        thread blocks.
+        thread blocks. On an event loop thread the wait for a holder on
+        another thread is capped at ``LOOP_THREAD_WAIT_CAP`` (contract
+        section 4: a wait on the loop is bounded and surfaced), so a sync
+        begin or batch write from a coroutine never stalls the loop for
+        long; a longer wait belongs in ``areserve``.
+
+        Raises ``StorageClosedError`` if the storage closed while waiting.
         """
         me = _caller()
         if self._is_nested(me):
             raise self._nested()
         owner = self._owner
-        if owner is not None and owner[0] == me[0] and owner[1] is not None:
+        if (
+            owner is not None
+            and owner[0] == me[0]
+            and owner[1] is not None
+            and owner[1]() is not None
+        ):
             raise StorageLockTimeoutError(
                 f"Another task on this thread's event loop holds the write lock on this "
                 f"{self._label} storage; blocking for it here would stall the loop it "
                 "needs to finish. Wait for the slot with areserve_write_slot instead"
             )
-        if not self._lock.acquire(timeout=max(timeout, 0)):
-            raise self._timed_out(timeout)
-        self._held_by(me)
+        on_loop = asyncio._get_running_loop() is not None
+        if on_loop:
+            timeout = min(timeout, LOOP_THREAD_WAIT_CAP)
+        lock = self._lock
+        if not lock.acquire(timeout=max(timeout, 0)):
+            raise self._timed_out(timeout, on_loop=on_loop)
+        if not self._held_by(me, lock):
+            lock.release()
+            raise StorageClosedError(_CLOSED_WHILE_WAITING)
 
     async def areserve(self, timeout: float) -> threading.Lock:
         """Wait for the slot without blocking the event loop.
@@ -183,7 +271,8 @@ class WriterLock:
         on the loop keep running, including the one that holds it. Waits
         behind other threads too. Cancelled while waiting, it holds nothing:
         the lock is only ever taken by a non-blocking try, and nothing is
-        awaited between taking it and returning.
+        awaited between taking it and returning. Raises
+        ``StorageClosedError`` if the storage closed while waiting.
 
         Returns:
             The lock acquired, to hand to a ``WriteSlot``.
@@ -200,7 +289,9 @@ class WriterLock:
                 raise self._timed_out(timeout)
             await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, _SLOT_POLL_MAX)
-        self._held_by(me)
+        if not self._held_by(me, lock):
+            lock.release()
+            raise StorageClosedError(_CLOSED_WHILE_WAITING)
         return lock
 
     def release(self, lock: threading.Lock | None = None) -> None:
@@ -208,14 +299,15 @@ class WriterLock:
 
         Args:
             lock: The lock the caller acquired, if known. Nothing is
-                released when it is no longer the current lock (a fork
-                reset the slot since).
+                released when it is no longer the current lock (a close
+                or a fork replaced the slot since).
         """
-        if lock is not None and lock is not self._lock:
-            return
-        self._owner = None
-        self._hold = None
-        self._lock.release()
+        with self._guard:
+            if lock is not None and lock is not self._lock:
+                return
+            self._owner = None
+            self._hold = None
+            self._lock.release()
 
     def take(
         self, storage: object, write_slot: WriteSlot | None, timeout: float
@@ -229,7 +321,8 @@ class WriterLock:
         hold keeps the mark of the context that reserved it, which a
         ``to_thread`` worker or a task spawned there carries; a taker that
         is a task is marked too. A plain thread taker is not, since its
-        context may be a pool worker's own, shared with unrelated jobs.
+        context may be a pool worker's own, shared with unrelated jobs. A
+        slot from before a close or a fork is refused (``StorageError``).
         Otherwise it is acquired, waiting up to ``timeout``.
 
         Returns:
@@ -238,16 +331,19 @@ class WriterLock:
             ``write_slot``'s holder.
         """
         if write_slot is not None:
-            write_slot._take(storage)
-            previous = self._owner
-            me = _caller()
-            self._owner = me
-            if me[1] is not None and self._hold is not None:
-                _mark_held(self._hold)
+            with self._guard:
+                write_slot._take(storage)
+                previous = self._owner
+                me = _caller()
+                self._owner = me
+                hold = self._hold
+            if me[1] is not None and hold is not None:
+                _mark_held(hold)
 
             def give_back() -> None:
-                self._owner = previous
-                write_slot._give_back()
+                with self._guard:
+                    self._owner = previous
+                    write_slot._give_back()
 
             return give_back
         self.acquire(timeout)
@@ -283,8 +379,8 @@ class WriteSlot:
 
         Args:
             storage: The storage whose writer slot this is.
-            lock: The writer lock acquired for it. Kept so a slot taken
-                before a fork never releases the child's fresh lock.
+            lock: The writer lock acquired for it. Kept so a slot from
+                before a close or a fork never releases the fresh lock.
         """
         self._storage = storage
         self._lock = lock
@@ -318,11 +414,19 @@ class WriteSlot:
             pass
 
     def _take(self, storage: object) -> None:
-        """Hand the slot to a transaction being begun on ``storage``."""
+        """Hand the slot to a transaction being begun on ``storage``.
+
+        A slot reserved before the storage was closed (or before a fork)
+        holds nothing any more: it is marked released and refused, so the
+        transaction never starts on a slot it does not hold.
+        """
         if storage is not self._storage:
             raise StorageError("Write slot belongs to a different storage")
         if self._state != "held":
             raise StorageError(f"Write slot is already {self._state}")
+        if self._lock is not self._storage._writer.lock:
+            self._state = "released"
+            raise StorageError("Write slot is stale: the storage was closed after it was reserved")
         self._state = "taken"
 
     def _give_back(self) -> None:
