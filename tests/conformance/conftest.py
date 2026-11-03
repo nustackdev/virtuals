@@ -10,11 +10,18 @@ import pytest
 
 from tests.conformance.backends import BACKENDS, BackendSpec
 from tests.conformance.known_failures import KNOWN_FAILURES
+from tests.support.valkey import redis_url_or_private
 
 
 @pytest.fixture(params=list(BACKENDS), ids=list(BACKENDS))
 def backend(request) -> BackendSpec:
     return BACKENDS[request.param]
+
+
+@pytest.fixture(scope="session")
+def redis_url(tmp_path_factory: pytest.TempPathFactory):
+    """Section 5 over the redis transport: TEST_REDIS_URL, else a private valkey."""
+    yield from redis_url_or_private(tmp_path_factory)
 
 
 @pytest.fixture
