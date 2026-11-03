@@ -314,3 +314,76 @@ def test_retry_delivers_when_server_comes_back(own_valkey):
         pub.disconnect()
         if s is not None:
             s.close()
+
+
+# =============================================================================
+# Drain on disconnect, drop counting
+# =============================================================================
+
+
+class _Slow(PublisherBase):
+    def __init__(self, delay: float = 0.2, fail: bool = False, **kw) -> None:
+        super().__init__(**kw)
+        self.delay = delay
+        self.fail = fail
+        self.sent: list = []
+
+    def _publish_batch(self, batch) -> None:
+        time.sleep(self.delay)
+        if self.fail:
+            raise ConnectionError("down")
+        self.sent.extend(batch)
+
+
+def test_disconnect_publishes_keys_queued_behind_inflight_batch():
+    """Keys queued while a batch is in flight are published, not lost, at stop."""
+    p = _Slow()
+    p.connect()
+    p.notify(("a",))
+    time.sleep(0.05)  # worker is inside the slow publish of ("a",)
+    p.notify([("b",), ("c",)])
+    p.disconnect()
+    assert sorted(p.sent) == [("a",), ("b",), ("c",)]
+    assert p.dropped_keys == 0
+    p.flush()  # nothing surfaced
+
+
+def test_disconnect_records_keys_it_cannot_publish():
+    """A failing transport at stop: one attempt per chunk, then counted and surfaced."""
+    p = _Slow(delay=0.05, fail=True, publish_retry_seconds=30)
+    p.connect()
+    p.notify(("a",))
+    time.sleep(0.02)
+    p.notify([("b",), ("c",)])
+    t0 = time.monotonic()
+    p.disconnect()
+    assert time.monotonic() - t0 < 5  # the retry window is cut short at stop
+    assert p.dropped_keys == 3
+    with pytest.raises(PublisherOperationError):
+        p.flush()
+
+
+@pytest.mark.redis
+def test_unroutable_key_counted_once_across_retries(redis_url, prefix, sub):
+    """Encoding runs once per chunk: retries do not re-record unroutable keys."""
+    h = sub.reg(PassAll())
+    pub = _make_publisher(redis_url, prefix)
+    real = pub._lua.call
+    calls = [0]
+
+    def flaky(*a):
+        calls[0] += 1
+        if calls[0] <= 3:
+            raise redis.ConnectionError("blip")
+        return real(*a)
+
+    pub._lua.call = flaky
+    try:
+        pub.notify([("ok",), ("bad", 1.5)])
+        with pytest.raises(PublisherOperationError):
+            pub.flush(timeout=3)
+        assert calls[0] == 4
+        assert pub.dropped_keys == 1
+        assert sub.read() == [(h, {"iid": pub._instance_id, "keys": [["ok"]]})]
+    finally:
+        pub.disconnect()
