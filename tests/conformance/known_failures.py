@@ -35,9 +35,6 @@ DROPPED_TXN = (
 
 # case name -> backend (or "backend-param" for one parametrization) -> (strict, reason)
 KNOWN_FAILURES: dict[str, dict[str, tuple[bool, str]]] = {
-    "test_s3_cross_process_contention_raises_retryable": {
-        "lmdb": (True, LMDB_XPROC),
-    },
     "test_s1_dropped_transaction_frees_slot": {
         "lmdb": (True, DROPPED_TXN.format(owner="P1 lmdb")),
     },

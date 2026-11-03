@@ -7,10 +7,13 @@ queueing on it, bounded waits, and snapshots never waiting behind a writer.
 from __future__ import annotations
 
 import asyncio
+import gc
+import json
+import multiprocessing as mp
 import os
 import threading
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
@@ -18,15 +21,16 @@ from tests._backends.storages import _write_slot_cases as cases
 from virtuals._backends.storages.lmdb import LMDBStorage, LMDBWriteSlot
 from virtuals.codecs import BinaryCodec
 from virtuals.tkv.storage import (
+    StorageClosedError,
     StorageError,
     StorageLockTimeoutError,
     StorageNestedTransactionError,
+    StorageScanOptions,
 )
 from virtuals.tkv.types import EMPTY
 
 
-if TYPE_CHECKING:
-    from pathlib import Path
+MAP = 64 * 1024 * 1024
 
 
 @pytest.fixture
@@ -269,7 +273,8 @@ def test_asyncio_run_inside_sync_txn_is_nested(storage: LMDBStorage) -> None:
 @pytest.mark.timeout(10)
 def test_racing_ends_release_slot_once(storage: LMDBStorage) -> None:
     tx = storage.begin_transaction()
-    tx._lmdb_txn.abort()  # end LMDB's side once; the race is in giving back the slot
+    # End LMDB's side once, on the thread that began it; the race is in giving back the slot.
+    storage._writer_thread.run(tx._lmdb_txn.abort)
     cases.racing_ends_release_once(storage, tx, lambda t: t._mark_closed(), "_holds_write_slot")
 
 
@@ -387,14 +392,15 @@ def test_spawned_task_waits(storage: LMDBStorage) -> None:
     cases.spawned_task_waits(storage)
 
 
-class _AbortDuringCommit:
-    """Wraps an LMDB write txn so ``fn`` runs inside commit, before LMDB's own."""
+class _SignalInsideCommit:
+    """Wraps an LMDB write txn so ``inside`` is set while its commit runs."""
 
-    def __init__(self, txn, fn) -> None:
-        self._txn, self._fn = txn, fn
+    def __init__(self, txn, inside: threading.Event) -> None:
+        self._txn, self._inside = txn, inside
 
     def commit(self) -> None:
-        self._fn()
+        self._inside.set()
+        time.sleep(0.1)
         self._txn.commit()
 
     def __getattr__(self, name: str):
@@ -403,16 +409,462 @@ class _AbortDuringCommit:
 
 @pytest.mark.timeout(10)
 @pytest.mark.parametrize("ctx", ["transaction", "write_batch"])
-def test_close_during_commit_keeps_one_outcome(storage: LMDBStorage, ctx: str) -> None:
+def test_abort_racing_commit_keeps_one_outcome(storage: LMDBStorage, ctx: str) -> None:
+    """An abort from another thread while the owner commits waits, then is a no-op."""
     tx = storage.begin_transaction() if ctx == "transaction" else storage.begin_write_batch()
+    tx.put(("k",), b"committed")
+    inside = threading.Event()
+    tx._lmdb_txn = _SignalInsideCommit(tx._lmdb_txn, inside)
+    errors: list[BaseException] = []
 
-    def during_commit(fn) -> None:
-        tx._lmdb_txn = _AbortDuringCommit(tx._lmdb_txn, fn)
+    def abort_from_elsewhere() -> None:
+        inside.wait(5)
+        try:
+            tx.abort()
+        except BaseException as e:
+            errors.append(e)
 
+    t = threading.Thread(target=abort_from_elsewhere)
+    t.start()
     if ctx == "transaction":
-        cases.close_during_commit_keeps_one_outcome(storage, tx, during_commit)
-        return
-    tx.put(("k",), b"1")
-    during_commit(tx.abort)
-    tx.write()
-    assert (tx._written, tx._aborted) == (True, False)
+        tx.commit()
+        assert (tx._committed, tx._aborted) == (True, False)
+    else:
+        tx.write()
+        assert (tx._written, tx._aborted) == (True, False)
+    t.join(5)
+    assert not errors, errors
+    with storage.snapshot() as snap:
+        assert snap.get(("k",)) == b"committed"
+    storage.begin_transaction().commit()
+
+
+# =========================================================================
+# Cross-process: bounded waits, thread-safe ends, close, readers, map growth
+# =========================================================================
+
+
+def _open(root: str, **kw) -> LMDBStorage:
+    kw.setdefault("map_size", MAP)
+    st = LMDBStorage(path=Path(root) / "db", codec=BinaryCodec(), **kw)
+    st.open()
+    return st
+
+
+# Spawn targets: module level so the child can import them.
+def _hold_write(root: str, hold: float, started, **kw) -> None:
+    st = _open(root, **kw)
+    tx = st.begin_transaction()
+    tx.put(("held",), b"1")
+    started.set()
+    time.sleep(hold)
+    tx.commit()
+    st.close()
+
+
+def _peer_write(root: str, busy_timeout: float, ready, go, out: str) -> None:
+    """Open now, write when told, report how it went."""
+    st = _open(root, busy_timeout=busy_timeout)
+    ready.set()
+    go.wait(30)
+    t0 = time.monotonic()
+    try:
+        with st.transaction() as tx:
+            tx.put(("peer",), b"1")
+        result = "ok"
+    except Exception as e:
+        result = type(e).__name__
+    took = time.monotonic() - t0
+    st.close()
+    Path(out).write_text(json.dumps({"result": result, "took": took}))
+
+
+def _die_holding_readers(root: str, n: int, max_readers: int) -> None:
+    st = _open(root, max_readers=max_readers)
+    snaps = [st.begin_snapshot() for _ in range(n)]
+    assert len(snaps) == n
+    os._exit(0)  # reader slots stay registered
+
+
+def _grow_map(root: str, map_size: int, nbytes: int) -> None:
+    st = _open(root, map_size=map_size)
+    with st.transaction() as tx:
+        for i in range(nbytes // 65536):
+            tx.put(("blob", i), os.urandom(65536))
+    st.close()
+
+
+def _busy_owner(st: LMDBStorage, go: threading.Event, result: list[str]) -> None:
+    ctx = st.begin_transaction()
+    go.set()
+    try:
+        for r in range(20000):
+            ctx.put(("w", r), b"x")
+            ctx.get(("k", r % 300))
+            if r % 20 == 0:
+                list(ctx.scan(StorageScanOptions(limit=40)).keys())
+        result.append("finished")
+    except StorageClosedError:
+        result.append("closed")
+    except Exception as e:
+        result.append(type(e).__name__)
+
+
+def _close_while_scanning(root: str, rounds: int) -> None:
+    """close() from the main thread while a worker is inside cursor calls on a write txn."""
+    outcomes: dict[str, int] = {}
+    for i in range(rounds):
+        st = _open(f"{root}/{i}", busy_timeout=2.0)
+        with st.transaction() as tx:
+            for k in range(300):
+                tx.put(("k", k), b"v" * 50)
+        go = threading.Event()
+        result: list[str] = []
+        th = threading.Thread(target=_busy_owner, args=(st, go, result), daemon=True)
+        th.start()
+        go.wait()
+        time.sleep(0.0005 * (i % 7))
+        st.close()
+        th.join(10)
+        key = result[0] if result else "hung"
+        outcomes[key] = outcomes.get(key, 0) + 1
+        st = _open(f"{root}/{i}")  # the env is usable again
+        st.begin_transaction().commit()
+        st.close()
+    assert set(outcomes) <= {"closed", "finished"}, outcomes
+    assert "closed" in outcomes, outcomes
+
+
+def _wait_pid(pid: int) -> int:
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status)
+
+
+@pytest.fixture
+def ctx():
+    return mp.get_context("spawn")
+
+
+@pytest.fixture
+def holder(ctx, tmp_path: Path):
+    """A spawned process holding a write transaction on ``tmp_path`` for 1.5s."""
+    started = ctx.Event()
+    p = ctx.Process(target=_hold_write, args=(str(tmp_path), 1.5, started))
+    p.start()
+    assert started.wait(20)
+    yield p
+    p.join(10)
+    if p.is_alive():
+        p.kill()
+
+
+@pytest.mark.timeout(20)
+def test_cross_process_wait_is_bounded(holder, tmp_path: Path) -> None:
+    """A sync writer behind another process gives up at busy_timeout with the retryable error."""
+    st = _open(str(tmp_path), busy_timeout=0.1)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(StorageLockTimeoutError, match="another process"):
+            with st.transaction() as tx:
+                tx.put(("mine",), b"1")
+        took = time.monotonic() - t0
+        assert 0.1 <= took < 0.5, took
+        assert not st._writer.lock.locked()
+        holder.join(10)
+        with st.transaction() as tx:  # the gate was given back
+            tx.put(("mine",), b"1")
+        with st.snapshot() as snap:
+            assert snap.get(("held",)) == b"1"
+            assert snap.get(("mine",)) == b"1"
+    finally:
+        st.close()
+
+
+async def _ticking(body, tick: float = 0.005):
+    """Run ``body`` beside a ticker; return (result, largest gap between ticks)."""
+    gaps: list[float] = []
+    last = time.perf_counter()
+
+    async def ticker() -> None:
+        nonlocal last
+        while True:
+            await asyncio.sleep(tick)
+            now = time.perf_counter()
+            gaps.append(now - last)
+            last = now
+
+    t = asyncio.create_task(ticker())
+    try:
+        return await body(), max(gaps, default=0.0)
+    finally:
+        t.cancel()
+
+
+@pytest.mark.timeout(20)
+def test_cross_process_wait_does_not_stall_loop(holder, tmp_path: Path) -> None:
+    """The async path waits for another process off the loop: bounded, loop keeps ticking."""
+    st = _open(str(tmp_path), busy_timeout=0.3)
+
+    async def give_up():
+        t0 = time.monotonic()
+        with pytest.raises(StorageLockTimeoutError):
+            await st.areserve_write_slot()
+        return time.monotonic() - t0
+
+    async def wait_through():
+        slot = await st.areserve_write_slot()
+        tx = st.begin_transaction(write_slot=slot)
+        tx.put(("mine",), b"1")
+        tx.commit()
+
+    async def main() -> None:
+        took, gap = await _ticking(give_up)
+        assert 0.3 <= took < 0.8, took
+        assert gap < 0.1, gap
+        st._busy_timeout = 5.0
+        _, gap = await _ticking(wait_through)  # the holder commits meanwhile
+        assert gap < 0.1, gap
+
+    try:
+        asyncio.run(main())
+        with st.snapshot() as snap:
+            assert snap.get(("mine",)) == b"1"
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("end", ["commit", "abort"])
+def test_end_on_another_thread_does_not_wedge(ctx, tmp_path: Path, end: str) -> None:
+    """Begin in to_thread, end on the loop: the next writer in this process and a peer get through."""
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    ready, go = ctx.Event(), ctx.Event()
+    out = tmp_path / "peer.json"
+    peer = ctx.Process(target=_peer_write, args=(str(tmp_path), 2.0, ready, go, str(out)))
+    peer.start()
+    assert ready.wait(20)  # the peer has the env open before we touch the writer lock
+    try:
+
+        async def main() -> None:
+            tx = await asyncio.to_thread(st.begin_transaction)
+            tx.put(("k",), b"1")
+            getattr(tx, end)()
+
+        asyncio.run(main())
+        t0 = time.monotonic()
+        with st.transaction() as tx:  # a fresh thread, in effect: the pool worker is gone
+            tx.put(("after",), b"1")
+        assert time.monotonic() - t0 < 1.0
+        go.set()
+        peer.join(10)
+        assert peer.exitcode == 0
+        report = json.loads(out.read_text())
+        assert report["result"] == "ok", report
+        assert report["took"] < 1.0, report
+        with st.snapshot() as snap:
+            assert snap.get(("peer",)) == b"1"
+            assert snap.get(("k",)) == (b"1" if end == "commit" else EMPTY)
+    finally:
+        if peer.is_alive():
+            peer.kill()
+        st.close()
+
+
+@pytest.mark.timeout(30)
+def test_close_with_live_worker_txn_does_not_wedge_peer(ctx, tmp_path: Path) -> None:
+    """close() from the main thread while a worker thread holds a txn: a peer still writes."""
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    ready, go = ctx.Event(), ctx.Event()
+    out = tmp_path / "peer.json"
+    peer = ctx.Process(target=_peer_write, args=(str(tmp_path), 2.0, ready, go, str(out)))
+    peer.start()
+    assert ready.wait(20)
+    keep = threading.Event()
+    box: dict = {}
+
+    def worker() -> None:
+        box["tx"] = st.begin_transaction()
+        box["tx"].put(("k",), b"1")
+        box["begun"].set()
+        keep.wait(10)
+
+    box["begun"] = threading.Event()
+    th = threading.Thread(target=worker, daemon=True)
+    th.start()
+    assert box["begun"].wait(5)
+    try:
+        t0 = time.monotonic()
+        st.close()
+        assert time.monotonic() - t0 < 1.0
+        assert box["tx"].is_closed
+        go.set()
+        peer.join(10)
+        assert peer.exitcode == 0
+        report = json.loads(out.read_text())
+        assert report["result"] == "ok", report
+        assert report["took"] < 1.0, report
+    finally:
+        keep.set()
+        if peer.is_alive():
+            peer.kill()
+    st = _open(str(tmp_path))
+    with st.snapshot() as snap:
+        assert snap.get(("peer",)) == b"1"
+        assert snap.get(("k",)) is EMPTY
+    st.close()
+
+
+@pytest.mark.timeout(60)
+def test_close_while_owner_is_inside_cursor_calls(ctx, tmp_path: Path) -> None:
+    """close() racing a worker's puts, gets and scans on a write txn: no crash, clean error."""
+    p = ctx.Process(target=_close_while_scanning, args=(str(tmp_path), 30))
+    p.start()
+    p.join(50)
+    if p.is_alive():
+        p.kill()
+        pytest.fail("close() racing an owner's calls hung")
+    assert p.exitcode == 0, f"exit code {p.exitcode} (negative: a signal, e.g. segfault)"
+
+
+@pytest.mark.timeout(20)
+def test_close_while_a_thread_waits_behind_a_peer(holder, tmp_path: Path) -> None:
+    """close() returns while a thread waits for the writer in another process.
+
+    The waiter gets StorageClosedError, snapshots from a third thread were
+    never blocked by the waiter, and the storage reopens.
+    """
+    st = _open(str(tmp_path), busy_timeout=5.0)
+    outcome: list = []
+
+    def waiter() -> None:
+        try:
+            st.begin_transaction()
+            outcome.append("begun")
+        except Exception as e:
+            outcome.append(type(e).__name__)
+
+    th = threading.Thread(target=waiter, daemon=True)
+    th.start()
+    time.sleep(0.2)
+    assert st._writer.lock.locked()  # the waiter holds the slot and polls the gate
+
+    t0 = time.monotonic()
+    with st.snapshot() as snap:
+        assert snap.get(("held",)) is EMPTY
+    assert time.monotonic() - t0 < 0.1
+
+    t0 = time.monotonic()
+    st.close()
+    assert time.monotonic() - t0 < 1.0
+    th.join(5)
+    assert outcome == ["StorageClosedError"]
+    assert not st._writer.lock.locked()
+    holder.join(10)
+    st.open()
+    with st.transaction() as tx:
+        tx.put(("after",), b"1")
+    st.close()
+
+
+@pytest.mark.timeout(20)
+def test_dropped_snapshots_free_reader_slots(tmp_path: Path) -> None:
+    """Snapshots nobody closed are collected, so they do not pin reader slots."""
+    st = _open(str(tmp_path), max_readers=8)
+    try:
+        for _ in range(3 * 8):
+            snap = st.begin_snapshot()
+            snap.get(("k",))
+            del snap
+        gc.collect()
+        assert len(st._active_snapshots) == 0
+        snaps = [st.begin_snapshot() for _ in range(8)]  # a full table's worth still opens
+        for s in snaps:
+            s.close()
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(30)
+def test_stale_readers_of_a_dead_process_are_reclaimed(ctx, tmp_path: Path) -> None:
+    """Reader slots of a process that died mid-snapshot are swept at open and when the table fills."""
+    max_readers = 4
+    st = _open(str(tmp_path), max_readers=max_readers)
+    p = ctx.Process(target=_die_holding_readers, args=(str(tmp_path), max_readers - 1, max_readers))
+    p.start()
+    p.join(20)
+    assert p.exitcode == 0
+    assert st._env.readers().count("\n") >= max_readers - 1  # dead pid still listed
+    snaps = [st.begin_snapshot() for _ in range(max_readers)]  # full table: swept and retried
+    for s in snaps:
+        s.close()
+    st.close()
+
+    p = ctx.Process(target=_die_holding_readers, args=(str(tmp_path), max_readers - 1, max_readers))
+    p.start()
+    p.join(20)
+    st = _open(str(tmp_path), max_readers=max_readers)  # swept at open
+    try:
+        assert st._env.readers().count("\n") <= 1, st._env.readers()
+        snaps = [st.begin_snapshot() for _ in range(max_readers)]
+        for s in snaps:
+            s.close()
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(30)
+def test_peer_grows_map_past_our_mapping(ctx, tmp_path: Path) -> None:
+    """A peer opened with a larger map writes past ours: the next begin here remaps and works."""
+    st = _open(str(tmp_path), map_size=1 << 20)
+    with st.transaction() as tx:
+        tx.put(("k",), b"1")
+    p = ctx.Process(target=_grow_map, args=(str(tmp_path), 16 << 20, 3 << 20))
+    p.start()
+    p.join(20)
+    assert p.exitcode == 0
+    try:
+        with st.snapshot() as snap:
+            assert snap.get(("blob", 0)) is not EMPTY
+        with st.transaction() as tx:
+            tx.put(("after",), b"1")
+        with st.snapshot() as snap:
+            assert snap.get(("after",)) == b"1"
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_fork_while_env_lock_is_held_elsewhere(storage: LMDBStorage) -> None:
+    """A fork while another parent thread holds the storage lock: the child is not deadlocked."""
+    with storage.transaction() as tx:
+        tx.put(("parent",), b"1")
+    held, go = threading.Event(), threading.Event()
+
+    def hold_lock() -> None:
+        with storage._env_lock:
+            held.set()
+            go.wait(5)
+
+    t = threading.Thread(target=hold_lock)
+    t.start()
+    held.wait()
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            with storage.snapshot() as snap:
+                assert snap.get(("parent",)) == b"1"
+            with storage.transaction() as tx:
+                tx.put(("child",), b"1")
+            storage.close()
+            code = 0
+        finally:
+            os._exit(code)
+    try:
+        assert _wait_pid(pid) == 0
+    finally:
+        go.set()
+        t.join()
+    with storage.snapshot() as snap:
+        assert snap.get(("child",)) == b"1"

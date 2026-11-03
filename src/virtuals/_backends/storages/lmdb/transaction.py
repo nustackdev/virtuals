@@ -53,61 +53,73 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         return True
 
     def commit(self) -> None:
-        """Commit all changes in the transaction."""
-        if self._closed:
-            logger.error("Cannot commit, transaction is closed")
-            raise StorageClosedError("Transaction is closed")
-        if self._committed:
-            logger.error("Cannot commit, transaction already committed")
-            raise StorageTransactionError("Transaction already committed")
-        if self._aborted:
-            logger.error("Cannot commit, transaction already aborted")
-            raise StorageTransactionError("Transaction already aborted")
+        """Commit all changes in the transaction.
 
-        txn = self._require_active()
-        if not self._claim_end():
-            raise StorageClosedError("Transaction was closed while committing")
+        LMDB's commit runs on the storage's writer thread, the one that
+        began the transaction, so this may be called from any thread.
+        """
+        with self._call_lock:
+            if self._closed:
+                logger.error("Cannot commit, transaction is closed")
+                raise StorageClosedError("Transaction is closed")
+            if self._committed:
+                logger.error("Cannot commit, transaction already committed")
+                raise StorageTransactionError("Transaction already committed")
+            if self._aborted:
+                logger.error("Cannot commit, transaction already aborted")
+                raise StorageTransactionError("Transaction already aborted")
 
-        try:
-            txn.commit()
-        except Exception as e:
-            # LMDB frees a write transaction whose commit fails, so close
-            # this one too and give back the writer slot.
-            self._aborted = True
-            self._mark_closed()
+            txn = self._require_active()
+            try:
+                self._storage._end_write(txn, commit=True)
+            except Exception as e:
+                # LMDB frees a write transaction whose commit fails, so close
+                # this one too and give back the writer slot.
+                self._aborted = True
+                self._mark_closed()
+                failure: Exception | None = e
+            else:
+                failure = None
+                self._committed = True
+                self._mark_closed()
+
+        if failure is not None:
             self._storage._untrack_transaction(self)
             logger.error("Transaction commit failed")
-            raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
+            raise StorageTransactionError(f"Failed to commit transaction: {failure}") from failure
 
         logger.info("Transaction committed")
-
-        self._committed = True
-        self._mark_closed()
-
         self._storage._notify_batch(self._modified_keys)
         self._storage._untrack_transaction(self)
 
     def abort(self) -> None:
-        """Abort transaction and discard all changes."""
-        if self._closed:
-            logger.debug("Abort called on closed transaction")
-            return
-        if not self._claim_end():
-            logger.debug("Abort skipped, transaction is already ending")
-            return
+        """Abort transaction and discard all changes.
 
-        txn = self._require_active()
+        Safe from any thread, including while the owner is inside a call:
+        the abort waits for that call, then ends the transaction on the
+        writer thread. A second abort, or one racing a commit, is a no-op.
+        """
+        with self._call_lock:
+            if self._closed:
+                logger.debug("Abort called on closed transaction")
+                return
+            txn = self._require_active()
+            failure: Exception | None = None
+            try:
+                self._storage._end_write(txn, commit=False)
+                logger.info("Transaction aborted")
+            except Exception as e:
+                logger.error("Transaction abort failed")
+                failure = e
+            finally:
+                self._aborted = True
+                self._mark_closed()
 
-        try:
-            txn.abort()
-            logger.info("Transaction aborted")
-        except Exception as e:
-            logger.error("Transaction abort failed")
-            raise StorageTransactionAbortedError(f"Failed to abort transaction: {e}") from e
-        finally:
-            self._aborted = True
-            self._mark_closed()
-            self._storage._untrack_transaction(self)
+        self._storage._untrack_transaction(self)
+        if failure is not None:
+            raise StorageTransactionAbortedError(
+                f"Failed to abort transaction: {failure}"
+            ) from failure
 
     def __enter__(self) -> LMDBTransaction:
         """Enter context manager."""
