@@ -20,7 +20,7 @@ The full suite takes about 3 minutes serial and under a minute with `-n 8`. Ever
 | `views/` | every view against storage: behaviour on every backend, op counts on the seeking backends (sqlite, lmdb, rocksdb). `test_dict_views_hardening.py` pins the contract rules for dict views: EMPTY, existence, kind change, cost | all four |
 | `functional/` | container and view behaviour through the public API, watches on subtrees and absent containers | mem |
 | `unit/` | pure units: key and path navigation, container types and markers, view registry and capabilities, fractional index keys | none |
-| `tkv/` | the tkv protocols: codecs, filters, transport, compliance suites a backend can import | mem |
+| `tkv/` | the tkv protocols: codecs, filters, transport, compliance suites a backend can import | compliance on sqlite, lmdb, rocksdb, mem; the rest none |
 | `support/` | shared helpers: `counting.py` (op counter for cost tests, `open_backend`), `valkey.py` (a private valkey for redis tests), `dict_view.py` | |
 
 ## Conventions

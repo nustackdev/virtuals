@@ -1230,3 +1230,44 @@ def test_fractional_move_of_an_absent_id_onto_itself_raises(root, move):
     assert list(view) == ["a"]
     getattr(view, move)("a", "a")  # present self move: a no-op
     assert list(view) == ["a"]
+
+
+# ============================================================================
+# PAGING: fractional view row bound and deleted cursor (contract 7, r3 F14)
+# ============================================================================
+
+
+@pytest.mark.parametrize("limit", [1, 5, 20])
+def test_fractional_paging_reads_at_most_limit_plus_two_rows(costed, limit):
+    storage, counts = costed
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("f", EagerFractionalIndexedDictView)
+        for i in range(60):
+            view.append(f"k{i:02d}", i)
+    for cursor in ("k00", "k30", "k58"):
+        cost = measure(
+            storage,
+            counts,
+            lambda root, cursor=cursor: list(
+                root.open_child("f", EagerFractionalIndexedDictView).keys(after=cursor, limit=limit)
+            ),
+        )
+        assert cost["scan_rows"] <= limit + 2, (cursor, limit, cost)
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("f", EagerFractionalIndexedDictView)
+        assert (
+            list(view.keys(after="k30", limit=limit))
+            == [f"k{i:02d}" for i in range(31, 31 + limit)][: 60 - 31]
+        )
+
+
+def test_fractional_paging_on_a_deleted_cursor_raises(root):
+    """The cursor's position went with its row, so the view raises instead of guessing."""
+    view = root.open_child("f", EagerFractionalIndexedDictView)
+    for i in range(10):
+        view.append(f"k{i}", i)
+    assert list(view.keys(after="k4", limit=3)) == ["k5", "k6", "k7"]
+    del view["k4"]
+    with pytest.raises(KeyError):
+        list(view.keys(after="k4", limit=3))
+    assert list(view.keys(after="k3", limit=3)) == ["k5", "k6", "k7"]

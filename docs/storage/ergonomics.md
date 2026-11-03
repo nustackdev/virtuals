@@ -1,4 +1,4 @@
-# Storage Layer — DX Ergonomics
+# Storage Layer: DX Ergonomics
 
 This layer is a **system interface**, not a Python container.
 

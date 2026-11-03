@@ -23,7 +23,7 @@ Writes are published after they commit. Observers wake subscribers whose filter 
 
 **Resync on reconnect.** Pub/sub cannot replay writes made while an observer was disconnected. When the redis connection drops, each filter loses its readiness until it is subscribed and registered again. Writes committed in that window are not delivered. Once a filter is re-registered, every local subscription on it gets one keyless wake: the receiver is called with `None`. That means re-read state. Level flows recover exactly. Event flows must treat `None` as a re-read or skip it.
 
-**Drops become resync wakes.** The publisher never drops silently. A failing send is retried with backoff for `publish_retry_seconds` (default 5s). Meanwhile the queue fills and `notify()` blocks (backpressure) for up to `notify_timeout` (default 1s on redis, unbounded on the in-memory transport), then drops the rest of its keys. Every drop is logged at ERROR, counted in `dropped_keys`, raised once by the next `flush()`, and followed by a resync wake to every subscriber on the prefix the next time the worker can publish. A drop costs readers one re-read, never a missed state.
+**Drops become resync wakes.** The publisher never drops silently. A failing send is retried with backoff for `publish_retry_seconds` (default 5s). Meanwhile the queue fills and `notify()` blocks (backpressure) for up to `notify_timeout` (default 1s on redis, unbounded on the in-memory transport), then drops the rest of its keys. Every drop is logged at ERROR, counted in `dropped_keys`, raised once by the next `flush()`, and followed by a resync wake to every subscriber on the prefix the next time the worker can publish. A drop costs readers one re-read, never a missed state. A commit while the publisher is disconnected is a drop too: the storage logs it, the keys are counted and raised once by the next `flush()`, and the first connection that sends again carries the resync wake.
 
 **Subscriptions on an absent container work.** A view whose container does not exist yet builds the same filter as an existing one. The first write under it fires the watch. Taking the watch writes nothing.
 
@@ -32,12 +32,12 @@ Writes are published after they commit. Observers wake subscribers whose filter 
 | knob | where | default | what it bounds |
 |---|---|---|---|
 | `notify_timeout` | publisher | 1s redis, none in-memory | how long a committing writer blocks on a full queue before dropping keys |
-| `publish_retry_seconds` | publisher | 5s | retry window for one failing chunk |
+| `publish_retry_seconds` | redis publisher | 5s | retry window for one failing chunk |
 | `socket_timeout` | redis publisher and observer | 2s | one socket call; connect timeout too. One send attempt is bounded by about twice this (one transparent redis-py retry) |
 | `subscribe_timeout` | redis observer | 2s | how long `subscribe()` waits for the server to confirm and register |
 | `queue_maxsize` | publisher | 100000 keys | queue capacity before backpressure |
 
-A stalled server bounds `subscribe()` at about the subscribe timeout plus twice the socket timeout. A slow receiver never stalls a `subscribe()` from another thread: the listener parks inbound keys in an overflow buffer and keeps serving commands.
+A stalled server bounds `subscribe()` at about the subscribe timeout plus twice the socket timeout. A slow receiver does not stall a `subscribe()` from another thread until both the dispatch queue and the overflow buffer are full: the listener parks inbound keys in the overflow buffer and keeps serving commands. Past that point it stops reading the socket, and a `subscribe()` can time out.
 
 ## Lifecycle
 
