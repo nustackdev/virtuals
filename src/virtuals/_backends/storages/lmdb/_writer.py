@@ -244,29 +244,27 @@ class WriterThread:
                 ) from None
             return done.result()
 
-    def try_run(self, fn: Callable[[], Any], timeout: float) -> bool:
-        """``run`` for finalizers: only if the thread is alive, bounded, never at exit.
+    def try_fire(self, fn: Callable[[], Any]) -> bool:
+        """``fire`` for finalizers: queued, never waited for, never at exit.
 
-        A finalizer may run while the interpreter shuts down, when the
-        daemon thread can no longer execute Python, or after ``stop``. Then
-        nothing is queued and False is returned: process exit releases
-        LMDB's writer lock and the gate anyway. Returns False as well when
-        ``fn`` did not finish within ``timeout``.
+        A finalizer runs on whatever thread triggered the collection, which
+        may hold a lock the writer thread needs (``_env_lock`` during a
+        begin or a close), so waiting here could stall that thread for the
+        whole timeout; the job is queued and the finalizer moves on. The
+        queue is FIFO, so a begin queued after it runs after it. At
+        interpreter shutdown, when the daemon thread can no longer execute
+        Python, or after ``stop``, nothing is queued and False is returned:
+        process exit releases LMDB's writer lock and the gate anyway, and
+        close() ends every live write itself.
         """
         if sys.is_finalizing():
             return False
         if self._on_thread():
             fn()
             return True
-        with self._lock:
-            thread = self._thread
-            if thread is None or not thread.is_alive():
-                return False
-            future: Future = Future()
-            self._queue.put((fn, future, None, None, None))
         try:
-            future.result(timeout)
-        except FutureTimeoutError:
+            self._submit(fn, Future(), None)
+        except StorageClosedError:
             return False
         return True
 
