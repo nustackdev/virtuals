@@ -161,7 +161,7 @@ class ListViewBase(
         EMPTY anywhere raises ``ValueError`` before anything is written.
         """
         normalized = self.normalize_address(address)
-        self._reject_empty(normalized, value)
+        value = self._reject_empty_at(normalized, value)
         self.ensure_created()
         self._populate_child_container(normalized, value, view_class=view_class)
 

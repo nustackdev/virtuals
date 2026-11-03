@@ -4,7 +4,7 @@
 .venv/bin/python -m pytest -q -p no:cacheprovider tests            # everything
 .venv/bin/python -m pytest -q -p no:cacheprovider tests -n 8       # parallel (xdist)
 .venv/bin/python -m pytest -q -p no:cacheprovider tests/views      # one area
-.venv/bin/python -m pytest -q -p no:cacheprovider tests -k "[lmdb]" # one backend
+.venv/bin/python -m pytest -q -p no:cacheprovider tests -k lmdb      # one backend
 ```
 
 The full suite takes about 3 minutes serial and under a minute with `-n 8`. Every test runs on the project venv; there is no other configuration.

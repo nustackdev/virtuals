@@ -206,6 +206,22 @@ class ViewBase(ABC):
         """
         reject_empty_value((*self._children_container().site, address), value)
 
+    def _reject_empty_at(self, address: site_.SiteSegment, value: object) -> object:
+        """Raise ValueError if the child value is or contains EMPTY; return it, walkable.
+
+        For the compound doors (``set_child_container_as``): a lazy iterable
+        is materialized as a list so it can be checked and then stored,
+        without being consumed twice; everything else comes back as it is.
+        Checked before ``ensure_created`` so a rejected write leaves nothing
+        behind.
+        """
+        if isinstance(value, Iterable) and not isinstance(
+            value, Mapping | list | tuple | set | frozenset | str | bytes | bytearray
+        ):
+            value = list(value)
+        reject_empty_value((*self._children_container().site, address), value)
+        return value
+
     def _reject_empty_in(self, value: object) -> object:
         """Raise ValueError if ``value`` is or contains EMPTY; return it, walkable.
 

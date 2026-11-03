@@ -586,7 +586,7 @@ class FractionalIndexedDictViewBase(
         anywhere raises ``ValueError`` before the view, the position rows or
         the child are written.
         """
-        self._reject_empty(address, value)
+        value = self._reject_empty_at(address, value)
         self.ensure_created()
         self._populate_child_container(address, value, view_class=view_class)
         self._ensure_positioned(address)

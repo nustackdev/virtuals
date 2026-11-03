@@ -232,7 +232,11 @@ class Kh57ViewBase(
         ``ShapeRef`` inside a ``Kh57ShapesRef``) get their declared layout
         instead of the registry's default for the Python value's type.
         """
-        self._put_encoded(self.normalize_address(address), value, view_class=view_class)
+        encoded = self.normalize_address(address)
+        # Materialize a lazy iterable and check it before any write, so it
+        # is stored as the declared container, never as a primitive blob.
+        value = self._reject_empty_at(encoded, value)
+        self._put_encoded(encoded, value, view_class=view_class)
 
     def _delete_encoded(self, encoded: int) -> None:
         """Remove the child at `encoded` if present. Silent on miss."""

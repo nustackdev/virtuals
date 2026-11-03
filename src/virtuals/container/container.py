@@ -398,7 +398,7 @@ class Container:
         key: site_.SiteSegment,
         value: Value,
     ) -> None:
-        """Put primitive child value — raw ctx.put(), no storage validation.
+        """Put primitive child value: raw ctx.put(), no storage validation.
 
         The caller must guarantee container chain exists and child is
         a primitive. EMPTY is still refused, as on every door.

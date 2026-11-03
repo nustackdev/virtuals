@@ -227,7 +227,7 @@ class IndexedDictViewBase(
         A value holding EMPTY anywhere raises ``ValueError`` before the view,
         the key list or the child are written.
         """
-        self._reject_empty(address, value)
+        value = self._reject_empty_at(address, value)
         self.ensure_created()
         self._populate_child_container(address, value, view_class=view_class)
 

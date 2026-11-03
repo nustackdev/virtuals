@@ -712,7 +712,7 @@ def put_child_primitive_unsafe(
     value: Value,
     ctx: StorageContextType,
 ) -> None:
-    """Put primitive child value — raw ctx.put(), no storage validation.
+    """Put primitive child value: raw ctx.put(), no storage validation.
 
     The caller must guarantee:
     - Parent container chain exists

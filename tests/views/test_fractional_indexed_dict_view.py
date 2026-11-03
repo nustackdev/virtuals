@@ -1044,13 +1044,23 @@ def shared_storage(request, tmp_path):
 
 
 def _writer(storage, barrier, op):
+    """Meet the peer at the barrier once, then run the transaction with retries.
+
+    The barrier sits outside the retried body, so a retry (a conflict or a
+    lock timeout, which the slot's 60s wait makes rare) never waits on a
+    barrier generation the peer has left.
+    """
+
     def body():
-        barrier.wait(timeout=5)
         with storage.transaction() as tx:
             view = Navigator(storage).root(tx).open_child("lst", EagerFractionalIndexedDictView)
             op(view)
 
-    return lambda: _retrying(body)
+    def run():
+        barrier.wait(timeout=5)
+        _retrying(body)
+
+    return run
 
 
 def test_two_writer_threads_inserting_at_the_same_gap(shared_storage):
