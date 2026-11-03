@@ -25,9 +25,6 @@ LMDB_SCAN_CLOSED = (
 MEM_SCAN_CLOSED = (
     "mem scan keeps yielding its buffered page after close; owner: P2 mem (audit 06 F10)"
 )
-MEM_CLOSE_KEYERROR = (
-    "mem close() racing a scan on another thread leaks a raw KeyError; owner: P2 mem (audit 06 F11)"
-)
 
 DROPPED_TXN = (
     "a transaction dropped without commit or abort holds the writer slot until close: "
@@ -52,7 +49,6 @@ KNOWN_FAILURES: dict[str, dict[str, tuple[bool, str]]] = {
     },
     "test_s4_close_during_in_flight_call_never_crashes": {
         "lmdb": (False, LMDB_CLOSE_CRASH),
-        "mem-txn": (False, MEM_CLOSE_KEYERROR),
     },
     "test_s3_scan_after_context_close_raises_closed": {
         "lmdb": (True, LMDB_SCAN_CLOSED),

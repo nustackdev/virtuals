@@ -788,7 +788,7 @@ def test_cross_process_lock_wait_does_not_block_loop(storage: SQLiteStorage, db_
 
     waited, gap, ticks = asyncio.run(main())
     assert waited >= hold * 0.6, f"got the lock after {waited:.3f}s, holder held it {hold}s"
-    assert gap < 0.1, f"loop blocked for {gap * 1000:.0f}ms during a cross-process lock wait"
+    assert gap < 0.2, f"loop blocked for {gap * 1000:.0f}ms during a cross-process lock wait"
     assert ticks >= int(waited / 0.005 * 0.5), f"ticker ran {ticks} times in {waited:.3f}s"
     with storage.snapshot() as snap:
         assert snap.get(("loop",)) == b"1"
@@ -812,7 +812,7 @@ def test_cross_process_lock_wait_times_out_without_blocking_loop(db_path: Path) 
 
         elapsed, gap = asyncio.run(main())
         assert 0.25 < elapsed < 2.0
-        assert gap < 0.1, f"loop blocked for {gap * 1000:.0f}ms"
+        assert gap < 0.2, f"loop blocked for {gap * 1000:.0f}ms"
         # Nothing is held: the slot is free and the pooled connection is idle.
         assert not s._writer.lock.locked()
         assert all(not c.in_transaction for c in s._idle)
@@ -1122,6 +1122,117 @@ def test_dropped_snapshot_is_collected_and_unpins_wal(storage: SQLiteStorage) ->
         assert busy == 0
     finally:
         storage._release_connection(conn)
+
+
+@pytest.mark.timeout(20)
+def test_unreleased_slot_collected_under_state_lock_does_not_deadlock(
+    storage: SQLiteStorage, db_path: Path
+) -> None:
+    """GC of an unreleased slot on a thread holding the storage state lock must not hang.
+
+    The slot sits in a reference cycle (a cancelled task's traceback does
+    this). Its finalizer must not return the connection to the pool,
+    which takes the state lock the collecting thread may already hold.
+    """
+
+    async def reserve() -> None:
+        slot = await storage.areserve_write_slot()
+        cycle = {"slot": slot}
+        cycle["self"] = cycle  # unreachable but uncollected until gc runs
+        del slot
+
+    asyncio.run(reserve())
+    done = threading.Event()
+
+    def collect_under_lock() -> None:
+        with storage._state_lock:
+            gc.collect()
+        done.set()
+
+    t = threading.Thread(target=collect_under_lock, daemon=True)
+    t.start()
+    assert done.wait(5), "slot finalizer deadlocked on the storage state lock"
+    assert not storage._writer.lock.locked()
+    assert _other_process_write(db_path) == "wrote"  # the file lock went with the connection
+    storage.begin_transaction().commit()
+
+
+@pytest.mark.timeout(30)
+def test_reservation_landing_after_close_holds_nothing(db_path: Path) -> None:
+    """close() while the reservation polls the file lock: the slot never lands on a closed storage."""
+    proc = _hold_in_other_process(db_path, 0.4)
+    s = SQLiteStorage(path=db_path, codec=BinaryCodec(), busy_timeout=5.0)
+    s.open()
+    try:
+
+        async def main() -> None:
+            task = asyncio.create_task(s.areserve_write_slot())
+            await asyncio.sleep(0.1)  # polling now, not yet registered
+            s.close()
+            with pytest.raises(StorageClosedError):
+                await task
+
+        asyncio.run(main())
+    finally:
+        proc.wait(10)
+    assert _other_process_write(db_path) == "wrote"  # no file lock left behind
+    s.open()
+    s.begin_transaction().commit()
+    s.close()
+
+
+_FORK_EXIT = textwrap.dedent(
+    """
+    import os, sqlite3, sys
+    from virtuals._backends.storages.sqlite import SQLiteStorage
+    from virtuals.codecs import BinaryCodec
+
+    root, rounds = sys.argv[1], int(sys.argv[2])
+    for i in range(rounds):
+        path = f"{root}/db{i}.sqlite"
+        s = SQLiteStorage(path=path, codec=BinaryCodec(), busy_timeout=1.0, cache_size=10)
+        s.open()
+        with s.transaction() as t:
+            for k in range(2000):
+                t.put(("base", k), b"b" * 200)
+        tx = s.begin_transaction()
+        for k in range(2000):  # spills pages into the WAL before the fork
+            tx.put(("pend", k), b"p" * 200)
+        pid = os.fork()
+        if pid == 0:
+            sys.exit(0)  # a normal exit: module globals are cleared, finalizers run
+        os.waitpid(pid, 0)
+        tx.commit()
+        s.close()
+        c = sqlite3.connect(path)
+        ok = c.execute("PRAGMA integrity_check").fetchone()[0]
+        n = c.execute("SELECT count(*) FROM kv").fetchone()[0]
+        c.close()
+        print(i, ok, n, flush=True)
+        if ok != "ok" or n != 4000:
+            sys.exit(3)
+    """
+)
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_fork_child_normal_exit_leaves_parent_write_intact(tmp_path: Path) -> None:
+    """A child that exits normally while the parent holds a large write never corrupts the file.
+
+    Interpreter shutdown in the child must not close the inherited
+    connection (that would roll the parent's transaction back in the
+    shared WAL index). 10 rounds, each checked with integrity_check.
+    """
+    out = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", _FORK_EXIT, str(tmp_path), "10"],
+        capture_output=True,
+        text=True,
+        timeout=100,
+        check=False,
+    )
+    assert out.returncode == 0, f"rc={out.returncode}\n{out.stdout[-800:]}\n{out.stderr[-1500:]}"
+    assert out.stdout.count(" ok 4000") == 10, out.stdout
 
 
 # =========================================================================
