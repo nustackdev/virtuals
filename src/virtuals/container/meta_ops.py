@@ -16,6 +16,7 @@ from virtuals.tkv.filter import LengthFilter, PrefixFilter
 from virtuals.tkv.storage import StorageScanOptions
 from virtuals.types import Empty
 
+from .container_ops import reject_empty_value
 from .context import require_read_context, require_write_context
 
 
@@ -49,9 +50,11 @@ def put_metadata(
         ctx: Storage context
 
     Raises:
+        ValueError: If ``value`` is EMPTY (the absent sentinel is never stored)
         StorageInterfaceError: If context doesn't support writes
     """
     meta_site = (METADATA_ROOT, *site[1:], key)
+    reject_empty_value(meta_site, value)
     require_write_context(ctx).put(meta_site, value)
 
 

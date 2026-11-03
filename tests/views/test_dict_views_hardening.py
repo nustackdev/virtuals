@@ -238,7 +238,14 @@ def test_container_put_child_primitive_rejects_empty(root):
         view.container.put_child_primitive("e", EMPTY)
     with pytest.raises(ValueError, match="EMPTY"):
         view.container.put_child_primitive("e", EMPTY, validate=False, validate_parent=False)
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.container.put_child_primitive_unsafe("e", EMPTY)
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.container.put_child_primitive_unsafe("e", {"n": [EMPTY]})
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.container.put_metadata("m", EMPTY)
     assert list(view) == ["a"]
+    assert view.container.get_metadata("m", "dflt") == "dflt"
 
 
 # ============================================================================
