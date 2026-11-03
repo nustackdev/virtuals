@@ -15,15 +15,25 @@ Exactly one dispatch worker ever runs callbacks. The worker owns the queue
 and stop event it was started with (it never reads them off the observer),
 so a worker that outlives a timed-out disconnect() can neither pick up the
 next connect()'s queue nor be revived by it; connect() refuses while such a
-worker is still inside a callback. The worker holds the observer only
+worker is still inside a callback. disconnect() closes every subscription
+before it waits, so the worker runs no receiver past the one it is in: once
+disconnect() has returned no callback starts, and the old worker is alive
+only for as long as that one callback. The worker holds the observer only
 weakly between batches, so an observer dropped without disconnect() is
 collected and its worker exits.
+
+Memory. A batch is at most `DISPATCH_BATCH_MAX` keys, so what one observer
+holds is bounded by its dispatch queue, the batch in hand, and whatever the
+transport parks on its own side (the Redis listener's overflow, at most one
+more queue). A keyless resync wake is queued at most once per filter hash
+until it is delivered, however many publishers or reconnects ask for one.
 """
 
 from __future__ import annotations
 
 import queue
 import threading
+import time
 import weakref
 from dataclasses import dataclass
 from logging import getLogger
@@ -67,6 +77,7 @@ logger = getLogger(__name__)
 
 __all__ = [
     "DEFAULT_DISPATCH_QUEUE_MAXSIZE",
+    "DISPATCH_BATCH_MAX",
     "ObserverBase",
 ]
 
@@ -83,6 +94,10 @@ _PUT_POLL_SECONDS: float = 0.1
 
 # How long disconnect() waits for the worker to finish the callback it is in.
 _WORKER_JOIN_SECONDS: float = 2.0
+
+# Most keys the worker takes off the queue per delivery round. Bounds what is
+# in hand (invisible to `qsize()`) and how long a stop waits between rounds.
+DISPATCH_BATCH_MAX: int = 256
 
 
 def _stop_worker(q: queue.Queue[Any], stop: threading.Event) -> None:
@@ -143,6 +158,8 @@ def _dispatch_worker(
                     return
             else:
                 batch.append(item)
+                if len(batch) >= DISPATCH_BATCH_MAX:
+                    break
             try:
                 item = q.get_nowait()
             except queue.Empty:
@@ -168,6 +185,10 @@ class ObserverBase:
         self._stop_event = threading.Event()
         self._dispatch_thread: threading.Thread | None = None
         self._worker_finalizer: weakref.finalize | None = None
+        # Filter hashes with a keyless resync wake queued (or parked by the
+        # transport) and not yet delivered: one wake per hash at a time.
+        self._resync_queued: set[str] = set()
+        self._resync_lock = threading.Lock()
 
     def _ensure_connected(self) -> None:
         if not self._connected:
@@ -192,6 +213,8 @@ class ObserverBase:
             self._registry = SubscriptionRegistry()
             stop = self._stop_event = threading.Event()
             q = self._dispatch_queue = queue.Queue(maxsize=self._dispatch_queue_maxsize)
+            with self._resync_lock:
+                self._resync_queued = set()
 
             self._on_connect()
 
@@ -221,15 +244,24 @@ class ObserverBase:
     def disconnect(self) -> None:
         """Symmetric shutdown. _on_disconnect hook runs after the worker joins.
 
-        Waits a bounded time for the worker to finish the callback it is in.
-        If the callback is still running after that, the worker is left to
-        exit on its own (logged at WARNING) and the next connect() refuses
-        until it has.
+        Closes every subscription first, so the worker calls no receiver
+        past the one it is in: nothing queued or in hand is delivered after
+        this returns. Then waits a bounded time for the worker to finish
+        that callback. If it is still running after that, the worker is
+        left to exit on its own (logged at WARNING) and the next connect()
+        refuses until it has.
         """
         if not self._connected:
             return
         try:
             _stop_worker(self._dispatch_queue, self._stop_event)
+            registry = self._registry
+            if registry is not None:
+                # Closed here, not through close(): the hooks would queue
+                # unsubscribes on a connection that is going down anyway.
+                for sub in registry.subscriptions():
+                    sub._closed = True
+                    sub._receivers.clear()
             if self._worker_finalizer is not None:
                 self._worker_finalizer.detach()
                 self._worker_finalizer = None
@@ -312,7 +344,9 @@ class ObserverBase:
         so the wake follows them.
         """
         if self._connected:
-            self._enqueue(_Resync(filter_hash))
+            item = self._resync_item(filter_hash)
+            if item is not None:
+                self._enqueue(item)
 
     def _dispatch_resync_all(self) -> None:
         """Queue one keyless resync wake per filter hash with a local subscription.
@@ -324,7 +358,23 @@ class ObserverBase:
         if not self._connected or registry is None:
             return
         for h in {s.filter_hash for s in registry.subscriptions()}:
-            self._enqueue(_Resync(h))
+            item = self._resync_item(h)
+            if item is not None:
+                self._enqueue(item)
+
+    def _resync_item(self, filter_hash: str) -> _Resync | None:
+        """A resync wake to queue for `filter_hash`, or None while one is pending.
+
+        One keyless wake per hash is enough until it is delivered: it
+        re-reads state as of its delivery, which is later than every drop
+        or reconnect that asked for one in the meantime. So W publishers
+        dropping in one stall cost each subscription one re-read, not W.
+        """
+        with self._resync_lock:
+            if filter_hash in self._resync_queued:
+                return None
+            self._resync_queued.add(filter_hash)
+        return _Resync(filter_hash)
 
     def _enqueue_nowait(self, item: object) -> bool:
         """Put `item` on the dispatch queue if there is room. False when full."""
@@ -358,12 +408,20 @@ class ObserverBase:
                     return False
 
     def flush(self, timeout: float = 1.0) -> None:
-        """Wait for the dispatch queue to drain. Test helper."""
+        """Wait up to `timeout` for everything queued so far to be delivered. Test helper.
+
+        Returns at the timeout whether or not the queue drained, including
+        when it is full and the marker cannot even be queued.
+        """
         if not self._connected:
             return
+        deadline = time.monotonic() + timeout
         done = threading.Event()
-        self._dispatch_queue.put(done)
-        done.wait(timeout=timeout)
+        try:
+            self._dispatch_queue.put(done, timeout=timeout)
+        except queue.Full:
+            return
+        done.wait(timeout=max(0.0, deadline - time.monotonic()))
 
     def _deliver_batch(self, batch: list[Key | _TaggedKey | _Resync]) -> None:
         if not batch:
@@ -377,6 +435,10 @@ class ObserverBase:
         for item in batch:
             if isinstance(item, _Resync):
                 h = item.filter_hash
+                # Released before the wake runs: a drop recorded from here on
+                # queues its own, since this one may read state from before it.
+                with self._resync_lock:
+                    self._resync_queued.discard(h)
                 woken = [s for s in registry.subscriptions() if s.filter_hash == h]
                 if woken:
                     notifications.append((None, woken))
