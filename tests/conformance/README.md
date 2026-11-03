@@ -42,6 +42,7 @@ Races are forced, not hoped for: a pause sits between each read and its dependen
 | `test_s1_nested_transaction_raises_distinct_error` | 1, 3 | a second write txn on the same storage raises `StorageNestedTransactionError`, not a retryable class |
 | `test_s2_repeatable_read_in_snapshot` | 2 | a re-read in an open snapshot ignores a concurrent commit |
 | `test_s2_snapshot_never_torn` | 2 | a snapshot never shows half of a commit that moves x and y together |
+| `test_s2_snapshot_never_waits_on_writer` | 2, 4 | with one writer holding a pending write and a second writer waiting at begin, a snapshot opens and reads in under 100ms and sees the pre-transaction value |
 | `test_s3_contention_raises_only_retryable` | 3 | writers aborted by conflict or busy raise only conflict or lock timeout |
 | `test_s3_closed_storage_error_not_retryable` | 3 | a write to a closed storage raises a non-retryable `StorageError` |
 | `test_s4_coroutine_writers_serialize` | 4 | N coroutines doing read, await, write all land, in bounded time |
@@ -63,6 +64,5 @@ Strict xfails: an unexpected pass fails the run, so delete the row in the commit
 | coroutine writers serialize | rocksdb, mem | lane K, lane D |
 | coroutine writers do not block loop | rocksdb | lane K |
 | view dict delete is point delete | all | lane B |
-| nested transaction, both section 4 cases | lmdb | lane C (non-strict until the writer slot merges) |
 
-`test_s1_nested_transaction_raises_distinct_error[sqlite]` fails until `StorageNestedTransactionError` lands in this lane. It is not marked.
+sqlite and lmdb carry no xfail outside section 7: `StorageNestedTransactionError` and the lmdb writer slot have landed. The second writer in the never-waits case blocks at begin on sqlite and lmdb; on rocksdb and mem it does not block, and the case still checks only the snapshot.
