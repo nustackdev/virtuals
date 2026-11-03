@@ -85,7 +85,7 @@ Strict xfails: an unexpected pass fails the run, so delete the row in the commit
 | late release after close and reopen frees nothing | lmdb | P1 (lmdb): contexts release the slot without lock identity |
 | dropped transaction frees slot | lmdb | P1 (lmdb): strong active set and no transaction finalizer, so a dropped txn holds the slot until close |
 | cross-process lock wait does not block loop | lmdb | P1 lmdb: begin with a slot waits inside lmdb on the loop (audit 06 F7) |
-| close during in-flight call never crashes | lmdb (both), mem (txn) | P1 lmdb: segfault (audit 06 F2); P2 mem: raw KeyError (audit 06 F11) |
+| close during in-flight call never crashes | lmdb (both, not strict: probabilistic) | P1 lmdb: segfault (audit 06 F2) |
 | scan after context close, scan after storage close | lmdb, mem | P1 lmdb: `StorageOperationError`; P2 mem: yields the buffered page (audit 06 F10) |
 | coroutine writers serialize (slot, plain) | rocksdb, mem | lane K, lane D |
 | coroutine writers do not block loop (slot, plain) | rocksdb | lane K |

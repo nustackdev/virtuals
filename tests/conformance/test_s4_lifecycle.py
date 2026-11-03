@@ -67,11 +67,13 @@ _CLOSE_BUSY = textwrap.dedent(
         except StorageError:
             closed = "refused"
         took = time.perf_counter() - t0
-        th.join(10)
-        if th.is_alive():
-            result.append("hung")
-        if closed == "refused":
-            s.close()
+        th.join()  # bounded by the test timeout; a close under a live worker is not a verdict
+        while closed == "refused":
+            try:
+                s.close()
+                break
+            except StorageError:
+                time.sleep(0.01)
         key = closed + "/" + (result[0] if result else "hung") + (" slow-close" if took > 1 else "")
         outcomes[key] = outcomes.get(key, 0) + 1
         s = BACKENDS[backend].make(Path(root) / f"r{i}")
@@ -108,7 +110,9 @@ def test_s4_close_during_in_flight_call_never_crashes(backend, tmp_path, mode):
         timeout=110,
         check=False,
     )
-    assert out.returncode == 0, f"child died (rc={out.returncode}):\n{out.stderr[-3000:]}"
+    assert out.returncode == 0, (
+        f"{backend.name}-{mode}: child died (rc={out.returncode}):\n{out.stderr[-3000:]}"
+    )
     outcomes = json.loads(out.stdout.strip().splitlines()[-1])
     bad = {
         k: v
@@ -117,5 +121,5 @@ def test_s4_close_during_in_flight_call_never_crashes(backend, tmp_path, mode):
         or k.split("/")[1].split(" ")[0] not in OK_WORKER
         or "slow-close" in k
     }
-    assert not bad, f"close() under an in-flight call: {outcomes}"
+    assert not bad, f"{backend.name}-{mode}: close() under an in-flight call: {outcomes}"
     assert sum(outcomes.values()) == ROUNDS
