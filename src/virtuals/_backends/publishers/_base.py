@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
 
 from typing_extensions import Self
 
-from virtuals.tkv.publisher import PublisherConnectionError
+from virtuals.tkv.publisher import PublisherConnectionError, PublisherOperationError
 
 
 if TYPE_CHECKING:
@@ -29,6 +30,7 @@ logger = getLogger(__name__)
 
 
 __all__ = [
+    "DEFAULT_PUBLISH_RETRY_SECONDS",
     "DEFAULT_QUEUE_MAXSIZE",
     "PublisherBase",
 ]
@@ -39,6 +41,13 @@ __all__ = [
 # publisher surfaces as writer backpressure well before OOM.
 DEFAULT_QUEUE_MAXSIZE: int = 100_000
 
+# How long a failing batch is retried before it is dropped and surfaced.
+DEFAULT_PUBLISH_RETRY_SECONDS: float = 5.0
+
+# Retry backoff: first delay, doubling, capped.
+_RETRY_BACKOFF_START: float = 0.05
+_RETRY_BACKOFF_CAP: float = 1.0
+
 # Sentinel used to unblock the worker sleeping on Queue.get() during disconnect.
 _STOP_MARKER: object = object()
 
@@ -47,14 +56,30 @@ class PublisherBase:
     """Write-side base with queue + worker.
 
     notify() enqueues keys; a background worker drains, batches, and
-    hands the batch to the subclass hook `_publish_batch`. Backpressure:
-    notify() blocks briefly when the queue is full (default capacity
-    DEFAULT_QUEUE_MAXSIZE). No silent drops.
+    hands the batch to the subclass hook `_publish_batch`, split into
+    chunks of at most `MAX_KEYS_PER_CALL` keys when a subclass sets it.
+
+    No silent drops. A failing chunk is retried with backoff for up to
+    `publish_retry_seconds`; meanwhile the worker does not drain, the queue
+    fills and notify() blocks (backpressure). After the deadline the keys
+    are logged at ERROR, counted in `dropped_keys`, and the next flush()
+    raises PublisherOperationError once.
     """
 
-    def __init__(self, *, queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE) -> None:
+    MAX_KEYS_PER_CALL: int | None = None
+
+    def __init__(
+        self,
+        *,
+        queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
+        publish_retry_seconds: float = DEFAULT_PUBLISH_RETRY_SECONDS,
+    ) -> None:
         self._queue_maxsize = queue_maxsize
+        self._publish_retry_seconds = publish_retry_seconds
         self._connected: bool = False
+        self.dropped_keys: int = 0
+        self._last_error: BaseException | None = None
+        self._error_lock = threading.Lock()
 
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=queue_maxsize)
         self._stop_event = threading.Event()
@@ -126,12 +151,28 @@ class PublisherBase:
 
         Places a sentinel in the queue. When the worker reaches it, all
         previously-enqueued keys have been handed to _publish_batch.
+
+        Raises:
+            PublisherOperationError: if keys were dropped since the last
+                flush (publish kept failing past `publish_retry_seconds`).
+                Raised once; the error is cleared.
         """
-        if not self._connected:
-            return
-        done = threading.Event()
-        self._queue.put(done)  # sentinel after all pending keys
-        done.wait(timeout=timeout)
+        if self._connected:
+            done = threading.Event()
+            self._queue.put(done)  # sentinel after all pending keys
+            done.wait(timeout=timeout)
+        self._raise_last_error()
+
+    def _record_drop(self, n: int, err: BaseException) -> None:
+        with self._error_lock:
+            self.dropped_keys += n
+            self._last_error = err
+
+    def _raise_last_error(self) -> None:
+        with self._error_lock:
+            err, self._last_error = self._last_error, None
+        if err is not None:
+            raise PublisherOperationError(f"Publish failed, keys dropped: {err}") from err
 
     def _worker(self) -> None:
         """Background thread: drain queue, batch, call _publish_batch."""
@@ -164,10 +205,29 @@ class PublisherBase:
     def _safe_publish(self, batch: list[Key]) -> None:
         if not batch:
             return
-        try:
-            self._publish_batch(batch)
-        except Exception as e:
-            logger.error("Publisher _publish_batch failed (%d keys): %s", len(batch), e)
+        n = self.MAX_KEYS_PER_CALL or len(batch)
+        for i in range(0, len(batch), n):
+            self._publish_with_retry(batch[i : i + n])
+
+    def _publish_with_retry(self, chunk: list[Key]) -> None:
+        """Publish one chunk, retrying with backoff until the deadline."""
+        deadline = time.monotonic() + self._publish_retry_seconds
+        delay = _RETRY_BACKOFF_START
+        while True:
+            try:
+                self._publish_batch(chunk)
+                return
+            except Exception as e:
+                remaining = deadline - time.monotonic()
+                # Disconnect in progress: don't hold the worker past one attempt.
+                if remaining <= 0 or self._stop_event.is_set():
+                    logger.error("Publish failed, dropping %d keys: %s", len(chunk), e)
+                    self._record_drop(len(chunk), e)
+                    return
+                logger.warning("Publish failed (%d keys), retrying: %s", len(chunk), e)
+                if self._stop_event.wait(min(delay, remaining)):
+                    continue  # loop once more; the check above records the drop
+                delay = min(delay * 2, _RETRY_BACKOFF_CAP)
 
     # -- Subclass hooks -------------------------------------------------------
 
