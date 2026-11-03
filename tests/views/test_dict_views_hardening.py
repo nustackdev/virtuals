@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 from tests.support.counting import (
     BACKENDS,
+    POINT_OPS,
     SEEKING_BACKENDS,
     install_counter,
     measure,
@@ -22,11 +23,13 @@ from virtuals._views import (
     EagerFractionalIndexedDictView,
     EagerIndexedDictView,
     EagerKh57View,
+    EagerListView,
     EagerLogIndexedDictView,
     FlatDictView,
     LazyDictView,
     LightDictView,
 )
+from virtuals.container import ContainerTypeError
 from virtuals.navigator import Navigator
 from virtuals.types import EMPTY
 
@@ -520,7 +523,14 @@ def test_large_values_round_trip(storage, view_cls):
 
 @pytest.mark.parametrize(
     "view_cls",
-    (EagerDictView, FlatDictView, EagerLogIndexedDictView, EagerFractionalIndexedDictView),
+    (
+        EagerDictView,
+        FlatDictView,
+        LightDictView,
+        EagerKh57View,
+        EagerLogIndexedDictView,
+        EagerFractionalIndexedDictView,
+    ),
 )
 def test_bool_is_one_seek_on_every_live_counted_view(costed, view_cls):
     storage, counts = costed
@@ -528,11 +538,72 @@ def test_bool_is_one_seek_on_every_live_counted_view(costed, view_cls):
     for n in (10, 1000):
         with storage.transaction() as tx:
             view = Navigator(storage).root(tx).open_child("d", view_cls)
-            view.store({f"k{i}": {"a": i} if view_cls is not FlatDictView else i for i in range(n)})
+            view.store(
+                {_key(view_cls, i): i if view_cls in FLAT_VIEWS else {"a": i} for i in range(n)}
+            )
         costs[n] = measure(storage, counts, lambda root: bool(root.open_child("d", view_cls)))
     assert costs[10] == costs[1000], costs
-    assert costs[10]["scan"] == 1, costs
+    # one storage op: a seek (scan of at most two rows) or, on Kh57, one get
+    assert sum(costs[10][k] for k in (*POINT_OPS, "scan")) == 1, costs
     assert costs[10]["scan_rows"] <= 2, costs
+
+
+@pytest.mark.parametrize("view_cls", (LightDictView, EagerKh57View))
+def test_bool_on_absent_flat_view_is_false_and_writes_nothing(root, view_cls):
+    view = root.open_child("absent", view_cls)
+    assert not view
+    assert not view.container.exists()
+    assert _rows_under(view) == []
+    view[_key(view_cls, 1)] = 1
+    assert view
+
+
+# ============================================================================
+# COST: known linear ops, pinned as accepted (contract 7, Q12)
+# ============================================================================
+
+
+def _linear_ops():
+    def indexed_delete(root, n):
+        view = root.open_child("d", EagerIndexedDictView)
+        del view[f"k{n // 2}"]
+
+    def list_insert(root, n):
+        root.open_child("l", EagerListView).insert(n // 2, -1)
+
+    def list_delete(root, n):
+        del root.open_child("l", EagerListView)[n // 2]
+
+    return (
+        pytest.param(EagerIndexedDictView, indexed_delete, id="indexed_dict_delete"),
+        pytest.param(EagerListView, list_insert, id="list_insert_mid"),
+        pytest.param(EagerListView, list_delete, id="list_delete_mid"),
+    )
+
+
+@pytest.mark.parametrize("view_cls, op", _linear_ops())
+def test_known_linear_ops_grow_with_n_and_stay_linear(costed, view_cls, op):
+    """IndexedDictView delete rewrites its key list; ListView insert and
+    delete shift the tail. Both are O(n) by design and documented as such.
+    This pins the cost as accepted: if one of them becomes constant, drop
+    its row here and its note in the docs."""
+    storage, counts = costed
+    costs = {}
+    for n in (20, 200):
+        with storage.transaction() as tx:
+            view = (
+                Navigator(storage)
+                .root(tx)
+                .open_child("d" if view_cls is EagerIndexedDictView else "l", view_cls)
+            )
+            if view_cls is EagerIndexedDictView:
+                view.store({f"k{i}": i for i in range(n)})
+            else:
+                view.store(list(range(n)))
+        costs[n] = measure(storage, counts, lambda root, n=n: op(root, n))
+    points = {n: sum(c[k] for k in POINT_OPS) for n, c in costs.items()}
+    assert points[200] > points[20], costs
+    assert points[200] <= 8 * 200, costs
 
 
 @pytest.mark.parametrize(
@@ -676,6 +747,49 @@ def test_nested_empty_leaves_no_partial_child(root, view_cls):
         assert view.get("y", "dflt") == "dflt"
 
 
+SCA_VIEWS = (*NESTED_VIEWS, EagerKh57View)
+"""Views with a ``set_child_container_as`` door (the Ref write path)."""
+
+
+@pytest.mark.parametrize("view_cls", SCA_VIEWS)
+def test_set_child_container_as_nested_empty_leaves_no_partial_child(root, view_cls):
+    """The Ref door: nothing is written before the nested EMPTY is found."""
+    view = root.open_child("d", view_cls)
+    keep, bad = _key(view_cls, 0), _key(view_cls, 1)
+    view[keep] = 1
+    rows = _rows_under(view)
+    for value in ({"ok": 1, "bad": EMPTY}, {"ok": 1, "deep": {"x": [1, {"y": EMPTY}]}}):
+        with pytest.raises(ValueError, match="EMPTY"):
+            view.set_child_container_as(bad, value, EagerDictView)
+        assert _rows_under(view) == rows
+        assert bad not in view
+        assert len(view) == 1
+        assert list(view) == [keep]
+        assert not view.open_child(bad, EagerDictView).container.exists()
+
+
+@pytest.mark.parametrize("view_cls", SCA_VIEWS)
+def test_set_child_container_as_nested_empty_on_absent_view_leaves_it_absent(root, view_cls):
+    view = root.open_child("absent", view_cls)
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.set_child_container_as(_key(view_cls, 1), {"bad": EMPTY}, EagerDictView)
+    assert not view.container.exists()
+    assert _rows_under(view) == []
+    assert len(view) == 0
+    assert list(view) == []
+
+
+def test_list_set_child_container_as_nested_empty_writes_nothing(root):
+    lst = root.open_child("lst", EagerListView)
+    lst.store([1, {"a": 1}])
+    rows = _rows_under(lst)
+    with pytest.raises(ValueError, match="EMPTY"):
+        lst.set_child_container_as(1, {"bad": {"z": EMPTY}}, EagerDictView)
+    assert _rows_under(lst) == rows
+    assert lst.extract() == [1, {"a": 1}]
+    assert len(lst) == 2
+
+
 @pytest.mark.parametrize("view_cls", DICT_VIEWS)
 def test_store_with_empty_leaves_the_view_as_it_was(root, view_cls):
     view = root.open_child("d", view_cls)
@@ -776,3 +890,120 @@ def test_bulk_doors_still_take_lazy_iterables(root):
     f = root.open_child("f", EagerFractionalIndexedDictView)
     f.store(f"k{i}" for i in range(3))
     assert list(f) == ["k0", "k1", "k2"]
+
+
+# ============================================================================
+# KIND CHANGE: a key keeps its kind until it is deleted (pinned, Q3)
+# ============================================================================
+
+
+@pytest.mark.parametrize("view_cls", NESTED_VIEWS)
+def test_changing_a_keys_kind_raises_and_keeps_the_old_value(root, view_cls):
+    """Pre-existing behaviour, pinned: a primitive key cannot take a
+    compound value and a compound key cannot take a primitive. The write
+    raises ``ContainerTypeError`` and changes nothing. Delete first, then
+    set. See docs/view/overview.md, "Write rules"."""
+    view = root.open_child("d", view_cls)
+    view.store({"p": 1, "c": {"z": 1}})
+    rows = _rows_under(view)
+    with pytest.raises(ContainerTypeError):
+        view["p"] = {"z": 2}
+    with pytest.raises(ContainerTypeError):
+        view["c"] = 5
+    with pytest.raises(ContainerTypeError):
+        view.set_child_container_as("p", {"z": 2}, EagerDictView)
+    assert _rows_under(view) == rows
+    eager = getattr(view, "eager", view)
+    assert eager.extract() == {"p": 1, "c": {"z": 1}}
+    assert set(view) == {"p", "c"}
+    del view["p"]
+    view["p"] = {"z": 2}
+    del view["c"]
+    view["c"] = 5
+    assert eager.extract() == {"p": {"z": 2}, "c": 5}
+
+
+def test_changing_a_list_items_kind_raises_and_keeps_the_old_value(root):
+    lst = root.open_child("lst", EagerListView)
+    lst.store([1, {"z": 1}])
+    rows = _rows_under(lst)
+    with pytest.raises(ContainerTypeError):
+        lst[0] = {"z": 2}
+    with pytest.raises(ContainerTypeError):
+        lst[1] = 5
+    with pytest.raises(ContainerTypeError):
+        lst.set_child_container_as(0, {"z": 2}, EagerDictView)
+    assert _rows_under(lst) == rows
+    assert lst.extract() == [1, {"z": 1}]
+    del lst[1]
+    lst.append(5)
+    assert lst.extract() == [1, 5]
+
+
+# ============================================================================
+# CONTRACT 6: lazy navigation, one-read existence, None is a value (Q15)
+# ============================================================================
+
+
+@pytest.mark.parametrize("view_cls", NESTED_VIEWS)
+def test_open_child_chain_touches_no_storage(costed, view_cls):
+    storage, counts = costed
+
+    def chain(root):
+        a = root.open_child("a", view_cls)
+        b = a.open_child("b", view_cls)
+        c = b.open_child("c", EagerListView)
+        return c
+
+    assert sum(measure(storage, counts, chain).values()) == 0
+    with storage.transaction() as tx:
+        Navigator(storage).root(tx).open_child("a", view_cls)["b"] = {"c": [1]}
+    assert sum(measure(storage, counts, chain).values()) == 0
+
+
+@pytest.mark.parametrize("view_cls", DICT_VIEWS)
+def test_exists_is_one_read(costed, view_cls):
+    storage, counts = costed
+    absent = measure(
+        storage, counts, lambda root: root.open_child("d", view_cls).container.exists()
+    )
+    assert sum(absent[k] for k in POINT_OPS) == 1, absent
+    assert absent["scan"] == 0, absent
+    with storage.transaction() as tx:
+        Navigator(storage).root(tx).open_child("d", view_cls)[_key(view_cls, 1)] = 1
+    present = measure(
+        storage, counts, lambda root: root.open_child("d", view_cls).container.exists()
+    )
+    assert sum(present[k] for k in POINT_OPS) == 1, present
+    assert present["scan"] == 0, present
+
+
+@pytest.mark.parametrize("view_cls", DICT_VIEWS)
+def test_none_is_a_stored_value(storage, view_cls):
+    k = _key(view_cls, 1)
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        view[k] = None
+        assert k in view
+        assert view[k] is None
+        assert list(view.items()) == [(k, None)]
+        assert len(view) == 1
+    with storage.snapshot() as snap:
+        view = Navigator(storage).root(snap).open_child("d", view_cls)
+        assert k in view
+        assert view[k] is None
+        assert view.get(k, "dflt") is None
+        assert getattr(view, "eager", view).extract() == {k: None}
+
+
+def test_none_is_a_stored_list_item(storage):
+    with storage.transaction() as tx:
+        lst = Navigator(storage).root(tx).open_child("l", EagerListView)
+        lst.store([None, 1])
+        lst.append(None)
+    with storage.snapshot() as snap:
+        lst = Navigator(storage).root(snap).open_child("l", EagerListView)
+        assert lst.extract() == [None, 1, None]
+        assert lst[0] is None
+        assert None in lst
+        assert len(lst) == 3

@@ -142,9 +142,11 @@ class ListViewBase(
         Mirrors ``__setitem__`` — normalize the index and populate the child
         — but takes ``view_class`` explicitly instead of dispatching by
         Python value type. Used by Refs that already know the child layout
-        (``ShapesListRef[Shape]`` overwriting a slot, etc.).
+        (``ShapesListRef[Shape]`` overwriting a slot, etc.). A value holding
+        EMPTY anywhere raises ``ValueError`` before anything is written.
         """
         normalized = self.normalize_address(address)
+        self._reject_empty(normalized, value)
         self.ensure_created()
         self._populate_child_container(normalized, value, view_class=view_class)
 

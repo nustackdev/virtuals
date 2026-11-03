@@ -529,7 +529,11 @@ class LogIndexedDictViewBase(
         explicitly instead of dispatching by Python value type. Used by Refs
         that carry ``view_type=view_class`` in their slot payload and know
         the child layout up front.
+
+        A value holding EMPTY anywhere raises ``ValueError`` before the view,
+        the log rows or the child are written.
         """
+        self._reject_empty(address, value)
         self.ensure_created()
         self._populate_child_container(address, value, view_class=view_class)
 

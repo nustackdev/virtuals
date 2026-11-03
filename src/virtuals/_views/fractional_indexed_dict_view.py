@@ -582,8 +582,11 @@ class FractionalIndexedDictViewBase(
     def set_child_container_as(self, address: Address, value: object, view_class: type) -> None:
         """Peer of ``__setitem__`` with an explicit child view class.
 
-        Same placement rule as ``__setitem__``.
+        Same placement rule as ``__setitem__``. A value holding EMPTY
+        anywhere raises ``ValueError`` before the view, the position rows or
+        the child are written.
         """
+        self._reject_empty(address, value)
         self.ensure_created()
         self._populate_child_container(address, value, view_class=view_class)
         self._ensure_positioned(address)
