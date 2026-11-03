@@ -14,9 +14,23 @@ opaque strings, and Python's Filter.matches stays the only exact matcher
 Delivery is at least once per retry: a chunk retried after a lost reply runs
 PUBLISH again, so an observer can see a key twice (see PublisherBase).
 
+Drops are not silent to readers. After any drop (retry window exhausted,
+notify() timed out on a full queue, unroutable key, drain cut short) the
+next time the worker can reach the server it publishes an empty-keys
+payload to every hash registered on the prefix: the observer turns that
+into one keyless resync wake per local subscription, so level flows re-read
+and recover what the drop lost. Every observer on the prefix is woken, not
+only those whose filters the dropped keys matched: the keys are gone before
+routing, and an extra re-read is harmless.
+
+The connection has a socket and connect timeout and at most one transparent
+redis-py retry, so one send attempt is bounded by about twice the socket
+timeout; the worker's own retry window stays in charge of the deadline.
+
 Wire format (unchanged for observers):
 - Channel: `{prefix}:notif:{filter_hash}`.
-- msgpack payload: `{"iid": pub_id, "keys": [[...], ...]}`.
+- msgpack payload: `{"iid": pub_id, "keys": [[...], ...]}`. Empty `keys`
+  is a keyless resync wake.
 
 Mixing publishers/observers from before server-side routing on one prefix is
 unsupported: the routing index lives under `{prefix}:nx1:*`.
@@ -24,17 +38,25 @@ unsupported: the routing index lives under `{prefix}:nx1:*`.
 
 from __future__ import annotations
 
+import weakref
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
 
 from virtuals._backends.notify.keyenc import enc_key
 from virtuals._backends.notify.router import NotifyLua
 
-from ._base import DEFAULT_PUBLISH_RETRY_SECONDS, DEFAULT_QUEUE_MAXSIZE, PublisherBase
+from ._base import (
+    DEFAULT_NOTIFY_TIMEOUT_SECONDS,
+    DEFAULT_PUBLISH_RETRY_SECONDS,
+    DEFAULT_QUEUE_MAXSIZE,
+    PublisherBase,
+)
 
 
 try:
     import redis
+    from redis.backoff import NoBackoff
+    from redis.retry import Retry
 except ImportError as e:
     raise ImportError(
         "redis is required for RedisPublisher. Install with: pip install virtuals-py[redis]"
@@ -56,6 +78,7 @@ logger = getLogger(__name__)
 
 
 __all__ = [
+    "DEFAULT_SOCKET_TIMEOUT_SECONDS",
     "MAX_KEYS_PER_CALL",
     "RedisPublisher",
 ]
@@ -65,6 +88,21 @@ __all__ = [
 # single threaded, a 250-key call holds it about 3 ms at most) and the
 # argument count of one call.
 MAX_KEYS_PER_CALL: int = 250
+
+# Socket read/write and connect timeout (seconds). A stalled server fails a
+# send after this instead of hanging the worker.
+DEFAULT_SOCKET_TIMEOUT_SECONDS: float = 2.0
+
+# msgpack array header for zero keys: the resync payload is `hdr + this`.
+_EMPTY_KEYS: bytes = b"\x90"
+
+
+def _close_connection(conn: object) -> None:
+    """Close the server connection. Runs from disconnect() and from the finalizer."""
+    try:
+        conn.close()  # type: ignore[attr-defined]
+    except Exception as e:
+        logger.warning("Error closing redis connection: %s", e)
 
 
 class RedisPublisher(PublisherBase):
@@ -79,10 +117,17 @@ class RedisPublisher(PublisherBase):
         channel_prefix: str = "nu",
         queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
         publish_retry_seconds: float = DEFAULT_PUBLISH_RETRY_SECONDS,
+        notify_timeout: float = DEFAULT_NOTIFY_TIMEOUT_SECONDS,
+        socket_timeout: float = DEFAULT_SOCKET_TIMEOUT_SECONDS,
     ) -> None:
-        super().__init__(queue_maxsize=queue_maxsize, publish_retry_seconds=publish_retry_seconds)
+        super().__init__(
+            queue_maxsize=queue_maxsize,
+            publish_retry_seconds=publish_retry_seconds,
+            notify_timeout=notify_timeout,
+        )
         self._redis_url = redis_url
         self._channel_prefix = channel_prefix
+        self._socket_timeout = socket_timeout
         # Instance id: kept in the wire payload for backwards-compat; the
         # RedisObserver ignores it.
         self._instance_id = id(self)
@@ -95,12 +140,19 @@ class RedisPublisher(PublisherBase):
         )
         self._redis_pub: Any = None
         self._lua = NotifyLua()
+        self._conn_finalizer: weakref.finalize | None = None
 
     # -- Lifecycle hooks ------------------------------------------------------
 
     def _on_connect(self) -> None:
         """Open the Redis connection and load the routing library."""
-        self._redis_pub = redis.from_url(self._redis_url)
+        self._redis_pub = redis.from_url(
+            self._redis_url,
+            socket_timeout=self._socket_timeout,
+            socket_connect_timeout=self._socket_timeout,
+            retry=Retry(NoBackoff(), 1),
+        )
+        self._conn_finalizer = weakref.finalize(self, _close_connection, self._redis_pub)
         self._redis_pub.ping()
         self._lua.ensure(self._redis_pub)
         logger.info(
@@ -112,12 +164,12 @@ class RedisPublisher(PublisherBase):
         )
 
     def _on_disconnect(self) -> None:
-        """Close the Redis connection."""
+        """Close the Redis connection (also after a failed connect)."""
+        if self._conn_finalizer is not None:
+            self._conn_finalizer.detach()
+            self._conn_finalizer = None
         if self._redis_pub is not None:
-            try:
-                self._redis_pub.close()
-            except Exception as e:
-                logger.warning("Error closing redis connection: %s", e)
+            _close_connection(self._redis_pub)
             self._redis_pub = None
         logger.info("Redis publisher stopped")
 
@@ -138,7 +190,9 @@ class RedisPublisher(PublisherBase):
                 # Not a str/int key, an int outside msgpack's range, or a str
                 # with lone surrogates. Logged, counted, raised by next flush().
                 logger.error("Skipping unroutable key %r: %s", key, e)
-                self._record_drop(1, e)
+                # Unreachable through a storage (its key codec refuses these),
+                # so no subscriber is behind on it: counted, no resync wake.
+                self._record_drop(1, e, resync=False)
                 continue
             args.append(packed)
             args.append(b"%d" % len(segs))
@@ -155,6 +209,24 @@ class RedisPublisher(PublisherBase):
         if self._redis_pub is None:
             raise redis.ConnectionError("RedisPublisher not connected")
         self._lua.call(self._redis_pub, "nu1_route", prepared)
+
+    def _send_resync(self) -> None:
+        """Publish an empty-keys payload to every hash registered on the prefix.
+
+        Two round trips, no Lua: the hashes come from the routing index's
+        refs hash, each gets one PUBLISH in a pipeline. A hash with no
+        subscriber left is unregistered lazily by the next routed publish.
+        """
+        if self._redis_pub is None:
+            raise redis.ConnectionError("RedisPublisher not connected")
+        hashes = self._redis_pub.hkeys(f"{self._channel_prefix}:nx1:refs")
+        if not hashes:
+            return
+        payload = self._hdr + _EMPTY_KEYS
+        pipe = self._redis_pub.pipeline(transaction=False)
+        for h in hashes:
+            pipe.publish(b"%s:notif:%s" % (self._channel_prefix.encode(), h), payload)
+        pipe.execute()
 
     def _publish_batch(self, batch: list[Key]) -> None:
         """Encode and send one chunk (no retry)."""
