@@ -1454,3 +1454,49 @@ def test_pending_transaction_holds_the_gate(ctx, tmp_path: Path) -> None:
         if peer.is_alive():
             peer.kill()
         st.close()
+
+
+# =========================================================================
+# Round 2: the loop-thread cap covers a holder in another process (X5, B3)
+# =========================================================================
+
+
+@pytest.mark.timeout(20)
+def test_sync_begin_on_loop_behind_peer_process_is_capped(holder, tmp_path: Path) -> None:
+    """A sync begin or batch write from a coroutine gives up after the cap, not busy_timeout."""
+    from virtuals._backends.storages._write_slot import LOOP_THREAD_WAIT_CAP
+
+    st = _open(str(tmp_path), busy_timeout=1.0)
+
+    def begin() -> float:
+        t0 = time.monotonic()
+        with pytest.raises(StorageLockTimeoutError, match="areserve_write_slot"):
+            st.begin_transaction()
+        return time.monotonic() - t0
+
+    def batch() -> float:
+        t0 = time.monotonic()
+        with pytest.raises(StorageLockTimeoutError, match="areserve_write_slot"):
+            with st.batch_write() as b:
+                b.put(("x",), b"1")
+        return time.monotonic() - t0
+
+    async def main() -> None:
+        for body in (begin, batch):
+
+            async def run(body=body):
+                return body()
+
+            took, gap = await _ticking(run)
+            assert LOOP_THREAD_WAIT_CAP <= took < 0.5, took  # timing: the cap, not busy_timeout
+            assert gap < 0.5, gap  # timing
+        assert not st._writer.lock.locked()
+        assert not st._gate_held
+
+    try:
+        asyncio.run(main())
+        holder.join(10)
+        with st.transaction() as tx:  # the gate is free again
+            tx.put(("mine",), b"1")
+    finally:
+        st.close()

@@ -6,6 +6,7 @@ MVCC snapshots, and optional change notifications via a publisher.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 import time
@@ -25,7 +26,7 @@ from virtuals.tkv.storage import (
     WriteBatchProtocol,
 )
 
-from .._write_slot import WriterLock, WriteSlot
+from .._write_slot import LOOP_THREAD_WAIT_CAP, WriterLock, WriteSlot
 from ._writer import WriterGate, WriterThread
 from .context import replay_pending
 from .snapshot import LMDBSnapshot
@@ -153,7 +154,12 @@ class LMDBStorage:
     ``begin_transaction(write_slot=...)``. A second writer from the task or
     thread that already holds the slot raises
     ``StorageNestedTransactionError``; a sync begin while another task on
-    the same loop holds it raises ``StorageLockTimeoutError`` at once.
+    the same loop holds it raises ``StorageLockTimeoutError`` at once. A
+    sync begin or batch write from a coroutine never stalls its loop for
+    long: on an event loop thread each wait (the slot, the gate, the begin
+    on the writer thread) is capped at ``LOOP_THREAD_WAIT_CAP``, whether
+    the holder is a thread or another process, and surfaces as the
+    retryable ``StorageLockTimeoutError``.
 
     close() ends open contexts from the closing thread. One whose owner is
     inside a call is ended after that call returns, never under it, and
@@ -746,10 +752,37 @@ class LMDBStorage:
         return write_batch
 
     def _acquire_gate(self, deadline: float) -> None:
-        """Take the cross-process gate, waiting until ``deadline`` at most."""
-        if self._gate is not None:
-            self._gate.acquire(deadline - time.monotonic())
-            self._gate_held = True
+        """Take the cross-process gate, waiting until ``deadline`` at most.
+
+        On an event loop thread the wait is capped at
+        ``LOOP_THREAD_WAIT_CAP`` like the in-process slot's (contract
+        section 4: a wait on the loop is bounded and surfaced); the longer
+        wait belongs in ``areserve_write_slot``.
+        """
+        if self._gate is None:
+            return
+        timeout = deadline - time.monotonic()
+        on_loop = asyncio._get_running_loop() is not None
+        if on_loop:
+            timeout = min(timeout, LOOP_THREAD_WAIT_CAP)
+        try:
+            self._gate.acquire(timeout)
+        except StorageLockTimeoutError:
+            if not on_loop:
+                raise
+            raise StorageLockTimeoutError(
+                f"Timed out after {timeout}s waiting for the write lock held by another "
+                f"process, on an event loop thread, where a sync begin waits at most "
+                f"{LOOP_THREAD_WAIT_CAP}s so the loop is not stalled. Wait for the slot "
+                "with areserve_write_slot instead"
+            ) from None
+        self._gate_held = True
+
+    def _hop_timeout(self) -> float:
+        """How long a begin on the writer thread is waited for: capped on a loop thread."""
+        if asyncio._get_running_loop() is not None:
+            return min(self._busy_timeout, LOOP_THREAD_WAIT_CAP)
+        return self._busy_timeout
 
     def _take_write_slot(self) -> threading.Lock:
         """Take the in-process slot, then the gate, bounded together by ``busy_timeout``.
@@ -771,12 +804,13 @@ class LMDBStorage:
         """Begin a pending transaction's LMDB txn and replay its writes on this thread.
 
         With the gate held the begin is not a wait on a virtuals peer, so
-        it gets the full timeout (a writer outside virtuals bounds). Returns
-        the handle and the keys whose delete found nothing. A failed replay
-        aborts the handle again and raises, leaving the transaction pending.
+        it gets the full timeout (a writer outside virtuals bounds), capped
+        on a loop thread. Returns the handle and the keys whose delete
+        found nothing. A failed replay aborts the handle again and raises,
+        leaving the transaction pending.
         """
         lmdb_txn = self._writer_thread.run(
-            self._begin_lmdb_write, timeout=self._busy_timeout, undo=self._abort_abandoned
+            self._begin_lmdb_write, timeout=self._hop_timeout(), undo=self._abort_abandoned
         )
         try:
             missing = replay_pending(lmdb_txn, pending)
@@ -798,7 +832,7 @@ class LMDBStorage:
         return self._writer_thread.run_staged(
             self._begin_lmdb_write,
             lambda lmdb_txn: self._apply_and_commit(lmdb_txn, pending),
-            timeout=self._busy_timeout,
+            timeout=self._hop_timeout(),
             undo=self._abort_abandoned,
         )
 
