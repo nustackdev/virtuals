@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import gc
+import os
 import random
 import subprocess
 import sys
@@ -942,6 +943,143 @@ def test_dropped_snapshot_is_collected_and_unpins_wal(storage: SQLiteStorage) ->
         # A pinned reader would make a TRUNCATE checkpoint report busy.
         busy, _, _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         assert busy == 0
+    finally:
+        storage._release_connection(conn)
+
+
+# =========================================================================
+# Fork
+# =========================================================================
+
+
+def _child_exits_with(code_fn, child_thread: bool) -> int:
+    """Run ``code_fn`` in a forked child (on a new thread if asked), return its exit code."""
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            if child_thread:
+                box: list[int] = []
+                x = threading.Thread(target=lambda: box.append(code_fn()))
+                x.start()
+                x.join()
+                code = box[0] if box else 1
+            else:
+                code = code_fn()
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status)
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.parametrize("child_thread", [False, True], ids=["forking-thread", "new-thread"])
+def test_fork_during_write_child_write_fails_clearly(
+    storage: SQLiteStorage, db_path: Path, child_thread: bool
+) -> None:
+    """A child forked while a parent thread holds a write gets a clear error, at once.
+
+    The inherited lock state marks the file's write lock as taken in the
+    child for good, so a plain begin would wait out busy_timeout and
+    raise a retryable error forever. Every write path refuses instead,
+    on the inherited storage and on a fresh one opened on the same file,
+    and close() never runs a statement on the parent's connections.
+    """
+    held, go = threading.Event(), threading.Event()
+    traced: list[str] = []
+
+    def holder() -> None:
+        with storage.transaction() as tx:
+            tx.put(("parent",), b"1")
+            assert tx._conn is not None
+            tx._conn.set_trace_callback(traced.append)
+            held.set()
+            go.wait()
+
+    t = threading.Thread(target=holder)
+    t.start()
+    held.wait()
+    parent_conn = next(iter(storage._active_transactions))._conn
+
+    def clear(begin) -> bool:
+        t0 = time.monotonic()
+        try:
+            begin()
+        except StorageError as e:
+            return type(e) is StorageError and "fork" in str(e) and time.monotonic() - t0 < 0.5
+        return False
+
+    def child() -> int:
+        go.wait(0.2)  # never set here: the parent's commit cannot reach the child
+        with storage.snapshot() as snap:  # reads still work
+            if snap.get(("parent",)) is not EMPTY:
+                return 2
+        if not clear(storage.begin_transaction):
+            return 3
+        if not clear(storage.begin_write_batch):
+            return 4
+        if not clear(lambda: asyncio.run(storage.areserve_write_slot())):
+            return 5
+        fresh = SQLiteStorage(path=db_path, codec=BinaryCodec(), busy_timeout=0.2)
+        fresh.open()
+        if not clear(fresh.begin_transaction):
+            return 6
+        fresh.close()
+        storage.close()  # returns, touches nothing inherited
+        if traced or not parent_conn.in_transaction:
+            return 7
+        return 0
+
+    try:
+        assert _child_exits_with(child, child_thread) == 0
+    finally:
+        go.set()
+        t.join()
+    assert traced == ["COMMIT"]
+    with storage.snapshot() as snap:
+        assert snap.get(("parent",)) == b"1"
+    storage.begin_transaction().commit()
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.parametrize("child_thread", [False, True], ids=["forking-thread", "new-thread"])
+def test_fork_without_write_child_writes(
+    storage: SQLiteStorage, db_path: Path, child_thread: bool
+) -> None:
+    """With no write in progress at fork, the child writes from any thread, and reopens."""
+    with storage.transaction() as tx:
+        tx.put(("parent",), b"1")
+    snap = storage.begin_snapshot()  # an open reader is fine to inherit
+
+    def child() -> int:
+        for value in (b"1", b"2"):
+            with storage.transaction() as tx:
+                tx.put(("child",), value)
+        with storage.snapshot() as s:
+            if s.get(("child",)) != b"2" or s.get(("parent",)) != b"1":
+                return 2
+        if not snap.is_closed:  # inherited contexts are forgotten, not ended
+            return 3
+        storage.close()
+        storage.open()
+        with storage.transaction() as tx:
+            tx.put(("child",), b"3")
+        storage.close()
+        return 0
+
+    assert _child_exits_with(child, child_thread) == 0
+    assert not snap.is_closed  # the parent's snapshot is untouched by the child
+    assert snap.get(("child",)) is EMPTY  # pinned before the child's writes
+    snap.close()
+    with storage.snapshot() as s:
+        assert s.get(("child",)) == b"3"
+    with storage.transaction() as tx:
+        tx.put(("parent",), b"2")
+    conn = storage._acquire_connection()
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         storage._release_connection(conn)
 
