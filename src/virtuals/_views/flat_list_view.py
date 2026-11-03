@@ -116,6 +116,8 @@ class FlatListView(
 
     def clear(self) -> None:
         """Remove all items."""
+        if not self.container.exists():
+            return  # clear of nothing is not a write: the view stays absent
         self.ensure_created()
         self.container.clear_children(validate=False)
         self._set_length(0)
@@ -144,12 +146,15 @@ class FlatListView(
     def extend(self, values: Iterable[Value]) -> None:
         """Append multiple values."""
         values = self._reject_empty_in(values)  # type: ignore[assignment]
-        self.ensure_created()
-        index = len(self)
+        index = None
         for item in values:
+            if index is None:  # created on the first item: extend([]) writes nothing
+                self.ensure_created()
+                index = len(self)
             self.container.put_child_primitive(index, item)
             index += 1
-        self._set_length(index)
+        if index is not None:
+            self._set_length(index)
 
     # -- Extract ------------------------------------------------------------
 

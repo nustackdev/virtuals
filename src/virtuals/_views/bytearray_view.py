@@ -115,8 +115,8 @@ class ByteArrayView(
         if not isinstance(value, int) or not 0 <= value <= 255:
             raise ValueError("byte must be in range(0, 256)")
 
+        normalized = self.normalize_address(address)  # IndexError before any write
         self.ensure_created()
-        normalized = self.normalize_address(address)
         self.container.put_child_primitive(normalized, value)
 
     def __iter__(self) -> Generator[int, None, None]:
@@ -145,8 +145,8 @@ class ByteArrayView(
 
         O(n) in the number of bytes after ``address``.
         """
+        normalized = self.normalize_address(address)  # IndexError before any write
         self.ensure_created()
-        normalized = self.normalize_address(address)
         length = len(self)
 
         self.container.delete_child(normalized)
@@ -237,6 +237,8 @@ class ByteArrayView(
 
     def clear(self) -> None:
         """Remove all bytes."""
+        if not self.container.exists():
+            return  # clear of nothing is not a write: the view stays absent
         self.ensure_created()
         self.container.clear_children()
         self._set_length(0)

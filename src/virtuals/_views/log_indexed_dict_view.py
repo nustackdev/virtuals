@@ -511,6 +511,8 @@ class LogIndexedDictViewBase(
             self._log_container().delete_child_primitive_unsafe(address)
 
     def clear(self) -> None:
+        if not self.container.exists():
+            return  # clear of nothing is not a write: the view stays absent
         self.ensure_created()
         self._data_container().clear_children(validate=False)
         self._keys_container().clear_children(validate=False)
