@@ -7,7 +7,27 @@
 .venv/bin/python -m pytest -q -p no:cacheprovider tests -k lmdb      # one backend
 ```
 
-The full suite takes about 3 minutes serial and under a minute with `-n 8`. Every test runs on the project venv; there is no other configuration.
+The full suite takes about 3 minutes serial and under a minute with `-n 8`. Every test runs on the project venv; the only configuration is the `slow` marker in `pyproject.toml`, excluded by default.
+
+## Model-based tiers
+
+Three files drive the storages and views with random operations against a reference model and run in two tiers:
+
+| file | drives |
+|---|---|
+| `conformance/test_s8_model.py` | a Hypothesis state machine over one storage: transactions begun on the main thread, a loop thread or a worker thread, batches, snapshots, drop, close and reopen, bulk rows across scan pages, big values, odd and oversized keys, against a dict model with a pending overlay |
+| `conformance/test_s1_randomized.py` | threads, coroutines and spawned processes under random load: bank sum, insert race on a scanned range, atomic multi-key visibility, with the default and a 20ms busy timeout, and with SIGKILL of writer processes on sqlite and lmdb |
+| `views/test_views_model.py` | random ops on five views (dict, log indexed, fractional indexed, list, set) against python models, every view and every raw storage row checked after each op |
+
+- `fast` runs in the default suite: a fixed seed, a few short examples, about 5 seconds per backend across the three files. The same seed draws the same operations every run.
+- `slow` is excluded by default and runs with `-m slow`: about 1 to 2 minutes per backend. `CONFORMANCE_MODEL_EXAMPLES` and `CONFORMANCE_MODEL_SEED` size and seed the two state machines, `CONFORMANCE_MODEL_SECONDS` scales the concurrent runs (30 is the default).
+
+```sh
+.venv/bin/python -m pytest -q -p no:cacheprovider -m slow tests                      # the slow tier
+CONFORMANCE_MODEL_EXAMPLES=500 .venv/bin/python -m pytest -q -p no:cacheprovider -m slow tests/views/test_views_model.py -k lmdb
+```
+
+A failure prints the shrunk sequence of steps that reproduces it. Open view bugs are routed around with named `OPEN_M*` flags at the top of `views/test_views_model.py`; delete a flag in the commit that fixes it.
 
 ## Layout
 
