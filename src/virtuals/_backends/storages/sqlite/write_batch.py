@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from virtuals.tkv.storage import (
     StorageClosedError,
     StorageLockTimeoutError,
+    StorageNestedTransactionError,
     StorageOperationError,
     StorageTransactionError,
     WriteBatchProtocol,
@@ -114,7 +115,7 @@ class SQLiteWriteBatch(ContextBase, WriteBatchProtocol):
             self._ops.clear()
             self._storage._untrack_write_batch(self)
             logger.error("Write batch write failed")
-            if isinstance(e, StorageLockTimeoutError):
+            if isinstance(e, (StorageLockTimeoutError, StorageNestedTransactionError)):
                 raise
             if is_busy_error(e):
                 raise StorageLockTimeoutError(f"Timed out writing batch: {e}") from e

@@ -9,7 +9,9 @@ from virtuals.tkv.storage.exceptions import (
     StorageInterfaceError,
     StorageIteratorError,
     StorageKeyError,
+    StorageLockTimeoutError,
     StorageLookupError,
+    StorageNestedTransactionError,
     StorageOperationError,
     StorageTransactionAbortedError,
     StorageTransactionConflictError,
@@ -452,3 +454,14 @@ class TestExceptionHierarchy:
         mro = StorageLookupError.__mro__
         assert StorageOperationError in mro
         assert LookupError in mro
+
+
+class TestStorageNestedTransactionError:
+    """The nested-transaction error is a transaction error, never a retryable one."""
+
+    def test_is_transaction_error(self):
+        assert issubclass(StorageNestedTransactionError, StorageTransactionError)
+
+    def test_is_not_retryable(self):
+        assert not issubclass(StorageNestedTransactionError, StorageTransactionConflictError)
+        assert not issubclass(StorageNestedTransactionError, StorageLockTimeoutError)

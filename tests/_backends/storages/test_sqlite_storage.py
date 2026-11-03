@@ -23,7 +23,11 @@ from virtuals._backends.storages.sqlite import SQLiteStorage
 from virtuals.codecs import BinaryCodec
 from virtuals.tkv import StorageScanOptions
 from virtuals.tkv.filter import LengthFilter, PrefixFilter
-from virtuals.tkv.storage import StorageError, StorageLockTimeoutError
+from virtuals.tkv.storage import (
+    StorageError,
+    StorageLockTimeoutError,
+    StorageNestedTransactionError,
+)
 from virtuals.tkv.types import EMPTY
 
 
@@ -222,7 +226,7 @@ def test_snapshot_does_not_wait_for_writer(storage: SQLiteStorage) -> None:
 def test_same_thread_second_writer_fails_fast(storage: SQLiteStorage) -> None:
     tx = storage.begin_transaction()
     t0 = time.monotonic()
-    with pytest.raises(StorageLockTimeoutError):
+    with pytest.raises(StorageNestedTransactionError):
         storage.begin_transaction()
     assert time.monotonic() - t0 < 0.5
     tx.abort()
@@ -345,11 +349,11 @@ def test_same_task_second_writer_fails_fast(storage: SQLiteStorage) -> None:
         slot = await storage.areserve_write_slot()
         tx = storage.begin_transaction(write_slot=slot)
         t0 = time.monotonic()
-        with pytest.raises(StorageLockTimeoutError, match="wait on itself"):
+        with pytest.raises(StorageNestedTransactionError, match="wait on itself"):
             await storage.areserve_write_slot()
-        with pytest.raises(StorageLockTimeoutError, match="wait on itself"):
+        with pytest.raises(StorageNestedTransactionError, match="wait on itself"):
             storage.begin_transaction()
-        with pytest.raises(StorageLockTimeoutError, match="wait on itself"):
+        with pytest.raises(StorageNestedTransactionError, match="wait on itself"):
             with storage.batch_write() as batch:
                 batch.put(("x",), b"1")
         assert time.monotonic() - t0 < 0.5
