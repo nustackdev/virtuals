@@ -115,6 +115,12 @@ def test_tuple_store_replaces_content(tuple_factory):
     assert data.extract() == (4, 5, 6, 7)
 
 
+def test_tuple_store_without_replace_appends(tuple_factory):
+    items = tuple_factory("items", (1, 2))
+    items.store((3,), replace=False)
+    assert items.extract() == (1, 2, 3)
+
+
 def test_tuple_extract_full(tuple_factory):
     """Test extract() returns full tuple."""
     data = tuple_factory("data", (10, 20, 30, 40, 50))

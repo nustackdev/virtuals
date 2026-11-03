@@ -485,7 +485,7 @@ class ChildNestedSetBase:
         children = self._children_container()  # type: ignore[attr-defined]
         child_container = Container(ctx=children.ctx, site=(*children.site, address))
         child_view = view_class(container=child_container, registry=self.registry, parent=self)  # type: ignore[call-arg]
-        self._ensure_child_view(child_view)  # type: ignore[attr-defined]
+        created = self._ensure_child_view(child_view)  # type: ignore[attr-defined]
 
         # Store if supported
         if not isinstance(child_view, Initializable):
@@ -499,7 +499,9 @@ class ChildNestedSetBase:
             )
             raise TypeError(f"Child view {view_class.__name__} does not support initialization")
 
-        child_view.store(value)
+        # A child created just now has nothing to clear: skip the child scan
+        # a replacing store would do. An existing child is replaced.
+        child_view.store(value, replace=not created)
 
 
 class ChildPrimitiveSetBase:

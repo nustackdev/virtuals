@@ -113,6 +113,13 @@ def test_flat_list_store_replaces_content(flat_list_factory):
     assert items.extract() == [4, 5, 6, 7]
 
 
+def test_flat_list_store_without_replace_appends(flat_list_factory):
+    items = flat_list_factory("items", [1, 2, 3])
+    items.store([4, 5], replace=False)
+    assert len(items) == 5
+    assert items.extract() == [1, 2, 3, 4, 5]
+
+
 def test_flat_list_extract_returns_list(flat_list_factory):
     items = flat_list_factory("items", [10, 20, 30])
     extracted = items.extract()

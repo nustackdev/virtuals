@@ -107,14 +107,14 @@ class Initializable(Protocol[V]):
         ...     container.store({"key": "value"}, replace=True)
     """
 
-    def store(self, value: V) -> None:
+    def store(self, value: V, *, replace: bool = True) -> None:
         """Store Python value into container.
 
         Args:
             value: Native Python value to store
-            *args: Positional arguments
-            replace: If True, clear existing content before storing
-            **kwargs: Keyword arguments
+            replace: If True, clear existing content before storing. If
+                False, add to what is there: mappings merge, sets union,
+                sequences append.
 
         Raises:
             TypeError: If value type not supported

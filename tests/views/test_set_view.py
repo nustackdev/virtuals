@@ -136,6 +136,15 @@ def test_set_store_replaces_content(set_factory):
     assert tags.extract() == {"go", "typescript", "java"}
 
 
+def test_set_store_without_replace_unions(set_factory):
+    """store(replace=False) keeps existing members."""
+    tags = set_factory("tags", {"python", "rust"})
+
+    tags.store({"rust", "go"}, replace=False)
+
+    assert tags.extract() == {"python", "rust", "go"}
+
+
 def test_set_extract_full(set_factory):
     """Test extract() returns full set."""
     tags = set_factory("tags", {"python", "rust", "go"})

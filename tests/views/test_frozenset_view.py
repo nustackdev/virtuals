@@ -117,6 +117,12 @@ def test_frozenset_store_replaces_content(frozenset_factory):
     assert extracted == frozenset({"go", "java"})
 
 
+def test_frozenset_store_without_replace_unions(frozenset_factory):
+    tags = frozenset_factory("tags", frozenset({"a", "b"}))
+    tags.store(frozenset({"b", "c"}), replace=False)
+    assert tags.extract() == frozenset({"a", "b", "c"})
+
+
 def test_frozenset_extract_returns_frozenset(frozenset_factory):
     tags = frozenset_factory("tags", {"a", "b", "c"})
     extracted = tags.extract()

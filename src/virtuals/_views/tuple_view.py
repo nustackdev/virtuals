@@ -189,19 +189,21 @@ class TupleView(
         """
         return tuple(self)
 
-    def store(self, value: Iterable[object]) -> None:
+    def store(self, value: Iterable[object], *, replace: bool = True) -> None:
         """Store tuple contents.
 
         Args:
             value: Sequence to store
-            replace: If True, clear existing content first
+            replace: If True, clear existing content first; if False, append
         """
         self.ensure_created()
-        self.container.clear_children()
-
-        count = 0
-        for index, item in enumerate(value):
-            self._set_child_value(index, item)
+        if replace:
+            self.container.clear_children()
+            count = 0
+        else:
+            count = len(self)
+        for item in value:
+            self._set_child_value(count, item)
             count += 1
 
         # Set final length metadata

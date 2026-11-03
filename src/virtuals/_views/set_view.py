@@ -231,13 +231,16 @@ class SetView(
         """
         return set(self)
 
-    def store(self, value: Iterable[object]) -> None:
+    def store(self, value: Iterable[object], *, replace: bool = True) -> None:
         """Store set contents.
 
         Args:
             value: Iterable to store
+            replace: If True, clear existing content first; if False, union
         """
-        self.clear()
+        self.ensure_created()
+        if replace:
+            self.clear()
 
         # Each new member is counted via _on_child_created
         for item in value:

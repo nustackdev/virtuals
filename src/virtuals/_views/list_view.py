@@ -218,11 +218,19 @@ class ListViewBase(
                 return
         raise ValueError(f"{value!r} is not in list")
 
-    def store(self, value: Iterable[object]) -> None:
-        """Store list contents."""
-        self.clear()
+    def store(self, value: Iterable[object], *, replace: bool = True) -> None:
+        """Store list contents.
 
-        count = 0
+        Args:
+            value: Iterable to store
+            replace: If True, clear existing content first; if False, append
+        """
+        self.ensure_created()
+        if replace:
+            self.clear()
+            count = 0
+        else:
+            count = len(self)
         for item in value:
             self._set_child_value(count, item)
             count += 1

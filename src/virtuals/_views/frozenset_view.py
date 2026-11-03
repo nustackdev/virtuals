@@ -173,16 +173,17 @@ class FrozenSetView(
         """
         return frozenset(self)
 
-    def store(self, value: Iterable[object]) -> None:
+    def store(self, value: Iterable[object], *, replace: bool = True) -> None:
         """Store frozenset contents.
 
         Args:
             value: Iterable to store
-            replace: If True, clear existing content first
+            replace: If True, clear existing content first; if False, union
         """
         self.ensure_created()
-        self.container.clear_children()
-        self._set_length(0)
+        if replace:
+            self.container.clear_children()
+            self._set_length(0)
 
         # Each new member is counted via _on_child_created
         for item in value:

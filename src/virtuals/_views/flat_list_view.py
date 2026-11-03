@@ -121,11 +121,19 @@ class FlatListView(
 
     # -- Bulk ---------------------------------------------------------------
 
-    def store(self, value: Iterable[Value]) -> None:
-        """Store list contents (replaces existing)."""
+    def store(self, value: Iterable[Value], *, replace: bool = True) -> None:
+        """Store list contents.
+
+        Args:
+            value: Iterable to store
+            replace: If True, clear existing content first; if False, append
+        """
         self.ensure_created()
-        self.clear()
-        count = 0
+        if replace:
+            self.clear()
+            count = 0
+        else:
+            count = len(self)
         for item in value:
             self.container.put_child_primitive(count, item)
             count += 1
