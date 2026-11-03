@@ -95,15 +95,36 @@ class SetView(
         """Normalize value address to an internal storage key."""
         return self._make_key(address)
 
+    def _check_member(self, value: object) -> None:
+        """Reject what a Python set would: EMPTY anywhere, or an unhashable value.
+
+        Raises before anything is written, so a rejected add leaves nothing
+        behind. A tuple or frozenset is a member like any other.
+        """
+        self._reject_empty_in(value)
+        hash(value)  # TypeError for list, dict, set: unhashable type
+
+    def _put_member(self, value: object) -> None:
+        """Write one member as a single opaque row under its hashed key.
+
+        Members never become child containers, whatever their Python type:
+        a tuple member reads back as a tuple, and iteration stays a
+        primitive read per row. Caller must have checked the member and
+        ensured the view exists. A new member is counted via
+        ``_on_child_created``.
+        """
+        self._put_child_primitive(self._make_key(value), value)
+
     def add(self, value: object) -> None:
         """Add value to set.
 
         Args:
-            value: Value to add
+            value: Value to add. Must be hashable, like a Python set member;
+                a list, dict or set raises ``TypeError`` before any write.
         """
-        self._reject_empty_in(value)
-        # A new value is counted via _on_child_created
-        self._set_child_value(self._make_key(value), value)
+        self._check_member(value)
+        self.ensure_created()
+        self._put_member(value)
 
     def remove(self, value: object) -> None:
         """Remove value from set.
@@ -241,14 +262,15 @@ class SetView(
             value: Iterable to store
             replace: If True, clear existing content first; if False, union
         """
-        value = self._reject_empty_in(value)  # type: ignore[assignment]
+        members = list(value)
+        for item in members:  # every member checked before any write
+            self._check_member(item)
         self.ensure_created()
         if replace:
             self.clear()
 
-        # Each new member is counted via _on_child_created
-        for item in value:
-            self._set_child_value(self._make_key(item), item)
+        for item in members:
+            self._put_member(item)
 
 
 MutableSet.register(SetView)

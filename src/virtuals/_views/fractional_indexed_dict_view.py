@@ -653,9 +653,9 @@ class FractionalIndexedDictViewBase(
 
     def move_before(self, address: Address, ref: Address) -> None:
         """Move ``address`` directly before ``ref``. Value untouched."""
+        okey = self._require_position(address)  # raises on an absent id, self move too
         if address == ref:
             return
-        okey = self._require_position(address)
         ref_okey = self._require_position(ref)
         prev = self._neighbour(ref_okey, before=True)
         if prev is not None and prev[0] == okey:
@@ -664,9 +664,9 @@ class FractionalIndexedDictViewBase(
 
     def move_after(self, address: Address, ref: Address) -> None:
         """Move ``address`` directly after ``ref``. Value untouched."""
+        okey = self._require_position(address)  # raises on an absent id, self move too
         if address == ref:
             return
-        okey = self._require_position(address)
         ref_okey = self._require_position(ref)
         nxt = self._neighbour(ref_okey, before=False)
         if nxt is not None and nxt[0] == okey:

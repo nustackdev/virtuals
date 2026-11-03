@@ -180,15 +180,19 @@ class FrozenSetView(
             value: Iterable to store
             replace: If True, clear existing content first; if False, union
         """
-        value = self._reject_empty_in(value)  # type: ignore[assignment]
+        members = list(value)
+        for item in members:  # every member checked before any write
+            self._reject_empty_in(item)
+            hash(item)  # TypeError for list, dict, set: unhashable type
         self.ensure_created()
         if replace:
             self.container.clear_children()
             self._set_length(0)
 
-        # Each new member is counted via _on_child_created
-        for item in value:
-            self._set_child_value(self._make_key(item), item)
+        # One opaque row per member, never a child container (a tuple member
+        # reads back as a tuple). A new member is counted via _on_child_created.
+        for item in members:
+            self._put_child_primitive(self._make_key(item), item)
 
 
 SetABC.register(FrozenSetView)

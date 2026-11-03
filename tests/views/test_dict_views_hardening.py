@@ -1133,3 +1133,100 @@ def test_clear_on_existing_view_empties_it_and_keeps_it(root, view_cls):
     assert len(view) == 0
     assert list(view) == []
     assert "v" in root
+
+
+# ============================================================================
+# MEMBERS AND SLOTS: r3 model audit M1 to M3
+# ============================================================================
+
+
+@pytest.mark.parametrize("member", [(1, 2), frozenset({1, "a"}), ("x", (2, 3)), None, b"raw"])
+def test_set_hashable_member_round_trips_as_one_row(root, member):
+    """A tuple or frozenset is a member like any other: it never becomes a child
+    container, so the set stays iterable and extract() returns it as stored."""
+    view = root.open_child("s", SetView)
+    view.add("x")
+    view.add(member)
+    assert len(view) == 2
+    assert member in view
+    assert set(view) == {"x", member}
+    assert view.extract() == {"x", member}
+    view.discard(member)
+    assert set(view) == {"x"}
+
+
+@pytest.mark.parametrize("member", [[1, 2], {"a": 1}, {1, 2}, (1, [2])])
+def test_set_unhashable_member_is_rejected_before_any_write(root, member):
+    """What a Python set refuses, SetView refuses, and an absent set stays absent."""
+    view = root.open_child("absent", SetView)
+    with pytest.raises(TypeError, match="unhashable"):
+        view.add(member)
+    _assert_absent(view)
+    with pytest.raises(TypeError, match="unhashable"):
+        view.store(["ok", member])
+    _assert_absent(view)
+    view.add("ok")
+    with pytest.raises(TypeError, match="unhashable"):
+        view.store([member], replace=True)
+    assert set(view) == {"ok"}
+
+
+def test_set_store_keeps_compound_members_readable(root):
+    view = root.open_child("s", SetView)
+    view.store([(1, 2), "a", frozenset({3})])
+    assert set(view) == {(1, 2), "a", frozenset({3})}
+    assert len(view) == 3
+    view.store([(9,)], replace=False)
+    assert len(view) == 4
+    assert (9,) in view
+
+
+def test_frozenset_store_keeps_compound_members_readable(root):
+    from virtuals._views import FrozenSetView
+
+    view = root.open_child("fs", FrozenSetView)
+    view.store([(1, 2), "a"])
+    assert set(view) == {(1, 2), "a"}
+    assert view.extract() == frozenset({(1, 2), "a"})
+    with pytest.raises(TypeError, match="unhashable"):
+        view.store(["b", [1]], replace=True)
+    assert set(view) == {(1, 2), "a"}
+
+
+@pytest.mark.parametrize("view_cls", (EagerListView, LazyListView))
+@pytest.mark.parametrize("at", [0, 1, 2])
+def test_list_insert_of_a_compound_over_a_primitive_slot_keeps_the_list_whole(root, view_cls, at):
+    """insert shifts the tail and vacates the slot: the new value never meets the
+    kind of the item that used to sit there. len, iteration and rows agree."""
+    view = root.open_child("ls", view_cls)
+    view.store([1, 2, 3])
+    view.insert(at, {"z": 1})
+    expected = [1, 2, 3]
+    expected.insert(at, {"z": 1})
+    assert len(view) == 4
+    assert [v.extract() if hasattr(v, "extract") else v for v in view] == expected
+    assert view.container.get_child_type(4).name == "NONE" or not view.container.exists_child(4)
+    view.append(9)
+    assert len(view) == 5
+    assert [v.extract() if hasattr(v, "extract") else v for v in view] == [*expected, 9]
+
+
+def test_list_insert_of_a_primitive_over_a_compound_slot_keeps_the_list_whole(root):
+    view = root.open_child("ls", EagerListView)
+    view.store([{"a": 1}, 2])
+    view.insert(0, 9)
+    view.insert(1, 8)
+    assert len(view) == 4
+    assert list(view) == [9, 8, {"a": 1}, 2]
+
+
+@pytest.mark.parametrize("move", ["move_before", "move_after"])
+def test_fractional_move_of_an_absent_id_onto_itself_raises(root, move):
+    """Naming an absent id raises KeyError on every move, the self move too."""
+    view = root.open_child("f", EagerFractionalIndexedDictView)
+    view.append("a", 1)
+    with pytest.raises(KeyError):
+        getattr(view, move)("zz", "zz")
+    assert list(view) == ["a"]
+    getattr(view, move)("a", "a")  # present self move: a no-op
+    assert list(view) == ["a"]
