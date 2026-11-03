@@ -414,7 +414,10 @@ def test_abort_racing_commit_keeps_one_outcome(storage: LMDBStorage, ctx: str) -
     tx = storage.begin_transaction() if ctx == "transaction" else storage.begin_write_batch()
     tx.put(("k",), b"committed")
     inside = threading.Event()
-    tx._lmdb_txn = _SignalInsideCommit(tx._lmdb_txn, inside)
+    raw, tx._lmdb_txn = tx._lmdb_txn, _SignalInsideCommit(tx._lmdb_txn, inside)
+    with storage._env_lock:  # the live set tracks handles by identity: track the wrapper
+        storage._live_writes.discard(raw)
+        storage._live_writes.add(tx._lmdb_txn)
     errors: list[BaseException] = []
 
     def abort_from_elsewhere() -> None:
@@ -1102,4 +1105,189 @@ def test_write_txn_data_calls_run_on_any_thread(ctx, tmp_path: Path) -> None:
     finally:
         if peer.is_alive():
             peer.kill()
+        st.close()
+
+
+# =========================================================================
+# Re-review regressions: fork with the gate lock held, ends racing close, gate fd reuse
+# =========================================================================
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_fork_while_gate_lock_is_held_elsewhere(storage: LMDBStorage) -> None:
+    """A fork while another parent thread holds the gate's lock: the child's first write works.
+
+    Hung before the fix: the child reopened the gate under the inherited lock.
+    """
+    with storage.transaction() as tx:
+        tx.put(("parent",), b"1")
+    held, go = threading.Event(), threading.Event()
+
+    def hold_lock() -> None:
+        with storage._gate._mu:
+            held.set()
+            go.wait(5)
+
+    t = threading.Thread(target=hold_lock)
+    t.start()
+    held.wait()
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            with storage.transaction() as tx:
+                tx.put(("child",), b"1")
+            storage.close()
+            code = 0
+        finally:
+            os._exit(code)
+    try:
+        assert _wait_pid(pid) == 0
+    finally:
+        go.set()
+        t.join()
+    with storage.snapshot() as snap:
+        assert snap.get(("child",)) == b"1"
+
+
+def _peer_can_write_now(ctx, tmp_path: Path):
+    """A spawned peer with the env open; call the returned function to make it write promptly."""
+    ready, go = ctx.Event(), ctx.Event()
+    out = tmp_path / "peer.json"
+    peer = ctx.Process(target=_peer_write, args=(str(tmp_path), 2.0, ready, go, str(out)))
+    peer.start()
+    assert ready.wait(20)
+
+    def check() -> None:
+        go.set()
+        peer.join(10)
+        if peer.is_alive():
+            peer.kill()
+        assert peer.exitcode == 0
+        report = json.loads(out.read_text())
+        assert report["result"] == "ok", report
+        assert report["took"] < 1.0, report  # timing
+
+    return check
+
+
+@pytest.mark.timeout(30)
+def test_finalizer_racing_close_leaves_no_live_write(ctx, tmp_path: Path, monkeypatch) -> None:
+    """A txn finalized on one thread while close() runs on another: close() ends it itself.
+
+    Before the fix the finalizer marked the context closed, close() skipped
+    it and stopped the writer thread, and the abort was never queued.
+    """
+    from virtuals._backends.storages.lmdb._writer import WriterThread
+
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    peer = _peer_can_write_now(ctx, tmp_path)
+    original = WriterThread.try_run
+    outcomes: list[bool] = []
+
+    def slow_try_run(self, fn, timeout):
+        time.sleep(0.3)  # the finalizer is descheduled right after it marked the context closed
+        result = original(self, fn, timeout)
+        outcomes.append(result)
+        return result
+
+    monkeypatch.setattr(WriterThread, "try_run", slow_try_run)
+
+    def drop() -> None:
+        tx = st.begin_transaction()
+        tx.put(("x",), b"1")
+        del tx
+
+    t = threading.Thread(target=drop)
+    t.start()
+    time.sleep(0.1)
+    st.close()
+    t.join(5)
+    assert outcomes == [False]  # the finalizer found the writer thread gone
+    assert not st._live_writes  # and close() had ended the txn itself
+    peer()
+    st = _open(str(tmp_path))
+    try:
+        with st.snapshot() as snap:
+            assert snap.get(("x",)) is EMPTY
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(30)
+def test_slot_release_racing_close_leaves_no_live_write(ctx, tmp_path: Path, monkeypatch) -> None:
+    """slot.release() on one thread while close() runs on another: the txn is ended once."""
+    from virtuals._backends.storages.lmdb._writer import WriterThread
+
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    peer = _peer_can_write_now(ctx, tmp_path)
+    slot = asyncio.run(st.areserve_write_slot())
+    original = WriterThread.run
+
+    def slow_run(self, fn, **kw):
+        if threading.current_thread().name == "releaser":
+            time.sleep(0.3)  # between taking the txn from the slot and ending it
+        return original(self, fn, **kw)
+
+    monkeypatch.setattr(WriterThread, "run", slow_run)
+    t = threading.Thread(target=slot.release, name="releaser")
+    t.start()
+    time.sleep(0.05)
+    st.close()
+    t.join(5)
+    assert not t.is_alive()
+    assert not st._live_writes
+    assert not st._writer.lock.locked()
+    peer()
+
+
+@pytest.mark.timeout(30)
+def test_gate_helper_never_locks_a_reused_descriptor_number(tmp_path: Path, monkeypatch) -> None:
+    """The helper flocks its own duplicate, so an fd number reused after close() is never locked.
+
+    A peer holds the gate; our wait times out; the storage closes (freeing
+    the gate's descriptor number) and reopens while the helper is still
+    about to call flock. Afterwards a peer must be able to take the gate.
+    """
+    import fcntl
+
+    from virtuals._backends.storages.lmdb import _writer
+
+    real = _writer.fcntl
+
+    class Shim:
+        LOCK_EX, LOCK_NB, LOCK_UN = real.LOCK_EX, real.LOCK_NB, real.LOCK_UN
+
+        @staticmethod
+        def flock(fd, op):
+            if threading.current_thread().name == "lmdb-gate" and op == real.LOCK_EX:
+                time.sleep(0.5)
+            return real.flock(fd, op)
+
+    monkeypatch.setattr(_writer, "fcntl", Shim)
+    st = _open(str(tmp_path), busy_timeout=0.1)
+    gate_file = tmp_path / "db" / "writer.lock"
+    peer = os.open(gate_file, os.O_RDWR)
+    fcntl.flock(peer, fcntl.LOCK_EX)  # a peer holds the gate
+    try:
+        with pytest.raises(StorageLockTimeoutError):
+            with st.transaction() as tx:
+                tx.put(("a",), b"1")
+        st.close()
+        fcntl.flock(peer, fcntl.LOCK_UN)
+        other = os.open(gate_file, os.O_RDWR)  # any open may take the freed number
+        st.open()
+        time.sleep(1.0)  # the helper's delayed flock runs now
+        peer2 = os.open(gate_file, os.O_RDWR)
+        try:
+            fcntl.flock(peer2, fcntl.LOCK_EX | fcntl.LOCK_NB)  # must be free
+            fcntl.flock(peer2, fcntl.LOCK_UN)
+        finally:
+            os.close(peer2)
+        os.close(other)
+        with st.transaction() as tx:
+            tx.put(("a",), b"1")
+    finally:
+        os.close(peer)
         st.close()
