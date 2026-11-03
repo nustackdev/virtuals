@@ -224,7 +224,7 @@ class WriterLock:
             )
         return StorageLockTimeoutError(message)
 
-    def acquire(self, timeout: float) -> None:
+    def acquire(self, timeout: float) -> threading.Lock:
         """Block for the slot, up to ``timeout`` seconds.
 
         Fails at once with ``StorageNestedTransactionError`` when called
@@ -238,6 +238,9 @@ class WriterLock:
         long; a longer wait belongs in ``areserve``.
 
         Raises ``StorageClosedError`` if the storage closed while waiting.
+
+        Returns:
+            The lock acquired: the slot's identity for the later ``release``.
         """
         me = _caller()
         if self._is_nested(me):
@@ -263,6 +266,7 @@ class WriterLock:
         if not self._held_by(me, lock):
             lock.release()
             raise StorageClosedError(_CLOSED_WHILE_WAITING)
+        return lock
 
     async def areserve(self, timeout: float) -> threading.Lock:
         """Wait for the slot without blocking the event loop.
@@ -309,9 +313,9 @@ class WriterLock:
             self._hold = None
             self._lock.release()
 
-    def take(
+    def take_slot(
         self, storage: object, write_slot: WriteSlot | None, timeout: float
-    ) -> Callable[[], None]:
+    ) -> tuple[threading.Lock, Callable[[], None]]:
         """Take the slot for a write transaction being begun on ``storage``.
 
         With ``write_slot`` the slot is already held and is taken over, and
@@ -326,13 +330,17 @@ class WriterLock:
         Otherwise it is acquired, waiting up to ``timeout``.
 
         Returns:
-            A callable that undoes the take after a failed begin: it
-            releases the slot, or returns it (and its owner) to
-            ``write_slot``'s holder.
+            The lock taken, which the context keeps and releases by
+            identity, and a callable that undoes the take after a failed
+            begin: it releases the slot, or returns it (and its owner) to
+            ``write_slot``'s holder. If the slot was replaced meanwhile
+            (close), the undo only marks ``write_slot`` released and
+            records nothing on the fresh slot.
         """
         if write_slot is not None:
             with self._guard:
                 write_slot._take(storage)
+                lock = write_slot._lock
                 previous = self._owner
                 me = _caller()
                 self._owner = me
@@ -342,13 +350,21 @@ class WriterLock:
 
             def give_back() -> None:
                 with self._guard:
-                    self._owner = previous
-                    write_slot._give_back()
+                    if lock is self._lock:
+                        self._owner = previous
+                        write_slot._give_back()
+                    else:
+                        write_slot._state = "released"
 
-            return give_back
-        self.acquire(timeout)
-        lock = self._lock
-        return lambda: self.release(lock)
+            return lock, give_back
+        lock = self.acquire(timeout)
+        return lock, lambda: self.release(lock)
+
+    def take(
+        self, storage: object, write_slot: WriteSlot | None, timeout: float
+    ) -> Callable[[], None]:
+        """``take_slot`` for callers that read the lock themselves; returns the undo only."""
+        return self.take_slot(storage, write_slot, timeout)[1]
 
 
 class WriteSlot:

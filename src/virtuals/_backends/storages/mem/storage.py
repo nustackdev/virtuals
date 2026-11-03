@@ -293,9 +293,9 @@ class InMemoryStorage:
             raise StorageError("Cannot start transaction in read only mode.")
         self._require_open()
 
-        give_back_slot = self._writer.take(self, write_slot, self._busy_timeout)
+        lock, give_back_slot = self._writer.take_slot(self, write_slot, self._busy_timeout)
         try:
-            transaction = InMemoryTransaction(self, self._writer.lock)
+            transaction = InMemoryTransaction(self, lock)
             with self._state_lock:
                 self._active_transactions.add(transaction)
         except BaseException:
