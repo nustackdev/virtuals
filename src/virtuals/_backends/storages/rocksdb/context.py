@@ -102,17 +102,35 @@ class ScanHandle:
     (freeing the iterator and the files it pins) when it ends first. The
     generator itself stays suspended and raises ``StorageClosedError`` if
     resumed, as before.
+
+    Every native step runs under the handle's lock, and so does ``close``:
+    a snapshot closed on another thread while a scan is inside
+    ``next_batch`` waits for that step to return before the iterator is
+    freed under it, and the scan's next step then sees it closed.
     """
 
-    __slots__ = ("__weakref__", "iterator")
+    __slots__ = ("__weakref__", "_lock", "iterator")
 
     def __init__(self, iterator: Any) -> None:  # noqa: ANN401
         """Wrap a native rdbpy iterator."""
         self.iterator = iterator
+        self._lock = threading.Lock()
+
+    def step(self, method: str, *args: Any) -> Any:  # noqa: ANN401
+        """Run one native call on the iterator, excluding ``close``.
+
+        Raises:
+            StorageClosedError: If the context closed the iterator since
+        """
+        with self._lock:
+            if self.iterator.closed:
+                raise StorageClosedError("Scan used after its context ended")
+            return getattr(self.iterator, method)(*args)
 
     def close(self) -> None:
-        """Close the native iterator. Idempotent."""
-        self.iterator.close()
+        """Close the native iterator once no step is inside it. Idempotent."""
+        with self._lock:
+            self.iterator.close()
 
 
 class ContextBase:
@@ -177,11 +195,15 @@ class ContextBase:
             self._scans.add(scan)
 
     def _close_scans(self) -> None:
-        """Close every live scan iterator of this context, freeing what it pins."""
-        scans = self._scans
-        if not scans:
-            return
-        for scan in list(scans):
+        """Close every live scan iterator of this context, freeing what it pins.
+
+        A scan on another thread that is inside a native step keeps its
+        iterator until that step returns (``ScanHandle.close`` waits for
+        it), so nothing is freed under a running call.
+        """
+        with _END_LOCK:
+            scans = list(self._scans) if self._scans else ()
+        for scan in scans:
             try:
                 scan.close()
             except Exception:  # noqa: S110 (iterator already gone with its parent)

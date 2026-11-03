@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 from virtuals.tkv.storage import (
     ScanProtocol,
@@ -161,7 +161,7 @@ class RocksDBScan(ScanProtocol):
         context._register_scan(handle)
 
         try:
-            self._seek(iterator, options.reverse, start_key_encoded)
+            self._seek(handle, options.reverse, start_key_encoded)
 
             count = 0
             max_depth = options.max_depth
@@ -170,7 +170,7 @@ class RocksDBScan(ScanProtocol):
                 first_batch = max(1, min(first_batch, options.limit))
             batch_size = first_batch
             while True:
-                rows = self._next_batch(iterator, batch_size)
+                rows = self._next_batch(handle, batch_size)
                 if not rows:
                     return
                 batch_size = min(batch_size * 4, _BATCH_MAX)
@@ -196,7 +196,7 @@ class RocksDBScan(ScanProtocol):
                     if max_depth is not None and len(key) > max_depth:
                         # Below the walked depth: one seek over the whole subtree,
                         # dropping the rest of this batch.
-                        self._seek(iterator, options.reverse, options.skip_bound(codec, key))
+                        self._seek(handle, options.reverse, options.skip_bound(codec, key))
                         batch_size = first_batch
                         break
 
@@ -225,7 +225,7 @@ class RocksDBScan(ScanProtocol):
             handle.close()
 
     @staticmethod
-    def _seek(iterator: Any, reverse: bool, start_key_encoded: bytes | None) -> None:  # noqa: ANN401
+    def _seek(handle: ScanHandle, reverse: bool, start_key_encoded: bytes | None) -> None:
         """Position the iterator on the first in-range key.
 
         Forward lands on the first key >= start, reverse on the last key
@@ -235,21 +235,25 @@ class RocksDBScan(ScanProtocol):
         try:
             if reverse:
                 if start_key_encoded:
-                    iterator.seek_for_prev(start_key_encoded)
+                    handle.step("seek_for_prev", start_key_encoded)
                 else:
-                    iterator.seek_to_last()
+                    handle.step("seek_to_last")
             elif start_key_encoded:
-                iterator.seek(start_key_encoded)
+                handle.step("seek", start_key_encoded)
             else:
-                iterator.seek_to_first()
+                handle.step("seek_to_first")
+        except StorageClosedError:
+            raise
         except Exception as e:
             raise classify_rdbpy(e, "Failed during scan") from e
 
     @staticmethod
-    def _next_batch(iterator: Any, n: int) -> list:  # noqa: ANN401
+    def _next_batch(handle: ScanHandle, n: int) -> list:
         """Up to ``n`` rows from the cursor in its direction; empty when exhausted."""
         try:
-            return iterator.next_batch(n)
+            return handle.step("next_batch", n)
+        except StorageClosedError:
+            raise
         except Exception as e:
             raise classify_rdbpy(e, "Failed during scan") from e
 
