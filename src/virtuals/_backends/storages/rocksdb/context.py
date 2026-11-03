@@ -173,27 +173,29 @@ class ReadOperationsMixin:
     _get_raw: Callable[[bytes], bytes | None]
     _iterator: Callable[..., Any]
 
-    def _read_with_catchup(self, key: Key, action: str, op: Callable[[], object]) -> object:
-        """Run a read `op`, surviving a stale-manifest secondary.
+    def _read_raw(self, key: Key, action: str, encoded_key: bytes) -> bytes | None:
+        """Point read at the context's snapshot, surviving a stale-manifest secondary.
 
-        On a read-only secondary, `op` can fail because the secondary's
+        On a read-only secondary, the read can fail because the secondary's
         manifest version references an SST the primary already compacted
         away. That is recoverable: force a catch-up to the current manifest
         and retry. Any other failure, and any failure at all on a primary,
         is classified and raised immediately.
         """
+        try:
+            return self._get_raw(encoded_key)
+        except Exception as e:
+            last = e
         storage = self._storage
-        message = f"Failed to {action} key {key}"
-        last: Exception | None = None
         for _ in range(_SECONDARY_STALE_RETRIES):
+            if not (storage._is_secondary and is_missing_file_error(last)):
+                break
+            storage.force_catch_up_with_primary()
             try:
-                return op()
+                return self._get_raw(encoded_key)
             except Exception as e:
-                if not (storage._is_secondary and is_missing_file_error(e)):
-                    raise classify_rdbpy(e, message) from e
                 last = e
-                storage.force_catch_up_with_primary()
-        raise classify_rdbpy(last, message) from last  # type: ignore[arg-type]
+        raise classify_rdbpy(last, f"Failed to {action} key {key}") from last
 
     def get(self, key: Key) -> Value | Empty:
         """Get value by key.
@@ -217,7 +219,7 @@ class ReadOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        encoded_value = self._read_with_catchup(key, "get", lambda: self._get_raw(encoded_key))
+        encoded_value = self._read_raw(key, "get", encoded_key)
 
         if encoded_value is None:
             return EMPTY
@@ -248,7 +250,7 @@ class ReadOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        return self._read_with_catchup(key, "check", lambda: self._get_raw(encoded_key) is not None)
+        return self._read_raw(key, "check", encoded_key) is not None
 
     def multiget(self, keys: list[Key]) -> dict[Key, Value]:
         """Get multiple keys.
