@@ -143,3 +143,106 @@ def test_reregistration_follows_resubscribe_confirmation(server, monkeypatch):
     finally:
         probe.close()
         obs.disconnect()
+
+
+def _wait_until(pred, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return pred()
+
+
+def test_same_filter_subscribe_waits_for_reregistration(server, caplog):
+    """Readiness resets on a drop: a same-filter subscribe is live on return.
+
+    While the server is down it raises instead of reporting ready. After the
+    restart it returns only once the hash is re-registered, so a write right
+    after it is delivered.
+    """
+    import logging
+
+    from virtuals._backends.observers.redis_pubsub import RedisObserver
+    from virtuals._backends.publishers.redis_pubsub import RedisPublisher
+    from virtuals.tkv.filter import PrefixFilter, filter_hash
+    from virtuals.tkv.observer import ObserverSubscriptionError, SubscriptionOptions
+
+    f = PrefixFilter(prefix=("u",))
+    h = filter_hash(f)
+    obs = RedisObserver(redis_url=server.url, channel_prefix="r", subscribe_timeout=0.5)
+    obs.connect()
+    pub = None
+    caplog.set_level(logging.WARNING, logger="virtuals._backends.observers.redis_pubsub")
+    try:
+        obs.subscribe(SubscriptionOptions(filter=f))
+        assert obs._ready[h].event.is_set()
+
+        _kill(server, "kill")
+        assert _wait_until(lambda: not obs._ready[h].event.is_set())
+        # The gap is named, not silent.
+        assert any("not routed until re-registered" in r.message for r in caplog.records)
+        t0 = time.monotonic()
+        with pytest.raises(ObserverSubscriptionError):
+            obs.subscribe(SubscriptionOptions(filter=f))
+        assert time.monotonic() - t0 >= 0.4
+        assert obs._local_hash_refcount == {h: 1}
+
+        server.start()
+        pub = RedisPublisher(redis_url=server.url, channel_prefix="r")
+        pub.connect()
+        got: list = []
+        t0 = time.monotonic()
+        while True:  # the restart may not be noticed yet: retry the subscribe
+            try:
+                s = obs.subscribe(SubscriptionOptions(filter=f))
+                break
+            except ObserverSubscriptionError:
+                assert time.monotonic() - t0 < 10
+        s.bind(got.append)
+        pub.notify(("u", "k"))
+        pub.flush(2)
+        assert _wait_until(lambda: got == [("u", "k")], 2.0), got
+    finally:
+        if pub is not None:
+            pub.disconnect()
+        obs.disconnect()
+
+
+def test_reregistration_raced_by_reconnect_waits(server, monkeypatch):
+    """A first registrant whose nu1_reg raced a drop waits for the re-registration."""
+    from virtuals._backends.observers.redis_pubsub import RedisObserver
+    from virtuals.tkv.filter import PrefixFilter, filter_hash
+    from virtuals.tkv.observer import SubscriptionOptions
+
+    obs = RedisObserver(redis_url=server.url, channel_prefix="r", subscribe_timeout=5.0)
+    obs.connect()
+    f = PrefixFilter(prefix=("race",))
+    h = filter_hash(f)
+    real = obs._register_hash
+    first = [True]
+
+    def racing(hh, entries):
+        out = real(hh, entries)
+        if first[0]:
+            first[0] = False
+            obs._invalidate_ready("lost")  # a drop right after nu1_reg
+        return out
+
+    monkeypatch.setattr(obs, "_register_hash", racing)
+    try:
+        done = threading.Event()
+
+        def run():
+            obs.subscribe(SubscriptionOptions(filter=f))
+            done.set()
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        assert not done.wait(0.3), "returned ready on a stale registration"
+        # The resubscribe confirmation after the reconnect queues a re-registration.
+        obs._rereg_q.put((h, obs._conn_gen))
+        assert done.wait(3)
+        assert obs._ready[h].event.is_set()
+    finally:
+        obs.disconnect()
