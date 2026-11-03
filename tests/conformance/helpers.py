@@ -75,8 +75,19 @@ async def aretrying(fn: Callable[[], Any], attempts: int = ATTEMPTS) -> Any:
     raise GaveUpError(f"still conflicting after {attempts} attempts")
 
 
+# Threads a stalled ``run_threads`` left behind. The ``reap_stalled_threads``
+# fixture joins them after the storage closed, so a stalled writer never
+# runs into the next case.
+STALLED_THREADS: list[threading.Thread] = []
+
+
 def run_threads(*targets: Callable[[], Any], timeout: float = JOIN) -> list[Any]:
-    """Run each target on its own thread, return results, re-raise the first error."""
+    """Run each target on its own thread, return results, re-raise the first error.
+
+    A target still running after ``timeout`` fails the case; the thread is
+    recorded in ``STALLED_THREADS`` and joined by the fixture once the
+    storage is closed (closing frees it with ``StorageClosedError``).
+    """
     results: list[Any] = [None] * len(targets)
     errors: list[BaseException] = []
 
@@ -94,7 +105,9 @@ def run_threads(*targets: Callable[[], Any], timeout: float = JOIN) -> list[Any]
     deadline = time.monotonic() + timeout
     for t in threads:
         t.join(max(0.0, deadline - time.monotonic()))
-    if any(t.is_alive() for t in threads):
+    stalled = [t for t in threads if t.is_alive()]
+    if stalled:
+        STALLED_THREADS.extend(stalled)
         raise AssertionError(f"threads still running after {timeout}s (stall)")
     if errors:
         raise errors[0]

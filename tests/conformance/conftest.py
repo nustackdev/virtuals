@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from tests.conformance.backends import BACKENDS, BackendSpec
+from tests.conformance.helpers import JOIN, STALLED_THREADS
 from tests.conformance.known_failures import KNOWN_FAILURES
 from tests.support.valkey import redis_url_or_private
 
@@ -30,6 +31,25 @@ def storage(backend: BackendSpec, tmp_path):
     st.open()
     yield st
     st.close()
+
+
+@pytest.fixture(autouse=True)
+def reap_stalled_threads():
+    """Join threads a stalled ``run_threads`` left behind, after the storage closed.
+
+    Autouse fixtures are set up first, so this tears down after ``storage``:
+    by then close() has freed any writer stuck in the backend. A thread
+    still alive after the join window fails here, by name, instead of
+    running on into the next case.
+    """
+    yield
+    if not STALLED_THREADS:
+        return
+    threads, STALLED_THREADS[:] = list(STALLED_THREADS), []
+    for t in threads:
+        t.join(JOIN)
+    alive = [t.name for t in threads if t.is_alive()]
+    assert not alive, f"stalled threads survived storage close: {alive}"
 
 
 @pytest.fixture
