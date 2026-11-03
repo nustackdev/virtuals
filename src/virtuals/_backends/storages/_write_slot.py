@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import weakref
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from virtuals.tkv.storage import (
@@ -30,16 +31,21 @@ __all__ = ["WriteSlot", "WriterLock"]
 _SLOT_POLL_MIN = 0.0005
 _SLOT_POLL_MAX = 0.005
 
-_Owner = tuple[int, "asyncio.Task | None"]
+_Owner = tuple[int, "weakref.ref[asyncio.Task] | None"]
 
 
 def _caller() -> _Owner:
-    """Who is asking for the writer slot: this thread, and its running task if any."""
+    """Who is asking for the writer slot: this thread, and its running task if any.
+
+    The task is held weakly: a task cancelled while holding a reserved slot
+    keeps the slot alive through its traceback, and a strong reference here
+    would keep that task alive in turn, so the slot could never be collected.
+    """
     try:
         task = asyncio.current_task()
     except RuntimeError:  # no running event loop on this thread
         task = None
-    return threading.get_ident(), task
+    return threading.get_ident(), None if task is None else weakref.ref(task)
 
 
 class _SlotStorage(Protocol):
@@ -112,7 +118,9 @@ class WriterLock:
 
         Polls with a short, growing sleep between tries, so other coroutines
         on the loop keep running, including the one that holds it. Waits
-        behind other threads too. Cancelled while waiting, it holds nothing.
+        behind other threads too. Cancelled while waiting, it holds nothing:
+        the lock is only ever taken by a non-blocking try, and nothing is
+        awaited between taking it and returning.
 
         Returns:
             The lock acquired, to hand to a ``WriteSlot``.
@@ -177,6 +185,12 @@ class WriteSlot:
 
     If beginning the transaction fails, the slot returns to the holder, so
     the holder's ``release`` still frees it.
+
+    Use it as a context manager (``with await storage.areserve_write_slot()
+    as slot:``) so a slot no transaction took is released however the block
+    exits, cancellation included. As a backstop, a held slot that is garbage
+    collected is released too: once unreachable, nothing can ever hand it to
+    a transaction or release it.
     """
 
     __slots__ = ("_lock", "_state", "_storage")
@@ -204,6 +218,21 @@ class WriteSlot:
             return
         self._state = "released"
         self._storage._release_write_slot(self._lock)
+
+    def __enter__(self) -> WriteSlot:
+        """Enter: the slot is already held."""
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Release the slot unless a transaction took it."""
+        self.release()
+
+    def __del__(self) -> None:
+        """Release a held slot dropped without ``release``."""
+        try:
+            self.release()
+        except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
+            pass
 
     def _take(self, storage: object) -> None:
         """Hand the slot to a transaction being begun on ``storage``."""
