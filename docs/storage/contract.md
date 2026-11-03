@@ -45,10 +45,10 @@ See [notify](notify.md). In short: notify after commit, subscribe ready on retur
 
 ## 6. Existence and EMPTY
 
-- `EMPTY` is the absent sentinel. A read of a missing key returns it. It is never stored: every view write door raises `ValueError` on an EMPTY value, nested EMPTY included, before anything is written. A rejected write on an absent view leaves it absent. Delete the key instead.
+- `EMPTY` is the absent sentinel. A read of a missing key returns it. It is never stored: every write door, the container's unsafe put and metadata put included, raises `ValueError` on an EMPTY value, nested EMPTY included, before anything is written. A rejected write on an absent view leaves it absent. Delete the key instead.
 - `None` is a stored value. An empty container is not absent: primitive and flat views store `{}` and `[]` as values, collection views exist once their marker row does, even with no children.
 - Navigation is lazy. Building `a.b.c` through `open_child` touches no storage.
-- Existence is one read: `view.container.exists()` reads the marker row. An absent container reads as empty, writes into it create it, subscriptions on it work.
+- Existence is one read: `view.container.exists()` reads the marker row. An absent container reads as empty, writes into it create it, subscriptions on it work. A list watch on a non-negative index names a slot and works before the list or the slot exists; a negative index needs the length.
 - Writes into an absent container create it.
 - A key keeps its kind. Writing a compound value over a primitive key, or a primitive over a compound key, raises `ContainerTypeError` and changes nothing. Delete the key first. Compound over compound replaces.
 

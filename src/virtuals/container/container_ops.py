@@ -712,19 +712,26 @@ def put_child_primitive_unsafe(
     value: Value,
     ctx: StorageContextType,
 ) -> None:
-    """Put primitive child value — raw ctx.put(), no validation.
+    """Put primitive child value — raw ctx.put(), no storage validation.
 
     The caller must guarantee:
     - Parent container chain exists
     - Child is a primitive (not a container)
+
+    The value is still checked for EMPTY: that check reads no storage and
+    EMPTY is never stored through any door.
 
     Args:
         parent_site: Parent container site
         key: Child key
         value: Primitive value
         ctx: Storage context (transaction)
+
+    Raises:
+        ValueError: If ``value`` is EMPTY (the absent sentinel is never stored)
     """
     child_site = (*parent_site, key)
+    reject_empty_value(child_site, value)
     require_write_context(ctx).put(child_site, value)
 
 

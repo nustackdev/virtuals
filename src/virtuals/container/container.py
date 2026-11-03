@@ -398,14 +398,17 @@ class Container:
         key: site_.SiteSegment,
         value: Value,
     ) -> None:
-        """Put primitive child value — raw ctx.put(), no validation.
+        """Put primitive child value — raw ctx.put(), no storage validation.
 
         The caller must guarantee container chain exists and child is
-        a primitive.
+        a primitive. EMPTY is still refused, as on every door.
 
         Args:
             key: Child key
             value: Primitive value to store
+
+        Raises:
+            ValueError: If ``value`` is EMPTY
         """
         container_ops.put_child_primitive_unsafe(self.site, key, value, self.ctx)
 
@@ -645,6 +648,7 @@ class Container:
             value: Primitive value to store
 
         Raises:
+            ValueError: If ``value`` is EMPTY (never stored, delete instead)
             ContainerNotFoundError: If this container doesn't exist
             StorageInterfaceError: If context doesn't support writes
         """
