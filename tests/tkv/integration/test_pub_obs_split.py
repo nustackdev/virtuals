@@ -35,11 +35,7 @@ def test_new_pair_end_to_end(redis_url, unique_channel_prefix, redis_cleanup):
     obs = RedisObserver(redis_url=redis_url, channel_prefix=unique_channel_prefix)
     obs.connect()
 
-    pub = RedisPublisher(
-        redis_url=redis_url,
-        channel_prefix=unique_channel_prefix,
-        refresh_debounce_seconds=0.01,
-    )
+    pub = RedisPublisher(redis_url=redis_url, channel_prefix=unique_channel_prefix)
     pub.connect()
 
     try:
@@ -49,9 +45,7 @@ def test_new_pair_end_to_end(redis_url, unique_channel_prefix, redis_cleanup):
         )
         sub.bind(lambda k: hits.append(k))
 
-        # Publisher must pick up observer's registration via the control channel.
-        assert _wait_until(lambda: len(pub._remote_registry) >= 1, timeout=2.0)
-
+        # subscribe() returned: the registration is live, write at once.
         pub.notify(("users", "alice"))
         pub.notify(("posts", "42"))  # should not match
         pub.flush(timeout=1.0)
@@ -108,19 +102,13 @@ def test_new_pair_local_delivery_via_transport(
 
     obs = RedisObserver(redis_url=redis_url, channel_prefix=unique_channel_prefix)
     obs.connect()
-    pub = RedisPublisher(
-        redis_url=redis_url,
-        channel_prefix=unique_channel_prefix,
-        refresh_debounce_seconds=0.01,
-    )
+    pub = RedisPublisher(redis_url=redis_url, channel_prefix=unique_channel_prefix)
     pub.connect()
 
     try:
         hits: list = []
         sub = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("x",))))
         sub.bind(lambda k: hits.append(k))
-
-        assert _wait_until(lambda: len(pub._remote_registry) >= 1, timeout=2.0)
 
         pub.notify(("x", "y"))
         pub.flush(timeout=1.0)

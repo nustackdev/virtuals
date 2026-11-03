@@ -575,25 +575,6 @@ class ObserverCompliance:
             time.sleep(0.3)
         observer.flush(timeout=1.0)
 
-    @staticmethod
-    def _await_sync(bundle: ObservableBundle, expected: int = 1) -> None:
-        """Wait for the publisher to see `expected` observer subscriptions.
-
-        For in-process transports there's nothing to wait for. For the
-        Redis pair, the observer HSETs + PUBLISHes on subscribe and the
-        publisher refreshes its cache off a debounced HGETALL. Tests
-        that write immediately after subscribe must let that catch up.
-        """
-        publisher = bundle.publisher
-        remote_registry = getattr(publisher, "_remote_registry", None)
-        if remote_registry is None:
-            return
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            if len(remote_registry) >= expected:
-                return
-            time.sleep(0.02)
-
     def test_subscribe_and_notify(self, bundle: ObservableBundle) -> None:
         """Test basic subscription and notification flow."""
         notifications: list = []
@@ -605,7 +586,6 @@ class ObserverCompliance:
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
-        self._await_sync(bundle)
 
         with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
@@ -625,7 +605,6 @@ class ObserverCompliance:
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
-        self._await_sync(bundle)
 
         with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
@@ -654,7 +633,6 @@ class ObserverCompliance:
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
-        self._await_sync(bundle)
 
         # Delete the key
         with bundle.storage.transaction() as tx:
@@ -701,7 +679,6 @@ class ObserverCompliance:
 
         sub2 = bundle.observer.subscribe(SubscriptionOptions(filter=LengthFilter(length=2)))
         sub2.bind(length_callback)
-        self._await_sync(bundle, expected=2)
 
         with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")  # Matches both (prefix + length 2)
@@ -727,7 +704,6 @@ class ObserverCompliance:
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
-        self._await_sync(bundle)
 
         with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
@@ -760,7 +736,6 @@ class ObserverCompliance:
         )
         sub.bind(callback1)
         sub.bind(callback2)
-        self._await_sync(bundle)
 
         with bundle.storage.transaction() as tx:
             tx.put(("users", "alice"), b"data")
@@ -782,7 +757,6 @@ class ObserverCompliance:
             SubscriptionOptions(filter=LengthFilter(length=2) | PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
-        self._await_sync(bundle)
 
         with bundle.storage.transaction() as tx:
             # Length 3 but has "users" prefix - should match via Or's second filter
@@ -803,7 +777,6 @@ class ObserverCompliance:
             SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
         )
         sub.bind(callback)
-        self._await_sync(bundle)
 
         tx = bundle.storage.begin_transaction()
         tx.put(("users", "alice"), b"data")
