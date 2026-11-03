@@ -235,9 +235,9 @@ class ViewBase(ABC):
 
         Fired once per new child, whether a container (``_ensure_child_view``)
         or a primitive (``_put_child_primitive``). Default is a no-op. Views
-        that keep their own counts or indexes override it: ``DictView``
+        that keep their own counts or indexes override it: ``SetView``
         bumps its length, indexed dicts record the key. Views that count
-        live or by position leave it alone.
+        live (``DictView``) or by position leave it alone.
 
         Args:
             address: Child address as stored (the normalized segment)

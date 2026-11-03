@@ -1,7 +1,7 @@
-"""FlatDictView - Flat dict view with length tracking but no nesting.
+"""FlatDictView - Flat dict view, no nesting.
 
 Lightweight dict view with:
-- Length tracking via metadata
+- Live length (no stored counter, so no key shared between writers)
 - Primitives only (no nested containers)
 - No observables
 - No functional operations
@@ -16,7 +16,7 @@ from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import EMPTY, Empty, Value, is_empty
 from virtuals.view import (
     ChildPrimitiveSetBase,
-    KeyedChildrenCountBase,
+    LiveChildrenCountBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
 )
@@ -33,18 +33,18 @@ __all__ = [
 
 
 class FlatDictView(
-    KeyedChildrenCountBase,
+    LiveChildrenCountBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
 ):
-    """Flat dict view with length tracking but no nested containers.
+    """Flat dict view with no nested containers.
 
     Stores only primitive values (int, float, str, bool, bytes, None).
-    Includes __len__ support via metadata tracking.
+    ``len`` counts the keys live; every write touches a constant number
+    of keys.
 
     Use when:
-    - You need len() support
     - You only store primitives
     - You don't need nested containers or observables
 
@@ -93,21 +93,16 @@ class FlatDictView(
             value: Primitive value to store
         """
         self.ensure_created()
-        # A new key is counted via _on_child_created
         self._put_child_primitive(key, value)
 
     def __delitem__(self, key: str | int) -> None:
-        """Delete key.
+        """Delete key. Silent if the key is missing.
 
         Args:
             key: Key to delete
-
-        Raises:
-            KeyError: If key not found
         """
         self.ensure_created()
         self.container.delete_child(key)
-        self._update_count()
 
     def __contains__(self, key: str | int) -> bool:
         """Check if key exists."""
@@ -151,7 +146,6 @@ class FlatDictView(
         """Remove all items."""
         self.ensure_created()
         self.container.clear_children(validate=False)
-        self._set_length(0)
 
     def update(self, other: PyMapping[str | int, Value] | None = None, **kwargs: Value) -> None:
         """Update from dict or kwargs."""
@@ -175,17 +169,12 @@ class FlatDictView(
         self.ensure_created()
         if replace:
             self.clear()
-
-        count = 0
         for key, val in value.items():
-            self.container.put_child_primitive(key, val)
-            count += 1
+            self._put_child_primitive(key, val)
 
-        if replace:
-            self._set_length(count)
-        else:
-            # When appending, adjust length for actually new keys
-            self._update_count()
+    def _rebuild_bookkeeping(self) -> None:
+        """Drop the stored counter older versions kept; length is live now."""
+        self.container.delete_metadata("__len__")
 
 
 class _FlatValuesView(ValuesView):

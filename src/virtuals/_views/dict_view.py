@@ -1,5 +1,9 @@
 """DictView - Dict-like view over container.
 
+Uncounted: no stored length. ``len`` counts live children with the
+subtree-skipping child scan, so every write touches a constant number of
+keys and no key is shared between writers of different entries.
+
 Provides three classes following the eager/lazy facet pattern:
 - DictViewBase: shared mutations, keys, lifecycle
 - EagerDictView: reads return extracted Python values
@@ -25,8 +29,8 @@ from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
     DescendantsObservableBase,
-    KeyedChildrenCountBase,
     LazyChildReadBase,
+    LiveChildrenCountBase,
     ObservableBase,
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
@@ -69,7 +73,7 @@ class DictViewBase(
     ObservableBase,
     ChildObservableBase[str | int],
     DescendantsObservableBase,
-    KeyedChildrenCountBase,
+    LiveChildrenCountBase,
     ChildNavigationBase[str | int],
     ChildNestedGetBase,
     ChildNestedSetBase,
@@ -128,14 +132,13 @@ class DictViewBase(
     # =========================================================================
 
     def __setitem__(self, address: str | int, value: object) -> None:
-        """Set value for key. A new key is counted via ``_on_child_created``."""
+        """Set value for key."""
         self._set_child_value(address, value)
 
     def __delitem__(self, address: str | int) -> None:
-        """Delete key. Raises KeyError if not found."""
+        """Delete key (and its subtree). Silent if the key is missing."""
         self.ensure_created()
         self.container.delete_child(address)
-        self._update_count()
 
     def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
         """Get value with default fallback."""
@@ -148,7 +151,6 @@ class DictViewBase(
         """Remove all items."""
         self.ensure_created()
         self.container.clear_children(validate=True)
-        self._set_length(0)
 
     def update(self, other: PyMapping[str | int, object] | None = None, **kwargs: object) -> None:
         """Update from dict or kwargs."""
@@ -162,11 +164,7 @@ class DictViewBase(
         """Store dict contents."""
         self.ensure_created()
         if replace:
-            current_len = len(self)
-            if current_len > 0:
-                self.clear()
-
-        # Each new key is counted via _on_child_created
+            self.clear()
         for key, val in value.items():
             self._set_child_value(key, val)
 
@@ -187,6 +185,10 @@ class DictViewBase(
         """
         self.ensure_created()
         self._populate_child_container(address, value, view_class=view_class)
+
+    def _rebuild_bookkeeping(self) -> None:
+        """Drop the stored counter older versions kept; length is live now."""
+        self.container.delete_metadata("__len__")
 
 
 # =============================================================================

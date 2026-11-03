@@ -128,7 +128,9 @@ class LiveChildrenCountBase:
     """Base for views that count children on-the-fly.
 
     Provides __len__ implementation that counts children in real-time
-    without relying on metadata. Less efficient but always accurate.
+    without relying on metadata. Always accurate, and keeps writes free
+    of any shared counter key. Costs one child scan, O(children): the
+    scan seeks over each child's subtree instead of walking it.
 
     Type Parameters:
         A: Address type for children
@@ -581,11 +583,11 @@ class UnsafePrimitiveOpsBase:
 
     No parent bookkeeping: these bypass ``_on_child_created`` and write at
     the view's own container site. A NEW key written this way is not
-    counted or indexed by views that keep counts or indexes (``DictView``
-    ``__len__``, ``FlatDictView``, indexed dicts' ``__keys__``), so ``len()``
-    and key iteration can miss it. Overwriting existing keys, or views that
-    count live (``LightDictView``), are unaffected. ``rebuild_bookkeeping``
-    repairs counts after the fact.
+    counted or indexed by views that keep counts or indexes (``SetView``
+    ``__len__``, indexed dicts' ``__keys__``), so ``len()`` and key
+    iteration can miss it. Overwriting existing keys, or views that count
+    live (``DictView``, ``FlatDictView``, ``LightDictView``), are
+    unaffected. ``rebuild_bookkeeping`` repairs counts after the fact.
 
     Methods:
         _unsafe_primitive_read(address)                        — ctx.get()
