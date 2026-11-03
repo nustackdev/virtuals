@@ -760,3 +760,70 @@ def test_close_waits_for_a_thread_inside_calls(tmp_path: Path) -> None:
         assert outcome in (["closed"], ["finished"]), outcome
         with pytest.raises(StorageClosedError):
             s.begin_snapshot()
+
+
+def test_sync_waiter_interrupted_by_signal_leaves_no_ghost(storage) -> None:
+    cases.sync_waiter_interrupted_by_signal_leaves_no_ghost(storage)
+
+
+def test_areserve_task_destroyed_with_its_loop_leaves_no_ghost(storage) -> None:
+    cases.areserve_task_destroyed_with_its_loop_leaves_no_ghost(storage)
+
+
+def test_areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage) -> None:
+    cases.areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage)
+
+
+@pytest.mark.timeout(30)
+def test_secondary_catches_up_past_the_staleness_bound_under_overlapping_readers(
+    tmp_path: Path,
+) -> None:
+    """Two readers whose snapshots always overlap still see fresh data within the staleness bound."""
+    from virtuals.tkv.storage import StorageTransactionConflictError
+
+    primary, secondary = _open_secondary(tmp_path, secondary_max_staleness=0.2)
+    secondary._secondary_refresh_interval = 0.02
+    stop = threading.Event()
+    n = [0]
+
+    def writer() -> None:
+        while not stop.is_set():
+            n[0] += 1
+            with primary.transaction() as t:
+                t.put(("a",), n[0])
+            time.sleep(0.001)
+
+    lags: list[tuple[float, int]] = []
+    t0 = time.perf_counter()
+
+    def reader(offset: float) -> None:
+        time.sleep(offset)
+        while not stop.is_set():
+            s = secondary.begin_snapshot()
+            try:
+                lags.append((time.perf_counter() - t0, n[0] - s.get(("a",))))
+            except StorageTransactionConflictError:
+                pass  # its view was retired by a catch-up: expected now and then
+            time.sleep(0.03)
+            s.close()
+
+    threads = [threading.Thread(target=writer)]
+    threads += [threading.Thread(target=reader, args=(o,)) for o in (0.0, 0.015)]
+    for th in threads:
+        th.start()
+    time.sleep(1.5)
+    stop.set()
+    for th in threads:
+        th.join(5)
+    try:
+        late = [lag for at, lag in lags if at > 0.5]
+        assert late, lags
+        # Lag is reset at least every 0.2s: the smallest lag in any 0.4s window is near zero,
+        # and lag never grows past what 0.4s of commits can add.
+        for start in (0.5, 0.9):
+            window = [lag for at, lag in lags if start <= at < start + 0.4]
+            assert window and min(window) <= 30, window
+        assert max(late) < 600, max(late)
+    finally:
+        secondary.close()
+        primary.close()
