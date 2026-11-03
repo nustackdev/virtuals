@@ -272,6 +272,7 @@ class SQLiteStorage:
             self._active_snapshots.clear()
             idle, self._idle = self._idle, []
             self._opened = False
+        self._writer.close()  # a reserved slot nobody took does not survive the reopen
 
         errors: list[Exception] = []
         for conn in idle:
