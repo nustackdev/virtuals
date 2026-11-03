@@ -163,6 +163,8 @@ class VersionedStore:
         self._undo_log: deque[tuple[int, Any]] = deque()
         # Open snapshots: pinned seq -> count. Insertion order is seq order.
         self._pins: dict[int, int] = {}
+        # Pins released by garbage collection, applied at the next locked operation.
+        self._deferred: deque[int] = deque()
 
     def reset(self) -> None:
         """Drop everything, keeping the lock."""
@@ -174,9 +176,7 @@ class VersionedStore:
             self._history_index = SortedKeys()
             self._undo_log = deque()
             self._pins = {}
-
-    def __len__(self) -> int:
-        return len(self._live)
+            self._deferred = deque()
 
     # ------------------------------------------------------------------
     # Live reads (what a write transaction sees under the writer slot)
@@ -209,6 +209,8 @@ class VersionedStore:
     def pin(self) -> int:
         """Register an open snapshot at the current sequence and return it."""
         with self.lock:
+            if self._deferred:
+                self._drain()
             seq = self._seq
             self._pins[seq] = self._pins.get(seq, 0) + 1
             return seq
@@ -216,12 +218,28 @@ class VersionedStore:
     def unpin(self, seq: int) -> None:
         """Release a snapshot pinned at ``seq`` and drop versions nobody needs."""
         with self.lock:
-            count = self._pins.get(seq, 0) - 1
-            if count > 0:
-                self._pins[seq] = count
-                return
-            self._pins.pop(seq, None)
+            self._release(seq)
+            if self._deferred:
+                self._drain()
             self._trim()
+
+    def unpin_later(self, seq: int) -> None:
+        """Release a pin at the next locked operation. Lock-free, safe from a finalizer."""
+        self._deferred.append(seq)
+
+    def _release(self, seq: int) -> None:
+        """Drop one pin at ``seq``; no trim."""
+        count = self._pins.get(seq, 0) - 1
+        if count > 0:
+            self._pins[seq] = count
+        else:
+            self._pins.pop(seq, None)
+
+    def _drain(self) -> None:
+        """Apply pins released by garbage collection. Caller holds the lock."""
+        deferred = self._deferred
+        while deferred:
+            self._release(deferred.popleft())
 
     def _trim(self) -> None:
         """Drop recorded versions no open snapshot can read."""
@@ -290,31 +308,67 @@ class VersionedStore:
         ``ops`` maps encoded key to ``(key, value)`` or ``(key, DELETED)``.
         Keys of deletes that removed an existing row are added to
         ``modified`` (deleting an absent key changes nothing).
+
+        All or nothing: if anything raises part way (a key the index
+        cannot compare, KeyboardInterrupt), every change made so far is
+        undone before the exception leaves, and the sequence is not
+        advanced.
         """
         with self.lock:
-            self._seq += 1
-            seq = self._seq
+            if self._deferred:
+                self._drain()
+                self._trim()
+            seq = self._seq + 1
             live, index = self._live, self._index
             record = bool(self._pins)
             history, history_index, log = self._history, self._history_index, self._undo_log
-            for enc, (key, value) in ops.items():
-                old = live.get(enc, ABSENT)
-                if value is DELETED:
-                    if old is ABSENT:
-                        continue
-                    del live[enc]
-                    index.discard(enc)
-                    modified.add(key)
-                else:
-                    live[enc] = (key, value)
-                    if old is ABSENT:
-                        index.add(enc)
-                if record:
-                    entries = history.get(enc)
-                    if entries is None:
-                        history[enc] = [(seq, old)]
-                        history_index.add(enc)
+            done: list[tuple[Encoded, Any]] = []  # (enc, previous entry) for undo
+            recorded = 0
+            try:
+                for enc, (key, value) in ops.items():
+                    old = live.get(enc, ABSENT)
+                    if value is DELETED:
+                        if old is ABSENT:
+                            continue
+                        index.discard(enc)
+                        del live[enc]
+                        modified.add(key)
                     else:
-                        entries.append((seq, old))
-                    log.append((seq, enc))
+                        if old is ABSENT:
+                            index.add(enc)  # the only call here that can fail; nothing changed yet
+                        live[enc] = (key, value)
+                    done.append((enc, old))
+                    if record:
+                        entries = history.get(enc)
+                        if entries is None:
+                            history[enc] = [(seq, old)]
+                            history_index.add(enc)
+                        else:
+                            entries.append((seq, old))
+                        log.append((seq, enc))
+                        recorded += 1
+            except BaseException:
+                self._undo(done, recorded)
+                raise
+            self._seq = seq
             return seq
+
+    def _undo(self, done: list[tuple[Encoded, Any]], recorded: int) -> None:
+        """Reverse a partial ``apply``: restore entries and drop its version records."""
+        live, index = self._live, self._index
+        for enc, old in reversed(done):
+            if old is ABSENT:
+                if live.pop(enc, None) is not None:
+                    index.discard(enc)
+            else:
+                if enc not in live:
+                    index.add(enc)
+                live[enc] = old
+        history, history_index, log = self._history, self._history_index, self._undo_log
+        for _ in range(recorded):
+            _, enc = log.pop()
+            entries = history[enc]
+            entries.pop()
+            if not entries:
+                del history[enc]
+                history_index.discard(enc)

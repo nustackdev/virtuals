@@ -12,6 +12,7 @@ from virtuals.tkv.storage import (
 )
 
 from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin
+from .sorted_keys import SortedKeys
 from .store import ABSENT, DELETED, merge_pages
 
 
@@ -21,7 +22,6 @@ if TYPE_CHECKING:
 
     from virtuals.tkv.types import Key
 
-    from .sorted_keys import SortedKeys
     from .storage import InMemoryStorage
     from .store import Encoded, Entry, Marker
 
@@ -41,6 +41,10 @@ class InMemoryTransaction(
     writers run one after another and nothing commits underneath it. Reads
     see committed state plus the transaction's own pending writes, point
     reads and scans alike. Commit applies the write set atomically.
+
+    ``_pending_index`` orders the pending keys for scans; it is built on
+    the first scan and kept in step from then on, so transactions that
+    never scan pay nothing for it.
     """
 
     __slots__ = ("_aborted", "_committed", "_modified_keys", "_pending", "_pending_index", "_slot")
@@ -74,34 +78,49 @@ class InMemoryTransaction(
         )
         if not self._pending:
             return base, (base[-1][0] if len(base) == n else None), len(base) < n
-        overlay = self._pending_page(bound, inclusive=inclusive, reverse=reverse, n=n, stop=stop)
+        index = self._pending_index
+        if index is None:
+            index = self._pending_index = SortedKeys(self._pending)
+        pending = self._pending
+        overlay: list[tuple[Any, Any]] = []
+        for enc in index.page(bound, inclusive=inclusive, reverse=reverse, n=n, stop=stop):
+            entry = pending[enc]
+            overlay.append((enc, ABSENT if entry[1] is DELETED else entry))
         return merge_pages(base, overlay, n, reverse)
 
+    def _stage(self, enc: Encoded, key: Key, value: object) -> None:
+        pending = self._pending
+        if enc not in pending and self._pending_index is not None:
+            self._pending_index.add(enc)
+        pending[enc] = (key, value)
+
     def _end(self) -> None:
-        """Close the transaction and give the writer slot back, whatever happened."""
-        self._closed = True
+        """Give the writer slot back and drop out of the active set. Runs once."""
         self._storage._release_write_slot(self._slot)
         self._storage._untrack_transaction(self)
 
     def commit(self) -> None:
-        """Apply the write set atomically, release the slot and notify."""
-        if self._closed:
+        """Apply the write set atomically, release the slot and notify.
+
+        The write set lands as a whole or not at all, and the slot is
+        released on every outcome, including KeyboardInterrupt or
+        SystemExit raised while applying.
+        """
+        if not self._claim_end():
             logger.error("Cannot commit, transaction is closed")
             raise StorageClosedError("Transaction is closed")
-        if self._committed:
-            raise StorageTransactionError("Transaction already committed")
-        if self._aborted:
-            raise StorageTransactionError("Transaction already aborted")
 
         modified = self._modified_keys
         try:
             if self._pending:
                 self._storage._store.apply(self._pending, modified)
-        except Exception as e:
+        except BaseException as e:
             self._aborted = True
             self._end()
             logger.error("Transaction commit failed")
-            raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
+            if isinstance(e, Exception):
+                raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
+            raise
 
         self._committed = True
         self._end()
@@ -110,7 +129,7 @@ class InMemoryTransaction(
 
     def abort(self) -> None:
         """Discard the write set and release the slot. No-op once closed."""
-        if self._closed:
+        if not self._claim_end():
             logger.debug("Abort called on closed transaction")
             return
         self._aborted = True
@@ -131,5 +150,5 @@ class InMemoryTransaction(
         """Commit on a clean exit, abort on an exception."""
         if exc_type is not None:
             self.abort()
-        elif not self._committed and not self._aborted:
+        elif not self._closed:
             self.commit()
