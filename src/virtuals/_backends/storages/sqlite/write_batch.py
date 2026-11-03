@@ -107,7 +107,7 @@ class SQLiteWriteBatch(ContextBase, WriteBatchProtocol):
                 # close() aborting this batch meanwhile is not held up by it.
                 conn, writer_lock = self._storage._begin_write_connection()
                 with self._lock:
-                    if self._closed:
+                    if self._closed or not self._storage._opened:
                         self._storage._release_connection(conn)
                         self._storage._release_write_slot(writer_lock)
                         raise StorageClosedError("Write batch was closed while writing")

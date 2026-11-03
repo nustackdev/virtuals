@@ -428,8 +428,11 @@ class SQLiteStorage:
 
         snapshot = SQLiteSnapshot(self, conn)
         with self._state_lock:
-            self._active_snapshots.add(snapshot)
-        return snapshot
+            if self._opened:
+                self._active_snapshots.add(snapshot)
+                return snapshot
+        snapshot.close()
+        raise StorageClosedError("Storage was closed while beginning the snapshot")
 
     def begin_transaction(self, *, write_slot: SQLiteWriteSlot | None = None) -> SQLiteTransaction:
         """Begin read-write transaction, taking the write lock now.
@@ -446,8 +449,12 @@ class SQLiteStorage:
         conn, writer_lock = self._begin_write_connection(write_slot)
         transaction = SQLiteTransaction(self, conn, writer_lock)
         with self._state_lock:
-            self._active_transactions.add(transaction)
-        return transaction
+            if self._opened:
+                self._active_transactions.add(transaction)
+                return transaction
+        # close() ran while this begin waited and did not see it.
+        transaction.abort()
+        raise StorageClosedError("Storage was closed while beginning the transaction")
 
     async def areserve_write_slot(self) -> SQLiteWriteSlot:
         """Wait for the write lock without blocking the event loop.
@@ -490,8 +497,13 @@ class SQLiteStorage:
             raise
         slot = SQLiteWriteSlot(self, lock, conn)
         with self._state_lock:
-            self._reserved_slots.add(slot)
-        return slot
+            if self._opened:
+                self._reserved_slots.add(slot)
+                return slot
+        # close() ran while the reservation polled and did not see it: the
+        # file lock just taken must not outlive the closed storage.
+        slot.release()
+        raise StorageClosedError("Storage was closed while reserving the write slot")
 
     async def _abegin_immediate(self, deadline: float) -> sqlite3.Connection:
         """Take the file write lock on a pooled connection, polling off the loop.
@@ -514,6 +526,10 @@ class SQLiteStorage:
                     except Exception as e:
                         if not is_busy_error(e):
                             raise StorageError(f"Failed to begin write transaction: {e}") from e
+                        if not self._opened:
+                            raise StorageClosedError(
+                                "Storage was closed while waiting for the write lock"
+                            ) from None
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise StorageLockTimeoutError(
