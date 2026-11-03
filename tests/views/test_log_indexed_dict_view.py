@@ -530,3 +530,247 @@ def test_lazy_log_reversed_items_matches_slice(log_dict_factory):
     dct = log_dict_factory("dct", {"a": 1, "b": 2, "c": 3}).lazy
     fwd = list(dct.items())
     assert list(reversed(dct.items())) == fwd[::-1]
+
+
+# ============================================================================
+# CURSOR + LIMIT (the storage limit must not count the cursor row)
+# ============================================================================
+
+
+def _cursor_of(dct, key):
+    return next(lk for lk, ak in dct.keys_with_log_keys() if ak == key)
+
+
+def test_keys_after_with_limit_is_exact(log_dict_factory):
+    dct = log_dict_factory("dct", {f"k{i}": i for i in range(6)})
+    cursor = _cursor_of(dct, "k1")
+    assert list(dct.keys(after=cursor, limit=3)) == ["k2", "k3", "k4"]
+    assert list(dct.keys(after=cursor, limit=1)) == ["k2"]
+    assert list(dct.keys(after=cursor, limit=10)) == ["k2", "k3", "k4", "k5"]
+    assert list(dct.keys(limit=3)) == ["k0", "k1", "k2"]
+
+
+def test_keys_reverse_before_with_limit_is_exact(log_dict_factory):
+    dct = log_dict_factory("dct", {f"k{i}": i for i in range(6)})
+    cursor = _cursor_of(dct, "k4")
+    assert list(dct.keys_reverse(before=cursor, limit=2)) == ["k3", "k2"]
+    assert list(dct.keys_reverse(before=cursor, limit=1)) == ["k3"]
+    assert list(dct.keys_reverse(before=cursor, limit=10)) == ["k3", "k2", "k1", "k0"]
+    assert list(dct.keys_reverse(limit=2)) == ["k5", "k4"]
+
+
+def test_keys_after_deleted_cursor_with_limit_is_exact(log_dict_factory):
+    """A cursor whose row was deleted still pages the same count."""
+    dct = log_dict_factory("dct", {f"k{i}": i for i in range(6)})
+    fwd = _cursor_of(dct, "k1")
+    rev = _cursor_of(dct, "k4")
+    del dct["k1"]
+    del dct["k4"]
+    assert list(dct.keys(after=fwd, limit=3)) == ["k2", "k3", "k5"]
+    assert list(dct.keys_reverse(before=rev, limit=2)) == ["k3", "k2"]
+    assert list(dct.keys_with_log_keys(after=fwd)) == [
+        (lk, ak) for lk, ak in dct.keys_with_log_keys() if ak in ("k2", "k3", "k5")
+    ]
+
+
+def test_next_key_after_cursor_with_limit_one(log_dict_factory):
+    dct = log_dict_factory("dct", {"a": 1, "b": 2})
+    first = dct.next_key_after(None)
+    second = dct.next_key_after(first[0])
+    assert (first[1], second[1]) == ("a", "b")
+    assert dct.next_key_after(second[0]) is None
+
+
+# ============================================================================
+# MUTABLEMAPPING REGISTRATION (both facets)
+# ============================================================================
+
+
+def test_both_facets_are_mutable_mappings():
+    from collections.abc import MutableMapping
+
+    from virtuals.views import LogIndexedDictView
+
+    assert issubclass(EagerLogIndexedDictView, MutableMapping)
+    assert issubclass(LazyLogIndexedDictView, MutableMapping)
+    assert issubclass(LogIndexedDictView, MutableMapping)
+
+
+def test_lazy_facet_isinstance_mutable_mapping(log_dict_factory):
+    from collections.abc import MutableMapping
+
+    dct = log_dict_factory("dct", {"a": 1})
+    assert isinstance(dct.lazy, MutableMapping)
+    assert isinstance(dct, MutableMapping)
+
+
+# ============================================================================
+# REVERSE INDEX: delete is a point op, old data still deletes
+# ============================================================================
+
+
+def test_delete_with_missing_reverse_row_falls_back_to_scan(log_dict_factory):
+    """Data logged before ``__log__/`` existed deletes through a log scan."""
+    dct = log_dict_factory("dct", {"a": 1, "b": 2, "c": 3})
+    dct._log_container().delete_child_primitive_unsafe("b")
+    del dct["b"]
+    assert list(dct) == ["a", "c"]
+    assert "b" not in dct
+    assert len(dct) == 2
+    assert list(dct._log_container().iter_child_keys(validate=False)) == ["a", "c"]
+
+
+def test_rebuild_bookkeeping_fills_reverse_index(log_dict_factory):
+    dct = log_dict_factory("dct", {"a": 1, "b": 2, "c": 3})
+    lc = dct._log_container()
+    lc.delete_child_primitive_unsafe("a")
+    lc.put_child_primitive("b", "stale-log-key", validate=False, validate_parent=False)
+    lc.put_child_primitive("zz", "no-such-key", validate=False, validate_parent=False)
+    dct.rebuild_bookkeeping()
+    expected = {ak: lk for lk, ak in dct.keys_with_log_keys()}
+    assert {k: info.primitive_value for k, info in lc.iter_children(validate=False)} == expected
+    del dct["a"]
+    del dct["b"]
+    assert list(dct) == ["c"]
+    assert list(dct._keys_container().iter_child_keys(validate=False)) == [expected["c"]]
+
+
+def test_delete_then_reinsert_gets_fresh_log_entry(log_dict_factory):
+    dct = log_dict_factory("dct", {"a": 1, "b": 2})
+    old = _cursor_of(dct, "a")
+    del dct["a"]
+    dct["a"] = 10
+    assert list(dct) == ["b", "a"]
+    assert _cursor_of(dct, "a") != old
+    assert dct._log_container().get_child_primitive_unsafe("a") == _cursor_of(dct, "a")
+
+
+def test_clear_drops_reverse_index(log_dict_factory):
+    dct = log_dict_factory("dct", {"a": 1, "b": 2})
+    dct.clear()
+    assert list(dct._log_container().iter_child_keys(validate=False)) == []
+    dct["c"] = 3
+    assert list(dct) == ["c"]
+    del dct["c"]
+    assert len(dct) == 0
+
+
+# ============================================================================
+# COST (seeking backends): delete and bool constant in n, len O(n)
+# ============================================================================
+
+
+@pytest.fixture(params=["sqlite", "lmdb", "rocksdb"])
+def costed(request, tmp_path, monkeypatch):
+    from tests.support.counting import install_counter, open_backend
+
+    storage = open_backend(request.param, tmp_path)
+    try:
+        yield storage, install_counter(storage, monkeypatch)
+    finally:
+        storage.close()
+
+
+def _fill_log(storage, n):
+    from virtuals.navigator import Navigator
+
+    with storage.transaction() as tx:
+        d = Navigator(storage).root(tx).open_child("d", EagerLogIndexedDictView)
+        d.store({f"k{i}": i for i in range(n)})
+
+
+def test_delete_cost_is_constant_in_n(costed):
+    from tests.support.counting import POINT_OPS, measure
+
+    storage, counts = costed
+    costs = {}
+    for n in (10, 1000):
+        _fill_log(storage, n)
+        costs[n] = measure(
+            storage,
+            counts,
+            lambda root, n=n: root.open_child("d", EagerLogIndexedDictView).__delitem__(
+                f"k{n - 1}"
+            ),
+        )
+    assert costs[10] == costs[1000], costs
+    assert costs[10]["scan"] == 0, costs
+    assert costs[10]["scan_rows"] == 0, costs
+    assert costs[10]["delete"] == 3, costs  # data row, log row, reverse row
+    assert sum(costs[10][name] for name in POINT_OPS) <= 8, costs
+
+
+def test_bool_cost_is_one_seek(costed):
+    from tests.support.counting import measure
+
+    storage, counts = costed
+    costs = {}
+    for n in (10, 1000):
+        _fill_log(storage, n)
+        costs[n] = measure(
+            storage, counts, lambda root: bool(root.open_child("d", EagerLogIndexedDictView))
+        )
+    assert costs[10] == costs[1000], costs
+    assert costs[10]["scan"] == 1, costs
+    assert costs[10]["scan_rows"] <= 2, costs
+
+
+def test_len_scans_only_log_rows(costed):
+    """len is a live count over ``__keys__/`` only: n rows, never the data."""
+    from tests.support.counting import measure
+
+    storage, counts = costed
+    for n in (10, 1000):
+        _fill_log(storage, n)
+        cost = measure(
+            storage, counts, lambda root: len(root.open_child("d", EagerLogIndexedDictView))
+        )
+        assert cost["scan"] == 1, cost
+        assert n <= cost["scan_rows"] <= n + 2, cost
+
+
+def test_set_new_cost_is_constant_in_n(costed):
+    from tests.support.counting import POINT_OPS, measure
+
+    storage, counts = costed
+    costs = {}
+    for n in (10, 1000):
+        _fill_log(storage, n)
+        costs[n] = measure(
+            storage,
+            counts,
+            lambda root: root.open_child("d", EagerLogIndexedDictView).__setitem__("new", 1),
+        )
+    assert costs[10] == costs[1000], costs
+    assert costs[10]["scan"] == 0, costs
+    assert costs[10]["put"] == 3, costs  # data, log, reverse
+    assert sum(costs[10][name] for name in POINT_OPS) <= 10, costs
+
+
+def test_keys_after_limit_scan_is_bounded(costed):
+    """Paging reads limit + 1 rows (the cursor row), never the whole log."""
+    from tests.support.counting import measure
+
+    storage, counts = costed
+    _fill_log(storage, 1000)
+    with storage.transaction() as tx:
+        from virtuals.navigator import Navigator
+
+        d = Navigator(storage).root(tx).open_child("d", EagerLogIndexedDictView)
+        cursor = _cursor_of(d, "k10")
+    cost = measure(
+        storage,
+        counts,
+        lambda root: list(
+            root.open_child("d", EagerLogIndexedDictView).keys(after=cursor, limit=5)
+        ),
+    )
+    assert cost["scan_rows"] <= 7, cost
+    cost = measure(
+        storage,
+        counts,
+        lambda root: list(
+            root.open_child("d", EagerLogIndexedDictView).keys_reverse(before=cursor, limit=5)
+        ),
+    )
+    assert cost["scan_rows"] <= 7, cost
