@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from typing import TYPE_CHECKING, Any
@@ -155,7 +156,8 @@ class ContextBase:
         own. The connection is closed outright (SQLite rolls back an open
         transaction on close) rather than pooled, and the writer slot is
         released by identity. The storage state lock is never taken here:
-        a collection may run on a thread that holds it.
+        a collection may run on a thread that holds it. A connection
+        inherited across a fork is parked, never closed.
         """
         with self._lock:
             conn, self._conn = self._conn, None
@@ -163,12 +165,26 @@ class ContextBase:
             writer_lock, self._writer_lock = self._writer_lock, None
             self._closed = True
         if conn is not None:
-            try:
-                conn.close()
-            except Exception:  # noqa: S110 (interpreter shutdown)
-                pass
+            if os.getpid() != self._storage._pid:
+                self._storage._park_inherited([conn])
+            else:
+                try:
+                    conn.close()
+                except Exception:  # noqa: S110 (interpreter shutdown)
+                    pass
         if holds:
             self._storage._release_write_slot(writer_lock)
+
+    def _forget(self) -> None:
+        """Mark the context ended without touching its connection.
+
+        For a forked child: the connection belongs to the parent and must
+        not be rolled back or closed here. The caller parks it.
+        """
+        self._conn = None
+        self._holds_write_lock = False
+        self._writer_lock = None
+        self._closed = True
 
     @property
     def is_closed(self) -> bool:

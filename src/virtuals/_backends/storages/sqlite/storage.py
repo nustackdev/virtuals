@@ -56,6 +56,35 @@ Synchronous = Literal["OFF", "NORMAL", "FULL", "EXTRA"]
 
 _SCHEMA = "CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID"
 
+# Connections a forked child inherited. SQLite forbids using a connection in
+# a child, and closing one counts: it would roll back the parent's open
+# transaction in the shared WAL index and tear down lock state the parent
+# still relies on. The child keeps them referenced, untouched, until it exits.
+_INHERITED_CONNECTIONS: list[sqlite3.Connection] = []
+
+# Database files whose write lock the parent held when this process was
+# forked off it. The inherited lock state marks the lock as held by this
+# process for as long as the inherited connections live (forever, see above),
+# so every new connection here would wait out ``busy_timeout`` and fail. A
+# write on such a file is refused with a clear error instead.
+_FORK_WRITE_POISONED: set[str] = set()
+
+# Storages open in this process, so a fork can be noticed as it happens.
+_OPEN_STORAGES: weakref.WeakSet[SQLiteStorage] = weakref.WeakSet()
+
+
+def _after_fork_in_child() -> None:
+    """Forget the parent's state on every open storage, before the child uses any."""
+    for storage in list(_OPEN_STORAGES):
+        try:
+            storage._check_fork()
+        except Exception as e:  # a fork hook must never raise
+            logger.error(f"Fork handling failed for {storage.path}: {e}")
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
+
 
 class SQLiteStorage:
     """SQLite storage implementation conforming to StorageProtocol.
@@ -95,6 +124,18 @@ class SQLiteStorage:
     ``StorageNestedTransactionError``; one whose loop has another task
     holding it raises ``StorageLockTimeoutError``. Both fail at once
     instead of waiting: the holder could never run to release it.
+
+    Multiple processes: open the storage in each process (e.g. with the
+    ``spawn`` start method); that is the supported path. Reusing an open
+    storage across ``os.fork`` is best effort. Connections inherited from
+    the parent are never used in the child, not even to close them (SQLite
+    forbids it: it would undo the parent's open transaction in the shared
+    WAL index). If no write was in progress at the fork, the child keeps
+    using the storage with fresh connections. If the parent held a write
+    transaction or the writer slot at the fork, the inherited lock state
+    marks the file's write lock as taken by the child for good, so every
+    write in the child, on this storage or any other opened on the same
+    file, raises a non-retryable ``StorageError`` saying so.
     """
 
     def __init__(
@@ -168,6 +209,7 @@ class SQLiteStorage:
         self._active_snapshots: weakref.WeakSet[SQLiteSnapshot] = weakref.WeakSet()
         self._opened = False
         self._pid = os.getpid()
+        self._forked_during_write = False
 
     @property
     def read_only(self) -> bool:
@@ -239,6 +281,7 @@ class SQLiteStorage:
             self._idle.append(conn)
             self._pid = os.getpid()
             self._opened = True
+        _OPEN_STORAGES.add(self)
 
     def close(self) -> None:
         """Close database and release all resources.
@@ -250,8 +293,11 @@ class SQLiteStorage:
 
         A context in use on another thread is ended once its current
         statement finishes (see ``ContextBase``), so close never pulls a
-        connection away mid-statement.
+        connection away mid-statement. In a forked child nothing inherited
+        from the parent is touched.
         """
+        self._check_fork()  # never end contexts inherited from the parent
+
         with self._state_lock:
             if not self._opened:
                 return
@@ -286,6 +332,7 @@ class SQLiteStorage:
 
         self._writer.close()  # a reserved slot nobody took does not survive the reopen
 
+        _OPEN_STORAGES.discard(self)
         errors: list[Exception] = []
         for conn in idle:
             try:
@@ -397,6 +444,7 @@ class SQLiteStorage:
             raise StorageError("Cannot reserve the write slot in read only mode.")
         self._require_open()
         self._check_fork()
+        self._require_writable_after_fork()
         lock = await self._writer.areserve(self._busy_timeout)
         return SQLiteWriteSlot(self, lock)
 
@@ -405,6 +453,8 @@ class SQLiteStorage:
         if self._read_only:
             raise StorageError("Cannot start write batch in read only mode.")
         self._require_open()
+        self._check_fork()
+        self._require_writable_after_fork()
 
         write_batch = SQLiteWriteBatch(self)
         with self._state_lock:
@@ -538,6 +588,7 @@ class SQLiteStorage:
             identity when the transaction ends).
         """
         self._check_fork()
+        self._require_writable_after_fork()
         give_back_slot = self._writer.take(self, write_slot, self._busy_timeout)
         writer_lock = self._writer.lock
 
@@ -562,19 +613,74 @@ class SQLiteStorage:
     def _check_fork(self) -> None:
         """Drop state inherited across a fork.
 
-        SQLite connections must not be used in a forked child, and a writer
-        slot held by a parent thread would never be released in the child.
-        If this process is not the one that opened the storage, the
-        inherited connections are dropped unused (not closed) and the
-        writer slot is reset, so the child opens fresh ones.
+        Runs from the fork hook in the child, and lazily from every entry
+        point in case the hook did not. If this process is not the one that
+        opened the storage: the parent's open contexts are marked ended
+        without being ended (no ROLLBACK on their connections), every
+        inherited connection is parked for the life of the process (see
+        ``_INHERITED_CONNECTIONS``), and the writer slot is reset so a lock held by a
+        parent thread does not wait forever here. If the parent held the
+        write lock at the fork, writes on this file are refused from now
+        on (see ``_require_writable_after_fork``).
         """
         if self._pid == os.getpid():
             return
+        # Another parent thread may have held the state lock at the fork;
+        # it does not exist here, so a fresh lock is the only usable one.
+        self._state_lock = threading.Lock()
         with self._state_lock:
-            if self._pid != os.getpid():
-                self._idle = []
-                self._writer.reset()
-                self._pid = os.getpid()
+            if self._pid == os.getpid():
+                return
+            contexts = [
+                *self._active_transactions,
+                *self._active_snapshots,
+                *self._active_write_batches,
+            ]
+            held_write = bool(
+                self._writer.lock.locked()
+                or self._active_transactions
+                or any(b._conn is not None for b in self._active_write_batches)
+            )
+            inherited = list(self._idle)
+            for context in contexts:
+                if context._conn is not None:
+                    inherited.append(context._conn)
+                context._forget()
+            self._idle = []
+            self._active_transactions = weakref.WeakSet()
+            self._active_snapshots = weakref.WeakSet()
+            self._active_write_batches = weakref.WeakSet()
+            self._writer.reset()
+            if held_write:
+                self._forked_during_write = True
+                _FORK_WRITE_POISONED.add(self._poison_key())
+            self._pid = os.getpid()
+        self._park_inherited(inherited)
+
+    def _poison_key(self) -> str:
+        """The file identity ``_FORK_WRITE_POISONED`` is keyed by."""
+        try:
+            return str(self._path.resolve())
+        except OSError:
+            return str(self._path)
+
+    def _require_writable_after_fork(self) -> None:
+        """Refuse writes on a file whose write lock a forked parent held."""
+        if self._forked_during_write or (
+            _FORK_WRITE_POISONED and self._poison_key() in _FORK_WRITE_POISONED
+        ):
+            raise StorageError(
+                "This SQLite database was inherited across a fork while the parent held "
+                "its write lock, so it cannot be written from this process (the inherited "
+                "lock state marks the lock as taken here for good, and SQLite forbids "
+                "touching inherited connections to undo that). Open the storage in a "
+                "spawned process instead, or fork only while no write is in progress"
+            )
+
+    @staticmethod
+    def _park_inherited(conns: list[sqlite3.Connection]) -> None:
+        """Keep inherited connections alive, untouched, for the life of the process."""
+        _INHERITED_CONNECTIONS.extend(conns)
 
     def _release_write_slot(self, lock: threading.Lock | None = None) -> None:
         """Release the in-process writer slot.
