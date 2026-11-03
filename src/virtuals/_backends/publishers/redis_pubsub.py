@@ -11,6 +11,9 @@ Python owns encoding (`notify.keyenc`): Lua only compares and concatenates
 opaque strings, and Python's Filter.matches stays the only exact matcher
 (the observer drops over-delivery).
 
+Delivery is at least once per retry: a chunk retried after a lost reply runs
+PUBLISH again, so an observer can see a key twice (see PublisherBase).
+
 Wire format (unchanged for observers):
 - Channel: `{prefix}:notif:{filter_hash}`.
 - msgpack payload: `{"iid": pub_id, "keys": [[...], ...]}`.
@@ -119,9 +122,13 @@ class RedisPublisher(PublisherBase):
 
     # -- Publish routing ------------------------------------------------------
 
-    def _route_args(self, batch: list[Key]) -> list[bytes]:
-        """Build nu1_route ARGV: P, hdr, then per key packed, nseg, segs."""
+    def _route_args(self, batch: list[Key]) -> tuple[list[bytes], int]:
+        """Build nu1_route ARGV: P, hdr, then per key packed, nseg, segs.
+
+        Returns the args and the number of routable keys in them.
+        """
         args: list[bytes] = [self._channel_prefix.encode(), self._hdr]
+        n = 0
         for key in batch:
             try:
                 segs = enc_key(key)
@@ -135,17 +142,24 @@ class RedisPublisher(PublisherBase):
             args.append(packed)
             args.append(b"%d" % len(segs))
             args.extend(segs)
-        return args
+            n += 1
+        return args, n
 
-    def _publish_batch(self, batch: list[Key]) -> None:
+    def _prepare_chunk(self, chunk: list[Key]) -> tuple[list[bytes], int]:
+        """Encode once per chunk; unroutable keys are recorded here, not per retry."""
+        return self._route_args(chunk)
+
+    def _send_chunk(self, prepared: list[bytes]) -> None:
         """One nu1_route call for a chunk of at most MAX_KEYS_PER_CALL keys."""
-        if not batch:
-            return
         if self._redis_pub is None:
             raise redis.ConnectionError("RedisPublisher not connected")
-        args = self._route_args(batch)
-        if len(args) > 2:
-            self._lua.call(self._redis_pub, "nu1_route", args)
+        self._lua.call(self._redis_pub, "nu1_route", prepared)
+
+    def _publish_batch(self, batch: list[Key]) -> None:
+        """Encode and send one chunk (no retry)."""
+        args, n = self._route_args(batch)
+        if n:
+            self._send_chunk(args)
 
 
 if TYPE_CHECKING:

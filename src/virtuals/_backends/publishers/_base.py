@@ -48,8 +48,12 @@ DEFAULT_PUBLISH_RETRY_SECONDS: float = 5.0
 _RETRY_BACKOFF_START: float = 0.05
 _RETRY_BACKOFF_CAP: float = 1.0
 
-# Sentinel used to unblock the worker sleeping on Queue.get() during disconnect.
+# Sentinel that ends the worker: everything queued before it is published.
 _STOP_MARKER: object = object()
+
+# How long disconnect() waits to queue the stop marker and for the worker to
+# drain up to it.
+_STOP_JOIN_SECONDS: float = 5.0
 
 
 class PublisherBase:
@@ -64,6 +68,20 @@ class PublisherBase:
     fills and notify() blocks (backpressure). After the deadline the keys
     are logged at ERROR, counted in `dropped_keys`, and the next flush()
     raises PublisherOperationError once.
+
+    disconnect() drains: the worker publishes every key queued before it
+    (one attempt per chunk, no retry window). Keys it cannot publish, and
+    keys still queued if the worker cannot finish, are counted and surfaced
+    the same way.
+
+    Delivery is at least once per retry: a chunk whose reply is lost (for
+    example a connection error after the server ran the call) is sent again,
+    so subscribers may see a key twice. Harmless for level flows, which
+    re-read state on every wake.
+
+    Subclasses either implement `_publish_batch(batch)`, or split it into
+    `_prepare_chunk(chunk)` (encode once) and `_send_chunk(prepared)` (the
+    retried transport call).
     """
 
     MAX_KEYS_PER_CALL: int | None = None
@@ -112,24 +130,50 @@ class PublisherBase:
             raise PublisherConnectionError(f"Failed to connect: {e}") from e
 
     def disconnect(self) -> None:
-        """Disconnect publisher: stop worker, drain, call _on_disconnect hook."""
+        """Disconnect publisher: drain the queue, stop worker, call _on_disconnect hook.
+
+        The worker publishes everything queued before the stop marker, one
+        attempt per chunk. Whatever it cannot reach in time is counted in
+        `dropped_keys` and raised by the next flush().
+        """
         if not self._connected:
             return
         try:
+            # Stop first: from here a failing chunk gets one attempt, so the
+            # worker reaches the marker in bounded time.
             self._stop_event.set()
-            # Best-effort wake if worker is blocked on Queue.get().
             try:
-                self._queue.put_nowait(_STOP_MARKER)
+                self._queue.put(_STOP_MARKER, timeout=_STOP_JOIN_SECONDS)
             except queue.Full:
-                pass  # worker will wake via get() timeout instead
+                pass  # worker stuck; its leftovers are recorded below
 
-            if self._thread is not None and self._thread.is_alive():
-                self._thread.join(timeout=2.0)
-                self._thread = None
+            if self._thread is not None:
+                self._thread.join(timeout=_STOP_JOIN_SECONDS)
+                if not self._thread.is_alive():
+                    self._thread = None
 
+            if self._thread is None:
+                self._drop_leftovers()
             self._on_disconnect()
         finally:
             self._connected = False
+
+    def _drop_leftovers(self) -> None:
+        """Record keys left in the queue once the worker is gone."""
+        n = 0
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, threading.Event):
+                item.set()
+            elif item is not _STOP_MARKER:
+                n += 1
+        if n:
+            err = PublisherConnectionError(f"{n} keys still queued at disconnect")
+            logger.error("Publisher disconnected with %d unpublished keys", n)
+            self._record_drop(n, err)
 
     def notify(self, keys: Key | Iterable[Key]) -> None:
         """Enqueue keys for publish.
@@ -175,11 +219,17 @@ class PublisherBase:
             raise PublisherOperationError(f"Publish failed, keys dropped: {err}") from err
 
     def _worker(self) -> None:
-        """Background thread: drain queue, batch, call _publish_batch."""
-        while not self._stop_event.is_set():
+        """Background thread: drain queue, batch, publish. Exits only at the stop marker.
+
+        Exits on an empty queue after stop too, in case disconnect() could
+        not queue the marker; anything queued later is recorded by it.
+        """
+        while True:
             try:
                 item = self._queue.get(timeout=0.1)
             except queue.Empty:
+                if self._stop_event.is_set():
+                    return
                 continue
 
             # Drain what's queued right now into a single batch. Sentinels
@@ -210,21 +260,33 @@ class PublisherBase:
             self._publish_with_retry(batch[i : i + n])
 
     def _publish_with_retry(self, chunk: list[Key]) -> None:
-        """Publish one chunk, retrying with backoff until the deadline."""
+        """Publish one chunk, retrying with backoff until the deadline.
+
+        The chunk is encoded once (`_prepare_chunk`); only the send retries,
+        so per-key encode errors are recorded once.
+        """
+        try:
+            prepared, n = self._prepare_chunk(chunk)
+        except Exception as e:
+            logger.error("Publish failed, dropping %d keys: %s", len(chunk), e)
+            self._record_drop(len(chunk), e)
+            return
+        if not n:
+            return
         deadline = time.monotonic() + self._publish_retry_seconds
         delay = _RETRY_BACKOFF_START
         while True:
             try:
-                self._publish_batch(chunk)
+                self._send_chunk(prepared)
                 return
             except Exception as e:
                 remaining = deadline - time.monotonic()
                 # Disconnect in progress: don't hold the worker past one attempt.
                 if remaining <= 0 or self._stop_event.is_set():
-                    logger.error("Publish failed, dropping %d keys: %s", len(chunk), e)
-                    self._record_drop(len(chunk), e)
+                    logger.error("Publish failed, dropping %d keys: %s", n, e)
+                    self._record_drop(n, e)
                     return
-                logger.warning("Publish failed (%d keys), retrying: %s", len(chunk), e)
+                logger.warning("Publish failed (%d keys), retrying: %s", n, e)
                 if self._stop_event.wait(min(delay, remaining)):
                     continue  # loop once more; the check above records the drop
                 delay = min(delay * 2, _RETRY_BACKOFF_CAP)
@@ -238,6 +300,18 @@ class PublisherBase:
     def _on_disconnect(self) -> None:
         """Hook called from disconnect() after the worker joins. Default: no-op."""
         return None
+
+    def _prepare_chunk(self, chunk: list[Key]) -> tuple[Any, int]:
+        """Encode a chunk once, before any send attempt.
+
+        Returns (prepared, n): what `_send_chunk` sends, and how many keys it
+        carries (0 skips the send). Default: the chunk as is.
+        """
+        return chunk, len(chunk)
+
+    def _send_chunk(self, prepared: Any) -> None:  # noqa: ANN401 -- subclass-defined
+        """Send one prepared chunk; retried on error. Default: `_publish_batch`."""
+        self._publish_batch(prepared)
 
     def _publish_batch(self, batch: list[Key]) -> None:
         """Send a batch of keys onto the transport. Subclass responsibility."""
