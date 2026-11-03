@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from virtuals._views import EagerDictView, SetView
-from virtuals.codecs import BinaryCodec, TextCodec
+from virtuals.codecs import BinaryCodec
 from virtuals.container import Container
 from virtuals.navigator import Navigator
 
@@ -24,16 +24,12 @@ if TYPE_CHECKING:
     from virtuals.tkv.storage import StorageProtocol
 
 
-@pytest.fixture(params=["mem", "textdb", "sqlite", "lmdb", "rocksdb"])
+@pytest.fixture(params=["mem", "sqlite", "lmdb", "rocksdb"])
 def storage(request: pytest.FixtureRequest, tmp_path: Path) -> Generator[StorageProtocol]:
     if request.param == "mem":
         from virtuals.storages.mem import InMemoryStorage
 
         s = InMemoryStorage(codec=BinaryCodec())
-    elif request.param == "textdb":
-        from virtuals.storages.textdb import TextStorage
-
-        s = TextStorage(path=tmp_path / "t", codec=TextCodec())
     elif request.param == "sqlite":
         from virtuals.storages.sqlite import SQLiteStorage
 

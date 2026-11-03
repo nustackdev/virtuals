@@ -9,7 +9,6 @@ from __future__ import annotations
 
 LANE_K = "fixed by lane K (rocksdb rewrite)"
 LANE_D = "fixed by lane D (mem rewrite)"
-LANE_B = "fixed by lane B (dict keeps no stored length)"
 LMDB_XPROC = (
     "lmdb cross-process writer wait is unbounded; contract §4; owner: lmdb writer slot follow-up"
 )
@@ -69,11 +68,5 @@ KNOWN_FAILURES: dict[str, dict[str, tuple[bool, str]]] = {
     },
     "test_s4_coroutine_writers_do_not_block_loop": {
         "rocksdb": (True, f"lock wait blocks the event loop thread; {LANE_K}"),
-    },
-    "test_s7_view_dict_delete_is_point_delete": {
-        "sqlite": (True, f"dict delete recounts all children; {LANE_B}"),
-        "lmdb": (True, f"dict delete recounts all children; {LANE_B}"),
-        "rocksdb": (True, f"dict delete recounts all children; {LANE_B}"),
-        "mem": (True, f"dict delete recounts all children; {LANE_B}"),
     },
 }
