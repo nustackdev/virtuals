@@ -6,9 +6,11 @@ import os
 import threading
 import time
 from collections import Counter
-from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from virtuals.codecs import BinaryKeyCodec
+from virtuals.codecs.pickle import PickleCodec
+from virtuals.tkv.codec import Codec
 from virtuals.tkv.storage import (
     StorageLockTimeoutError,
     StorageTransactionConflictError,
@@ -134,77 +136,32 @@ def proc_increment(backend: str, root: str, key: tuple, iters: int, pause: float
         st.close()
 
 
-# Section 7 counting proxy.
-class _CountingScan:
-    def __init__(self, raw: Any, filt: Any, counts: Counter) -> None:
-        self._raw, self._filter, self._c = raw, filt, counts
+# Section 7 counter, below the transaction API.
+class CountingCodec(Codec):
+    """``BinaryCodec`` that counts every key the backend encodes or decodes.
 
-    def _keep(self, k: Any) -> bool:
-        self._c["visited"] += 1
-        return self._filter is None or self._filter.matches(k)
-
-    def items(self):
-        for k, v in self._raw.items():
-            if self._keep(k):
-                yield k, v
-
-    def keys(self):
-        for k in self._raw.keys():
-            if self._keep(k):
-                yield k
-
-    def values(self):
-        for k, v in self._raw.items():
-            if self._keep(k):
-                yield v
-
-    def __iter__(self):
-        return self.keys()
-
-
-class CountingTxn:
-    """Wrap a transaction and count every key it touches.
-
-    Scans run with the include ``filter`` stripped and applied here, so
-    ``visited`` counts every key the backend walks, not only the matches.
-    ``break_filter`` and ``limit`` pass through.
+    Every backend turns a key into bytes to address it and decodes a key for
+    every entry it walks in a scan, so ``touched()`` counts keys handled
+    inside the backend, whatever the transaction wrapper reports. It cannot
+    see a walk over raw bytes that never decodes, which the timing check in
+    section 7 covers.
     """
 
-    def __init__(self, inner: Any) -> None:
-        self._i = inner
+    def __init__(self) -> None:
+        super().__init__(key_codec_cls=BinaryKeyCodec, value_codec_cls=PickleCodec)
         self.c: Counter = Counter()
+        self.encode_key = self._counted("encode_key", self.encode_key)
+        self.decode_key = self._counted("decode_key", self.decode_key)
 
-    def get(self, k):
-        self.c["get"] += 1
-        return self._i.get(k)
+    def _counted(self, name: str, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
+        def counted(x: Any) -> Any:
+            self.c[name] += 1
+            return fn(x)
 
-    def exists(self, k):
-        self.c["exists"] += 1
-        return self._i.exists(k)
+        return counted
 
-    def multiget(self, ks):
-        ks = list(ks)
-        self.c["multiget"] += len(ks)
-        return self._i.multiget(ks)
-
-    def put(self, k, v):
-        self.c["put"] += 1
-        return self._i.put(k, v)
-
-    def delete(self, k):
-        self.c["delete"] += 1
-        return self._i.delete(k)
-
-    def scan(self, options):
-        self.c["scan"] += 1
-        filt = options.filter
-        if filt is None or options.limit is not None:
-            # a limit applies after the filter, so it cannot be stripped
-            return _CountingScan(self._i.scan(options), None, self.c)
-        return _CountingScan(self._i.scan(replace(options, filter=None)), filt, self.c)
+    def reset(self) -> None:
+        self.c.clear()
 
     def touched(self) -> int:
-        return sum(v for k, v in self.c.items() if k != "scan")
-
-    def __getattr__(self, name):
-        return getattr(self._i, name)
+        return self.c["encode_key"] + self.c["decode_key"]
