@@ -60,8 +60,16 @@ logger = getLogger(__name__)
 
 
 DEFAULT_MAP_SIZE = 10 * 1024 * 1024 * 1024  # 10 GiB
-DEFAULT_MAX_READERS = 126
+# Reader slots are shared by every process on the environment and each
+# open snapshot takes one (py-lmdb opens with MDB_NOTLS). A slot is a
+# cache line in the lock file, so a large table costs nothing to speak
+# of, while a full one turns every new snapshot away.
+DEFAULT_MAX_READERS = 1024
 DEFAULT_BUSY_TIMEOUT = 60.0  # seconds
+# How often, at most, a write begin checks for reader slots of dead
+# processes (seconds). Such a slot pins every page freed since its
+# transaction began, so without the check the file grows until MAP_FULL.
+READER_CHECK_INTERVAL = 1.0
 
 
 class LMDBWriteSlot(WriteSlot):
@@ -273,6 +281,7 @@ class LMDBStorage:
         self._opened = False
         self._pid = os.getpid()
         self._forked_during_write = False
+        self._last_reader_check = 0.0
         _storages.add(self)
 
     @property
@@ -343,11 +352,31 @@ class LMDBStorage:
         env = self._env
         if env is None:
             return 0
+        self._last_reader_check = time.monotonic()
         try:
-            return env.reader_check()
+            cleared = env.reader_check()
         except Exception as e:  # read-only lock file, or an env without locking
             logger.debug(f"LMDB reader check skipped: {e}")
             return 0
+        if cleared:
+            logger.info(f"LMDB reader check cleared {cleared} slot(s) of dead processes")
+        return cleared
+
+    def _after_map_full(self, what: str) -> StorageLockTimeoutError | None:
+        """The retryable error for ``MDB_MAP_FULL`` behind a dead reader, else None.
+
+        LMDB cannot reuse pages freed since the oldest reader's transaction
+        began, and the slot of a process that died inside a snapshot stays
+        until a reader check clears it. Cleared here, a retry has those
+        pages back; a map that is full with no such slot is a hard limit
+        and stays non-retryable.
+        """
+        if not self._sweep_dead_readers():
+            return None
+        return StorageLockTimeoutError(
+            f"Failed to {what}: the LMDB map was full behind a reader slot of a dead "
+            "process; the slot is cleared now, retry"
+        )
 
     def _reset_locks_after_fork(self) -> None:
         """Replace locks a parent thread may hold at the fork (``register_at_fork``)."""
@@ -565,10 +594,16 @@ class LMDBStorage:
             raise StorageClosedError("Storage is not open")
         try:
             return env.begin(write=False)
-        except lmdb.ReadersFullError:
-            if self._sweep_dead_readers() == 0:
-                raise
-            return env.begin(write=False)
+        except lmdb.ReadersFullError as e:
+            if self._sweep_dead_readers():
+                return env.begin(write=False)
+            # Every slot is a live snapshot somewhere; one closes soon, so
+            # the wait is the caller's to retry (contract section 3).
+            raise StorageLockTimeoutError(
+                f"LMDB reader table is full: {self._max_readers} snapshots are open across "
+                f"every process on this environment (max_readers, set by whoever created "
+                f"its lock file). Close one or retry: {e}"
+            ) from e
         except lmdb.MapResizedError:
             self._remap_to_file_size()
             return env.begin(write=False)
@@ -583,6 +618,8 @@ class LMDBStorage:
         env = self._env
         if env is None:
             raise StorageClosedError("Storage is not open")
+        if time.monotonic() - self._last_reader_check >= READER_CHECK_INTERVAL:
+            self._sweep_dead_readers()  # before a dead reader pins the map full
         try:
             lmdb_txn = env.begin(write=True)
         except lmdb.MapResizedError:
@@ -609,10 +646,16 @@ class LMDBStorage:
             # Taken off the live set before the end: nothing else ends a
             # live txn, and close() joins this thread before env.close().
             self._live_writes.discard(lmdb_txn)
-        if commit:
-            lmdb_txn.commit()
-        else:
+        if not commit:
             lmdb_txn.abort()
+            return
+        try:
+            lmdb_txn.commit()
+        except lmdb.MapFullError as e:
+            retry = self._after_map_full("commit")
+            if retry is not None:
+                raise retry from e
+            raise
 
     def _remap_to_file_size(self) -> None:
         """Adopt the map size a peer grew the file to (``MDB_MAP_RESIZED``).
@@ -809,18 +852,22 @@ class LMDBStorage:
         found nothing. A failed replay aborts the handle again and raises,
         leaving the transaction pending.
         """
-        lmdb_txn = self._writer_thread.run(
-            self._begin_lmdb_write, timeout=self._hop_timeout(), undo=self._abort_abandoned
-        )
-        try:
-            missing = replay_pending(lmdb_txn, pending)
-        except Exception as e:
+        swept = False
+        while True:
+            lmdb_txn = self._writer_thread.run(
+                self._begin_lmdb_write, timeout=self._hop_timeout(), undo=self._abort_abandoned
+            )
             try:
-                self._end_write(lmdb_txn, commit=False)
-            except Exception as abort_error:
-                logger.error(f"Abort after a failed replay failed: {abort_error}")
-            raise StorageOperationError(f"Failed to apply pending writes: {e}") from e
-        return lmdb_txn, missing
+                return lmdb_txn, replay_pending(lmdb_txn, pending)
+            except Exception as e:
+                try:
+                    self._end_write(lmdb_txn, commit=False)
+                except Exception as abort_error:
+                    logger.error(f"Abort after a failed replay failed: {abort_error}")
+                if not swept and isinstance(e, lmdb.MapFullError) and self._sweep_dead_readers():
+                    swept = True  # a dead reader pinned the pages: once more with them back
+                    continue
+                raise StorageOperationError(f"Failed to apply pending writes: {e}") from e
 
     def _commit_pending(self, pending: Pending) -> set[bytes]:
         """Begin, replay and commit on the writer thread in one job.
@@ -837,14 +884,25 @@ class LMDBStorage:
         )
 
     def _apply_and_commit(self, lmdb_txn: Any, pending: Pending) -> set[bytes]:  # noqa: ANN401
-        """Second stage of a write-only commit, on the writer thread."""
-        try:
-            missing = replay_pending(lmdb_txn, pending)
-        except BaseException:
-            self._end_live(lmdb_txn, False)
-            raise
-        self._end_live(lmdb_txn, True)
-        return missing
+        """Second stage of a write-only commit, on the writer thread.
+
+        A replay that fills the map behind a dead reader's slot is retried
+        once after the sweep, on a fresh begin (the requester still holds
+        the gate); a commit that does so raises the retryable error.
+        """
+        swept = False
+        while True:
+            try:
+                missing = replay_pending(lmdb_txn, pending)
+            except BaseException as e:
+                self._end_live(lmdb_txn, False)
+                if not swept and isinstance(e, lmdb.MapFullError) and self._sweep_dead_readers():
+                    swept = True
+                    lmdb_txn = self._begin_lmdb_write()
+                    continue
+                raise
+            self._end_live(lmdb_txn, True)
+            return missing
 
     def _abort_abandoned(self, lmdb_txn: Any) -> None:  # noqa: ANN401
         """End a begin whose requester gave up (runs on the writer thread).
