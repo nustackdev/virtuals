@@ -19,8 +19,13 @@ __all__ = [
     "SubscriptionReceiver",
 ]
 
-SubscriptionCallback: TypeAlias = "Callable[[Key], None]"
-"""Callback function type for subscription notifications."""
+SubscriptionCallback: TypeAlias = "Callable[[Key | None], None]"
+"""Callback function type for subscription notifications.
+
+The argument is the changed key, or None for a keyless resync wake: the
+observer may have missed changes (a reconnect) and the receiver should re-read
+the state it watches.
+"""
 
 SubscriptionReceiver: TypeAlias = "SubscriptionCallback"
 """Receiver function type for subscription notifications."""

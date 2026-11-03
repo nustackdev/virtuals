@@ -294,6 +294,11 @@ class SubscriptionRegistry:
         positions = tuple(i for i, seg in enumerate(pattern) if seg != WILDCARD)
         return positions, tuple(pattern[i] for i in positions)
 
+    def subscriptions(self) -> tuple[Subscription, ...]:
+        """Snapshot of every registered subscription."""
+        with self._lock:
+            return tuple(self._all_subscriptions)
+
     def __len__(self) -> int:
         """Return number of subscriptions in the registry."""
         with self._lock:

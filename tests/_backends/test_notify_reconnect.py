@@ -79,7 +79,11 @@ def test_subscriptions_keep_delivering_after_restart(server, how, restarts):
         evs: list[threading.Event] = []
         for f in filters:
             ev = threading.Event()
-            obs.subscribe(SubscriptionOptions(filter=f)).bind(lambda k, ev=ev: ev.set())
+            # real keys only: a keyless resync wake after the restart must not
+            # stand in for the delivery this test checks
+            obs.subscribe(SubscriptionOptions(filter=f)).bind(
+                lambda k, ev=ev: k is not None and ev.set()
+            )
             evs.append(ev)
         for k, ev in zip(keys, evs, strict=True):
             assert _deliver_until(pub, k, ev) == 1
@@ -202,7 +206,8 @@ def test_same_filter_subscribe_waits_for_reregistration(server, caplog):
         s.bind(got.append)
         pub.notify(("u", "k"))
         pub.flush(2)
-        assert _wait_until(lambda: got == [("u", "k")], 2.0), got
+        # a resync wake (None) for the re-registered hash may reach s too
+        assert _wait_until(lambda: [k for k in got if k is not None] == [("u", "k")], 2.0), got
     finally:
         if pub is not None:
             pub.disconnect()
@@ -245,4 +250,130 @@ def test_reregistration_raced_by_reconnect_waits(server, monkeypatch):
         assert done.wait(3)
         assert obs._ready[h].event.is_set()
     finally:
+        obs.disconnect()
+
+
+def test_level_subscriber_converges_after_restart_mid_stream(server):
+    """Writes made while the observer is cut off are recovered by the resync wake.
+
+    A writer streams values for a few keys and keeps writing while valkey is
+    down (those PUBLISHes go nowhere). The last write lands while it is down.
+    A level subscriber re-reads the whole state on every wake, whatever the
+    key. After the restart nobody writes again, so only the keyless resync
+    wake can bring it to the final state.
+    """
+    from virtuals._backends.observers.redis_pubsub import RedisObserver
+    from virtuals._backends.publishers.redis_pubsub import RedisPublisher
+    from virtuals.tkv.filter import PrefixFilter
+    from virtuals.tkv.observer import SubscriptionOptions
+
+    truth: dict = {}
+    truth_lock = threading.Lock()
+    view: dict = {}
+    wakes: list = []
+    asked = threading.Event()
+    stop = threading.Event()
+
+    def reader():  # the level flow: one pass per wake, re-reads everything
+        while not stop.is_set():
+            if not asked.wait(0.05):
+                continue
+            asked.clear()
+            with truth_lock:
+                snap = dict(truth)
+            view.clear()
+            view.update(snap)
+
+    def on_wake(key):
+        wakes.append(key)
+        asked.set()
+
+    obs = RedisObserver(redis_url=server.url, channel_prefix="r")
+    obs.connect()
+    pub = RedisPublisher(redis_url=server.url, channel_prefix="r", publish_retry_seconds=0.2)
+    pub.connect()
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    def write(i):
+        k = ("lv", i % 5)
+        with truth_lock:
+            truth[k] = i
+        pub.notify(k)
+
+    try:
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("lv",)))).bind(on_wake)
+        for i in range(200):
+            write(i)
+        pub.flush(timeout=5)
+        assert _wait_until(lambda: view == truth, 5.0)
+
+        _kill(server, "kill")
+        for i in range(200, 400):  # written while the observer is cut off
+            write(i)
+            time.sleep(0.002)
+        try:
+            pub.flush(timeout=3)
+        except Exception:  # noqa: S110 - publishes during the outage are dropped
+            pass
+        time.sleep(0.5)  # outlast the publisher's retry window
+        assert view != truth
+        n_keyed = sum(1 for k in wakes if k is not None)
+
+        server.start()
+        assert _wait_until(lambda: view == truth, 10.0), (view, truth)
+        assert None in wakes
+        # nothing keyed arrived after the restart: the resync did it
+        assert sum(1 for k in wakes if k is not None) == n_keyed
+        assert truth[("lv", 399 % 5)] == 399
+    finally:
+        stop.set()
+        t.join(2)
+        pub.disconnect()
+        obs.disconnect()
+
+
+def test_event_consumer_gets_keyless_wake_without_crashing(server):
+    """An event-style consumer sees exactly one None per subscription and keeps going.
+
+    A receiver that assumes a real key (and raises on None) is logged, not
+    fatal: other receivers still get the wake and later keys still arrive.
+    """
+    from virtuals._backends.observers.redis_pubsub import RedisObserver
+    from virtuals._backends.publishers.redis_pubsub import RedisPublisher
+    from virtuals.tkv.filter import PrefixFilter
+    from virtuals.tkv.observer import SubscriptionOptions
+
+    obs = RedisObserver(redis_url=server.url, channel_prefix="r")
+    obs.connect()
+    pub = None
+    events: list = []
+    other: list = []
+    strict_seen: list = []
+
+    def strict(key):  # an event body that indexes the key
+        strict_seen.append(key[0])
+
+    try:
+        s1 = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("ev",))))
+        s1.bind(strict)
+        s1.bind(events.append)
+        s2 = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("ot",))))
+        s2.bind(other.append)
+
+        _kill(server, "kill")
+        server.start()
+        assert _wait_until(lambda: events == [None] and other == [None], 10.0), (events, other)
+
+        pub = RedisPublisher(redis_url=server.url, channel_prefix="r")
+        pub.connect()
+        pub.notify([("ev", 1), ("ot", 2)])
+        pub.flush(2)
+        assert _wait_until(lambda: events == [None, ("ev", 1)] and other == [None, ("ot", 2)])
+        assert strict_seen == ["ev"]
+        time.sleep(0.2)
+        assert events.count(None) == 1 and other.count(None) == 1
+    finally:
+        if pub is not None:
+            pub.disconnect()
         obs.disconnect()
