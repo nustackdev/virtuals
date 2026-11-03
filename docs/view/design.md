@@ -159,7 +159,14 @@ class LiveChildrenCountBase:
         return sum(1 for _ in self.container.iter_child_keys())
 ```
 
-Choose based on access pattern. Frequent length checks → metadata. Rare checks → live.
+Live counting costs one child scan, and the scan seeks over each child's
+subtree (`StorageScanOptions.max_depth`), so it is O(children), not
+O(descendants). Metadata counting makes every insert and delete read and
+write one shared key, which serializes concurrent writers of the same
+collection and can lose updates on backends that do not track reads.
+Dicts (`DictView`, `FlatDictView`, `LightDictView`) count live for that
+reason; positional views (lists, tuples) keep the counter since it is their
+index bound; sets keep it for O(1) length.
 
 ## Navigation
 
@@ -205,11 +212,11 @@ row = rows.ensure_child("r1", DictView)
   calls the parent's `_on_child_created(address)` once.
 - `ensure_created()` on a missing child view asks its parent to create it,
   recursively up the chain. Only a root creates itself.
-- `_on_child_created` is where a view keeps its own books: `DictView`,
-  `FlatDictView`, `SetView`, `FrozenSetView` and `Kh57View` bump `__len__`,
-  `IndexedDictView` and `LogIndexedDictView` record the key. Positional
-  views (lists, tuples, bytearrays) and live-counting views (`LightDictView`)
-  leave it alone. A new primitive child fires the same hook.
+- `_on_child_created` is where a view keeps its own books: `SetView`,
+  `FrozenSetView` and `Kh57View` bump `__len__`, `IndexedDictView` and
+  `LogIndexedDictView` record the key. Positional views (lists, tuples,
+  bytearrays) and live-counting views (`DictView`, `FlatDictView`,
+  `LightDictView`) leave it alone. A new primitive child fires the same hook.
 - Unsafe primitive writes skip the hook: a new key written that way is not
   counted or indexed. `view.rebuild_bookkeeping()` rebuilds counters and
   indexes from storage for a view and its whole subtree.

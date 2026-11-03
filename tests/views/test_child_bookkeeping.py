@@ -2,8 +2,8 @@
 
 Every child, however it is created (nested write, lazily opened child view,
 ``ensure_child``, ``__setitem__``, ``store``), goes through its parent view,
-so views that keep their own count or index (``DictView`` ``__len__``,
-indexed dicts' ``__keys__``) see it exactly once.
+so views that keep their own index (indexed dicts' ``__keys__``) see it
+exactly once, and views that count live (``DictView``) see it at once.
 """
 
 from __future__ import annotations
@@ -261,16 +261,6 @@ def test_light_dict_counts_live(root_view):
     assert len(root_view) == 1
 
 
-def test_unsafe_write_skips_parent_bookkeeping(root_view):
-    view = root_view.ensure_child("d", EagerDictView)
-    view["a"] = 1
-    view._unsafe_primitive_write("b", 2)
-
-    # Documented: a new key written unsafely is not counted
-    assert len(view) == 1
-    assert set(view.keys()) == {"a", "b"}
-
-
 # ============================================================================
 # PARENT CHAIN
 # ============================================================================
@@ -306,25 +296,30 @@ def test_root_at_missing_storage_parent_raises(nav, tx):
 # ============================================================================
 
 
-def test_rebuild_repairs_dict_counters_in_subtree(root_view):
+def test_dict_len_is_live_and_ignores_stale_counter(root_view):
+    """A ``__len__`` left by an older version is ignored, and rebuild drops it."""
     _write_nested(root_view, EagerDictView, ("r1", "r2", "r3"))
     rows = root_view.open_child("rows", EagerDictView)
-    rows._set_length(0)
-    rows.open_child("r1", EagerDictView)._set_length(7)
-    root_view._set_length(0)
-
-    root_view.rebuild_bookkeeping()
+    rows.container.put_metadata("__len__", 0)
+    rows.open_child("r1", EagerDictView).container.put_metadata("__len__", 7)
 
     assert len(root_view) == 1
     assert len(rows) == 3
     assert len(rows.open_child("r1", EagerDictView)) == 1
+    assert "__len__" not in rows.keys()
+
+    root_view.rebuild_bookkeeping()
+
+    assert not rows.container.exists_metadata("__len__")
+    assert not rows.open_child("r1", EagerDictView).container.exists_metadata("__len__")
+    assert len(rows) == 3
 
 
-def test_rebuild_counts_unsafe_writes(root_view):
+def test_dict_len_counts_unsafe_writes(root_view):
     view = root_view.ensure_child("d", EagerDictView)
     view._unsafe_primitive_write("a", 1)
     view._unsafe_primitive_write("b", 2)
-    assert len(view) == 0
+    assert len(view) == 2
 
     view.rebuild_bookkeeping()
     assert len(view) == 2
@@ -361,7 +356,6 @@ def test_rebuild_skips_unknown_structures(root_view):
     root_view["a"] = {"x": 1}
     child = root_view.open_child("a", EagerDictView)
     child.container.ctx.put((*root_view.container.site, "odd"), _marker(99))
-    root_view._set_length(0)
 
     root_view.rebuild_bookkeeping()
     assert len(root_view) == 2
