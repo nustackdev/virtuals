@@ -87,6 +87,16 @@ class LMDBStorage:
     ``StorageNestedTransactionError``; a sync begin while another task on
     the same loop holds it raises ``StorageLockTimeoutError`` at once.
     An LMDB write transaction must finish on the thread that began it.
+
+    Multiple processes: open the storage in each process (e.g. with the
+    ``spawn`` start method); that is the supported path. Reusing an open
+    storage across ``os.fork`` is best effort. If no write was in progress
+    at the fork, the child keeps using it from any thread, but its readers
+    stay registered under the parent's pid, so a reader check elsewhere
+    can misjudge them. If the parent held a write transaction or the
+    writer slot at the fork, LMDB's writer state in the child is unusable
+    and py-lmdb cannot reopen the same files there, so every write in the
+    child raises a non-retryable ``StorageError`` saying so.
     """
 
     def __init__(
@@ -153,6 +163,7 @@ class LMDBStorage:
         self._active_snapshots: set[LMDBSnapshot] = set()
         self._opened = False
         self._pid = os.getpid()
+        self._forked_during_write = False
 
     @property
     def read_only(self) -> bool:
@@ -200,6 +211,7 @@ class LMDBStorage:
                 raise StorageError(f"Failed to open LMDB environment: {e}") from e
 
             self._pid = os.getpid()
+            self._forked_during_write = False
             self._opened = True
 
     def _check_fork(self) -> None:
@@ -209,25 +221,47 @@ class LMDBStorage:
         the child. If this process is not the one that opened the storage,
         the slot is reset and the parent's open contexts are forgotten, not
         ended: aborting them here would write to the lock file the parent
-        still uses (its reader slots). py-lmdb frees nothing for objects
-        inherited across a fork, and it refuses a second open of the same
-        files in one process, so the child keeps the inherited environment.
+        still uses (its reader slots and writer mutex). py-lmdb frees
+        nothing for objects inherited across a fork, and it refuses a
+        second open of the same files in one process, so the child keeps
+        the inherited environment.
+
+        If a write was in progress at the fork, LMDB's inherited writer
+        state rejects or blocks every write in the child, so writes fail
+        with a clear error instead (see ``_require_writable_after_fork``).
         """
         if self._pid == os.getpid():
             return
         with self._env_lock:
             if self._pid == os.getpid():
                 return
+            self._forked_during_write = bool(
+                self._writer.lock.locked()
+                or self._active_transactions
+                or self._active_write_batches
+            )
             self._active_transactions = set()
             self._active_write_batches = set()
             self._active_snapshots = set()
             self._writer.reset()
             self._pid = os.getpid()
 
+    def _require_writable_after_fork(self) -> None:
+        """Refuse writes on a storage inherited mid-write across a fork."""
+        if self._forked_during_write:
+            raise StorageError(
+                "This LMDB storage was inherited across a fork while the parent held a "
+                "write transaction, so it cannot write in this process (LMDB's inherited "
+                "writer state is unusable here, and py-lmdb cannot reopen the same files "
+                "in it). Open the storage in a spawned process instead, or fork only "
+                "while no write is in progress"
+            )
+
     def close(self) -> None:
         """Close database and release all resources."""
         if not self._opened:
             return
+        self._check_fork()  # never end contexts inherited from the parent
 
         with self._env_lock:
             for transaction in list(self._active_transactions):
@@ -252,7 +286,11 @@ class LMDBStorage:
             self._active_write_batches.clear()
             self._active_snapshots.clear()
 
-            if self._env is not None:
+            if self._env is not None and self._forked_during_write:
+                # Closing an environment inherited mid-write can hang in
+                # LMDB; drop it instead (py-lmdb frees nothing inherited).
+                self._env = None
+            elif self._env is not None:
                 try:
                     self._env.close()
                 except Exception as e:
@@ -333,6 +371,7 @@ class LMDBStorage:
 
         self._require_open()
         self._check_fork()
+        self._require_writable_after_fork()
 
         lmdb_txn = self._begin_write(write_slot, StorageError, "transaction")
         transaction = LMDBTransaction(self, lmdb_txn)
@@ -361,6 +400,7 @@ class LMDBStorage:
             raise StorageError("Cannot reserve the write slot in read only mode.")
         self._require_open()
         self._check_fork()
+        self._require_writable_after_fork()
         lock = await self._writer.areserve(self._busy_timeout)
         return LMDBWriteSlot(self, lock)
 
@@ -371,6 +411,7 @@ class LMDBStorage:
 
         self._require_open()
         self._check_fork()
+        self._require_writable_after_fork()
 
         lmdb_txn = self._begin_write(None, StorageOperationError, "write batch")
         write_batch = LMDBWriteBatch(self, lmdb_txn)
