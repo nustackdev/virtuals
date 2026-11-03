@@ -4,7 +4,7 @@ Owns the SubscriptionRegistry, subscribe / _close_subscription, and the
 transport-facing `_dispatch_incoming(keys)` entry point. Subclasses
 provide `_on_connect / _on_disconnect / _on_subscribe / _on_unsubscribe`
 hooks for backend-specific setup (registering with an in-mem transport,
-HSET on Redis, etc.).
+a confirmed SUBSCRIBE plus routing registration on Redis, etc.).
 
 Includes an internal queue + worker so `_dispatch_incoming` returns as
 soon as the keys are queued: a slow subscriber backs up the OBSERVER's

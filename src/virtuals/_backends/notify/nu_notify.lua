@@ -1,4 +1,9 @@
 #!lua name=nu_notify_v1
+-- VERSIONING: bump the library name (nu_notify_v1 -> v2, and the matching
+-- name in router.py) on ANY change to this file. Every client runs FUNCTION
+-- LOAD REPLACE on connect, so an edited body under the same name would
+-- silently replace the library for every client on the server, old ones too.
+--
 -- Server-side notify routing for virtuals RedisPublisher / RedisObserver.
 --
 -- Lua does no verification and no number handling: Python encodes every key
