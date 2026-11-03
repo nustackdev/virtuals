@@ -1,40 +1,49 @@
-"""In-memory storage backend with copy-on-write transaction isolation.
+"""In-memory storage backend.
 
-Fast, ephemeral key-value storage for testing and prototyping. Uses overlay pattern
-for efficient transaction isolation without full state copies.
+Ephemeral key-value storage for tests, prototypes and per-process state,
+meeting the same contract as the persistent adapters:
 
-Features:
-- Copy-on-write transaction isolation (overlay pattern)
-- Thread-safe with RLock
-- Optional publisher support for change notifications
-- No persistence - all data lost on close
-- Implements full StorageProtocol
+- Serializable transactions. One writer at a time through an in-process
+  writer slot (the SQLite shape: a lock with a thread-and-task owner, a
+  bounded sync wait, and an async wait that never blocks the event loop).
+  A transaction reads committed state plus its own writes and commits
+  atomically.
+- Real snapshots. A snapshot is pinned at the commit sequence it opened
+  at and reads multi-version state, so it is repeatable and never torn.
+  Nothing is copied on begin.
+- Ordered keys. A chunked sorted index gives seek, range and reverse scans
+  in encoded key order, with first and last in O(log n).
+- Notifications after commit through the publisher, like every adapter.
 
-Limitations:
-- No durability (in-memory only)
-- No conflict detection (last commit wins)
-- Memory-bound by dataset size
+Single-process: nothing is shared across processes, and all data is lost
+on close.
 """
 
 from __future__ import annotations
 
+import asyncio
+import os
 import threading
+import time
 from contextlib import contextmanager
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 from virtuals.tkv.storage import (
     SnapshotProtocol,
     StorageClosedError,
-    StorageOperationError,
+    StorageError,
+    StorageLockTimeoutError,
+    StorageNestedTransactionError,
     TransactionProtocol,
     WriteBatchProtocol,
 )
 
 from .snapshot import InMemorySnapshot
-from .state import TransactionState
+from .store import VersionedStore
 from .transaction import InMemoryTransaction
 from .write_batch import InMemoryWriteBatch
+from .write_slot import InMemoryWriteSlot
 
 
 if TYPE_CHECKING:
@@ -52,163 +61,131 @@ __all__ = ["InMemoryStorage"]
 logger = getLogger(__name__)
 
 
-class InMemoryStorage:
-    """In-memory storage backend with copy-on-write transaction isolation.
+DEFAULT_BUSY_TIMEOUT = 60.0  # seconds
 
-    Fast, ephemeral key-value storage using overlay pattern for efficient
-    transaction isolation. All data is lost when storage is closed.
+# Poll interval bounds for a coroutine waiting on the writer slot (seconds).
+_SLOT_POLL_MIN = 0.0005
+_SLOT_POLL_MAX = 0.005
+
+_Owner = tuple[int, "asyncio.Task | None"]
+
+_NESTED_MESSAGE = (
+    "This task or thread already holds the write lock on this in-memory storage; "
+    "a second write transaction here would wait on itself"
+)
+
+
+def _caller() -> _Owner:
+    """Who is asking for the writer slot: this thread, and its running task if any."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:  # no running event loop on this thread
+        task = None
+    return threading.get_ident(), task
+
+
+class InMemoryStorage:
+    """In-memory storage conforming to ``StorageProtocol``.
+
+    Threading: contexts may be begun on one thread and finished on
+    another. A sync ``begin_transaction`` waits for the writer slot up to
+    ``busy_timeout`` and then raises ``StorageLockTimeoutError``. On an
+    event loop, wait with ``areserve_write_slot`` and hand the slot to
+    ``begin_transaction(write_slot=...)``; a sync begin on a thread whose
+    loop peer holds the slot fails fast rather than stalling the loop.
+    Beginning a second write transaction from the slot's own holder raises
+    ``StorageNestedTransactionError``, which is not retryable.
 
     Attributes:
-        codec: Codec for key/value encoding
+        codec: Codec for key and value encoding. Views read it directly.
+        process_model: ``"single"``: one process owns the data.
     """
+
+    process_model = "single"
 
     def __init__(
         self,
         codec: CodecProtocol,
         publisher: PublisherProtocol | None = None,
         read_only: bool = False,
+        *,
+        busy_timeout: float = DEFAULT_BUSY_TIMEOUT,
     ) -> None:
         """Initialize in-memory storage.
 
         Args:
-            codec: Codec for key/value encoding
-            publisher: Optional publisher for change notifications
-            read_only: Mode
+            codec: Codec for key and value encoding.
+            publisher: Optional publisher for change notifications.
+            read_only: Refuse transactions and write batches.
+            busy_timeout: Seconds a writer waits for the slot before
+                ``StorageLockTimeoutError``.
         """
         self.codec = codec
         self._publisher = publisher
-
         self._read_only = read_only
+        self._busy_timeout = busy_timeout
 
-        # State
-        self._state: dict[str, Any] = {}  # key_str -> value
+        self._store = VersionedStore()
         self._opened = False
+        self._pid = os.getpid()
 
-        # Synchronization (use RLock to allow reentrant locking)
-        self._lock = threading.RLock()
+        self._state_lock = threading.Lock()
+        # In-process writer slot. A plain Lock (not RLock): it may be
+        # released from a different thread than the one that took it.
+        self._write_lock = threading.Lock()
+        self._write_owner: _Owner | None = None
 
-        # Context tracking
         self._active_transactions: set[InMemoryTransaction] = set()
         self._active_snapshots: set[InMemorySnapshot] = set()
         self._active_write_batches: set[InMemoryWriteBatch] = set()
 
     @property
     def read_only(self) -> bool:
-        """Storage access."""
+        """Storage access mode."""
         return self._read_only
-
-    def _require_open(self) -> None:
-        """Validate storage is open.
-
-        Raises:
-            StorageClosedError: If storage is not open
-        """
-        if not self._opened:
-            raise StorageClosedError("Storage is not open")
-
-    def _notify_batch(self, keys: set[Key]) -> None:
-        """Notify publisher of key changes (batch).
-
-        Fire-and-forget: writer enqueues and returns. Delivery happens on
-        the publisher's worker thread. Callers that need a delivery barrier
-        call publisher.flush() explicitly.
-
-        Args:
-            keys: Keys that changed
-        """
-        if self._publisher is not None and keys:
-            try:
-                self._publisher.notify(keys)
-            except Exception:
-                logger.error("Publisher notification failed")
-
-    def _untrack_transaction(self, txn: InMemoryTransaction) -> None:
-        """Remove transaction from active set.
-
-        Args:
-            txn: Transaction to untrack
-        """
-        with self._lock:
-            self._active_transactions.discard(txn)
-
-    def _untrack_snapshot(self, snap: InMemorySnapshot) -> None:
-        """Remove snapshot from active set.
-
-        Args:
-            snap: Snapshot to untrack
-        """
-        with self._lock:
-            self._active_snapshots.discard(snap)
-
-    def _untrack_write_batch(self, batch: InMemoryWriteBatch) -> None:
-        """Remove write batch from active set.
-
-        Args:
-            batch: Write batch to untrack
-        """
-        with self._lock:
-            self._active_write_batches.discard(batch)
 
     # =========================================================================
     # Lifecycle
     # =========================================================================
 
     def open(self) -> None:
-        """Open storage and initialize resources.
-
-        Raises:
-            StorageOperationError: If open fails
-        """
+        """Open storage with empty state."""
         if self._opened:
             return
-
-        try:
-            self._state = {}
-            self._opened = True
-        except Exception as e:
-            raise StorageOperationError(f"Failed to open storage: {e}") from e
+        self._store.reset()
+        self._opened = True
 
     def close(self) -> None:
-        """Close storage and release resources.
-
-        All data is lost. Active transactions/snapshots are aborted/closed.
-
-        Raises:
-            StorageOperationError: If close fails
-        """
+        """Close storage. Active contexts are aborted or closed, all data is dropped."""
         if not self._opened:
             return
 
-        with self._lock:
-            # Close all active transactions
-            for txn in list(self._active_transactions):
-                try:
-                    txn.abort()
-                except Exception as e:
-                    logger.error(f"Failed to abort transaction during close: {e}")
+        with self._state_lock:
+            transactions = list(self._active_transactions)
+            snapshots = list(self._active_snapshots)
+            batches = list(self._active_write_batches)
+        for txn in transactions:
+            try:
+                txn.abort()
+            except Exception as e:
+                logger.error(f"Failed to abort transaction during close: {e}")
+        for snap in snapshots:
+            try:
+                snap.close()
+            except Exception as e:
+                logger.error(f"Failed to close snapshot during close: {e}")
+        for batch in batches:
+            try:
+                batch.abort()
+            except Exception as e:
+                logger.error(f"Failed to abort write batch during close: {e}")
 
-            # Close all active snapshots
-            for snap in list(self._active_snapshots):
-                try:
-                    snap.close()
-                except Exception as e:
-                    logger.error(f"Failed to close snapshot during close: {e}")
-
-            # Close all active write batches
-            for batch in list(self._active_write_batches):
-                try:
-                    batch.abort()
-                except Exception as e:
-                    logger.error(f"Failed to abort write batch during close: {e}")
-
-            # Clear tracking sets
+        with self._state_lock:
             self._active_transactions.clear()
             self._active_snapshots.clear()
             self._active_write_batches.clear()
-
-            # Clear state
-            self._state = {}
-            self._opened = False
+        self._store.reset()
+        self._opened = False
 
     def __enter__(self) -> InMemoryStorage:
         """Enter context manager."""
@@ -225,7 +202,7 @@ class InMemoryStorage:
         self.close()
 
     # =========================================================================
-    # Transaction Management
+    # Contexts
     # =========================================================================
 
     @overload
@@ -245,20 +222,7 @@ class InMemoryStorage:
         read_only: bool = False,
         write_only: bool = False,
     ) -> WriteBatchProtocol | SnapshotProtocol | TransactionProtocol:
-        """Begin new transaction with specified access level.
-
-        Args:
-            read_only: If True, creates a read-only snapshot
-            write_only: If True, creates a write-only batch
-
-        Returns:
-            SnapshotProtocol if read_only=True
-            WriteBatchProtocol if write_only=True
-            TransactionProtocol otherwise
-
-        Raises:
-            StorageOperationError: If transaction creation fails
-        """
+        """Begin a snapshot, write batch or transaction."""
         if read_only:
             return self.begin_snapshot()
         elif write_only:
@@ -267,95 +231,222 @@ class InMemoryStorage:
             return self.begin_transaction()
 
     def begin_snapshot(self) -> InMemorySnapshot:
-        """Begin read-only snapshot.
-
-        Returns:
-            New snapshot instance with full state copy
-
-        Raises:
-            StorageOperationError: If snapshot creation fails
-        """
+        """Begin a read-only snapshot pinned at this moment."""
         self._require_open()
-
-        with self._lock:
-            # Reference live state directly (no copy) — read-committed semantics.
-            # Safe for in-process asyncio: no true concurrency between sync operations.
-            snapshot = InMemorySnapshot(self, self._state)
+        snapshot = InMemorySnapshot(self, self._store.pin())
+        with self._state_lock:
             self._active_snapshots.add(snapshot)
-            return snapshot
+        return snapshot
 
-    def begin_transaction(self) -> InMemoryTransaction:
-        """Begin read-write transaction.
+    def begin_transaction(
+        self, *, write_slot: InMemoryWriteSlot | None = None
+    ) -> InMemoryTransaction:
+        """Begin a read-write transaction, taking the writer slot now.
+
+        Args:
+            write_slot: A slot from ``areserve_write_slot``. The transaction
+                takes it over instead of acquiring the slot itself, then
+                releases it on commit or abort. None acquires as usual.
+        """
+        if self._read_only:
+            raise StorageError("Cannot start transaction in read only mode.")
+        self._require_open()
+        self._check_fork()
+
+        if write_slot is not None:
+            lock = write_slot._take(self)
+        else:
+            lock = self._acquire_write_slot()
+        try:
+            transaction = InMemoryTransaction(self, lock)
+            with self._state_lock:
+                self._active_transactions.add(transaction)
+        except BaseException:
+            if write_slot is not None:
+                write_slot._give_back()
+            else:
+                self._release_write_slot(lock)
+            raise
+        return transaction
+
+    async def areserve_write_slot(self) -> InMemoryWriteSlot:
+        """Wait for the writer slot without blocking the event loop.
+
+        Polls the slot with a short, growing sleep between tries, so other
+        coroutines on the loop keep running, including the one that holds
+        it. Waits behind other threads too.
 
         Returns:
-            New transaction instance with copy-on-write overlay
+            The held slot, for ``begin_transaction(write_slot=...)``. Call
+            its ``release`` if no transaction takes it.
 
         Raises:
-            StorageOperationError: If transaction creation fails
+            StorageNestedTransactionError: If this task already holds the slot.
+            StorageLockTimeoutError: If the slot is not free within ``busy_timeout``.
         """
+        if self._read_only:
+            raise StorageError("Cannot reserve the write slot in read only mode.")
         self._require_open()
+        self._check_fork()
 
-        with self._lock:
-            # Create transaction with overlay (no copy)
-            overlay = TransactionState(self._state)
-            transaction = InMemoryTransaction(self, overlay)
-            self._active_transactions.add(transaction)
-            return transaction
+        me = _caller()
+        if self._write_owner == me:
+            raise StorageNestedTransactionError(_NESTED_MESSAGE)
+        lock = self._write_lock
+        deadline = time.monotonic() + max(self._busy_timeout, 0)
+        delay = _SLOT_POLL_MIN
+        while not lock.acquire(blocking=False):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StorageLockTimeoutError(
+                    f"Timed out after {self._busy_timeout}s waiting for the write lock"
+                )
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, _SLOT_POLL_MAX)
+        self._write_owner = me
+        return InMemoryWriteSlot(self, lock)
 
     def begin_write_batch(self) -> InMemoryWriteBatch:
-        """Begin write-only batch.
-
-        Returns:
-            New write batch instance with copy-on-write overlay
-
-        Raises:
-            StorageOperationError: If batch creation fails
-        """
+        """Begin a write-only batch. Takes no lock until ``write``."""
+        if self._read_only:
+            raise StorageError("Cannot start write batch in read only mode.")
         self._require_open()
-
-        with self._lock:
-            # Create write batch with overlay (no copy)
-            overlay = TransactionState(self._state)
-            write_batch = InMemoryWriteBatch(self, overlay)
-            self._active_write_batches.add(write_batch)
-            return write_batch
+        batch = InMemoryWriteBatch(self)
+        with self._state_lock:
+            self._active_write_batches.add(batch)
+        return batch
 
     @contextmanager
     def transaction(self) -> Iterator[InMemoryTransaction]:
-        """Context manager for transactions: commit on success, abort on exception."""
+        """Context manager for a transaction: commit on success, abort on exception."""
         txn = self.begin_transaction()
         try:
             yield txn
-        except Exception:
-            if not txn._committed and not txn._aborted:
-                txn.abort()
+        except BaseException:
+            txn.abort()
             raise
         else:
-            if not txn._committed and not txn._aborted:
+            if not txn.is_closed:
                 txn.commit()
 
     @contextmanager
     def snapshot(self) -> Iterator[InMemorySnapshot]:
-        """Context manager for read-only snapshots: always closes snapshot on exit."""
+        """Context manager for a snapshot: always closed on exit."""
         snap = self.begin_snapshot()
         try:
             yield snap
         finally:
-            try:
-                snap.close()
-            except Exception as e:
-                logger.error(f"Failed to close snapshot during close: {e}")
+            snap.close()
 
     @contextmanager
     def batch_write(self) -> Iterator[InMemoryWriteBatch]:
-        """Context manager for write batches: write on success, abort on exception."""
+        """Context manager for a write batch: write on success, abort on exception."""
         batch = self.begin_write_batch()
         try:
             yield batch
-        except Exception:
-            if not batch._written and not batch._aborted:
-                batch.abort()
+        except BaseException:
+            batch.abort()
             raise
         else:
-            if not batch._written and not batch._aborted:
+            if not batch.is_closed:
                 batch.write()
+
+    # =========================================================================
+    # Writer slot
+    # =========================================================================
+
+    def _acquire_write_slot(self) -> threading.Lock:
+        """Block for the writer slot, up to ``busy_timeout``, and return its lock.
+
+        Fails at once when the slot is held from this same thread: by this
+        task or thread (a nested transaction, which would wait on itself),
+        or by another coroutine on this thread's loop, which cannot run to
+        release it while this thread blocks.
+        """
+        me = _caller()
+        owner = self._write_owner
+        if owner is not None and owner[0] == me[0]:
+            if owner == me:
+                raise StorageNestedTransactionError(_NESTED_MESSAGE)
+            raise StorageLockTimeoutError(
+                "Another task on this thread's event loop holds the write lock on this "
+                "in-memory storage; blocking for it here would stall the loop it needs to "
+                "finish. Wait for the slot with areserve_write_slot instead"
+            )
+        lock = self._write_lock
+        if not lock.acquire(timeout=max(self._busy_timeout, 0)):
+            raise StorageLockTimeoutError(
+                f"Timed out after {self._busy_timeout}s waiting for the write lock"
+            )
+        self._write_owner = me
+        return lock
+
+    def _release_write_slot(self, lock: threading.Lock | None = None) -> None:
+        """Release the writer slot.
+
+        Args:
+            lock: The lock the caller acquired, if known. Nothing is
+                released when it is no longer the storage's lock (a fork
+                reset the slot since).
+        """
+        if lock is not None and lock is not self._write_lock:
+            return
+        self._write_owner = None
+        self._write_lock.release()
+
+    def _check_fork(self) -> None:
+        """Reset locks inherited across a fork.
+
+        A slot held by a parent thread would never be released in the
+        child, so the child starts with fresh locks and no owner. The data
+        itself is the child's copy.
+        """
+        if self._pid == os.getpid():
+            return
+        with self._state_lock:
+            if self._pid != os.getpid():
+                self._write_lock = threading.Lock()
+                self._write_owner = None
+                self._store.lock = threading.Lock()
+                self._pid = os.getpid()
+
+    # =========================================================================
+    # Internal
+    # =========================================================================
+
+    def _notify_batch(self, keys: set[Key]) -> None:
+        """Notify the publisher of changed keys after a commit.
+
+        Fire-and-forget: the writer enqueues and returns. Callers that need
+        a delivery barrier call ``publisher.flush()`` explicitly.
+        """
+        if self._publisher is not None and keys:
+            try:
+                self._publisher.notify(keys)
+            except Exception as e:
+                logger.error(f"Publisher notification failed: {e}")
+
+    def _untrack_transaction(self, transaction: InMemoryTransaction) -> None:
+        """Remove transaction from active set."""
+        with self._state_lock:
+            self._active_transactions.discard(transaction)
+
+    def _untrack_snapshot(self, snapshot: InMemorySnapshot) -> None:
+        """Remove snapshot from active set."""
+        with self._state_lock:
+            self._active_snapshots.discard(snapshot)
+
+    def _untrack_write_batch(self, batch: InMemoryWriteBatch) -> None:
+        """Remove write batch from active set."""
+        with self._state_lock:
+            self._active_write_batches.discard(batch)
+
+    def _require_open(self) -> None:
+        """Validate storage is open."""
+        if not self._opened:
+            raise StorageClosedError("Storage is not open")
+
+
+if TYPE_CHECKING:
+    _: type[TransactionProtocol] = InMemoryTransaction
+    __: type[SnapshotProtocol] = InMemorySnapshot

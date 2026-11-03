@@ -1,4 +1,4 @@
-"""Read-only snapshot for in-memory storage."""
+"""Read-only snapshot for the in-memory storage."""
 
 from __future__ import annotations
 
@@ -13,42 +13,50 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from .storage import InMemoryStorage
+    from .store import Encoded, Entry, Marker
 
 
 __all__ = ["InMemorySnapshot"]
 
 
 class InMemorySnapshot(ContextBase, ReadOperationsMixin, SnapshotProtocol):
-    """Read-only snapshot for in-memory storage.
+    """A point-in-time view, pinned at the commit sequence it was begun at.
 
-    Provides point-in-time view of storage state with full copy isolation.
+    Every read answers as the store stood at that sequence: repeatable,
+    and never half of a later commit. Takes no lock and copies nothing;
+    the store keeps the versions this snapshot may still need until it
+    closes.
     """
 
-    __slots__ = ()
+    __slots__ = ("_seq",)
 
-    def __init__(self, storage: InMemoryStorage, state: dict[str, Any]) -> None:
-        """Initialize snapshot with copied state.
-
-        Args:
-            storage: Parent storage instance
-            state: Snapshot of state (copied, not shared)
-        """
-        super().__init__(storage, state)
+    def __init__(self, storage: InMemoryStorage, seq: int) -> None:
+        """Bind the snapshot to ``storage`` at pinned sequence ``seq``."""
+        super().__init__(storage)
+        self._seq = seq
 
     @property
     def writable(self) -> bool:
-        """Check if snapshot is writable.
-
-        Returns:
-            Always False for snapshots.
-        """
+        """Always False for snapshots."""
         return False
 
+    def _lookup(self, enc: Encoded) -> Entry | Marker:
+        return self._storage._store.get_at(enc, self._seq)
+
+    def _page(
+        self, bound: Encoded | None, *, inclusive: bool, reverse: bool, n: int, stop: Encoded | None
+    ) -> tuple[list[tuple[Any, Entry]], Any, bool]:
+        return self._storage._store.page_at(
+            self._seq, bound, inclusive=inclusive, reverse=reverse, n=n, stop=stop
+        )
+
     def close(self) -> None:
-        """Close snapshot and release resources."""
-        if not self._closed:
-            self._mark_closed()
-            self._storage._untrack_snapshot(self)
+        """Close the snapshot and let the store drop versions only it needed."""
+        if self._closed:
+            return
+        self._closed = True
+        self._storage._store.unpin(self._seq)
+        self._storage._untrack_snapshot(self)
 
     def __enter__(self) -> InMemorySnapshot:
         """Enter context manager."""

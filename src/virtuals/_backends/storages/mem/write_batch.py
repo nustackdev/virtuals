@@ -1,12 +1,14 @@
-"""Write-only batch for in-memory storage."""
+"""Write-only batch for the in-memory storage."""
 
 from __future__ import annotations
 
 from logging import getLogger
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from virtuals.tkv.storage import (
     StorageClosedError,
+    StorageLockTimeoutError,
+    StorageNestedTransactionError,
     StorageTransactionError,
     WriteBatchProtocol,
 )
@@ -19,8 +21,9 @@ if TYPE_CHECKING:
 
     from virtuals.tkv.types import Key
 
-    from .state import TransactionState
+    from .sorted_keys import SortedKeys
     from .storage import InMemoryStorage
+    from .store import Encoded, Entry
 
 
 __all__ = ["InMemoryWriteBatch"]
@@ -30,103 +33,75 @@ logger = getLogger(__name__)
 
 
 class InMemoryWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
-    """Write-only batch for in-memory storage.
+    """Buffered writes applied as one atomic commit on ``write``.
 
-    Accumulates writes without read capabilities for efficient bulk operations.
-    Uses copy-on-write overlay like transactions.
+    Holds no lock while writes accumulate; ``write`` takes the writer slot
+    for just as long as it takes to apply the batch.
     """
 
-    __slots__ = ("_aborted", "_modified_keys", "_written")
+    __slots__ = ("_aborted", "_modified_keys", "_pending", "_pending_index", "_written")
 
-    def __init__(self, storage: InMemoryStorage, state: TransactionState) -> None:
-        """Initialize write batch with overlay state.
-
-        Args:
-            storage: Parent storage instance
-            state: Overlay state (copy-on-write)
-        """
-        super().__init__(storage, state)
+    def __init__(self, storage: InMemoryStorage) -> None:
+        """Begin an empty batch."""
+        super().__init__(storage)
+        self._pending: dict[Encoded, Entry] = {}
+        self._pending_index: SortedKeys[Encoded] | None = None
         self._modified_keys: set[Key] = set()
         self._written = False
         self._aborted = False
 
     @property
     def writable(self) -> bool:
-        """Check if write batch is writable.
-
-        Returns:
-            Always True for write batches.
-        """
+        """Always True for write batches."""
         return True
 
     def write(self) -> None:
-        """Write batch and make changes permanent.
-
-        Raises:
-            StorageTransactionError: If write fails
-            StorageClosedError: If already written or aborted
-        """
+        """Apply the batch atomically and notify."""
         if self._closed:
             logger.error("Cannot write, batch is closed")
             raise StorageClosedError("Write batch is closed")
         if self._written:
-            logger.error("Cannot write, batch already written")
             raise StorageTransactionError("Write batch already written")
         if self._aborted:
-            logger.error("Cannot write, batch already aborted")
             raise StorageTransactionError("Write batch already aborted")
 
+        storage = self._storage
+        modified = self._modified_keys
         try:
-            # Apply overlay directly to parent state (O(changes) not O(state_size))
-            state = cast("TransactionState", self._state)
-
-            with self._storage._lock:
-                for k in state._deleted:
-                    self._storage._state.pop(k, None)
-                self._storage._state.update(state._local)
-
-            logger.info(
-                "Write batch written",
-                extra={"modified_keys": len(self._modified_keys)},
-            )
-
-            self._written = True
-            self._mark_closed()
-
-            # Notify observers (batch)
-            self._storage._notify_batch(self._modified_keys)
-
-            self._storage._untrack_write_batch(self)
+            if self._pending:
+                storage._check_fork()
+                lock = storage._acquire_write_slot()
+                try:
+                    storage._store.apply(self._pending, modified)
+                finally:
+                    storage._release_write_slot(lock)
         except Exception as e:
-            logger.error(
-                "Write batch write failed",
-                extra={"error": str(e)},
-                exc_info=True,
-            )
+            self._aborted = True
+            self._closed = True
+            self._pending.clear()
+            storage._untrack_write_batch(self)
+            logger.error("Write batch write failed")
+            if isinstance(e, (StorageLockTimeoutError, StorageNestedTransactionError)):
+                raise
             raise StorageTransactionError(f"Failed to write batch: {e}") from e
 
-    def abort(self) -> None:
-        """Abort write batch and discard changes.
+        self._written = True
+        self._closed = True
+        self._pending.clear()
+        storage._untrack_write_batch(self)
+        logger.debug("Write batch written")
+        storage._notify_batch(modified)
 
-        Raises:
-            StorageTransactionError: If abort fails
-        """
+    def abort(self) -> None:
+        """Discard the batch. No-op once closed."""
         if self._closed:
-            # Already closed, nothing to do
             logger.debug("Abort called on closed write batch")
             return
-
-        try:
-            logger.info(
-                "Write batch aborted",
-                extra={"discarded_keys": len(self._modified_keys)},
-            )
-
-            self._aborted = True
-            self._mark_closed()
-            self._storage._untrack_write_batch(self)
-        except Exception as e:
-            raise StorageTransactionError(f"Failed to abort write batch: {e}") from e
+        self._aborted = True
+        self._closed = True
+        self._pending.clear()
+        self._storage._untrack_write_batch(self)
+        logger.debug("Write batch aborted")
 
     def __enter__(self) -> InMemoryWriteBatch:
         """Enter context manager."""
@@ -138,11 +113,8 @@ class InMemoryWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        """Exit context manager."""
+        """Write on a clean exit, abort on an exception."""
         if exc_type is not None:
-            # Exception occurred, abort
             self.abort()
-        else:
-            # Success, write if not already done
-            if not self._written and not self._aborted:
-                self.write()
+        elif not self._written and not self._aborted:
+            self.write()
