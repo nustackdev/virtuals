@@ -292,3 +292,59 @@ def test_failed_registration_fails_waiters(redis_url, prefix, monkeypatch):
         obs.subscribe(SubscriptionOptions(filter=f))  # fresh first registrant works
     finally:
         obs.disconnect()
+
+
+def test_waiter_outlasts_slow_first_registrant(redis_url, prefix, monkeypatch):
+    """A same-filter waiter shares the first registrant's deadline plus a margin.
+
+    The first registrant's nu1_reg ends past `subscribe_timeout` from the
+    waiter's start; the waiter must not raise on a hash that goes live.
+    """
+    from virtuals.tkv.filter import PrefixFilter, filter_hash
+    from virtuals.tkv.observer import SubscriptionOptions
+
+    obs = _make_observer(redis_url, prefix, subscribe_timeout=0.4)
+    real = obs._register_hash
+    started = threading.Event()
+
+    def slow(h, entries):
+        started.set()
+        time.sleep(0.6)
+        return real(h, entries)
+
+    monkeypatch.setattr(obs, "_register_hash", slow)
+    f = PrefixFilter(prefix=("slowreg",))
+    errors: list = []
+
+    def run():
+        try:
+            obs.subscribe(SubscriptionOptions(filter=f))
+        except Exception as e:  # pragma: no cover - surfaced below
+            errors.append(e)
+
+    try:
+        first = threading.Thread(target=run)
+        first.start()
+        assert started.wait(2)
+        waiter = threading.Thread(target=run)
+        waiter.start()
+        for t in (first, waiter):
+            t.join(5)
+        assert errors == []
+        assert obs._local_hash_refcount == {filter_hash(f): 2}
+    finally:
+        obs.disconnect()
+
+
+def test_stale_confirmation_unsubscribes_orphan_channel(redis_url, prefix, probe):
+    """A confirmation popped for a hash no longer local is undone (no leak)."""
+    obs = _make_observer(redis_url, prefix)
+    ch = f"{prefix}:notif:orphanhash"
+    try:
+        # A SUBSCRIBE whose registrant is gone: nothing local for this hash.
+        ack = obs._dispatch_pubsub_cmd("sub", ch, wait=True)
+        assert ack is not None and ack.event.wait(2)
+        assert _wait_until(lambda: probe.pubsub_numsub(ch)[0][1] == 0)
+        assert _wait_until(lambda: ch.encode() not in obs._pubsub.channels)
+    finally:
+        obs.disconnect()

@@ -15,6 +15,23 @@ Owns:
   resubscribed after a reconnect (valkey restart included: the loader then
   reloads the library).
 
+Reconnect window. When the pubsub connection drops, every live hash loses its
+readiness until it is resubscribed and registered again: a same-filter
+subscribe() in that window waits for the re-registration (or raises on
+timeout) instead of returning early. Writes committed while the connection
+is down, or before the re-registration lands, are NOT delivered (a restarted
+server lost the index; a dropped connection misses the PUBLISH). The observer
+logs a WARNING when this starts and an INFO per re-registered hash. Callbacks
+get no synthetic wake (an event flow is promised the key of a real change);
+level flows catch up at their next scheduled re-check.
+
+Subscribing from inside a callback. Callbacks run on the dispatch worker. The
+listener blocks while the dispatch queue is full (backpressure), and while it
+blocks it cannot read the SUBSCRIBE confirmation a nested subscribe() waits
+for. So under a full queue a subscribe() from a callback raises
+ObserverSubscriptionError after `subscribe_timeout` instead of deadlocking.
+Subscribe from another thread when callbacks can face a backlog.
+
 Unsubscribe is a fire-and-forget UNSUBSCRIBE. The index entry is removed
 lazily by the router: a PUBLISH that reaches 0 subscribers unregisters it.
 That is safe because registration always follows a confirmed SUBSCRIBE.
@@ -38,6 +55,7 @@ import queue
 import select
 import socket
 import threading
+import time
 from collections import deque
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
@@ -89,6 +107,10 @@ DEFAULT_SUBSCRIBE_TIMEOUT_SECONDS: float = 2.0
 # missed wake.
 _LISTENER_IDLE_SECONDS: float = 1.0
 
+# Extra time a same-filter waiter allows past the first registrant's deadline,
+# which covers the first registrant's `nu1_reg` after a late confirmation.
+_WAITER_MARGIN_SECONDS: float = 1.0
+
 # Re-registration retry backoff after a reconnect (seconds).
 _REREG_BACKOFF_MIN: float = 0.05
 _REREG_BACKOFF_MAX: float = 1.0
@@ -97,11 +119,13 @@ _REREG_BACKOFF_MAX: float = 1.0
 class _Ack:
     """One waiter's view of a queued pubsub command."""
 
-    __slots__ = ("error", "event")
+    __slots__ = ("error", "event", "gen")
 
     def __init__(self) -> None:
         self.event = threading.Event()
         self.error: BaseException | None = None
+        # Connection generation the confirmation was read on (set by the listener).
+        self.gen: int = -1
 
     def fail(self, error: BaseException) -> None:
         self.error = error
@@ -109,13 +133,18 @@ class _Ack:
 
 
 class _Ready:
-    """Readiness of one filter hash: set once SUBSCRIBE is confirmed and registered."""
+    """Readiness of one filter hash: set once SUBSCRIBE is confirmed and registered.
 
-    __slots__ = ("error", "event")
+    `deadline` (monotonic) is the first registrant's own deadline, shared by
+    same-filter waiters; None for a readiness reset by a reconnect.
+    """
 
-    def __init__(self) -> None:
+    __slots__ = ("deadline", "error", "event")
+
+    def __init__(self, deadline: float | None = None) -> None:
         self.event = threading.Event()
         self.error: BaseException | None = None
+        self.deadline = deadline
 
 
 class RedisObserver(ObserverBase):
@@ -148,6 +177,9 @@ class RedisObserver(ObserverBase):
         self._local_hash_refcount: dict[str, int] = {}
         self._local: dict[str, list[HintEntry]] = {}  # h -> routing entries
         self._ready: dict[str, _Ready] = {}
+        # Bumped on every pubsub connection loss and reconnect. A registration
+        # only marks a hash ready when no reconnect happened since it started.
+        self._conn_gen: int = 0
         self._state_lock = threading.Lock()
 
         # channel (bytes) -> one group of acks per SUBSCRIBE sent, in send order.
@@ -159,7 +191,7 @@ class RedisObserver(ObserverBase):
         self._obs_stop_event = threading.Event()
         self._listener_thread: threading.Thread | None = None
         self._maint_thread: threading.Thread | None = None
-        self._rereg_q: queue.Queue[str | None] = queue.Queue()
+        self._rereg_q: queue.Queue[tuple[str, int] | None] = queue.Queue()
         # (action, channel, ack). action in {'sub', 'unsub', 'shutdown'}.
         self._control_cmd_queue: queue.Queue[tuple[str, str | None, _Ack | None]] | None = None
         # Local socketpair: a byte on `_wake_w` wakes the listener's select().
@@ -275,24 +307,34 @@ class RedisObserver(ObserverBase):
 
         The first local registrant of a hash SUBSCRIBEs, waits for the server's
         confirmation, then registers the routing hints. Concurrent registrants
-        of the same hash wait for that readiness. Any failure or timeout raises
-        ObserverSubscriptionError in every waiter and rolls the hash back.
+        of the same hash wait for that readiness, up to the first registrant's
+        deadline plus a margin (so they never give up while it succeeds). After
+        a pubsub reconnect they wait for the re-registration instead. Any
+        failure or timeout raises ObserverSubscriptionError in every waiter and
+        rolls the hash back.
+
+        A subscribe() from inside a callback can time out while the dispatch
+        queue is full (see the module docstring).
         """
         h = filter_hash(f)
+        timeout = self._subscribe_timeout
+        now = time.monotonic()
         with self._state_lock:
             prior = self._local_hash_refcount.get(h, 0)
             self._local_hash_refcount[h] = prior + 1
             if prior == 0:
-                ready = self._ready[h] = _Ready()
+                ready = self._ready[h] = _Ready(deadline=now + timeout)
             else:
                 ready = self._ready[h]
-        timeout = self._subscribe_timeout
 
         if prior:
-            if not ready.event.wait(timeout):
+            wait_until = now + timeout
+            if ready.deadline is not None:
+                wait_until = max(wait_until, ready.deadline + _WAITER_MARGIN_SECONDS)
+            if not ready.event.wait(max(0.0, wait_until - time.monotonic())):
                 self._release(h, ready)
                 raise ObserverSubscriptionError(
-                    f"Subscription for hash {h} not ready within {timeout}s"
+                    f"Subscription for hash {h} not ready within {wait_until - now:.2f}s"
                 )
             if ready.error is not None:
                 # The first registrant already rolled the hash back.
@@ -301,6 +343,7 @@ class RedisObserver(ObserverBase):
                 ) from ready.error
             return
 
+        deadline = now + timeout
         subscribed = False
         try:
             entries = hint_entries(canonicalize(f).routing_hints())
@@ -310,7 +353,7 @@ class RedisObserver(ObserverBase):
                 channel = self._notif_channel(h)
                 ack = self._dispatch_pubsub_cmd("sub", channel, wait=True)
                 subscribed = True
-                if ack is None or not ack.event.wait(timeout):
+                if ack is None or not ack.event.wait(max(0.0, deadline - time.monotonic())):
                     raise ObserverSubscriptionError(
                         f"SUBSCRIBE {channel} not confirmed within {timeout}s"
                     )
@@ -319,6 +362,20 @@ class RedisObserver(ObserverBase):
                         f"SUBSCRIBE {channel} failed: {ack.error}"
                     ) from ack.error
                 self._register_hash(h, entries)
+                with self._state_lock:
+                    # A loss or reconnect since the confirmation was read?
+                    stale = self._conn_gen != ack.gen
+                    if not stale:
+                        ready.event.set()
+                # A reconnect raced the registration: the index may have lost
+                # it. The resubscribe confirmation re-registers and sets
+                # `ready` (still this object); wait for that.
+                if stale and not ready.event.wait(
+                    max(0.0, deadline + _WAITER_MARGIN_SECONDS - time.monotonic())
+                ):
+                    raise ObserverSubscriptionError(
+                        f"Subscription for hash {h} not re-registered after a reconnect"
+                    )
         except BaseException as e:
             with self._state_lock:
                 if self._ready.get(h) is ready:
@@ -433,11 +490,37 @@ class RedisObserver(ObserverBase):
         channel's pending groups into one so that confirmation releases them
         all, and drop groups for channels no longer subscribed.
         """
+        self._invalidate_ready("reconnected")
         channels = self._pubsub.channels
         for ch in list(self._pending):
             groups = self._pending.pop(ch)
             if ch in channels:
                 self._pending[ch] = deque([[a for g in groups for a in g]])
+
+    def _invalidate_ready(self, why: str) -> None:
+        """Pubsub connection lost or replaced: no local hash is known to be routed.
+
+        Swaps each registered hash's readiness for a fresh unset one, so a
+        same-filter subscribe() waits for the re-registration. A hash whose
+        first registrant is still in flight keeps its readiness: that
+        registrant notices the generation change and waits itself.
+        """
+        reset = 0
+        with self._state_lock:
+            self._conn_gen += 1
+            for h in self._local:
+                r = self._ready.get(h)
+                if r is not None and r.event.is_set() and r.error is None:
+                    self._ready[h] = _Ready()
+                    reset += 1
+        if reset:
+            logger.warning(
+                "Redis observer pubsub connection %s: %d subscribed filter hash(es) not "
+                "routed until re-registered; writes in this window are not delivered "
+                "(level flows catch up at their next re-check)",
+                why,
+                reset,
+            )
 
     def _run_cmd(self, action: str, channel: str | None, ack: _Ack | None) -> bool:
         """Run one queued command. Returns True on shutdown."""
@@ -465,27 +548,47 @@ class RedisObserver(ObserverBase):
 
     def _on_subscribed(self, channel: bytes, notif_prefix: bytes) -> None:
         """Server confirmed a SUBSCRIBE: release its waiters, or re-register."""
-        groups = self._pending.get(channel)
-        if groups:
-            for a in groups.popleft():
-                a.event.set()
-            if not groups:
-                del self._pending[channel]
-            return
-        # Nobody waits: a resubscribe after reconnect.
         if not channel.startswith(notif_prefix):
             return
         h = channel[len(notif_prefix) :].decode()
+        groups = self._pending.get(channel)
+        if groups:
+            with self._state_lock:
+                gen = self._conn_gen
+            for a in groups.popleft():
+                a.gen = gen
+                a.event.set()
+            if groups:
+                return
+            del self._pending[channel]
+            with self._state_lock:
+                live = h in self._local
+            # A stale group (its registrant timed out and rolled back, and
+            # the rollback UNSUBSCRIBE was lost in a reconnect) ate this
+            # confirmation: unsubscribe the orphan channel.
+            if not live:
+                self._unsubscribe_orphan(channel)
+            return
+        # Nobody waits: a resubscribe after reconnect.
         with self._state_lock:
             live = h in self._local
+            gen = self._conn_gen
         if live:
-            self._rereg_q.put(h)
+            self._rereg_q.put((h, gen))
         else:
             # redis-py resubscribed a channel whose UNSUBSCRIBE was lost.
-            try:
-                self._pubsub.unsubscribe(channel)
-            except Exception as e:
-                logger.warning("Listener unsubscribe(%s) failed: %s", channel, e)
+            self._unsubscribe_orphan(channel)
+
+    def _unsubscribe_orphan(self, channel: bytes) -> None:
+        """UNSUBSCRIBE a channel with no local hash, unless one is already in flight."""
+        if channel not in self._pubsub.channels:
+            return
+        if channel in self._pubsub.pending_unsubscribe_channels:
+            return
+        try:
+            self._pubsub.unsubscribe(channel)
+        except Exception as e:
+            logger.warning("Listener unsubscribe(%s) failed: %s", channel, e)
 
     def _listener_loop(self) -> None:
         """Owns `self._pubsub`; drains cmd queue; polls messages; fans out notifs."""
@@ -512,6 +615,7 @@ class RedisObserver(ObserverBase):
                     continue
             except Exception as e:
                 logger.warning("Listener get_message failed: %s", e)
+                self._invalidate_ready("lost")
                 self._obs_stop_event.wait(0.5)
                 continue
 
@@ -551,9 +655,10 @@ class RedisObserver(ObserverBase):
         registered, unsubscribed locally, or the observer stops.
         """
         while not self._obs_stop_event.is_set():
-            h = self._rereg_q.get()
-            if h is None:
+            item = self._rereg_q.get()
+            if item is None:
                 return
+            h, gen = item
             backoff = _REREG_BACKOFF_MIN
             while not self._obs_stop_event.is_set():
                 with self._state_lock:
@@ -563,9 +668,21 @@ class RedisObserver(ObserverBase):
                 try:
                     self._register_hash(h, entries)
                     logger.info("Re-registered filter hash %s after reconnect", h)
+                    self._mark_ready(h, gen)
                     break
                 except Exception as e:
                     logger.warning("Re-register of hash %s failed, retrying: %s", h, e)
                     if self._obs_stop_event.wait(backoff):
                         return
                     backoff = min(backoff * 2, _REREG_BACKOFF_MAX)
+
+    def _mark_ready(self, h: str, gen: int) -> None:
+        """Re-registration landed: release same-filter waiters.
+
+        Skipped when a newer loss or reconnect happened since the confirmation
+        that queued it; that one queues its own re-registration.
+        """
+        with self._state_lock:
+            r = self._ready.get(h)
+            if r is not None and gen == self._conn_gen and h in self._local and r.error is None:
+                r.event.set()
