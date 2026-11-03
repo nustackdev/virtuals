@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, TypeAlias
 
 
 if TYPE_CHECKING:
+    from ..codec import CodecProtocol
     from ..filter import Filter
     from ..types import Key
     from .context import SnapshotProtocol, TransactionProtocol, WriteBatchProtocol
@@ -64,6 +65,27 @@ class StorageScanOptions:
     encoding ``start`` — the door to raw sentinels like a codec's
     ``upper_bound_of_prefix`` output (which cannot be expressed as a plain
     tuple key). When both are set, ``start_encoded`` wins."""
+    max_depth: int | None = None
+    """Deepest key length the scan walks row by row. A key longer than this
+    is not visited: the scan jumps over the whole subtree of its ancestor
+    at ``max_depth`` with one seek (past it forward, onto it reverse), see
+    ``skip_bound``. Child scans set ``len(site) + 1`` so they cost
+    O(children), not O(descendants). Shorter keys are still visited, so
+    pair it with a filter when they are unwanted."""
+
+    def skip_bound(self, codec: CodecProtocol, key: Key) -> object:
+        """Encoded seek target that leaves the subtree ``key`` sits in.
+
+        ``key`` is longer than ``max_depth``. Its ancestor at ``max_depth``
+        roots the subtree to skip: forward, the codec's upper bound of that
+        ancestor is the first encoded key past the subtree; reverse, the
+        ancestor's own encoding is the last key at or below it (a reverse
+        seek lands on the ancestor when it exists, else just below it).
+        """
+        ancestor = key[: self.max_depth]
+        if self.reverse:
+            return codec.encode_key(ancestor)
+        return codec.upper_bound_of_prefix(ancestor)
 
 
 StorageContextType: TypeAlias = "SnapshotProtocol | WriteBatchProtocol | TransactionProtocol"

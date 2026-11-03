@@ -140,6 +140,7 @@ def iter_metadata_keys(
         start=(*meta_site, ""),  # Start after meta_site itself
         break_filter=prefix,
         filter=prefix & child_len,
+        max_depth=len(meta_site) + 1,  # seek over descendants' metadata
     )
     for meta_key in require_read_context(ctx).scan(options).keys():
         # Extract last segment (metadata key)

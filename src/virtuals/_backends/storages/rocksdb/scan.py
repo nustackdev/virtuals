@@ -149,6 +149,7 @@ class RocksDBScan(ScanProtocol):
         self._seek(iterator, options.reverse, start_key_encoded)
 
         count = 0
+        max_depth = options.max_depth
         context = self._context
 
         while True:
@@ -171,6 +172,11 @@ class RocksDBScan(ScanProtocol):
 
             if options.break_filter is not None and not options.break_filter.matches(key):
                 break
+
+            if max_depth is not None and len(key) > max_depth:
+                # Below the walked depth: one seek over the whole subtree.
+                self._seek(iterator, options.reverse, options.skip_bound(codec, key))
+                continue
 
             if options.filter is not None and not options.filter.matches(key):
                 if not self._advance(iterator, options.reverse):

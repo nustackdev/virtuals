@@ -713,6 +713,70 @@ class StorageProtocolCompliance:
                 assert k[0] == "users"
                 assert len(k) == 2
 
+    def _fill_tree(self, storage: StorageProtocol) -> None:
+        """A small tree: three children of ("t",), one orphan subtree, one sibling."""
+        keys = [
+            ("t",),
+            ("t", "a"),
+            ("t", "a", "x"),
+            ("t", "a", "x", "y"),
+            ("t", "b"),
+            ("t", "c"),
+            ("t", "c", "z"),
+            ("t", "d", "q"),  # no ("t", "d") row: a skip target that is absent
+            ("u",),
+            ("u", "w"),
+        ]
+        with storage.transaction() as txn:
+            for k in keys:
+                txn.put(k, b"value")
+
+    def test_scan_with_max_depth(self, storage: StorageProtocol) -> None:
+        """max_depth seeks over every subtree below it; shallower keys still show."""
+        self._fill_tree(storage)
+
+        with storage.snapshot() as snap:
+            scan = snap.scan(
+                StorageScanOptions(
+                    start=("t",),
+                    break_filter=PrefixFilter(prefix=("t",)),
+                    max_depth=2,
+                )
+            )
+            assert list(scan.keys()) == [("t",), ("t", "a"), ("t", "b"), ("t", "c")]
+
+    def test_scan_with_max_depth_reverse(self, storage: StorageProtocol) -> None:
+        """Reverse max_depth lands on each subtree's root, or just below an absent one."""
+        self._fill_tree(storage)
+
+        with storage.snapshot() as snap:
+            scan = snap.scan(
+                StorageScanOptions(
+                    start_encoded=storage.codec.upper_bound_of_prefix(("t",)),
+                    reverse=True,
+                    break_filter=PrefixFilter(prefix=("t",)),
+                    max_depth=2,
+                )
+            )
+            assert list(scan.keys()) == [("t", "c"), ("t", "b"), ("t", "a"), ("t",)]
+
+    def test_scan_with_max_depth_and_filter(self, storage: StorageProtocol) -> None:
+        """The child-scan shape: prefix + length filter + max_depth, values included."""
+        self._fill_tree(storage)
+
+        with storage.snapshot() as snap:
+            prefix = PrefixFilter(prefix=("t",))
+            scan = snap.scan(
+                StorageScanOptions(
+                    start=("t",),
+                    break_filter=prefix,
+                    filter=prefix & LengthFilter(length=2),
+                    max_depth=2,
+                    limit=2,
+                )
+            )
+            assert list(scan.items()) == [(("t", "a"), b"value"), (("t", "b"), b"value")]
+
     def test_scan_closed_transaction_raises(self, storage: StorageProtocol) -> None:
         """Test scanning closed transaction raises error."""
         txn = storage.begin_transaction()

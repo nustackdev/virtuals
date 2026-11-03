@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from enum import Enum, auto
 from typing import TYPE_CHECKING, cast
 
@@ -73,29 +74,26 @@ class InMemoryScan(ScanProtocol):
         else:
             start_str = None
 
-        # Get all encoded keys
-        if isinstance(state, TransactionState):
-            encoded_keys = list(state.keys())
+        # Every scan sorts the whole store: O(N log N) by design, the start
+        # bound and `max_depth` skips are then bisects on the sorted list.
+        encoded_keys = sorted(state.keys())
+        n = len(encoded_keys)
+        reverse = options.reverse
+        step = -1 if reverse else 1
+        max_depth = options.max_depth
+
+        # Start is inclusive: forward the first key >= start, reverse the
+        # last key <= start.
+        if start_str is None:
+            i = n - 1 if reverse else 0
+        elif reverse:
+            i = bisect_right(encoded_keys, start_str) - 1
         else:
-            encoded_keys = list(state.keys())
+            i = bisect_left(encoded_keys, start_str)
 
-        # Sort lexicographically
-        encoded_keys.sort(reverse=options.reverse)
-
-        # Iterate over sorted encoded keys
         count = 0
-        for key_str in encoded_keys:
-            # Check start bound (compare encoded keys)
-            # Start is inclusive
-            if start_str is not None:
-                if options.reverse:
-                    # For reverse, start from keys <= start
-                    if key_str > start_str:
-                        continue
-                else:
-                    # For forward, start from keys >= start
-                    if key_str < start_str:
-                        continue
+        while 0 <= i < n:
+            key_str = encoded_keys[i]
 
             # Decode key
             try:
@@ -108,9 +106,19 @@ class InMemoryScan(ScanProtocol):
                 if not options.break_filter.matches(key):
                     break
 
+            # Below the walked depth: jump over the whole subtree
+            if max_depth is not None and len(key) > max_depth:
+                bound = options.skip_bound(codec, key)
+                if reverse:
+                    i = bisect_right(encoded_keys, bound) - 1
+                else:
+                    i = bisect_left(encoded_keys, bound)
+                continue
+
             # Check filter - skip keys that don't match
             if options.filter is not None:
                 if not options.filter.matches(key):
+                    i += step
                     continue
 
             # Check result limit
@@ -126,6 +134,7 @@ class InMemoryScan(ScanProtocol):
                         value_encoded = state[key_str]
                     value = codec.decode_value(value_encoded)
                 except KeyError:
+                    i += step
                     continue
                 except Exception as e:
                     raise StorageOperationError(f"Failed to decode value for {key_str}: {e}") from e
@@ -141,6 +150,7 @@ class InMemoryScan(ScanProtocol):
                 yield (key, value)
 
             count += 1
+            i += step
 
     def items(self) -> Generator[tuple[Key, Value], None, None]:
         """Iterate over (key, value) tuples.
