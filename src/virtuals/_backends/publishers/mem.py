@@ -6,7 +6,8 @@ worker thread.
 
 There is no stalled server to protect a writer against, so notify() keeps
 pure backpressure by default (`notify_timeout=None`: it blocks until the
-queue has room, never drops). With a timeout set, a drop is followed by a
+queue has room, never drops while connected; a notify while disconnected
+is a counted drop like on any publisher). With a timeout set, a drop is followed by a
 resync fan-out on the transport, so every observer on it re-reads.
 """
 
