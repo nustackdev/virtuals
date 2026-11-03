@@ -335,10 +335,20 @@ class PublisherBase:
         blocks until there is room (pure backpressure, never a drop).
 
         Accepts a single key (tuple) or a batch of keys (set, list, etc.).
+
+        While not connected the keys cannot be sent: they are counted as a
+        drop (logged, surfaced by the next flush(), followed by a resync
+        wake once a connection sends again) and `PublisherConnectionError`
+        is raised. A commit that lands between disconnect() and connect()
+        is therefore never lost silently.
         """
-        self._ensure_connected()
-        q = self._queue
         batch = [keys] if isinstance(keys, tuple) else list(keys)
+        if not self._connected:
+            if n := len(batch):
+                logger.error("Publisher not connected, dropping %d keys", n)
+                self._record_drop(n, PublisherConnectionError(f"not connected, {n} keys dropped"))
+            self._ensure_connected()
+        q = self._queue
         timeout = self._notify_timeout
         deadline: float | None = None
         for i, k in enumerate(batch):
