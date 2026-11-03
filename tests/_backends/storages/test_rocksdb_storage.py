@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import weakref
 from typing import TYPE_CHECKING, Any
 
@@ -476,6 +477,44 @@ def test_transaction_end_closes_its_scan_iterators(tmp_path: Path, end: str) -> 
     with pytest.raises(StorageClosedError):
         next(items)
     s.close()
+
+
+@pytest.mark.timeout(60)
+def test_snapshot_close_on_another_thread_never_frees_a_running_scan_step(
+    storage: RocksDBStorage,
+) -> None:
+    """Closing a snapshot while a thread is inside a scan step waits for the step; the scan then stops."""
+    with storage.transaction() as txn:
+        for i in range(20000):
+            txn.put(("s", i), b"v" * 64)
+    for _ in range(25):
+        snap = storage.begin_snapshot()
+        started = threading.Event()
+        outcome: dict = {}
+
+        def scan(snap=snap, started=started, outcome=outcome) -> None:
+            n = 0
+            try:
+                for _ in snap.scan(StorageScanOptions()).values():
+                    n += 1
+                    if n == 1:
+                        started.set()
+                outcome["rows"] = n
+            except StorageClosedError:
+                outcome["closed_after"] = n
+            except BaseException as e:
+                outcome["error"] = e
+            finally:
+                started.set()
+
+        t = threading.Thread(target=scan)
+        t.start()
+        assert started.wait(5)
+        snap.close()
+        t.join(10)
+        assert not t.is_alive()
+        assert "error" not in outcome, outcome
+        assert "closed_after" in outcome or outcome.get("rows") == 20000, outcome
 
 
 def test_finished_scan_is_forgotten_by_its_context(storage: RocksDBStorage) -> None:
