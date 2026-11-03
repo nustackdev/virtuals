@@ -94,11 +94,7 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
                 raise StorageClosedError("Context handle is invalid")
             storage = self._storage
             if not pending:  # read first: just the begin, nothing to replay
-                txn = storage._writer_thread.run(
-                    storage._begin_lmdb_write,
-                    timeout=storage._hop_timeout(),
-                    undo=storage._abort_abandoned,
-                )
+                txn = storage._begin_on_writer()
             else:
                 txn, missing = storage._begin_pending(pending)
                 for encoded_key in missing:

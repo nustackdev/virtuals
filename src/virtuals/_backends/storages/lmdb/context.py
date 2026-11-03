@@ -77,6 +77,9 @@ WRITER_BLOCKED_AFTER = 0.01
 WRITER_BACKOFF_STEPS = 10
 WRITER_YIELD = 0.0002
 PROGRESS_EVERY = 256
+# A stamp older than this is nobody's (a starved writer gets the GIL within
+# a few switch intervals): readers ignore it rather than sleep on it.
+WRITER_STAMP_STALE = 1.0
 
 
 def yield_to_writer(
@@ -98,6 +101,8 @@ def yield_to_writer(
     wait_since = writer_thread._wait_since
     if wait_since:
         age = now - wait_since
+        if age > WRITER_STAMP_STALE:
+            return yielded_at, backoff_left
         if age > WRITER_BLOCKED_AFTER and backoff_left > 0 and asyncio._get_running_loop() is None:
             while backoff_left > 0:
                 backoff_left -= 1
@@ -112,11 +117,14 @@ def yield_to_writer(
         soft_since = writer_thread._soft_since
         if not soft_since:
             return yielded_at, backoff_left
+        age = now - soft_since
+        if age > WRITER_STAMP_STALE:
+            return yielded_at, backoff_left
         # The same threshold as the progress stamp: the gate's flock calls
         # need it this low (measured: 5ms here loses most of the writer
         # win in a snapshot-get-close loop), and a commit's fsync at this
         # threshold costs a concurrent long scan nothing measurable.
-        starved = now - soft_since > WRITER_STARVED_AFTER
+        starved = age > WRITER_STARVED_AFTER
     if starved and now - yielded_at > WRITER_YIELD_EVERY:
         time.sleep(WRITER_YIELD)
         return now, backoff_left
@@ -461,7 +469,8 @@ class WriteOperationsMixin:
                 raise StorageClosedError("Context is closed")
             pending = self._pending
             if pending is not None:
-                self._storage._check_key(encoded_key, key)
+                if not self._storage._key_fits(encoded_key):
+                    return  # a key LMDB cannot store cannot exist: a no-op, as when begun
                 pending[encoded_key] = (key, None)
                 existed = True  # settled when the pending writes are replayed
             else:

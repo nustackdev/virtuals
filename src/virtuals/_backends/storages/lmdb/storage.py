@@ -36,7 +36,7 @@ from .write_batch import LMDBWriteBatch
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from types import TracebackType
 
     from virtuals.tkv.codec import CodecProtocol
@@ -127,14 +127,18 @@ _storages: weakref.WeakSet[LMDBStorage] = weakref.WeakSet()
 # py-lmdb objects inherited across a fork, kept alive for the life of the
 # child (see ``_park_inherited``).
 _INHERITED: list[Any] = []
-# The inherited environment per path, for a child that closes the storage
-# it inherited and opens that path again (the same object, or a new one):
-# py-lmdb refuses a second open of a path in one process, and the parked
-# one is never closed, so open() adopts it instead.
+# The inherited environment per path. In a forked child the path is blocked
+# for good: py-lmdb refuses a second open of it in this process while the
+# parked one lives, and the parked one is never used nor closed here.
 _PARKED_ENVS: dict[str, Any] = {}
-# Paths whose environment was inherited while the parent held a write:
-# a storage opened on them in the child refuses writes too.
-_FORK_WRITE_POISONED: set[str] = set()
+
+_FORK_MESSAGE = (
+    "This LMDB environment belongs to the parent process: it was open when this process "
+    "forked. Using it here is unsafe (its snapshots are torn by the parent's close and "
+    "its reader slots are never freed), and py-lmdb cannot open the path again in this "
+    "process. Use spawn, not fork, for processes that use LMDB, or open the storage only "
+    "after forking"
+)
 
 
 def _park_inherited(objects: list[Any]) -> None:
@@ -227,23 +231,19 @@ class LMDBStorage:
     inside a call is ended after that call returns, never under it, and
     the owner's next call raises ``StorageClosedError``.
 
-    Multiple processes: open the storage in each process (e.g. with the
-    ``spawn`` start method); that is the supported path. Reusing an open
-    storage across ``os.fork`` is best effort. If no write was in progress
-    at the fork, the child keeps using it from any thread, but its readers
-    stay registered under the parent's pid, so a reader check elsewhere
-    can misjudge them. If the parent held a write transaction or the
-    writer slot at the fork, LMDB's writer state in the child is unusable
-    and py-lmdb cannot reopen the same files there, so every write in the
-    child raises a non-retryable ``StorageError`` saying so. Whatever the
-    parent had open at the fork (snapshots, transactions, reserved slots)
-    is closed in the child without touching LMDB, and the inherited
-    environment is never closed there, ``close()`` included: both would
-    clear the parent's reader slots in the shared lock file. A child may
-    close the storage and open the path again (this object or a new
-    one): the open adopts the inherited environment, since py-lmdb allows
-    one environment per path per process, and a mid-write inheritance
-    keeps refusing writes through that reopen.
+    Multiple processes: open the storage in each process with the
+    ``spawn`` start method; that is the only supported path. A process
+    forked while this storage is open must not use LMDB at all, as LMDB
+    itself requires: the inherited environment carries the parent's pid,
+    so the parent's close tears any snapshot the child holds and no
+    reader check ever frees a slot the child leaves behind, and py-lmdb
+    refuses to open the path again in the child. So in a forked child
+    every new transaction, snapshot, batch or reservation on the
+    inherited storage raises a non-retryable ``StorageError`` saying to
+    use spawn, and so does ``open()`` on that path (this object or a new
+    one). Whatever the parent had open at the fork is closed in the child
+    without touching LMDB, and ``close()`` there parks the environment
+    instead of closing it: both would clear the parent's reader slots.
 
     The environment must live on a local filesystem, as LMDB requires (its
     lock file is shared memory and its data file is mmapped); the gate is
@@ -352,7 +352,6 @@ class LMDBStorage:
         self._env_key = ""  # set by open()
         self._max_key_size = 511
         self._forked = False  # inherited across a fork: the env is the parent's
-        self._forked_during_write = False
         self._last_reader_check = 0.0
         self._snapshot_yielded_at = 0.0  # shared by every thread opening snapshots; benign races
         _storages.add(self)
@@ -398,14 +397,12 @@ class LMDBStorage:
             open_kwargs.update(self._env_options)
 
             self._env_key = self._path_key()
-            parked = _PARKED_ENVS.get(self._env_key)
-            if parked is not None:
-                self._env = parked  # a forked child reopening the path it inherited
-            else:
-                try:
-                    self._env = lmdb.open(**open_kwargs)
-                except Exception as e:
-                    raise StorageError(f"Failed to open LMDB environment: {e}") from e
+            if self._env_key in _PARKED_ENVS:
+                raise StorageError(_FORK_MESSAGE)
+            try:
+                self._env = lmdb.open(**open_kwargs)
+            except Exception as e:
+                raise StorageError(f"Failed to open LMDB environment: {e}") from e
             try:
                 self._max_key_size = self._env.max_key_size()
             except Exception:  # older bindings
@@ -426,20 +423,23 @@ class LMDBStorage:
             self._writer_thread.start()
 
             self._pid = os.getpid()
-            self._forked = parked is not None  # never close an inherited environment
-            self._forked_during_write = self._env_key in _FORK_WRITE_POISONED
+            self._forked = False
             self._opened = True
 
     def _path_key(self) -> str:
-        """The file identity ``_PARKED_ENVS`` and ``_FORK_WRITE_POISONED`` are keyed by."""
+        """The file identity ``_PARKED_ENVS`` is keyed by."""
         try:
             return str(self._path.resolve())
         except OSError:
             return str(self._path)
 
+    def _key_fits(self, encoded_key: bytes) -> bool:
+        """Whether LMDB can store a key of this size (1 to ``max_key_size`` bytes)."""
+        return 0 < len(encoded_key) <= self._max_key_size
+
     def _check_key(self, encoded_key: bytes, key: Key) -> None:
         """Refuse a key LMDB would refuse, so a buffered put fails where an eager one did."""
-        if not encoded_key or len(encoded_key) > self._max_key_size:
+        if not self._key_fits(encoded_key):
             raise StorageOperationError(
                 f"Failed to put key {key}: encoded key is {len(encoded_key)} bytes, LMDB "
                 f"takes 1 to {self._max_key_size}"
@@ -485,22 +485,20 @@ class LMDBStorage:
             self._gate.reset_after_fork()
 
     def _check_fork(self) -> None:
-        """Drop writer state inherited across a fork.
+        """Park what was inherited across a fork; the storage is unusable here.
 
-        A writer slot held by a parent thread would never be released in
-        the child. If this process is not the one that opened the storage,
-        the slot is reset and the parent's open contexts are forgotten, not
-        ended: aborting them here would write to the lock file the parent
-        still uses (its reader slots and writer mutex). py-lmdb frees
-        nothing for objects inherited across a fork, and it refuses a
-        second open of the same files in one process, so the child keeps
-        the inherited environment. The writer thread does not exist in the
-        child and is started afresh; the gate descriptor is reopened, since
-        the inherited one shares the parent's lock.
-
-        If a write was in progress at the fork, LMDB's inherited writer
-        state rejects or blocks every write in the child, so writes fail
-        with a clear error instead (see ``_require_writable_after_fork``).
+        If this process is not the one that opened the storage, the
+        parent's open contexts are forgotten, not ended: aborting them
+        here would write to the lock file the parent still uses (its
+        reader slots and writer mutex). Their handles and the environment
+        are parked, never used again: the environment carries the parent's
+        pid, so the parent's close clears any reader slot taken here (a
+        torn snapshot) and no reader check ever frees one left behind,
+        and py-lmdb refuses a second open of the path in this process.
+        Every begin raises ``StorageError`` (see ``_require_not_forked``);
+        ``close()`` only parks. The writer slot is reset so an inherited
+        holder never blocks the error path, and the gate descriptor is
+        reopened, since the inherited one shares the parent's lock.
         """
         if self._pid == os.getpid():
             return
@@ -508,17 +506,6 @@ class LMDBStorage:
             if self._pid == os.getpid():
                 return
             self._forked = True
-            # _live_writes: a begun txn whose abort is queued (a finalizer,
-            # an abandoned begin) still holds LMDB's writer mutex after
-            # its slot was given back.
-            self._forked_during_write = bool(
-                self._writer.lock.locked()
-                or self._active_transactions
-                or self._reserved_slots
-                or self._live_writes
-            )
-            if self._forked_during_write:
-                _FORK_WRITE_POISONED.add(self._env_key)
             # The parent's contexts are forgotten, not ended, and their
             # handles parked: ending or collecting one here would write to
             # the parent's reader slots and writer mutex in the lock file.
@@ -555,18 +542,10 @@ class LMDBStorage:
                     logger.error(f"Failed to reopen the LMDB writer gate after fork: {e}")
             self._pid = os.getpid()
 
-    def _require_writable_after_fork(self) -> None:
-        """Refuse writes on a storage inherited mid-write across a fork."""
-        if self._forked_during_write or (
-            _FORK_WRITE_POISONED and self._env_key in _FORK_WRITE_POISONED
-        ):
-            raise StorageError(
-                "This LMDB storage was inherited across a fork while the parent held a "
-                "write transaction, so it cannot write in this process (LMDB's inherited "
-                "writer state is unusable here, and py-lmdb cannot reopen the same files "
-                "in it). Open the storage in a spawned process instead, or fork only "
-                "while no write is in progress"
-            )
+    def _require_not_forked(self) -> None:
+        """Refuse every new context on a storage inherited across a fork."""
+        if self._forked:
+            raise StorageError(_FORK_MESSAGE)
 
     def close(self) -> None:
         """Close database and release all resources.
@@ -706,6 +685,7 @@ class LMDBStorage:
         """Begin read-only snapshot."""
         self._require_open()
         self._check_fork()
+        self._require_not_forked()
         writer_thread = self._writer_thread
         if writer_thread._wait_since or writer_thread._soft_since:  # see yield_to_writer
             self._snapshot_yielded_at, _ = yield_to_writer(
@@ -792,7 +772,7 @@ class LMDBStorage:
         # was once it is done (the hand-off after it is a wait like any).
         writer_thread = self._writer_thread
         previous = writer_thread._wait_since
-        writer_thread._unstamp()
+        writer_thread._wait_since = 0.0  # the owner keeps waiting; only the stamp rests
         soft = writer_thread._stamp_soft()
         try:
             lmdb_txn.commit()
@@ -803,7 +783,7 @@ class LMDBStorage:
             raise
         finally:
             writer_thread._unstamp_soft(soft)
-            if previous:
+            if previous and writer_thread._waiting:  # not if the owner left meanwhile
                 writer_thread._wait_since = previous
 
     def _remap_to_file_size(self) -> None:
@@ -846,7 +826,7 @@ class LMDBStorage:
 
         self._require_open()
         self._check_fork()
-        self._require_writable_after_fork()
+        self._require_not_forked()
 
         deadline = time.monotonic() + self._busy_timeout
         lock, give_back_slot = self._writer.take_slot(self, write_slot, self._busy_timeout)
@@ -906,7 +886,7 @@ class LMDBStorage:
             raise StorageError("Cannot reserve the write slot in read only mode.")
         self._require_open()
         self._check_fork()
-        self._require_writable_after_fork()
+        self._require_not_forked()
         deadline = time.monotonic() + self._busy_timeout
         lock = await self._writer.areserve(self._busy_timeout)
         try:
@@ -939,7 +919,7 @@ class LMDBStorage:
 
         self._require_open()
         self._check_fork()
-        self._require_writable_after_fork()
+        self._require_not_forked()
 
         write_batch = LMDBWriteBatch(self)
         with self._env_lock:
@@ -972,11 +952,30 @@ class LMDBStorage:
             self._writer_thread._unstamp_soft(stamp)
         self._gate_held = True
 
-    def _hop_timeout(self) -> float:
-        """How long a begin on the writer thread is waited for: capped on a loop thread."""
-        if asyncio._get_running_loop() is not None:
-            return min(self._busy_timeout, LOOP_THREAD_WAIT_CAP)
-        return self._busy_timeout
+    def _hop(self, run: Callable[[float], Any]) -> Any:  # noqa: ANN401
+        """Run a begin hop with its bound: ``busy_timeout``, capped on a loop thread.
+
+        With the gate held the begin is not a wait on a virtuals peer, so
+        it gets the full timeout (a writer outside virtuals bounds). On an
+        event loop thread the wait is capped like the slot's and the
+        gate's, with the same error.
+        """
+        on_loop = asyncio._get_running_loop() is not None
+        timeout = min(self._busy_timeout, LOOP_THREAD_WAIT_CAP) if on_loop else self._busy_timeout
+        try:
+            return run(timeout)
+        except StorageLockTimeoutError:
+            if on_loop:
+                raise self._writer.loop_cap_timeout("LMDB's writer lock") from None
+            raise
+
+    def _begin_on_writer(self) -> Any:  # noqa: ANN401
+        """Begin an LMDB write txn on the writer thread, bounded; the caller holds the gate."""
+        return self._hop(
+            lambda timeout: self._writer_thread.run(
+                self._begin_lmdb_write, timeout=timeout, undo=self._abort_abandoned
+            )
+        )
 
     def _take_write_slot(self) -> threading.Lock:
         """Take the in-process slot, then the gate, bounded together by ``busy_timeout``.
@@ -984,7 +983,7 @@ class LMDBStorage:
         For a write that holds both only while it is applied (a batch's
         ``write``). Give both back with ``_release_write_slot(lock)``.
         """
-        self._require_writable_after_fork()
+        self._require_not_forked()
         deadline = time.monotonic() + self._busy_timeout
         lock = self._writer.acquire(self._busy_timeout)
         try:
@@ -997,17 +996,13 @@ class LMDBStorage:
     def _begin_pending(self, pending: Pending) -> tuple[Any, set[bytes]]:
         """Begin a pending transaction's LMDB txn and replay its writes on this thread.
 
-        With the gate held the begin is not a wait on a virtuals peer, so
-        it gets the full timeout (a writer outside virtuals bounds), capped
-        on a loop thread. Returns the handle and the keys whose delete
-        found nothing. A failed replay aborts the handle again and raises,
-        leaving the transaction pending.
+        Returns the handle and the keys whose delete found nothing. A
+        failed replay aborts the handle again and raises, leaving the
+        transaction pending.
         """
         swept = False
         while True:
-            lmdb_txn = self._writer_thread.run(
-                self._begin_lmdb_write, timeout=self._hop_timeout(), undo=self._abort_abandoned
-            )
+            lmdb_txn = self._begin_on_writer()
             if not pending:
                 return lmdb_txn, ()  # a read-first transaction: nothing to replay
             try:
@@ -1029,11 +1024,13 @@ class LMDBStorage:
         any other; once it has landed the commit runs to the end. Returns
         the keys whose delete found nothing.
         """
-        return self._writer_thread.run_staged(
-            self._begin_lmdb_write,
-            lambda lmdb_txn: self._apply_and_commit(lmdb_txn, pending),
-            timeout=self._hop_timeout(),
-            undo=self._abort_abandoned,
+        return self._hop(
+            lambda timeout: self._writer_thread.run_staged(
+                self._begin_lmdb_write,
+                lambda lmdb_txn: self._apply_and_commit(lmdb_txn, pending),
+                timeout=timeout,
+                undo=self._abort_abandoned,
+            )
         )
 
     def _apply_and_commit(self, lmdb_txn: Any, pending: Pending) -> set[bytes]:  # noqa: ANN401
@@ -1044,7 +1041,7 @@ class LMDBStorage:
         the gate); a commit that does so raises the retryable error.
         """
         swept = False
-        progress = self._writer_thread._stamp
+        progress = self._writer_thread._progress
         while True:
             try:
                 missing = replay_pending(lmdb_txn, pending, progress)

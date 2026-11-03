@@ -350,8 +350,8 @@ def test_fork_during_write_child_write_fails_clearly(
 @pytest.mark.timeout(10)
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 @pytest.mark.parametrize("child_thread", [False, True], ids=["forking-thread", "new-thread"])
-def test_fork_without_write_child_writes(storage: LMDBStorage, child_thread: bool) -> None:
-    """With no write in progress at fork, the child writes from any thread."""
+def test_fork_child_cannot_use_inherited_storage(storage: LMDBStorage, child_thread: bool) -> None:
+    """In a forked child every new transaction, snapshot, batch or reservation says to use spawn."""
     with storage.transaction() as tx:
         tx.put(("parent",), b"1")
     pid = os.fork()
@@ -360,10 +360,14 @@ def test_fork_without_write_child_writes(storage: LMDBStorage, child_thread: boo
 
         def child() -> None:
             nonlocal code
-            for value in (b"1", b"2"):
-                with storage.transaction() as ctx:
-                    ctx.put(("child",), value)
-            code = 0
+            if (
+                _fork_refused(storage.begin_transaction)
+                and _fork_refused(storage.begin_snapshot)
+                and _fork_refused(storage.begin_write_batch)
+                and _fork_refused(lambda: asyncio.run(storage.areserve_write_slot()))
+            ):
+                storage.close()  # parks, does not hang
+                code = 0
 
         try:
             if child_thread:
@@ -377,7 +381,7 @@ def test_fork_without_write_child_writes(storage: LMDBStorage, child_thread: boo
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0
     with storage.snapshot() as snap:
-        assert snap.get(("child",)) == b"2"
+        assert snap.get(("parent",)) == b"1"
     storage.begin_transaction().commit()
 
 
@@ -565,6 +569,15 @@ def _close_while_scanning(root: str, rounds: int) -> None:
 def _wait_pid(pid: int) -> int:
     _, status = os.waitpid(pid, 0)
     return os.waitstatus_to_exitcode(status)
+
+
+def _fork_refused(begin) -> bool:
+    """True if ``begin`` raised the non-retryable error that points a forked child at spawn."""
+    try:
+        begin()
+    except StorageError as e:
+        return type(e) is StorageError and "spawn" in str(e)
+    return False
 
 
 @pytest.fixture
@@ -880,12 +893,9 @@ def test_fork_while_env_lock_is_held_elsewhere(storage: LMDBStorage) -> None:
     if pid == 0:
         code = 1
         try:
-            with storage.snapshot() as snap:
-                assert snap.get(("parent",)) == b"1"
-            with storage.transaction() as tx:
-                tx.put(("child",), b"1")
-            storage.close()
-            code = 0
+            if _fork_refused(storage.begin_snapshot) and _fork_refused(storage.begin_transaction):
+                storage.close()
+                code = 0
         finally:
             os._exit(code)
     try:
@@ -894,7 +904,7 @@ def test_fork_while_env_lock_is_held_elsewhere(storage: LMDBStorage) -> None:
         go.set()
         t.join()
     with storage.snapshot() as snap:
-        assert snap.get(("child",)) == b"1"
+        assert snap.get(("parent",)) == b"1"
 
 
 @pytest.mark.timeout(30)
@@ -1140,7 +1150,7 @@ def test_write_txn_data_calls_run_on_any_thread(ctx, tmp_path: Path) -> None:
 @pytest.mark.timeout(20)
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 def test_fork_while_gate_lock_is_held_elsewhere(storage: LMDBStorage) -> None:
-    """A fork while another parent thread holds the gate's lock: the child's first write works.
+    """A fork while another parent thread holds the gate's lock: the child's error path works.
 
     Hung before the fix: the child reopened the gate under the inherited lock.
     """
@@ -1160,10 +1170,9 @@ def test_fork_while_gate_lock_is_held_elsewhere(storage: LMDBStorage) -> None:
     if pid == 0:
         code = 1
         try:
-            with storage.transaction() as tx:
-                tx.put(("child",), b"1")
-            storage.close()
-            code = 0
+            if _fork_refused(storage.begin_transaction):
+                storage.close()
+                code = 0
         finally:
             os._exit(code)
     try:
@@ -1172,7 +1181,7 @@ def test_fork_while_gate_lock_is_held_elsewhere(storage: LMDBStorage) -> None:
         go.set()
         t.join()
     with storage.snapshot() as snap:
-        assert snap.get(("child",)) == b"1"
+        assert snap.get(("parent",)) == b"1"
 
 
 def _peer_can_write_now(ctx, tmp_path: Path):
@@ -1878,71 +1887,35 @@ def test_writes_keep_flowing_under_spinning_reader_threads(tmp_path: Path) -> No
 
 @pytest.mark.timeout(30)
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
-@pytest.mark.parametrize("mid_write", [False, True], ids=["idle", "mid-write"])
-def test_forked_child_reopens_the_path(storage: LMDBStorage, mid_write: bool) -> None:
-    """A child closes the inherited storage and opens the path again, same object or a new one.
+def test_forked_child_cannot_reopen_the_path(storage: LMDBStorage) -> None:
+    """A child that closes the inherited storage cannot open the path again, on either route.
 
-    The open adopts the parked environment (py-lmdb allows one per path per
-    process); a mid-write inheritance keeps refusing writes through it; the
-    parent's snapshot slot survives all of it.
+    py-lmdb refuses a second open of the path while the parked environment
+    lives, and the parked one is never adopted (the parent's close would
+    tear the child's snapshots). The parent's snapshot slot survives it all.
     """
     with storage.transaction() as tx:
         tx.put(("a",), b"1")
     snap = storage.begin_snapshot()
     txnid = str(snap._lmdb_txn.id())
-    held, go = threading.Event(), threading.Event()
-
-    def holder() -> None:
-        with storage.transaction() as tx:
-            tx.put(("parent",), b"1")
-            held.set()
-            go.wait()
-
-    t = threading.Thread(target=holder)
-    if mid_write:
-        t.start()
-        held.wait()
     pid = os.fork()
     if pid == 0:
         code = 1
         try:
-
-            def write(st: LMDBStorage, key: str) -> str:
-                try:
-                    with st.transaction() as tx:
-                        tx.put((key,), b"1")
-                    return "ok"
-                except StorageError as e:
-                    if type(e) is StorageError and "fork" in str(e):
-                        return "poisoned"
-                    return f"other: {e}"
-
-            storage.close()
-            storage.open()
-            r1 = write(storage, "c1")
             storage.close()
             fresh = LMDBStorage(
                 path=storage._path, codec=BinaryCodec(), map_size=MAP, busy_timeout=2.0
             )
-            fresh.open()
-            r2 = write(fresh, "c2")
-            with fresh.snapshot() as s:
-                seen = s.get(("a",))
-            fresh.close()
-            expect = "poisoned" if mid_write else "ok"
-            code = 0 if (r1, r2, seen) == (expect, expect, b"1") else 2
+            if _fork_refused(storage.open) and _fork_refused(fresh.open):
+                code = 0
         finally:
             os._exit(code)
-    if mid_write:
-        time.sleep(0.05)
-        go.set()
-        t.join()
     assert _wait_child(pid, 15.0) == 0
     assert any(row[2] == txnid for row in _slot_rows(storage))
-    with storage.snapshot() as s:
-        expected = (EMPTY, EMPTY) if mid_write else (b"1", b"1")
-        assert (s.get(("c1",)), s.get(("c2",))) == expected
+    assert snap.get(("a",)) == b"1"
     snap.close()
+    with storage.transaction() as tx:
+        tx.put(("b",), b"1")
 
 
 @pytest.mark.timeout(20)
@@ -1950,7 +1923,7 @@ def test_forked_child_reopens_the_path(storage: LMDBStorage, mid_write: bool) ->
 def test_fork_with_a_queued_abort_poisons_the_child(storage: LMDBStorage) -> None:
     """A begun txn dropped while the writer thread is busy: slot free, LMDB's mutex held.
 
-    The child must get the clear "inherited mid-write" error, not py-lmdb's.
+    The child must get the clear fork error, not py-lmdb's.
     """
     with storage.transaction() as tx:
         tx.put(("base",), b"1")
@@ -1977,7 +1950,7 @@ def test_fork_with_a_queued_abort_poisons_the_child(storage: LMDBStorage) -> Non
                     with storage.transaction() as tx:
                         tx.put(("child",), b"1")
                 except StorageError as e:
-                    code = 0 if type(e) is StorageError and "fork" in str(e) else 2
+                    code = 0 if type(e) is StorageError and "spawn" in str(e) else 2
             finally:
                 os._exit(code)
         assert _wait_child(pid, 15.0) == 0
@@ -1992,13 +1965,12 @@ def test_fork_with_a_queued_abort_poisons_the_child(storage: LMDBStorage) -> Non
 
 @pytest.mark.timeout(10)
 def test_bad_key_fails_at_put_in_a_pending_transaction(storage: LMDBStorage) -> None:
-    """A key LMDB would refuse fails at put (and delete), as it did when puts were eager."""
+    """A key LMDB would refuse fails at put, as it did when puts were eager; delete is a no-op."""
     big = ("x" * 700,)
     with storage.transaction() as tx:
         with pytest.raises(StorageOperationError, match="LMDB takes"):
             tx.put(big, b"1")
-        with pytest.raises(StorageOperationError):
-            tx.delete(big)
+        tx.delete(big)  # no-op, see test_delete_of_a_bad_key_is_a_no_op
         tx.put(("ok",), b"1")  # the transaction is still usable
     with storage.snapshot() as s:
         assert s.get(("ok",)) == b"1"
@@ -2006,3 +1978,96 @@ def test_bad_key_fails_at_put_in_a_pending_transaction(storage: LMDBStorage) -> 
     with pytest.raises(StorageOperationError):
         batch.put(big, b"1")
     batch.abort()
+
+
+# =========================================================================
+# Re-review: an interrupted commit leaves no stamp (F1-a), delete of a bad key (F4-a), RB slot cases
+# =========================================================================
+
+
+@pytest.mark.timeout(30)
+def test_interrupted_commit_leaves_no_stamp(tmp_path: Path) -> None:
+    """A requester that leaves its commit by an exception leaves no writer stamp behind.
+
+    Before, the writer thread restored the stamp after the commit and nobody
+    cleared it, so every read sat in the back-off tier until the next write.
+    """
+    import signal
+
+    st = _open(str(tmp_path), busy_timeout=5.0, map_size=1 << 30, sync=True)
+
+    class InterruptedCommitError(Exception):
+        pass
+
+    def handler(*_args) -> None:
+        raise InterruptedCommitError
+
+    previous = signal.signal(signal.SIGALRM, handler)
+    try:
+        tx = st.begin_transaction()
+        tx.get(("a",))  # begun: the commit is the uncapped hop
+        for i in range(20000):
+            tx.put(("k", i), os.urandom(2000))
+        signal.setitimer(signal.ITIMER_REAL, 0.003)
+        with pytest.raises(Exception, match=r"InterruptedCommitError|Failed to commit"):
+            tx.commit()
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        deadline = time.monotonic() + 20
+        while st._live_writes and time.monotonic() < deadline:
+            time.sleep(0.01)  # the commit lands on the writer thread meanwhile
+        assert not st._live_writes
+        writer_thread = st._writer_thread
+        assert writer_thread._wait_since == 0.0
+        assert writer_thread._soft_since == 0.0
+        assert not writer_thread._waiting
+        with st.snapshot() as snap:
+            t0 = time.perf_counter()
+            for _ in range(1000):
+                snap.get(("a",))
+            assert (time.perf_counter() - t0) / 1000 < 0.0005  # timing: us, not ms
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        st.close()
+
+
+@pytest.mark.timeout(10)
+def test_delete_of_a_bad_key_is_a_no_op(storage: LMDBStorage) -> None:
+    """A key LMDB cannot store cannot exist: deleting it is a no-op in every mode, not notified."""
+    seen: list[set] = []
+
+    class Pub:
+        def notify(self, keys) -> None:
+            seen.append(set(keys))
+
+    storage._publisher = Pub()
+    big = ("x" * 700,)
+    with storage.transaction() as tx:  # pending
+        tx.delete(big)
+        tx.put(("ok",), b"1")
+    with storage.transaction() as tx:  # begun
+        tx.get(("ok",))
+        tx.delete(big)
+    with storage.batch_write() as b:
+        b.delete(big)
+    assert seen == [{("ok",)}]
+
+
+def test_sync_waiter_interrupted_by_signal_leaves_no_ghost(storage: LMDBStorage) -> None:
+    cases.sync_waiter_interrupted_by_signal_leaves_no_ghost(storage)
+
+
+def test_areserve_task_destroyed_with_its_loop_leaves_no_ghost(storage: LMDBStorage) -> None:
+    cases.areserve_task_destroyed_with_its_loop_leaves_no_ghost(storage)
+
+
+def test_areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage: LMDBStorage) -> None:
+    cases.areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage)
+
+
+def test_grant_to_a_loop_closed_after_the_handoff_is_reclaimed(storage: LMDBStorage) -> None:
+    cases.grant_to_a_loop_closed_after_the_handoff_is_reclaimed(storage)
+
+
+def test_areserve_timeout_meeting_a_release_is_a_lock_timeout(storage: LMDBStorage) -> None:
+    cases.areserve_timeout_meeting_a_release_is_a_lock_timeout(storage)

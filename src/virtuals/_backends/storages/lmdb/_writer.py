@@ -90,7 +90,16 @@ class WriterThread:
     transaction per environment).
     """
 
-    __slots__ = ("_lock", "_name", "_queue", "_soft_since", "_stopped", "_thread", "_wait_since")
+    __slots__ = (
+        "_lock",
+        "_name",
+        "_queue",
+        "_soft_since",
+        "_stopped",
+        "_thread",
+        "_wait_since",
+        "_waiting",
+    )
 
     def __init__(self, name: str) -> None:
         """Initialize an idle writer thread.
@@ -120,6 +129,10 @@ class WriterThread:
         # costs that one job its protection, and readers of one storage
         # never yield to another storage's writer. Both accepted.
         self._wait_since = 0.0
+        # True between a requester's stamp and its clear: the thread only
+        # refreshes or restores a stamp somebody still owns, so a requester
+        # that left by an exception mid-job never leaves one behind.
+        self._waiting = False
         # A GIL-free call that takes its time for a good reason (the fsync
         # commit, or the gate's flock behind a peer process's transaction).
         # Readers answer it with the nudge tier only: the GIL is needed
@@ -127,10 +140,17 @@ class WriterThread:
         self._soft_since = 0.0
 
     def _stamp(self) -> None:
+        self._waiting = True
         self._wait_since = time.monotonic()
 
     def _unstamp(self) -> None:
+        self._waiting = False
         self._wait_since = 0.0
+
+    def _progress(self) -> None:
+        """Refresh the owner's stamp from the thread (a long replay is progress)."""
+        if self._waiting:
+            self._wait_since = time.monotonic()
 
     def _stamp_soft(self) -> float:
         stamp = time.monotonic()
