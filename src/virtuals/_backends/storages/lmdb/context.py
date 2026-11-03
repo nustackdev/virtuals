@@ -169,6 +169,17 @@ class ContextBase:
         if holds:
             self._storage._release_write_slot(self._write_lock)
 
+    def _forget(self) -> Any:  # noqa: ANN401
+        """Mark the context closed without touching LMDB; returns its handle.
+
+        For a forked child: the handle is the parent's. The caller parks
+        it so it is never aborted or collected here.
+        """
+        handle, self._lmdb_txn = self._lmdb_txn, None
+        self._closed = True
+        self._holds_write_slot = False
+        return handle
+
     def _finalize_unended_write(self, what: str) -> None:
         """Last resort for a write context dropped without commit or abort.
 

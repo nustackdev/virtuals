@@ -1658,3 +1658,147 @@ def test_finalizer_under_env_lock_does_not_wait(tmp_path: Path, what: str) -> No
     finally:
         gc.enable()
         st.close()
+
+
+# =========================================================================
+# Round 2: a forked child never touches the parent's environment (X3, X8)
+# =========================================================================
+
+
+def _slot_rows(st: LMDBStorage) -> list[list[str]]:
+    """Reader table rows as [pid, thread, txnid] (the first line is a header)."""
+    return [row.split() for row in st._env.readers().strip().splitlines()[1:]]
+
+
+def _wait_child(pid: int, timeout: float) -> int | None:
+    """Exit code of ``pid``, or None if it did not exit within ``timeout`` (then killed)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid:
+            return os.waitstatus_to_exitcode(status)
+        if time.monotonic() > deadline:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+            return None
+        time.sleep(0.002)
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_child_close_leaves_parent_readers_alone(storage: LMDBStorage) -> None:
+    """100 forks under load with a parent snapshot open: the child closes, the parent's slot stays.
+
+    Before, the child's close() ran env.close() on the inherited environment
+    (and closing the inherited snapshot aborted the parent's read txn),
+    which cleared the parent's reader slots in the shared lock file, and the
+    close hung some children.
+    """
+    with storage.transaction() as tx:
+        tx.put(("a",), b"1")
+    stop = threading.Event()
+
+    def writer() -> None:
+        n = 0
+        while not stop.is_set():
+            try:
+                with storage.transaction() as tx:
+                    tx.put(("w", n % 8), b"x" * 100)
+                n += 1
+            except StorageError:
+                pass
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                with storage.snapshot() as snap:
+                    list(snap.scan(StorageScanOptions()).keys())
+            except StorageError:
+                pass
+
+    threads = [threading.Thread(target=writer, daemon=True) for _ in range(2)]
+    threads.append(threading.Thread(target=reader, daemon=True))
+    for t in threads:
+        t.start()
+    snap = storage.begin_snapshot()
+    assert snap.get(("a",)) == b"1"
+    txnid = str(snap._lmdb_txn.id())
+    hung: list[int] = []
+    failed: list[int] = []
+    try:
+        for k in range(100):
+            pid = os.fork()
+            if pid == 0:
+                code = 1
+                try:
+                    snap.close()  # inherited: forgotten, never aborted
+                    gc.collect()
+                    storage.close()  # the inherited environment is never closed
+                    code = 0
+                finally:
+                    os._exit(code)
+            exit_code = _wait_child(pid, 10.0)
+            if exit_code is None:
+                hung.append(k)
+            elif exit_code != 0:
+                failed.append(k)
+            assert any(row[2] == txnid for row in _slot_rows(storage)), (
+                f"child {k} cleared the parent's reader slot"
+            )
+        assert hung == [], hung
+        assert failed == [], failed
+        assert snap.get(("a",)) == b"1"
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(5)
+        snap.close()
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_inherited_reserved_slot_released_in_child_keeps_parents_gate(ctx, tmp_path: Path) -> None:
+    """Releasing or collecting the parent's reserved slot in a child drops neither its gate nor its txn."""
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    ready, go = ctx.Event(), ctx.Event()
+    out = tmp_path / "peer.json"
+    peer = ctx.Process(target=_peer_write, args=(str(tmp_path), 0.3, ready, go, str(out)))
+    peer.start()
+    assert ready.wait(20)
+    try:
+        slot = asyncio.run(st.areserve_write_slot())
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                slot.release()  # the parent's: a no-op here
+                slot.__del__()
+                gc.collect()
+                st.close()
+                code = 0 if not st._gate_held else 2
+            finally:
+                os._exit(code)
+        assert _wait_child(pid, 10.0) == 0
+        assert slot.held
+        import fcntl
+
+        probe = os.open(tmp_path / "db" / "writer.lock", os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):  # the parent's gate is still held
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+        go.set()
+        peer.join(10)
+        report = json.loads(out.read_text())
+        assert report["result"] == "StorageLockTimeoutError", report
+        tx = st.begin_transaction(write_slot=slot)
+        tx.put(("mine",), b"1")
+        tx.commit()
+        with st.snapshot() as snap:
+            assert snap.get(("mine",)) == b"1"
+            assert snap.get(("peer",)) is EMPTY
+    finally:
+        if peer.is_alive():
+            peer.kill()
+        st.close()
