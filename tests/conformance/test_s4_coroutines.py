@@ -1,0 +1,143 @@
+"""Contract section 4: coroutine writers on one event loop queue, and never stall it."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+
+import pytest
+
+from tests.conformance.helpers import CORO_N, aretrying, put_committed
+
+
+K = ("counter",)
+STEP = 0.005  # the await inside each transaction
+TICK = 0.005
+MAX_GAP = 0.2  # longest the loop may go without running the ticker
+WALL = 2.0  # bound for CORO_N=10; scales linearly
+
+
+class StalledError(Exception):
+    """The loop was blocked for MAX_GAP. Not retryable, so writers stop."""
+
+
+class LoopWatch:
+    """Tracks the longest stretch the event loop went without running the ticker."""
+
+    def __init__(self, stop_on_stall: bool) -> None:
+        self.stop_on_stall = stop_on_stall
+        self.last = time.perf_counter()
+        self.gap = 0.0
+
+    def mark(self) -> None:
+        now = time.perf_counter()
+        self.gap = max(self.gap, now - self.last)
+        self.last = now
+
+    def check(self) -> None:
+        # Writers call this too: after a blocking call several writers may
+        # run before the ticker gets a turn, and each could block again.
+        self.gap = max(self.gap, time.perf_counter() - self.last)
+        if self.stop_on_stall and self.gap >= MAX_GAP:
+            raise StalledError
+
+
+async def _begin(backend, storage):
+    if backend.has_write_slot(storage):
+        slot = await storage.areserve_write_slot()
+        try:
+            return storage.begin_transaction(write_slot=slot)
+        except BaseException:
+            slot.release()
+            raise
+    return storage.begin_transaction()
+
+
+async def _txn(backend, storage, body, watch: LoopWatch) -> None:
+    async def attempt() -> None:
+        watch.check()
+        t = await _begin(backend, storage)
+        try:
+            await body(t)
+            watch.check()
+            t.commit()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                t.abort()
+            raise
+
+    await aretrying(attempt)
+
+
+def _run(backend, storage, body, *, stop_on_stall: bool = False):
+    """Run CORO_N coroutines of ``body`` next to a ticker. Return (wall, max loop gap).
+
+    With ``stop_on_stall`` the writers stop once the loop has been blocked
+    for MAX_GAP: the verdict is in, so the case does not sit through every
+    further stall.
+    """
+
+    async def main():
+        watch = LoopWatch(stop_on_stall)
+        stop = asyncio.Event()
+
+        async def ticker() -> None:
+            while not stop.is_set():
+                await asyncio.sleep(TICK)
+                watch.mark()
+
+        tick = asyncio.create_task(ticker())
+        watch.mark()
+        t0 = time.perf_counter()
+        try:
+            results = await asyncio.gather(
+                *(_txn(backend, storage, body, watch) for _ in range(CORO_N)),
+                return_exceptions=True,
+            )
+        finally:
+            wall = time.perf_counter() - t0
+            stop.set()
+            await tick
+        errors = [
+            r for r in results if isinstance(r, BaseException) and not isinstance(r, StalledError)
+        ]
+        if errors:
+            raise errors[0]
+        return wall, watch.gap
+
+    return asyncio.run(main())
+
+
+@pytest.mark.timeout(20)
+def test_s4_coroutine_writers_serialize(backend, storage):
+    """N coroutines doing read, await, write each land their increment, in bounded time."""
+    put_committed(storage, {K: 0})
+
+    async def body(t) -> None:
+        v = t.get(K)
+        await asyncio.sleep(STEP)
+        t.put(K, v + 1)
+
+    wall, _ = _run(backend, storage, body)
+    with storage.snapshot() as s:
+        assert s.get(K) == CORO_N
+    assert wall < WALL * CORO_N / 10, f"{CORO_N} writers took {wall:.2f}s"
+
+
+@pytest.mark.timeout(20)
+def test_s4_coroutine_writers_do_not_block_loop(backend, storage):
+    """While coroutine writers hold a write across an await, the event loop keeps running.
+
+    Each writer writes first and then awaits before commit, so a backend that
+    waits for a held lock on the loop thread shows up as a long loop gap.
+    """
+    put_committed(storage, {K: 0})
+
+    async def body(t) -> None:
+        t.put(K, t.get(K) + 1)
+        await asyncio.sleep(STEP)
+
+    wall, gap = _run(backend, storage, body, stop_on_stall=True)
+    assert gap < MAX_GAP, f"event loop blocked for {gap * 1000:.0f}ms"
+    assert wall < WALL * CORO_N / 10, f"{CORO_N} writers took {wall:.2f}s"
