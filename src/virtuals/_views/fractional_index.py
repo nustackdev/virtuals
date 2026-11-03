@@ -19,11 +19,13 @@ Public entry points:
 - ``generate_key_between(a, b)``: the plain rocicorp key. Deterministic.
 - ``generate_suffixed_key_between(a, b)``: the key the view stores. The
   plain key is extended with random base62 chars; when the plain key is a
-  prefix of ``b`` the extension first steps strictly below ``b`` so the
-  random tail can never cross it. The result is itself a valid key, so it
-  is a fine input for the next call. Two writers that compute a key from
-  the same neighbours get keys that differ in the random tail and both
-  sort strictly between those neighbours.
+  prefix of ``b`` the plain step is repeated with that key as the upper
+  bound, so the random tail can never cross ``b``. The result is itself a
+  valid key, so it is a fine input for the next call. Two writers that
+  compute a key from the same neighbours get keys that differ in the
+  random tail and both sort strictly between those neighbours.
+- ``generate_n_suffixed_keys_between(a, b, n)``: ``n`` evenly spread
+  suffixed keys, used to respace a run of rows.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ __all__ = [
     "BASE_62_DIGITS",
     "generate_key_between",
     "generate_n_keys_between",
+    "generate_n_suffixed_keys_between",
     "generate_suffixed_key_between",
     "validate_order_key",
 ]
@@ -265,27 +268,60 @@ def generate_suffixed_key_between(
     digits. ``k > a`` and ``k`` is never a prefix of ``a``, so anything
     appended to ``k`` stays above ``a``. If ``k`` is a proper prefix of
     ``b`` (the integer part of ``b``, or the consecutive-digit midpoint
-    case) a random tail could cross ``b``, so ``k`` is first moved
-    strictly below ``b`` at a fixed position:
+    case) a random tail could cross ``b``, so ``k`` itself becomes the
+    upper bound and the plain step runs again, ``generate_key_between(a, k)``,
+    until the key is no longer a prefix of ``b``. Each step shortens a
+    prefix of ``b``, so the loop ends. The key then differs from ``b`` at
+    a position inside itself, so anything appended stays below ``b``.
 
-    - with no lower bound, one more plain step ``generate_key_between(None, k)``
-      decrements the integer part, so a prepend run grows like the plain
-      algorithm instead of digging into ``b``'s fraction;
-    - otherwise ``b``'s remainder past ``k`` is entered: its leading zeros
-      are copied and the next digit (never zero, since keys do not end in
-      zero) is halved. The key now differs from ``b`` at that position,
-      so anything appended stays below ``b``.
+    Stepping the bound down (rather than digging into ``b``'s remainder)
+    matters when ``b`` is a long key just above a short integer: the key
+    stays near ``a``'s length instead of copying ``b``'s zeros, which is
+    what lets a window respace shrink keys next to a long neighbour.
 
-    The result is a valid key and sorts strictly between the bounds, and
-    the growth per insert at one gap stays about one char per six.
+    The result is a valid key and sorts strictly between the bounds. Keys
+    inserted again and again at one gap grow about one char per four
+    inserts (one per six after a fixed key, one per four before one).
     """
     k = generate_key_between(a, b)
-    if b is not None and b.startswith(k):
-        if a is None:
-            k = generate_key_between(None, k)
-        else:
-            rest = b[len(k) :]
-            zeros = len(rest) - len(rest.lstrip(_ZERO))
-            below = BASE_62_DIGITS[BASE_62_DIGITS.index(rest[zeros]) // 2]
-            k = k + rest[:zeros] + below
+    while b is not None and b.startswith(k):
+        k = generate_key_between(a, k)
     return k + _random_suffix(suffix_length)
+
+
+def generate_n_suffixed_keys_between(
+    a: str | None,
+    b: str | None,
+    n: int,
+    *,
+    suffix_length: int = DEFAULT_SUFFIX_LENGTH,
+) -> list[str]:
+    """Return ``n`` ascending suffixed keys strictly between ``a`` and ``b``.
+
+    Open ends chain plain steps (integer increments or decrements, so an
+    append or prepend run stays short); a bounded gap is split at its
+    midpoint recursively, so the keys are evenly spread and about
+    ``log2(n)`` steps deep.
+    """
+    if n <= 0:
+        return []
+    if n == 1:
+        return [generate_suffixed_key_between(a, b, suffix_length=suffix_length)]
+    if b is None:
+        out = [generate_suffixed_key_between(a, None, suffix_length=suffix_length)]
+        for _ in range(n - 1):
+            out.append(generate_suffixed_key_between(out[-1], None, suffix_length=suffix_length))
+        return out
+    if a is None:
+        out = [generate_suffixed_key_between(None, b, suffix_length=suffix_length)]
+        for _ in range(n - 1):
+            out.append(generate_suffixed_key_between(None, out[-1], suffix_length=suffix_length))
+        out.reverse()
+        return out
+    mid = n // 2
+    c = generate_suffixed_key_between(a, b, suffix_length=suffix_length)
+    return [
+        *generate_n_suffixed_keys_between(a, c, mid, suffix_length=suffix_length),
+        c,
+        *generate_n_suffixed_keys_between(c, b, n - mid - 1, suffix_length=suffix_length),
+    ]
