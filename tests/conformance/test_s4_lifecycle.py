@@ -123,3 +123,9 @@ def test_s4_close_during_in_flight_call_never_crashes(backend, tmp_path, mode):
     }
     assert not bad, f"{backend.name}-{mode}: close() under an in-flight call: {outcomes}"
     assert sum(outcomes.values()) == ROUNDS
+
+
+def test_s4_backend_declares_process_model(backend):
+    """Every backend class says which process model it meets (contract section 4)."""
+    st = backend.make(Path("/nonexistent"))
+    assert getattr(type(st), "process_model", None) == backend.process_model
