@@ -78,6 +78,28 @@ class SQLiteWriteSlot(WriteSlot):
         self._drop_conn()
         super().release()
 
+    def __del__(self) -> None:
+        """Last resort: free a held slot that became unreachable unreleased.
+
+        Takes no storage lock: a collection can run on a thread that holds
+        the storage state lock (e.g. inside the pool), so the connection
+        is closed outright instead of being returned to the pool (SQLite
+        rolls the begun transaction back on close), or parked in a forked
+        child. The in-process lock is then released by identity as usual.
+        """
+        try:
+            if getattr(self, "_state", "released") != "held":
+                return
+            conn = self._detach_conn()
+            if conn is not None:
+                if os.getpid() != self._pid:
+                    self._storage._park_inherited([conn])  # type: ignore[attr-defined]
+                else:
+                    conn.close()
+            self.release()
+        except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
+            pass
+
     def _take(self, storage: object) -> None:
         """Hand the slot to a transaction being begun on ``storage``.
 
