@@ -64,11 +64,11 @@ class InMemoryWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
         modified = self._modified_keys
         try:
             if self._pending:
-                lock = storage._acquire_write_slot()
+                give_back_slot = storage._writer.take(storage, None, storage._busy_timeout)
                 try:
                     storage._store.apply(self._pending, modified, self._generation)
                 finally:
-                    storage._release_write_slot(lock)
+                    give_back_slot()
         except BaseException as e:
             self._aborted = True
             self._pending.clear()
