@@ -41,6 +41,18 @@ KNOWN_FAILURES: dict[str, dict[str, tuple[bool, str]]] = {
         "rocksdb": (True, f"snapshot reads see later commits; {LANE_K}"),
         "mem": (True, f"snapshot reads live state; {LANE_D}"),
     },
+    "test_s2_snapshot_binds_at_open_get": {
+        "rocksdb": (True, f"snapshot reads see commits after open; {LANE_K}"),
+        "mem": (True, f"snapshot reads live state; {LANE_D}"),
+    },
+    "test_s2_snapshot_binds_at_open_scan": {
+        "rocksdb": (True, f"snapshot scans see commits after open; {LANE_K}"),
+        "mem": (True, f"snapshot scans live state; {LANE_D}"),
+    },
+    "test_s2_commit_atomic_to_concurrent_snapshots": {
+        "rocksdb": (True, f"snapshot reads see commits landing between its reads; {LANE_K}"),
+        "mem": (True, f"snapshot reads live state while commits land; {LANE_D}"),
+    },
     "test_s4_coroutine_writers_serialize": {
         "rocksdb": (True, f"no writer slot, coroutines lose updates; {LANE_K}"),
         "mem": (True, f"no writer slot, coroutines lose updates; {LANE_D}"),
