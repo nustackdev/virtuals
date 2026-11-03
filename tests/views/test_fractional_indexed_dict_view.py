@@ -1306,3 +1306,163 @@ def test_key_touches_are_constant_in_n(backend, tmp_path):
     for name, counts in at_10.items():
         total = sum(counts.values())
         print(f"  {name:20s} total={total:2d}  {counts}")
+
+
+# ============================================================================
+# HARDENING: bool, repairs through every set door, key collisions, partial inserts
+# ============================================================================
+
+
+def test_bool_on_absent_view_is_false_and_writes_nothing(broot):
+    view = broot.open_child("absent", EagerFractionalIndexedDictView)
+    assert not view
+    assert not view.container.exists()
+    view.store({"a": 1})
+    assert view
+    view.clear()
+    assert not view
+    assert len(view) == 0
+
+
+@pytest.mark.parametrize("backend", SEEKING_BACKENDS)
+def test_bool_cost_is_one_seek(backend, tmp_path, monkeypatch):
+    from tests.support.counting import install_counter, measure, open_backend
+
+    storage = open_backend(backend, tmp_path)
+    try:
+        counts = install_counter(storage, monkeypatch)
+        costs = {}
+        for n in (10, 1000):
+            with storage.transaction() as tx:
+                view = Navigator(storage).root(tx).open_child("lst", EagerFractionalIndexedDictView)
+                view.store({f"k{i}": i for i in range(n)})
+            costs[n] = measure(
+                storage,
+                counts,
+                lambda root: bool(root.open_child("lst", EagerFractionalIndexedDictView)),
+            )
+        assert costs[10] == costs[1000], costs
+        assert costs[10]["scan"] == 1, costs
+        assert costs[10]["scan_rows"] <= 2, costs
+    finally:
+        storage.close()
+
+
+def _drop_position(view, address):
+    view._order_container().delete_child_primitive_unsafe(view.position(address))
+    view._pos_container().delete_child_primitive_unsafe(address)
+
+
+def test_data_without_position_is_appended_by_set_child_container_as(fdict):
+    view = fdict("lst", {"a": {"n": 1}, "b": {"n": 2}, "c": {"n": 3}})
+    _drop_position(view, "b")
+    assert "b" not in view
+    assert list(view) == ["a", "c"]
+    view.set_child_container_as("b", {"n": 20}, EagerDictView)
+    assert list(view) == ["a", "c", "b"]
+    assert "b" in view
+    assert view["b"] == {"n": 20}
+    assert len(view) == 3
+    _assert_consistent(view)
+
+
+def test_data_without_position_is_appended_by_set_primitive(fdict):
+    view = fdict("lst", {"a": 1, "b": 2, "c": 3})
+    _drop_position(view, "b")
+    view.set_primitive("b", [1, 2])
+    assert list(view) == ["a", "c", "b"]
+    assert view["b"] == [1, 2]
+    _assert_consistent(view)
+
+
+def test_set_child_container_as_keeps_existing_position(fdict):
+    view = fdict("lst", {"a": {"n": 1}, "b": {"n": 2}, "c": {"n": 3}})
+    okey = view.position("b")
+    view.set_child_container_as("b", {"n": 20}, EagerDictView)
+    assert view.position("b") == okey
+    assert list(view) == ["a", "b", "c"]
+    view.set_child_container_as("d", {"n": 4}, EagerDictView)
+    assert list(view) == ["a", "b", "c", "d"]
+    _assert_consistent(view)
+
+
+def test_same_suffix_draw_in_one_gap_gets_a_fresh_key(fdict, monkeypatch):
+    """Two keys drawn from the same neighbours with the same random tail do not collide."""
+    from virtuals._views import fractional_index as fi
+
+    view = fdict("lst", {"a": 1, "b": 2})
+    prev = view.position("a")
+    nxt = view.position("b")
+    draws = iter(["ZZZZ", "ZZZZ", "ZZZZ", "AAAA"])
+    monkeypatch.setattr(fi, "_random_suffix", lambda n: next(draws))
+    first = view._place("x", prev, nxt)
+    second = view._place("y", prev, nxt)
+    view._write_value("x", 10)
+    view._write_value("y", 20)
+    assert first != second
+    assert prev < first < nxt
+    assert prev < second < nxt
+    assert list(view) == ["a", "y", "x", "b"]
+    assert len(view) == 4
+    _assert_consistent(view)
+
+
+def test_allot_gives_up_when_every_draw_is_taken(fdict, monkeypatch):
+    from virtuals._views import fractional_index as fi
+
+    view = fdict("lst", {"a": 1, "b": 2})
+    prev = view.position("a")
+    nxt = view.position("b")
+    monkeypatch.setattr(fi, "_random_suffix", lambda n: "ZZZZ")
+    # Serialised inserts never collide (the second sees the first as its
+    # neighbour); only a placement against stale neighbours can.
+    view.insert_after("a", "x")
+    view.insert_after("a", "y")
+    assert list(view) == ["a", "y", "x", "b"]
+    with pytest.raises(RuntimeError, match="No free order key"):
+        view._place("z", prev, nxt)
+    assert "z" not in view
+    assert list(view) == ["a", "y", "x", "b"]
+    _assert_consistent(view)
+
+
+class _HalfWritingView(EagerFractionalIndexedDictView):
+    """Writes part of a compound value, then fails: a nested write dying half way."""
+
+    def _write_value(self, address, value):
+        if isinstance(value, dict) and "boom" in value:
+            super()._write_value(address, {k: v for k, v in value.items() if k != "boom"})
+            raise RuntimeError("boom")
+        super()._write_value(address, value)
+
+
+def test_failed_compound_write_leaves_no_data(broot):
+    view = broot.open_child("lst", _HalfWritingView)
+    view.store({"a": 1, "b": 2})
+    with pytest.raises(RuntimeError, match="boom"):
+        view.insert_after("a", "x", {"ok": 1, "boom": 2})
+    assert "x" not in view
+    assert len(view) == 2
+    assert list(view) == ["a", "b"]
+    assert view.get("x") is None
+    assert not view._data_container().exists_child("x")
+    assert list(view.items()) == [("a", 1), ("b", 2)]
+    _assert_consistent(view)
+    # A plain set after the failure appends, with nothing left over from the failed value.
+    view["x"] = {"fresh": True}
+    assert list(view) == ["a", "b", "x"]
+    assert view["x"] == {"fresh": True}
+    _assert_consistent(view)
+
+
+def test_failed_compound_write_over_stale_data_leaves_no_data(broot):
+    """Stale data without a position is dropped too when the overwrite fails."""
+    view = broot.open_child("lst", _HalfWritingView)
+    view.store({"a": 1, "x": {"old": 1}})
+    _drop_position(view, "x")
+    with pytest.raises(RuntimeError, match="boom"):
+        view.append("x", {"new": 1, "boom": 2})
+    assert "x" not in view
+    assert view.get("x") is None
+    assert not view._data_container().exists_child("x")
+    _assert_consistent(view)

@@ -39,17 +39,19 @@ every rewritten row (one delete and one put per row) as if those ids had
 moved, though their relative order is unchanged.
 
 Partial states. An insert writes ``__pos__``, then the value, then
-``__order__``; if the value write raises, the position is deleted again
-before the error propagates, so the id is absent (not ``in``, not
-counted, not iterated) and a retry inserts it as if new. A position
-without an order row can still appear through bypass writes; such an id
-is ``in`` the view and counted by ``len`` but not iterated, and a plain
-set does not repair it (the id has data and a position, so set keeps it
-as is): delete it and insert again, or call ``rebuild_bookkeeping()``.
-``items``, ``values`` and ``extract`` skip order rows whose data is
-missing; ``iter`` and ``keys`` do not check (one scan, no gets). Setting
-an id that has data but no position appends it. ``rebuild_bookkeeping()``
-repairs everything in O(n).
+``__order__``; if the value write raises, the position and whatever part
+of the value was written are deleted again before the error propagates,
+so the id is absent (not ``in``, not counted, not iterated, not readable)
+and a retry inserts it as if new. A position without an order row can
+still appear through bypass writes; such an id is ``in`` the view and
+counted by ``len`` but not iterated, and a plain set does not repair it
+(the id has data and a position, so set keeps it as is): delete it and
+insert again, or call ``rebuild_bookkeeping()``. ``items``, ``values``
+and ``extract`` skip order rows whose data is missing; ``iter`` and
+``keys`` do not check (one scan, no gets). Setting an id that has data
+but no position appends it, through ``__setitem__``, ``set_primitive``
+and ``set_child_container_as`` alike. ``rebuild_bookkeeping()`` repairs
+everything in O(n).
 
 Concurrency. Two writers inserting at the same gap get distinct keys
 (random tail) and both land in the gap. That holds as long as nobody
@@ -69,10 +71,24 @@ transactions inserting the same id there both commit and the second
 ``__pos__`` write wins (last-writer-wins, two order rows for one id
 until ``rebuild_bookkeeping()``); sqlite and rocksdb reject the second
 writer.
+
+Order key collision. Two writers that read the same neighbours get the
+same plain key and differ only in the random tail (``SUFFIX_LENGTH``
+base62 chars, one collision in about 14.8 million same-gap pairs at 4).
+Before writing, ``_allot`` reads the order row of its fresh key and
+draws again if the row exists, so a collision with any row this
+transaction can see is impossible. A collision with a row committed by
+a concurrent transaction after this one's snapshot is not caught on
+backends that do not track reads (rocksdb, mem): the later ``__order__``
+put overwrites the earlier one, and the losing id keeps its ``__pos__``
+row (``in`` and counted) but is not iterated until
+``rebuild_bookkeeping()``. sqlite and lmdb serialise writers, so their
+second writer sees the first row and never collides.
 """
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
@@ -268,17 +284,29 @@ class FractionalIndexedDictViewBase(
             return row
         return None
 
-    def _allot(self, prev: str | None, nxt: str | None) -> str:
-        """Fresh order key for the gap between ``prev`` and ``nxt``.
+    ALLOT_ATTEMPTS: ClassVar[int] = 8
+    """Fresh keys tried before an allot gives up on a gap whose keys are all taken."""
 
-        No storage touch unless the key passes ``MAX_KEY_LENGTH``; then the
-        rows around the gap are respaced first (``_respace_around``) and the
-        key comes from the respaced window.
+    def _allot(self, prev: str | None, nxt: str | None) -> str:
+        """Fresh order key for the gap between ``prev`` and ``nxt``, not yet in ``__order__``.
+
+        One ``__order__`` get checks the key is free (a row this transaction
+        can see, written by another id with the same random tail, would be
+        overwritten by ``_index``); on a hit a new tail is drawn. If the
+        key passes ``MAX_KEY_LENGTH`` the rows around the gap are respaced
+        first (``_respace_around``) and the key comes from the respaced
+        window.
         """
-        okey = generate_suffixed_key_between(prev, nxt, suffix_length=self.SUFFIX_LENGTH)
-        if len(okey) <= self.MAX_KEY_LENGTH:
-            return okey
-        return self._respace_around(prev, nxt)
+        oc = self._order_container()
+        for _ in range(self.ALLOT_ATTEMPTS):
+            okey = generate_suffixed_key_between(prev, nxt, suffix_length=self.SUFFIX_LENGTH)
+            if len(okey) > self.MAX_KEY_LENGTH:
+                return self._respace_around(prev, nxt)
+            if is_empty(oc.get_child_primitive_unsafe(okey)):
+                return okey
+        raise RuntimeError(
+            f"No free order key between {prev!r} and {nxt!r} after {self.ALLOT_ATTEMPTS} draws"
+        )
 
     def _respace_around(self, prev: str | None, nxt: str | None) -> str:
         """Rewrite a bounded window of rows around the gap, return the gap's key.
@@ -440,7 +468,12 @@ class FractionalIndexedDictViewBase(
     # -- Membership & order ------------------------------------------------
 
     def __len__(self) -> int:
+        """Live count of ``__pos__`` rows. O(n) over primitive rows, no stored length."""
         return self._pos_container().count_children()
+
+    def __bool__(self) -> bool:
+        """True if any id is ordered. One seek, so ``if view:`` never counts."""
+        return self._edge(last=False) is not None
 
     def __contains__(self, obj: Address) -> bool:
         return not is_empty(self._position_or_empty(obj))
@@ -514,6 +547,17 @@ class FractionalIndexedDictViewBase(
 
     # -- Mutations ---------------------------------------------------------
 
+    def _ensure_positioned(self, address: Address) -> None:
+        """Append ``address`` if its data exists without a position. One pos get.
+
+        A plain set of an id whose position is missing (a bypass write, or
+        a delete that stopped half way) must land it in the order again;
+        ``_on_child_created`` only fires for a new data child.
+        """
+        if is_empty(self._position_or_empty(address)):
+            last = self._edge(last=True)
+            self._place(address, None if last is None else last[0], None)
+
     def __setitem__(self, address: Address, value: object) -> None:
         """Set the value. A new id is appended, an existing id keeps its place.
 
@@ -521,20 +565,28 @@ class FractionalIndexedDictViewBase(
         that stopped half way) is appended too: one extra pos get.
         """
         self._set_child_value(address, value)
-        if is_empty(self._position_or_empty(address)):
-            last = self._edge(last=True)
-            self._place(address, None if last is None else last[0], None)
+        self._ensure_positioned(address)
 
     def set_primitive(self, address: Address, value: object) -> None:
-        """Store a compound value as one primitive blob (no decomposition)."""
+        """Store a compound value as one primitive blob (no decomposition).
+
+        Same placement rule as ``__setitem__``: a new id is appended, an
+        existing id keeps its place, an id with data but no position is
+        appended.
+        """
         self._reject_empty(address, value)
         self.ensure_created()
         self._put_child_primitive(address, value)
+        self._ensure_positioned(address)
 
     def set_child_container_as(self, address: Address, value: object, view_class: type) -> None:
-        """Peer of ``__setitem__`` with an explicit child view class."""
+        """Peer of ``__setitem__`` with an explicit child view class.
+
+        Same placement rule as ``__setitem__``.
+        """
         self.ensure_created()
         self._populate_child_container(address, value, view_class=view_class)
+        self._ensure_positioned(address)
 
     def _insert(self, address: Address, value: object, prev: str | None, nxt: str | None) -> None:
         """Position, then value, then order row; a failed value write undoes the position.
@@ -554,8 +606,12 @@ class FractionalIndexedDictViewBase(
         try:
             self._write_value(address, value)
         except BaseException:
-            # Leave no position behind: the id must not be `in` or counted.
-            pc.delete_child_primitive_unsafe(address)
+            # Leave nothing behind: the id must not be `in`, counted, or
+            # readable with a partial value. The cleanup must not mask the
+            # original error if storage itself is failing.
+            with contextlib.suppress(Exception):
+                pc.delete_child_primitive_unsafe(address)
+                self._data_container().delete_child(address)
             raise
         self._order_container().put_child_primitive(
             okey, address, validate=False, validate_parent=False
