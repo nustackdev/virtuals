@@ -777,6 +777,12 @@ class StorageProtocolCompliance:
             )
             assert list(scan.items()) == [(("t", "a"), b"value"), (("t", "b"), b"value")]
 
+    def test_scan_max_depth_below_one_rejected(self, storage: StorageProtocol) -> None:
+        """A depth of 0 would skip every key; the options refuse it up front."""
+        for depth in (0, -1):
+            with pytest.raises(ValueError, match="max_depth"):
+                StorageScanOptions(start=("t",), max_depth=depth)
+
     def test_scan_closed_transaction_raises(self, storage: StorageProtocol) -> None:
         """Test scanning closed transaction raises error."""
         txn = storage.begin_transaction()

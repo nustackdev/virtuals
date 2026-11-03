@@ -71,7 +71,11 @@ class StorageScanOptions:
     at ``max_depth`` with one seek (past it forward, onto it reverse), see
     ``skip_bound``. Child scans set ``len(site) + 1`` so they cost
     O(children), not O(descendants). Shorter keys are still visited, so
-    pair it with a filter when they are unwanted."""
+    pair it with a filter when they are unwanted. Must be at least 1."""
+
+    def __post_init__(self) -> None:
+        if self.max_depth is not None and self.max_depth < 1:
+            raise ValueError(f"max_depth must be >= 1, got {self.max_depth}")
 
     def skip_bound(self, codec: CodecProtocol, key: Key) -> object:
         """Encoded seek target that leaves the subtree ``key`` sits in.
