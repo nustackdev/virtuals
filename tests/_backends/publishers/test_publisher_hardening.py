@@ -501,3 +501,77 @@ def test_stalled_fast_path_does_not_survive_a_reconnect():
         assert 0.25 < time.monotonic() - t0 < 0.6, "dropped at once on a fresh connection"
     finally:
         p.disconnect()
+
+
+# =============================================================================
+# r3 F1: a notify while disconnected is a counted drop, never a silent one
+# =============================================================================
+
+
+def test_notify_while_disconnected_counts_the_drop_and_wakes_after_reconnect():
+    """notify() between disconnect() and connect() still raises, and the keys
+    it could not queue are a drop: counted, raised once by flush(), and
+    followed by a resync wake as soon as the new worker can send."""
+    p = _Gated()
+    p.gate.set()
+    p.connect()
+    p.disconnect()
+    with pytest.raises(PublisherConnectionError, match="not connected"):
+        p.notify(("a",))
+    with pytest.raises(PublisherConnectionError, match="not connected"):
+        p.notify([("b",), ("c",)])
+    assert p.dropped_keys == 3
+    assert p._resync_pending
+    p.connect()
+    try:
+        assert _wait_until(lambda: p.resyncs == 1, 5), "no resync wake after reconnect"
+        with pytest.raises(PublisherOperationError, match="not connected"):
+            p.flush(2)
+        p.flush(2)  # raised once, then clean
+        assert p.sent == []
+    finally:
+        p.disconnect()
+
+
+@pytest.mark.redis
+def test_commit_while_publisher_disconnected_resyncs_the_reader_after_reconnect(
+    own_valkey, tmp_path
+):
+    """The storage keeps committing while its publisher is disconnected (the
+    failed notify is logged, the commit stands). The level reader gets one
+    keyless wake once the publisher is back, so it re-reads what it missed."""
+    pytest.importorskip("redis")
+    from virtuals._backends.observers.redis_pubsub import RedisObserver
+    from virtuals._backends.publishers.redis_pubsub import RedisPublisher
+    from virtuals._backends.storages.sqlite import SQLiteStorage
+    from virtuals.codecs import NoOpCodec
+
+    pub = RedisPublisher(redis_url=own_valkey.url, channel_prefix="d")
+    pub.connect()
+    storage = SQLiteStorage(tmp_path / "s.sqlite", codec=NoOpCodec(), publisher=pub)
+    storage.open()
+    obs = RedisObserver(redis_url=own_valkey.url, channel_prefix="d")
+    obs.connect()
+    got: list = []
+    try:
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("k",)))).bind(got.append)
+        with storage.begin_transaction() as tx:
+            tx.put(("k", 1), b"a")
+        pub.flush(2)
+        assert _wait_until(lambda: got == [("k", 1)], 5)
+
+        pub.disconnect()
+        with storage.begin_transaction() as tx:
+            tx.put(("k", 2), b"b")  # committed; the wake cannot be sent
+        assert pub.dropped_keys == 1
+        pub.connect()
+        assert _wait_until(lambda: None in got, 5), got
+        with pytest.raises(PublisherOperationError, match="not connected"):
+            pub.flush(2)
+        pub.flush(2)
+        with storage.snapshot() as snap:
+            assert snap.get(("k", 2)) == b"b"
+    finally:
+        obs.disconnect()
+        storage.close()
+        pub.disconnect()
