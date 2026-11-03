@@ -8,19 +8,25 @@ BaseException. The kv contract cases live in ``test_rocksdb_contract.py``.
 
 from __future__ import annotations
 
+import gc
 import os
 import subprocess
 import sys
 import textwrap
+import weakref
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from tests._backends.storages import _write_slot_cases as cases
 from virtuals._backends.storages.rocksdb import RocksDBStorage
+from virtuals._backends.storages.rocksdb.snapshot import RocksDBSnapshot
+from virtuals._backends.storages.rocksdb.transaction import RocksDBTransaction
 from virtuals.codecs import BinaryCodec
 from virtuals.tkv import StorageScanOptions
 from virtuals.tkv.filter import PrefixFilter
-from virtuals.tkv.storage import StorageClosedError
+from virtuals.tkv.storage import StorageClosedError, StorageError
+from virtuals.tkv.types import EMPTY
 
 
 if TYPE_CHECKING:
@@ -29,7 +35,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture
 def storage(tmp_path: Path):
-    s = RocksDBStorage(path=tmp_path / "db", codec=BinaryCodec())
+    s = RocksDBStorage(path=tmp_path / "db", codec=BinaryCodec(), busy_timeout=5.0)
     s.open()
     yield s
     s.close()
@@ -293,3 +299,254 @@ def test_write_batch_after_storage_close_raises(tmp_path: Path) -> None:
     s.close()
     with pytest.raises(StorageClosedError):
         batch.write()
+
+
+# =============================================================================
+# Shared writer slot cases (every backend on the shared slot runs these)
+# =============================================================================
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("ctx", ["transaction", "batch_write"])
+def test_cancel_inside_block_releases_slot(storage: RocksDBStorage, ctx: str) -> None:
+    cases.cancel_inside_block(storage, ctx)
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("ctx", ["transaction", "batch_write"])
+def test_keyboard_interrupt_inside_block_releases_slot(storage: RocksDBStorage, ctx: str) -> None:
+    cases.keyboard_interrupt_inside_block(storage, ctx)
+
+
+@pytest.mark.timeout(10)
+def test_cancel_while_reserving_holds_nothing(storage: RocksDBStorage) -> None:
+    cases.cancel_while_reserving(storage)
+
+
+@pytest.mark.timeout(10)
+def test_cancel_between_reserve_and_begin_releases_slot(storage: RocksDBStorage) -> None:
+    cases.cancel_between_reserve_and_begin(storage)
+
+
+@pytest.mark.timeout(10)
+def test_to_thread_nested_raises_fast(storage: RocksDBStorage) -> None:
+    cases.to_thread_nested_raises_fast(storage)
+
+
+@pytest.mark.timeout(10)
+def test_asyncio_run_inside_sync_txn_is_nested(storage: RocksDBStorage) -> None:
+    cases.asyncio_run_inside_sync_txn_is_nested(storage)
+
+
+@pytest.mark.timeout(10)
+def test_racing_ends_release_slot_once(storage: RocksDBStorage) -> None:
+    tx = storage.begin_transaction()
+    cases.racing_ends_release_once(storage, tx, lambda t: t._mark_closed(), "_holds_write_slot")
+
+
+@pytest.mark.timeout(10)
+def test_handoff_worker_is_not_nested(storage: RocksDBStorage) -> None:
+    cases.handoff_worker_is_not_nested(storage)
+
+
+@pytest.mark.timeout(10)
+def test_handoff_then_writers_on_same_worker(storage: RocksDBStorage) -> None:
+    cases.handoff_then_writers_on_same_worker(storage)
+
+
+@pytest.mark.timeout(10)
+def test_spawned_task_waits(storage: RocksDBStorage) -> None:
+    cases.spawned_task_waits(storage)
+
+
+@pytest.mark.timeout(10)
+def test_reserved_slot_does_not_survive_close(storage: RocksDBStorage) -> None:
+    cases.reserved_slot_does_not_survive_close(storage)
+
+
+@pytest.mark.timeout(10)
+def test_waiter_on_stale_slot_wakes_on_close(storage: RocksDBStorage) -> None:
+    cases.waiter_on_stale_slot_wakes_on_close(storage)
+
+
+@pytest.mark.timeout(10)
+def test_writer_waiting_across_close_gets_closed_error(storage: RocksDBStorage) -> None:
+    cases.writer_waiting_across_close_gets_closed_error(storage)
+
+
+@pytest.mark.timeout(10)
+def test_dropped_transaction_frees_slot(storage: RocksDBStorage) -> None:
+    cases.dropped_transaction_frees_slot(storage)
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("ctx", ["transaction", "batch_write"])
+def test_sync_begin_on_loop_thread_is_bounded(storage: RocksDBStorage, ctx: str) -> None:
+    cases.sync_begin_on_loop_thread_is_bounded(storage, ctx)
+
+
+@pytest.mark.timeout(10)
+def test_context_end_after_slot_reset_touches_nothing(storage: RocksDBStorage) -> None:
+    cases.context_end_after_slot_reset_touches_nothing(storage, storage.begin_transaction())
+
+
+# =============================================================================
+# Lifecycle and open edges (audit 03, R1 and R4 to R9)
+# =============================================================================
+
+
+def test_dropped_transaction_is_collected_and_frees_slot(storage: RocksDBStorage) -> None:
+    """The active set is weak: a dropped transaction is collected, its finalizer frees the slot."""
+    txn = storage.begin_transaction()
+    txn.put(("k",), 1)
+    ref = weakref.ref(txn)
+    del txn
+    gc.collect()
+    assert ref() is None
+    assert not storage._writer.lock.locked()
+    assert not storage._active_transactions
+    with storage.snapshot() as snap:
+        assert snap.get(("k",)) is EMPTY  # rolled back natively
+
+
+def test_begin_during_close_window_raises_closed_error(tmp_path: Path) -> None:
+    """Between the native close and the state update, begin reports a closed storage."""
+    s = RocksDBStorage(path=tmp_path / "db", codec=BinaryCodec())
+    s.open()
+    s._db.close()
+    with pytest.raises(StorageClosedError):
+        s.begin_transaction()
+    assert not s._writer.lock.locked()  # the slot taken for the begin was given back
+    with pytest.raises(StorageClosedError):
+        s.begin_snapshot()
+    s._db = None
+    s._opened = False
+
+
+@pytest.mark.parametrize("mode", ["read_only", "secondary"])
+def test_read_only_open_of_missing_path_leaves_no_directory(tmp_path: Path, mode: str) -> None:
+    """A read-only or secondary open of a missing path fails and leaves nothing behind.
+
+    (A read-write open with ``create_if_missing=False`` fails too, but
+    rocksdb itself drops its LOCK and LOG files there first; a later open
+    finds no data in them, so nothing is adopted.)
+    """
+    path = tmp_path / "nope"
+    kwargs: dict = {"read_only": True}
+    if mode == "secondary":
+        kwargs["secondary_path"] = tmp_path / "secondary"
+    s = RocksDBStorage(path=path, codec=BinaryCodec(), **kwargs)
+    with pytest.raises(StorageError):
+        s.open()
+    assert not path.exists()
+    # A read-write open afterwards creates a fresh database as usual.
+    with RocksDBStorage(path=path, codec=BinaryCodec()) as rw, rw.transaction() as txn:
+        txn.put(("k",), 1)
+
+
+def test_snapshot_close_closes_its_scan_iterators(storage: RocksDBStorage) -> None:
+    """A suspended scan's native iterator is closed with the snapshot, not with the generator."""
+    _fill(storage, KEYS)
+    snap = storage.begin_snapshot()
+    keys = snap.scan(StorageScanOptions()).keys()
+    assert next(keys) == ("a", 0)
+    (handle,) = list(snap._scans)
+    assert not handle.iterator.closed
+    snap.close()
+    assert handle.iterator.closed
+    with pytest.raises(StorageClosedError):
+        next(keys)  # the generator is still there and still refuses
+    assert snap._snapshot is None
+
+
+@pytest.mark.parametrize("end", ["commit", "abort", "close"])
+def test_transaction_end_closes_its_scan_iterators(tmp_path: Path, end: str) -> None:
+    s = RocksDBStorage(path=tmp_path / "db", codec=BinaryCodec())
+    s.open()
+    _fill(s, KEYS)
+    txn = s.begin_transaction()
+    items = txn.scan(StorageScanOptions()).items()
+    next(items)
+    (handle,) = list(txn._scans)
+    if end == "close":
+        s.close()
+    else:
+        getattr(txn, end)()
+    assert handle.iterator.closed
+    with pytest.raises(StorageClosedError):
+        next(items)
+    s.close()
+
+
+def test_finished_scan_is_forgotten_by_its_context(storage: RocksDBStorage) -> None:
+    _fill(storage, KEYS)
+    with storage.snapshot() as snap:
+        list(snap.scan(StorageScanOptions(limit=3)).keys())
+        gc.collect()
+        assert not snap._scans  # the handle died with the generator
+
+
+class _Publisher:
+    def __init__(self) -> None:
+        self.batches: list[set] = []
+
+    def notify(self, keys) -> None:
+        self.batches.append(set(keys))
+
+
+def test_delete_of_absent_key_notifies_from_txn_and_batch_alike(tmp_path: Path) -> None:
+    """Contract section 5 allows a spurious wake; the two write paths agree on it."""
+    pub = _Publisher()
+    with RocksDBStorage(path=tmp_path / "db", codec=BinaryCodec(), publisher=pub) as s:
+        with s.transaction() as txn:
+            txn.delete(("absent", 1))
+        with s.batch_write() as batch:
+            batch.delete(("absent", 2))
+    assert pub.batches == [{("absent", 1)}, {("absent", 2)}]
+
+
+def test_exists_reads_the_key_only(storage: RocksDBStorage, monkeypatch) -> None:
+    """exists never fetches the value, and sees a transaction's own pending writes."""
+    _fill(storage, KEYS)
+
+    def boom(self, encoded_key):
+        raise AssertionError("exists fetched the value")
+
+    monkeypatch.setattr(RocksDBSnapshot, "_get_raw", boom)
+    monkeypatch.setattr(RocksDBTransaction, "_get_raw", boom)
+    with storage.snapshot() as snap:
+        assert snap.exists(("a", 0))
+        assert not snap.exists(("a", 0, "below"))  # a longer key with this prefix is not it
+        assert not snap.exists(("zzz",))
+    txn = storage.begin_transaction()
+    try:
+        txn.put(("new",), 1)
+        txn.delete(("a", 1))
+        assert txn.exists(("new",))
+        assert not txn.exists(("a", 1))
+        assert txn.exists(("a", 2))
+    finally:
+        txn.abort()
+
+
+def test_second_open_explains_single_process(storage: RocksDBStorage) -> None:
+    other = RocksDBStorage(path=storage.path, codec=BinaryCodec())
+    with pytest.raises(StorageError, match="single-process"):
+        other.open()
+    code = textwrap.dedent(
+        f"""
+        from virtuals._backends.storages.rocksdb import RocksDBStorage
+        from virtuals.codecs import BinaryCodec
+        from virtuals.tkv.storage import StorageError
+        try:
+            RocksDBStorage(path={str(storage.path)!r}, codec=BinaryCodec()).open()
+        except StorageError as e:
+            print("single-process" in str(e))
+        """
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+    proc = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode == 0 and proc.stdout.strip() == "True", proc.stdout + proc.stderr

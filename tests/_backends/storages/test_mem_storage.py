@@ -14,10 +14,12 @@ import os
 import random
 import threading
 import time
+import weakref
 from bisect import bisect_left, bisect_right
 
 import pytest
 
+from tests._backends.storages import _write_slot_cases as cases
 from virtuals._backends.storages.mem import InMemoryStorage
 from virtuals._backends.storages.mem.sorted_keys import SortedKeys
 from virtuals._backends.storages.mem.storage import InMemoryStorage as _Base
@@ -1292,3 +1294,166 @@ def test_scan_on_closed_context_raises(storage: InMemoryStorage) -> None:
         list(scan.items())
     with pytest.raises(StorageClosedError):
         snap.scan(StorageScanOptions())
+
+
+# =========================================================================
+# Shared writer slot cases (every backend on the shared slot runs these)
+# =========================================================================
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("ctx", ["transaction", "batch_write"])
+def test_cancel_inside_block_releases_slot(storage: InMemoryStorage, ctx: str) -> None:
+    cases.cancel_inside_block(storage, ctx)
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("ctx", ["transaction", "batch_write"])
+def test_keyboard_interrupt_inside_block_releases_slot(storage: InMemoryStorage, ctx: str) -> None:
+    cases.keyboard_interrupt_inside_block(storage, ctx)
+
+
+@pytest.mark.timeout(10)
+def test_cancel_while_reserving_holds_nothing(storage: InMemoryStorage) -> None:
+    cases.cancel_while_reserving(storage)
+
+
+@pytest.mark.timeout(10)
+def test_cancel_between_reserve_and_begin_releases_slot(storage: InMemoryStorage) -> None:
+    cases.cancel_between_reserve_and_begin(storage)
+
+
+@pytest.mark.timeout(10)
+def test_to_thread_nested_raises_fast(storage: InMemoryStorage) -> None:
+    cases.to_thread_nested_raises_fast(storage)
+
+
+@pytest.mark.timeout(10)
+def test_asyncio_run_inside_sync_txn_is_nested(storage: InMemoryStorage) -> None:
+    cases.asyncio_run_inside_sync_txn_is_nested(storage)
+
+
+@pytest.mark.timeout(10)
+def test_racing_ends_release_slot_once(storage: InMemoryStorage) -> None:
+    tx = storage.begin_transaction()
+    cases.racing_ends_release_once(storage, tx, lambda t: t.abort(), "_closed")
+
+
+@pytest.mark.timeout(10)
+def test_handoff_worker_is_not_nested(storage: InMemoryStorage) -> None:
+    cases.handoff_worker_is_not_nested(storage)
+
+
+@pytest.mark.timeout(10)
+def test_handoff_then_writers_on_same_worker(storage: InMemoryStorage) -> None:
+    cases.handoff_then_writers_on_same_worker(storage)
+
+
+@pytest.mark.timeout(10)
+def test_spawned_task_waits(storage: InMemoryStorage) -> None:
+    cases.spawned_task_waits(storage)
+
+
+@pytest.mark.timeout(10)
+def test_shared_reserved_slot_does_not_survive_close(storage: InMemoryStorage) -> None:
+    cases.reserved_slot_does_not_survive_close(storage)
+
+
+@pytest.mark.timeout(10)
+def test_shared_waiter_on_stale_slot_wakes_on_close(storage: InMemoryStorage) -> None:
+    cases.waiter_on_stale_slot_wakes_on_close(storage)
+
+
+@pytest.mark.timeout(10)
+def test_shared_writer_waiting_across_close_gets_closed_error(storage: InMemoryStorage) -> None:
+    cases.writer_waiting_across_close_gets_closed_error(storage)
+
+
+@pytest.mark.timeout(10)
+def test_dropped_transaction_frees_slot(storage: InMemoryStorage) -> None:
+    cases.dropped_transaction_frees_slot(storage)
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("ctx", ["transaction", "batch_write"])
+def test_sync_begin_on_loop_thread_is_bounded(storage: InMemoryStorage, ctx: str) -> None:
+    cases.sync_begin_on_loop_thread_is_bounded(storage, ctx)
+
+
+@pytest.mark.timeout(10)
+def test_context_end_after_slot_reset_touches_nothing(storage: InMemoryStorage) -> None:
+    cases.context_end_after_slot_reset_touches_nothing(storage, storage.begin_transaction())
+
+
+# =========================================================================
+# Lifecycle edges, round 2
+# =========================================================================
+
+
+class _AbortingIndex:
+    """A pending index whose page is interrupted by an abort on another thread."""
+
+    def __init__(self, inner: SortedKeys, tx) -> None:
+        self.inner = inner
+        self.tx = tx
+
+    def page(self, *args, **kwargs):
+        for i, enc in enumerate(self.inner.page(*args, **kwargs)):
+            if i == 1:
+                self.tx._pending.clear()  # close() aborting the transaction lands here
+            yield enc
+
+
+def test_scan_page_survives_abort_under_it(storage: InMemoryStorage) -> None:
+    """A page cut by an abort on another thread yields what it has, never a raw KeyError."""
+    _put(storage, ("k", 0), 0)
+    tx = storage.begin_transaction()
+    for i in range(1, 20):
+        tx.put(("k", i), i)
+    tx._pending_index = _AbortingIndex(SortedKeys(tx._pending), tx)
+    keys = list(tx.scan(StorageScanOptions()).keys())
+    assert keys[:2] == [("k", 0), ("k", 1)]  # the committed row and the first pending one
+    tx.abort()
+    assert tx._pending_index is None and not tx._pending
+
+
+def test_dropped_transaction_is_collected_and_frees_slot(storage: InMemoryStorage) -> None:
+    """The active set is weak: a dropped transaction is collected, its finalizer frees the slot."""
+    tx = storage.begin_transaction()
+    tx.put(X, 1)
+    ref = weakref.ref(tx)
+    del tx
+    gc.collect()
+    assert ref() is None
+    assert not storage._writer.lock.locked()
+    assert not storage._active_transactions
+    assert _get(storage, X) is EMPTY
+    _put(storage, X, 2)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_fork_while_this_thread_holds_the_slot_child_writes(storage: InMemoryStorage) -> None:
+    """Forking from the thread that holds the writer slot: the child gets a fresh slot."""
+    _put(storage, X, 1)
+    tx = storage.begin_transaction()
+    tx.put(X, 2)  # pending in the parent; the child sees committed state only
+    pid = os.fork()
+    if pid == 0:  # child
+        code = 4
+        try:
+            with storage.transaction() as t:
+                t.put(Y, 3)
+            with storage.snapshot() as s:
+                code = 0 if (s.get(X), s.get(Y)) == (1, 3) else 3
+        except BaseException:
+            code = 5
+        os._exit(code)
+    killer = threading.Timer(3.0, lambda: os.kill(pid, 9))
+    killer.start()
+    try:
+        _, status = os.waitpid(pid, 0)
+    finally:
+        killer.cancel()
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+    tx.commit()  # the parent's hold was never touched
+    assert _get(storage, X) == 2 and _get(storage, Y) is EMPTY
