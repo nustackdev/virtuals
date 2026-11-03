@@ -1,19 +1,9 @@
-"""In-memory storage backend with copy-on-write transaction isolation.
+"""In-memory storage backend.
 
-Fast, ephemeral key-value storage for testing and prototyping. Uses overlay pattern
-for efficient transaction isolation without full state copies.
-
-Features:
-- Copy-on-write transaction isolation (overlay pattern)
-- Thread-safe with RLock
-- Optional observer support for notifications
-- No persistence - all data lost on close
-- Implements full StorageProtocol
-
-Limitations:
-- No durability (in-memory only)
-- No conflict detection (last commit wins)
-- Memory-bound by dataset size
+Ephemeral key-value storage for tests, prototypes and per-process state.
+Serializable transactions through a writer slot, snapshots pinned at a
+commit sequence (repeatable, never torn), ordered keys with native seek,
+and notifications after commit. Single-process; all data is lost on close.
 """
 
 from __future__ import annotations

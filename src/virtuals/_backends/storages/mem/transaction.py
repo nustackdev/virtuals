@@ -1,9 +1,9 @@
-"""Read-write transaction for in-memory storage."""
+"""Read-write transaction for the in-memory storage."""
 
 from __future__ import annotations
 
 from logging import getLogger
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any
 
 from virtuals.tkv.storage import (
     StorageClosedError,
@@ -12,15 +12,18 @@ from virtuals.tkv.storage import (
 )
 
 from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin
+from .store import ABSENT, DELETED, merge_pages
 
 
 if TYPE_CHECKING:
+    import threading
     from types import TracebackType
 
     from virtuals.tkv.types import Key
 
-    from .state import TransactionState
+    from .sorted_keys import SortedKeys
     from .storage import InMemoryStorage
+    from .store import Encoded, Entry, Marker
 
 
 __all__ = ["InMemoryTransaction"]
@@ -32,93 +35,88 @@ logger = getLogger(__name__)
 class InMemoryTransaction(
     ContextBase, ReadOperationsMixin, WriteOperationsMixin, TransactionProtocol
 ):
-    """Read-write transaction for in-memory storage.
+    """A serializable read-write transaction.
 
-    Provides isolated workspace with copy-on-write overlay and commit/abort semantics.
+    Holds the storage's writer slot from begin to commit or abort, so
+    writers run one after another and nothing commits underneath it. Reads
+    see committed state plus the transaction's own pending writes, point
+    reads and scans alike. Commit applies the write set atomically.
     """
 
-    __slots__ = ("_aborted", "_committed", "_modified_keys")
+    __slots__ = ("_aborted", "_committed", "_modified_keys", "_pending", "_pending_index", "_slot")
 
-    def __init__(self, storage: InMemoryStorage, state: TransactionState) -> None:
-        """Initialize transaction with overlay state.
-
-        Args:
-            storage: Parent storage instance
-            state: Overlay state (copy-on-write)
-        """
-        super().__init__(storage, state)
+    def __init__(self, storage: InMemoryStorage, slot: threading.Lock) -> None:
+        """Begin over an already acquired writer slot ``slot``."""
+        super().__init__(storage)
+        self._slot = slot
+        self._pending: dict[Encoded, Entry] = {}
+        self._pending_index: SortedKeys[Encoded] | None = None
         self._modified_keys: set[Key] = set()
         self._committed = False
         self._aborted = False
 
     @property
     def writable(self) -> bool:
-        """Check if transaction is writable.
-
-        Returns:
-            Always True for transactions.
-        """
+        """Always True for transactions."""
         return True
 
-    def commit(self) -> None:
-        """Commit transaction and make changes permanent.
+    def _lookup(self, enc: Encoded) -> Entry | Marker:
+        entry = self._pending.get(enc)
+        if entry is None:
+            return self._storage._store.get(enc)
+        return ABSENT if entry[1] is DELETED else entry
 
-        Raises:
-            StorageTransactionError: If commit fails
-            StorageClosedError: If already committed or aborted
-        """
+    def _page(
+        self, bound: Encoded | None, *, inclusive: bool, reverse: bool, n: int, stop: Encoded | None
+    ) -> tuple[list[tuple[Any, Entry]], Any, bool]:
+        base = self._storage._store.page(
+            bound, inclusive=inclusive, reverse=reverse, n=n, stop=stop
+        )
+        if not self._pending:
+            return base, (base[-1][0] if len(base) == n else None), len(base) < n
+        overlay = self._pending_page(bound, inclusive=inclusive, reverse=reverse, n=n, stop=stop)
+        return merge_pages(base, overlay, n, reverse)
+
+    def _end(self) -> None:
+        """Close the transaction and give the writer slot back, whatever happened."""
+        self._closed = True
+        self._storage._release_write_slot(self._slot)
+        self._storage._untrack_transaction(self)
+
+    def commit(self) -> None:
+        """Apply the write set atomically, release the slot and notify."""
         if self._closed:
             logger.error("Cannot commit, transaction is closed")
             raise StorageClosedError("Transaction is closed")
         if self._committed:
-            logger.error("Cannot commit, transaction already committed")
             raise StorageTransactionError("Transaction already committed")
         if self._aborted:
-            logger.error("Cannot commit, transaction already aborted")
             raise StorageTransactionError("Transaction already aborted")
 
+        modified = self._modified_keys
         try:
-            # Apply overlay directly to parent state (O(changes) not O(state_size))
-            state = cast("TransactionState", self._state)
-
-            with self._storage._lock:
-                for k in state._deleted:
-                    self._storage._state.pop(k, None)
-                self._storage._state.update(state._local)
-
-            logger.info("Transaction committed")
-
-            self._committed = True
-            self._mark_closed()
-
-            # Notify observers (batch)
-            self._storage._notify_batch(self._modified_keys)
-
-            self._storage._untrack_transaction(self)
+            if self._pending:
+                self._storage._store.apply(self._pending, modified)
         except Exception as e:
+            self._aborted = True
+            self._end()
             logger.error("Transaction commit failed")
             raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
 
-    def abort(self) -> None:
-        """Abort transaction and discard changes.
+        self._committed = True
+        self._end()
+        logger.debug("Transaction committed")
+        self._storage._notify_batch(modified)
 
-        Raises:
-            StorageTransactionError: If abort fails
-        """
+    def abort(self) -> None:
+        """Discard the write set and release the slot. No-op once closed."""
         if self._closed:
-            # Already closed, nothing to do
             logger.debug("Abort called on closed transaction")
             return
-
-        try:
-            logger.info("Transaction aborted")
-
-            self._aborted = True
-            self._mark_closed()
-            self._storage._untrack_transaction(self)
-        except Exception as e:
-            logger.error("Transaction abort failed")
-            raise StorageTransactionError(f"Failed to abort transaction: {e}") from e
+        self._aborted = True
+        self._pending.clear()
+        self._end()
+        logger.debug("Transaction aborted")
 
     def __enter__(self) -> InMemoryTransaction:
         """Enter context manager."""
@@ -130,11 +128,8 @@ class InMemoryTransaction(
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        """Exit context manager."""
+        """Commit on a clean exit, abort on an exception."""
         if exc_type is not None:
-            # Exception occurred, abort
             self.abort()
-        else:
-            # Success, commit if not already done
-            if not self._committed and not self._aborted:
-                self.commit()
+        elif not self._committed and not self._aborted:
+            self.commit()

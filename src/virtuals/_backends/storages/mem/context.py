@@ -1,4 +1,11 @@
-"""Base context classes and operation mixins for in-memory storage."""
+"""Base context and the read and write mixins shared by in-memory contexts.
+
+A context decides what a read sees through two hooks the mixins call:
+``_lookup`` for a point read and ``_page`` for one page of a scan. A
+snapshot answers them from the store as of its pinned sequence; a
+transaction answers them from live state overlaid with its own pending
+writes. The mixins own the codec work and the protocol's error mapping.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +19,8 @@ from virtuals.tkv.storage import (
 )
 from virtuals.tkv.types import EMPTY, Empty
 
-from .state import TransactionState
+from .sorted_keys import SortedKeys
+from .store import ABSENT, DELETED, Encoded, Entry, Marker
 
 
 if TYPE_CHECKING:
@@ -29,245 +37,151 @@ __all__ = [
 
 
 class ContextBase:
-    """Base class for in-memory storage contexts.
+    """What every in-memory context has: its storage and a closed flag."""
 
-    Provides common functionality for state management, validation, and
-    resource cleanup.
-    """
+    __slots__ = ("_closed", "_storage")
 
-    __slots__ = ("_closed", "_state", "_storage")
-
-    def __init__(self, storage: InMemoryStorage, state: dict[str, Any] | TransactionState) -> None:
-        """Initialize context with storage reference and state.
-
-        Args:
-            storage: Parent storage instance
-            state: State dictionary or overlay
-        """
+    def __init__(self, storage: InMemoryStorage) -> None:
+        """Bind the context to its storage."""
         self._storage = storage
-        self._state = state
         self._closed = False
 
     @property
     def storage(self) -> InMemoryStorage:
-        """Get the storage instance.
-
-        Returns:
-            Storage this context was initiated from.
-        """
+        """The storage this context was begun on."""
         return self._storage
 
-    def _require_active(self) -> dict[str, Any] | TransactionState:
-        """Validate context is active and return state.
-
-        Returns:
-            Active state
-
-        Raises:
-            StorageClosedError: If context is closed
-        """
+    def _require_active(self) -> None:
+        """Raise ``StorageClosedError`` if the context is closed."""
         if self._closed:
             raise StorageClosedError("Context is closed")
-        return self._state
-
-    def _mark_closed(self) -> None:
-        """Mark context as closed."""
-        self._closed = True
 
     @property
     def is_closed(self) -> bool:
-        """Check if context is closed.
-
-        Returns:
-            True if closed, False otherwise.
-        """
+        """True once committed, aborted or closed."""
         return self._closed
 
     @property
     def is_active(self) -> bool:
-        """Check if context is active.
-
-        Returns:
-            True if active and not closed, False otherwise.
-        """
+        """True until committed, aborted or closed."""
         return not self._closed
 
 
 class ReadOperationsMixin:
-    """Mixin providing read operations for in-memory storage contexts."""
+    """Point reads and scans over a context's view of the store."""
 
     __slots__ = ()
 
-    # Type hints for mixed-in attributes
     _storage: InMemoryStorage
     _require_active: Any
 
+    def _lookup(self, enc: Encoded) -> Entry | Marker:
+        """Entry visible to this context for an encoded key, or ABSENT."""
+        raise NotImplementedError
+
+    def _page(
+        self, bound: Encoded | None, *, inclusive: bool, reverse: bool, n: int, stop: Encoded | None
+    ) -> tuple[list[tuple[Any, Entry]], Any, bool]:
+        """One page of rows visible to this context. Returns ``(rows, cover, done)``."""
+        raise NotImplementedError
+
     def get(self, key: Key) -> Value | Empty:
-        """Get value by key.
-
-        Args:
-            key: Key to retrieve
-
-        Returns:
-            Value at key, or EMPTY if key not found.
-            Never raises on missing keys.
-
-        Raises:
-            StorageOperationError: If operation fails
-            StorageClosedError: If context is closed
-        """
-        state = self._require_active()
+        """Value at ``key``, or EMPTY when absent. Never raises on a missing key."""
+        self._require_active()
         codec = self._storage.codec
-
-        # Encode key using codec
         try:
-            key_str = codec.encode_key(key)
+            enc = codec.encode_key(key)
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
-
-        # Check if key exists - return EMPTY instead of raising
-        try:
-            if isinstance(state, TransactionState):
-                value_encoded = state.get(key_str)
-            else:
-                if key_str not in state:
-                    return EMPTY
-                value_encoded = state[key_str]
-        except KeyError:
+        entry = self._lookup(enc)
+        if entry is ABSENT:
             return EMPTY
-
-        # Decode and return value
         try:
-            return codec.decode_value(value_encoded)
+            return codec.decode_value(entry[1])
         except Exception as e:
             raise StorageOperationError(f"Failed to decode value for key {key}: {e}") from e
 
     def exists(self, key: Key) -> bool:
-        """Check if key exists.
-
-        Args:
-            key: Key to check
-
-        Returns:
-            True if key exists, False otherwise
-
-        Raises:
-            StorageOperationError: If check fails
-            StorageClosedError: If context is closed
-        """
-        state = self._require_active()
-        codec = self._storage.codec
-
+        """True when ``key`` is visible to this context."""
+        self._require_active()
         try:
-            key_str = codec.encode_key(key)
+            enc = self._storage.codec.encode_key(key)
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
-
-        return key_str in state
+        return self._lookup(enc) is not ABSENT
 
     def multiget(self, keys: list[Key]) -> dict[Key, Value]:
-        """Get multiple keys.
-
-        Args:
-            keys: List of keys to retrieve
-
-        Returns:
-            Dict mapping keys to values. Missing keys are omitted.
-
-        Raises:
-            StorageOperationError: If operation fails
-            StorageClosedError: If context is closed
-        """
+        """Values for ``keys``; missing keys are omitted."""
         result: dict[Key, Value] = {}
-
         for key in keys:
             value = self.get(key)
             if value is not EMPTY:
                 result[key] = value
-
         return result
 
     def scan(self, options: StorageScanOptions) -> ScanProtocol:
-        """Create scan iterator with configured options.
-
-        Args:
-            options: Scan configuration (start, reverse, limit, filter, break_filter)
-
-        Returns:
-            Scan iterator conforming to ScanProtocol
-
-        Raises:
-            StorageOperationError: If scan creation fails
-            StorageClosedError: If context is closed
-        """
+        """A lazy scan over this context's view with ``options`` applied."""
         from .scan import InMemoryScan
 
-        # Validate context is active before creating scan
         self._require_active()
         return InMemoryScan(self, options)  # type: ignore[arg-type]
 
 
 class WriteOperationsMixin:
-    """Mixin providing write operations for in-memory storage contexts."""
+    """Buffered writes: a write set applied as a whole on commit or write.
+
+    ``_pending`` maps encoded key to ``(key, value)`` or ``(key, DELETED)``.
+    ``_pending_index`` orders those keys for scans; it is built on the
+    first scan and kept in step from then on, so transactions that never
+    scan pay nothing for it.
+    """
 
     __slots__ = ()
 
-    # Type hints for mixed-in attributes
     _storage: InMemoryStorage
     _require_active: Any
+    _pending: dict[Encoded, Entry]
+    _pending_index: SortedKeys[Encoded] | None
     _modified_keys: set[Key]
 
     def put(self, key: Key, value: Value) -> None:
-        """Put key-value pair.
-
-        Args:
-            key: Key to set
-            value: Value to store
-
-        Raises:
-            StorageOperationError: If write fails
-            StorageClosedError: If context is closed
-        """
-        state = self._require_active()
+        """Set ``key`` to ``value`` in the write set."""
+        self._require_active()
         codec = self._storage.codec
-
-        # Encode key using codec
         try:
-            key_str = codec.encode_key(key)
+            enc = codec.encode_key(key)
+            encoded = codec.encode_value(value)
         except Exception as e:
-            raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
-
-        # Encode and store value
-        try:
-            state[key_str] = codec.encode_value(value)
-        except Exception as e:
-            raise StorageOperationError(f"Failed to encode value for key {key}: {e}") from e
-
-        # Track modification
+            raise StorageOperationError(f"Failed to encode key/value for {key}: {e}") from e
+        self._stage(enc, key, encoded)
         self._modified_keys.add(key)
 
     def delete(self, key: Key) -> None:
-        """Delete key (idempotent).
-
-        Silent if key doesn't exist (never raises for missing keys).
-
-        Args:
-            key: Key to delete
-
-        Raises:
-            StorageOperationError: If deletion fails
-            StorageClosedError: If context is closed
-        """
-        state = self._require_active()
-        codec = self._storage.codec
-
+        """Delete ``key``; silently nothing when absent."""
+        self._require_active()
         try:
-            key_str = codec.encode_key(key)
+            enc = self._storage.codec.encode_key(key)
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
+        self._stage(enc, key, DELETED)
 
-        # Delete if exists, otherwise silently do nothing
-        if key_str in state:
-            del state[key_str]
-            # Track modification only if key existed
-            self._modified_keys.add(key)
+    def _stage(self, enc: Encoded, key: Key, value: object) -> None:
+        """Record one write, keeping the pending index in step when it exists."""
+        pending = self._pending
+        if enc not in pending and self._pending_index is not None:
+            self._pending_index.add(enc)
+        pending[enc] = (key, value)
+
+    def _pending_page(
+        self, bound: Encoded | None, *, inclusive: bool, reverse: bool, n: int, stop: Encoded | None
+    ) -> list[tuple[Any, Any]]:
+        """One page of the write set as a scan overlay: entries, or ABSENT for deletes."""
+        index = self._pending_index
+        if index is None:
+            index = self._pending_index = SortedKeys(self._pending)
+        pending = self._pending
+        out: list[tuple[Any, Any]] = []
+        for enc in index.page(bound, inclusive=inclusive, reverse=reverse, n=n, stop=stop):
+            entry = pending[enc]
+            out.append((enc, ABSENT if entry[1] is DELETED else entry))
+        return out
