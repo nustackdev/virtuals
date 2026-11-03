@@ -7,8 +7,10 @@ collection. Hooks run on mem with the in-memory transport.
 
 from __future__ import annotations
 
+import random
 from collections import Counter
 from collections.abc import ItemsView, KeysView, ValuesView
+from typing import ClassVar
 
 import pytest
 
@@ -125,7 +127,8 @@ def test_empty(fdict):
     assert view.first() is None
     assert view.last() is None
     assert "a" not in view
-    assert view.get("a") is None or view.get("a", None) is None
+    assert view.get("a") is None
+    assert view.get("a", "dflt") == "dflt"
 
 
 def test_set_appends_in_order(fdict):
@@ -199,6 +202,13 @@ def test_set_primitive_blob(fdict):
     assert list(view) == ["a", "b"]
     assert view["a"] == {"x": 1}
     assert view["b"] == [1, 2]
+
+
+def test_get_missing_returns_none(fdict):
+    """Mapping contract: no default means None, never the EMPTY sentinel."""
+    view = fdict("lst", {"a": 1})
+    assert view.get("zz") is None
+    assert view.get("a") == 1
 
 
 def test_update_and_get(fdict):
@@ -283,6 +293,15 @@ def test_insert_missing_ref_raises(fdict):
         view.insert_after("nope", "b", 2)
     assert "b" not in view
     assert list(view) == ["a"]
+
+
+def test_insert_missing_ref_does_not_create_view(fdict):
+    view = fdict()
+    with pytest.raises(KeyError):
+        view.insert_before("nope", "b", 2)
+    with pytest.raises(KeyError):
+        view.insert_after("nope", "b", 2)
+    assert not view.container.exists()
 
 
 def test_move_before_after(fdict):
@@ -646,6 +665,268 @@ def test_respace_empty(fdict):
 
 
 # ============================================================================
+# KEY LENGTH: WINDOW RESPACE KEEPS KEYS BOUNDED
+# ============================================================================
+
+
+class _TightView(EagerFractionalIndexedDictView):
+    """Respaces early, so a short run hits the window path on every backend."""
+
+    MAX_KEY_LENGTH = 24
+    RESPACE_WINDOW = 4
+    RESPACE_TARGET = 16
+
+
+class _CountingRespaceView(_TightView):
+    respaces: ClassVar[list] = []
+
+    def _respace_around(self, prev, nxt):
+        okey = super()._respace_around(prev, nxt)
+        type(self).respaces.append(okey)
+        return okey
+
+
+def _max_key_len(view):
+    return max(len(okey) for okey, _ in view.positions())
+
+
+def test_hot_gap_10k_inserts_on_lmdb_keys_stay_bounded(tmp_path):
+    """LMDB caps keys at 511 bytes; 10k inserts after one id used to fail at ~2.3k."""
+    storage = _open_storage("lmdb", tmp_path)
+    try:
+        with storage.transaction() as tx:
+            view = Navigator(storage).root(tx).open_child("lst", EagerFractionalIndexedDictView)
+            view.store(["head", "tail"])
+            for i in range(10_000):
+                view.insert_after("head", f"c{i}")
+                assert len(view.position(f"c{i}")) <= view.MAX_KEY_LENGTH
+            expected = ["head", *[f"c{i}" for i in reversed(range(10_000))], "tail"]
+            assert list(view) == expected
+            assert _max_key_len(view) <= view.MAX_KEY_LENGTH
+            _assert_consistent(view)
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("hot", ["after_head", "before_tail", "alternate"])
+def test_hot_gap_respaces_bounded_window(broot, hot):
+    _CountingRespaceView.respaces = []
+    view = broot.open_child("lst", _CountingRespaceView)
+    view.store(["head", "tail"])
+    model = ["head", "tail"]
+    for i in range(600):
+        after = hot == "after_head" or (hot == "alternate" and i % 2 == 0)
+        if after:
+            view.insert_after("head", i)
+            model.insert(1, i)
+        else:
+            view.insert_before("tail", i)
+            model.insert(len(model) - 1, i)
+    assert list(view) == model
+    assert _max_key_len(view) <= view.MAX_KEY_LENGTH
+    assert len(_CountingRespaceView.respaces) >= 5
+    # The key handed to the gap after a respace is short again.
+    assert max(len(k) for k in _CountingRespaceView.respaces) <= view.RESPACE_TARGET
+    _assert_consistent(view)
+
+
+def test_mixed_hot_gap_and_random_ops_match_list_model(broot):
+    rng = random.Random(11)  # noqa: S311
+    view = broot.open_child("lst", _TightView)
+    view.store(["h", "t"])
+    model = ["h", "t"]
+    nid = 0
+    for _ in range(1500):
+        r = rng.random()
+        if r < 0.35:
+            view.insert_after("h", nid)
+            model.insert(model.index("h") + 1, nid)
+            nid += 1
+        elif r < 0.55:
+            view.insert_before("t", nid)
+            model.insert(model.index("t"), nid)
+            nid += 1
+        elif r < 0.7:
+            ref = rng.choice(model)
+            view.insert_before(ref, nid)
+            model.insert(model.index(ref), nid)
+            nid += 1
+        elif r < 0.85:
+            x, ref = rng.sample(model, 2)
+            view.move_after(x, ref)
+            model.remove(x)
+            model.insert(model.index(ref) + 1, x)
+        elif len(model) > 2:
+            x = rng.choice([m for m in model if m not in ("h", "t")])
+            del view[x]
+            model.remove(x)
+        assert _max_key_len(view) <= view.MAX_KEY_LENGTH
+    assert list(view) == model
+    _assert_consistent(view)
+
+
+class _NoRoomView(_TightView):
+    """Window keys never fit the target, so every respace is the full fallback."""
+
+    RESPACE_TARGET = 3
+
+
+def test_window_respace_falls_back_to_full_respace(broot):
+    ids = [chr(c) for c in range(ord("a"), ord("z") + 1)]
+    view = broot.open_child("lst", _NoRoomView)
+    view.store(ids)
+    far = {"a": view.position("a"), "z": view.position("z")}
+    for i in range(120):
+        view.insert_after("m", f"x{i}")
+    expected = [*ids[:13], *[f"x{i}" for i in reversed(range(120))], *ids[13:]]
+    assert list(view) == expected
+    assert _max_key_len(view) <= view.MAX_KEY_LENGTH
+    # A full respace rewrites rows far outside any window too.
+    assert view.position("a") != far["a"]
+    assert view.position("z") != far["z"]
+    _assert_consistent(view)
+
+
+def test_window_respace_leaves_far_rows_alone(broot):
+    ids = [chr(c) for c in range(ord("a"), ord("z") + 1)]
+    view = broot.open_child("lst", _TightView)
+    view.store(ids)
+    far = {"a": view.position("a"), "z": view.position("z")}
+    for i in range(120):
+        view.insert_after("m", f"x{i}")
+    assert list(view)[:14] == [*ids[:13], "x119"]
+    assert _max_key_len(view) <= view.MAX_KEY_LENGTH
+    assert view.position("a") == far["a"]
+    assert view.position("z") == far["z"]
+    _assert_consistent(view)
+
+
+@pytest.mark.parametrize("backend", SEEKING_BACKENDS)
+def test_respacing_insert_touches_are_bounded(backend, tmp_path):
+    """A respacing insert costs about 2 * RESPACE_WINDOW rows, then inserts cost as before."""
+    storage = _open_storage(backend, tmp_path)
+    try:
+        with storage.transaction() as tx:
+            view = Navigator(storage).root(tx).open_child("lst", EagerFractionalIndexedDictView)
+            view.store(["head", "tail"])
+            i = 0
+            while len(view.position("head" if i == 0 else f"c{i - 1}")) < view.MAX_KEY_LENGTH - 6:
+                view.insert_after("head", f"c{i}")
+                i += 1
+        with storage.transaction() as tx:
+            ctx = CountingContext(tx)
+            view = Navigator(storage).root(ctx).open_child("lst", EagerFractionalIndexedDictView)
+            ctx.reset()
+            view.insert_after("head", "plain")
+            plain = dict(ctx.counts)
+            respacing = None
+            for j in range(60):
+                ctx.reset()
+                view.insert_after("head", f"r{j}")
+                if ctx.counts.get("delete", 0):
+                    respacing = dict(ctx.counts)
+                    break
+            assert respacing is not None
+            window = view.RESPACE_WINDOW
+            assert respacing["delete"] <= 2 * window
+            assert respacing["put"] <= 4 * window + 3
+            assert respacing["scan"] <= 3
+            assert respacing["scan_row"] <= 2 * window + 4
+            assert sum(respacing.values()) <= 100
+            assert len(view.position(f"r{j}")) <= view.RESPACE_TARGET
+            # The next insert is an ordinary one again.
+            ctx.reset()
+            view.insert_after("head", "after")
+            assert dict(ctx.counts) == plain
+            assert _max_key_len(view) <= view.MAX_KEY_LENGTH
+            _assert_consistent(view)
+    finally:
+        storage.close()
+
+
+# ============================================================================
+# PARTIAL STATES: ROWS MISSING BY HAND OR BY A FAILED WRITE
+# ============================================================================
+
+
+class _FailingWriteView(EagerFractionalIndexedDictView):
+    def _write_value(self, address, value):
+        if value == "boom":
+            raise RuntimeError("boom")
+        super()._write_value(address, value)
+
+
+def test_failed_value_write_leaves_no_order_row(broot):
+    view = broot.open_child("lst", _FailingWriteView)
+    view.store({"a": 1, "b": 2})
+    with pytest.raises(RuntimeError, match="boom"):
+        view.insert_after("a", "x", "boom")
+    # Position only: counted and contained, never iterated, no data.
+    assert "x" in view
+    assert list(view) == ["a", "b"]
+    assert list(view.items()) == [("a", 1), ("b", 2)]
+    assert view.extract() == {"a": 1, "b": 2}
+    with pytest.raises(KeyError):
+        view["x"]
+    # The stale position does not block a retry; the retry lands where asked.
+    view.insert_after("a", "x", 3)
+    assert list(view) == ["a", "x", "b"]
+    assert view["x"] == 3
+    _assert_consistent(view)
+
+
+def test_failed_value_write_then_delete_cleans_up(broot):
+    view = broot.open_child("lst", _FailingWriteView)
+    view.store({"a": 1})
+    with pytest.raises(RuntimeError):
+        view.append("x", "boom")
+    del view["x"]
+    assert "x" not in view
+    assert len(view) == 1
+    _assert_consistent(view)
+
+
+def test_data_without_position_is_appended_on_set(fdict):
+    view = fdict("lst", {"a": 1, "b": 2, "c": 3})
+    view._order_container().delete_child_primitive_unsafe(view.position("b"))
+    view._pos_container().delete_child_primitive_unsafe("b")
+    assert "b" not in view
+    assert view["b"] == 2
+    assert list(view) == ["a", "c"]
+    view["b"] = 20
+    assert list(view) == ["a", "c", "b"]
+    assert view["b"] == 20
+    _assert_consistent(view)
+
+
+def test_data_without_position_is_appended_by_update_and_store(fdict):
+    view = fdict("lst", {"a": 1, "b": 2, "c": 3})
+    for lost in ("a", "c"):
+        view._order_container().delete_child_primitive_unsafe(view.position(lost))
+        view._pos_container().delete_child_primitive_unsafe(lost)
+    assert list(view) == ["b"]
+    view.update({"a": 10})
+    view.store({"c": 30}, replace=False)
+    assert list(view) == ["b", "a", "c"]
+    _assert_consistent(view)
+
+
+def test_order_row_without_data_is_skipped_by_items(fdict):
+    view = fdict("lst", {"a": 1, "b": 2, "c": {"n": 3}})
+    view._data_container().delete_child("b")
+    view._data_container().delete_child("c")
+    assert list(view) == ["a", "b", "c"]  # one scan, no per-row data check
+    assert list(view.items()) == [("a", 1)]
+    assert list(view.values()) == [1]
+    assert list(reversed(view.values())) == [1]
+    assert view.extract() == {"a": 1}
+    assert list(view.lazy.items()) == [("a", 1)]
+    view.rebuild_bookkeeping()
+    assert list(view) == ["a"]
+    _assert_consistent(view)
+
+
+# ============================================================================
 # CONCURRENCY: TWO WRITERS AT THE SAME GAP
 # ============================================================================
 
@@ -718,16 +999,17 @@ def observed_storage():
 
 
 class _Hooks:
-    def __init__(self, storage, publisher, observer):
+    def __init__(self, storage, publisher, observer, view_cls=EagerFractionalIndexedDictView):
         self.storage = storage
         self.publisher = publisher
         self.observer = observer
+        self.view_cls = view_cls
         self.nav = Navigator(storage)
         self.hits: dict[str, list] = {}
         self.subs = []
 
     def view(self, ctx):
-        return self.nav.root(ctx).open_child("lst", EagerFractionalIndexedDictView)
+        return self.nav.root(ctx).open_child("lst", self.view_cls)
 
     def watch(self, name, options):
         hits: list = []
@@ -808,6 +1090,37 @@ def test_hooks_fire_on_add_delete_move(observed_storage):
     hits = h.run(lambda v: v.move_after("a", "c"))
     assert hits["children"] == []
     assert hits["change"] == []
+
+
+def test_respacing_insert_fires_children_for_rewritten_rows_only(observed_storage):
+    """A window respace reads as a move of each rewritten row; data never fires."""
+    h = _Hooks(*observed_storage, view_cls=_TightView)
+    with h.storage.transaction() as tx:
+        h.view(tx).store(["head", "tail"])
+    with h.storage.snapshot() as snap:
+        view = h.view(snap)
+        h.watch("children", view.on_children_change())
+        h.watch("change", view.on_change())
+    found = False
+    for i in range(200):
+        with h.storage.snapshot() as snap:
+            before = dict(h.view(snap).positions())
+        hits = h.run(lambda v, i=i: v.insert_after("head", f"c{i}"))
+        with h.storage.snapshot() as snap:
+            after = dict(h.view(snap).positions())
+            order = list(h.view(snap))
+        assert order[:2] == ["head", f"c{i}"]
+        if len(hits["children"]) == 1:
+            continue
+        found = True
+        rewritten = {addr for okey, addr in before.items() if after.get(okey) != addr}
+        assert 1 <= len(rewritten) <= 2 * view.RESPACE_WINDOW
+        # one delete + one put per rewritten row, one put for the new id
+        assert len(hits["children"]) == 2 * len(rewritten) + 1
+        data_hits = [k for k in hits["change"] if "__data__" in k]
+        assert data_hits == [(*view.container.site, "__data__", f"c{i}")]
+        break
+    assert found
 
 
 # ============================================================================
