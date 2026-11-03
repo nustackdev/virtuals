@@ -115,7 +115,11 @@ class RocksDBStorage:
     snapshot is skipped then), so the view is fixed for the snapshot's
     life, up to ``secondary_max_staleness``: once the last catch-up is
     older than that, the next snapshot begin catches up anyway, so
-    overlapping readers cannot freeze the replica. Three things move an
+    overlapping readers cannot freeze the replica. The cost: on a replica
+    with steady readers, a snapshot held longer than the bound is always
+    retired before it finishes, and retrying does not help; give such a
+    reader a larger bound, or ``float("inf")`` to turn the bound off (the
+    replica then freezes for as long as that snapshot lives). Three things move an
     open view: that staleness bound, ``force_catch_up_with_primary``, and
     a read that hits an SST file the primary compacted away, which
     catches up to read at all. Each time every open snapshot loses its
@@ -190,8 +194,10 @@ class RocksDBStorage:
             secondary_max_staleness: Seconds after which a snapshot begin
                 catches up even though snapshots are open, retiring their
                 views (see the class docstring). None means
-                ``max(1.0, 20 * secondary_refresh_interval)``, or never when
-                the refresh interval is None.
+                ``max(5.0, 20 * secondary_refresh_interval)``, or never when
+                the refresh interval is None. Every snapshot on this
+                secondary must finish inside this bound while other readers
+                are active; ``float("inf")`` turns the bound off.
             wal_path: Optional separate WAL directory
             options: ``rdbpy.Options`` kwargs. ``block_cache_mb`` (an int)
                 and ``block_table`` (a dict of block table kwargs) are also
@@ -227,7 +233,7 @@ class RocksDBStorage:
 
         self._secondary_refresh_interval = secondary_refresh_interval
         if secondary_max_staleness is None and secondary_refresh_interval is not None:
-            secondary_max_staleness = max(1.0, 20 * secondary_refresh_interval)
+            secondary_max_staleness = max(5.0, 20 * secondary_refresh_interval)
         self._secondary_max_staleness = secondary_max_staleness
         self._last_catchup_monotonic: float = 0.0
         # Bumped by every catch-up of a secondary: a Snapshot begun under an

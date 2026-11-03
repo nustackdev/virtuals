@@ -18,7 +18,10 @@ an unlock, so neither side starves. A coroutine waiter whose loop is
 blocked (a long sync call on the loop thread) holds up the queue for as
 long as the loop does not run: the slot is handed to it and only its
 loop can take it. Keep loop callbacks short, as the loop already asks.
-A waiter whose loop closed, or whose future ended, is skipped at handoff.
+A waiter whose loop closed, or whose future ended, is skipped at handoff,
+and a grant held by a loop that closed after the handoff is taken back at
+the next acquire. A loop that is stopped but never closed keeps the grant:
+nothing can tell it apart from a loop that is about to run again.
 
 Lifecycle: a storage's ``close()`` calls ``WriterLock.close()``, which
 replaces the slot. Nothing reserved or taken before survives into a
@@ -290,6 +293,10 @@ class WriterLock:
             if waited:
                 self._sync_waiting -= 1
             if lock is not self._lock:
+                if waited:
+                    # A release on the new slot may have unlocked for this
+                    # thread while it was still counted: hand that on.
+                    self._rescue_queue()
                 return False
             self._owner = me
             self._hold = hold
@@ -375,6 +382,20 @@ class WriterLock:
             self._lock.release()
             self._barge_next = False
 
+    def _reclaim_dead_pending(self) -> None:
+        """Take back a grant to a coroutine whose loop has closed since the handoff.
+
+        ``_hand_off`` skips a dead waiter, but a loop that was merely
+        stopped at that moment takes the grant and, closed later, can
+        never run the coroutine to use or hand it on.
+        """
+        pending = self._pending
+        if pending is not None and pending.state == "granted" and pending.loop.is_closed():
+            pending.state = "abandoned"
+            self._pending = None
+            if pending.lock is self._lock:
+                self._release_locked()
+
     def _rescue_queue(self) -> None:
         """A thread stopped waiting: if the lock is free and coroutines are queued, hand it on.
 
@@ -450,6 +471,7 @@ class WriterLock:
             waited = False
         else:
             with self._guard:
+                self._reclaim_dead_pending()
                 lock = self._lock
                 self._sync_waiting += 1
             waited = True
@@ -465,6 +487,7 @@ class WriterLock:
                     # unlocked for it must go to the queue instead.
                     with self._guard:
                         self._sync_waiting -= 1
+                        self._reclaim_dead_pending()
                         self._rescue_queue()
             if not got:
                 raise self._timed_out(timeout, on_loop=on_loop)
@@ -491,7 +514,10 @@ class WriterLock:
             raise self._nested()
         loop = asyncio.get_running_loop()
         with self._guard:
-            if not self._waiters and self._lock.acquire(blocking=False):
+            self._reclaim_dead_pending()
+            # Behind queued coroutines, and behind threads blocked in the
+            # lock: a free lock they are counted on is theirs to take.
+            if not self._waiters and not self._sync_waiting and self._lock.acquire(blocking=False):
                 lock = self._lock
                 if not self._held_by(me, lock):  # pragma: no cover (close under the guard)
                     lock.release()
@@ -508,7 +534,9 @@ class WriterLock:
                 state = waiter.state
                 if state == "waiting":
                     self._waiters.remove(waiter)
-            if state == "waiting":
+            if state in ("waiting", "abandoned"):
+                # Abandoned: a release saw the future already cancelled by
+                # the timeout and skipped this waiter, which holds nothing.
                 if isinstance(e, asyncio.TimeoutError):
                     raise self._timed_out(timeout) from None
                 raise
