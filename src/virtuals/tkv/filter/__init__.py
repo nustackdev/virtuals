@@ -21,9 +21,11 @@ from .filter import (
     filter_from_dict,
     filter_hash,
 )
+from .hints import ALL, RoutingHint
 
 
 __all__ = [
+    "ALL",
     "WILDCARD",
     "And",
     "Filter",
@@ -32,6 +34,7 @@ __all__ = [
     "PassAll",
     "PassNone",
     "PrefixFilter",
+    "RoutingHint",
     "SuffixFilter",
     "WildcardFilter",
     "canonicalize",
