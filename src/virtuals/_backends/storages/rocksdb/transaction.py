@@ -18,6 +18,7 @@ from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin, cla
 
 
 if TYPE_CHECKING:
+    import threading
     from types import TracebackType
 
     from virtuals.tkv.types import Key
@@ -49,18 +50,30 @@ class RocksDBTransaction(
     The rocksdb row locks and snapshot validation underneath are a second
     line of defence: a writer that somehow bypasses the slot surfaces as a
     retryable conflict or lock timeout, never as a silent lost update.
+
+    Commit or abort on every path is the contract. A transaction dropped
+    without either is aborted by its finalizer once it is unreachable
+    (rdbpy rolls the native transaction back on its own), so a forgotten
+    transaction cannot hold the writer slot until the storage closes; that
+    may be much later than the drop, e.g. when a traceback keeps it alive.
     """
 
     __slots__ = ("_aborted", "_committed", "_modified_keys", "_rdbpy_txn")
 
-    def __init__(self, storage: RocksDBStorage, rdbpy_txn: Any) -> None:  # noqa: ANN401
+    def __init__(
+        self,
+        storage: RocksDBStorage,
+        rdbpy_txn: Any,  # noqa: ANN401
+        write_lock: threading.Lock,
+    ) -> None:
         """Initialize transaction.
 
         Args:
             storage: Parent storage instance
             rdbpy_txn: rdbpy transaction handle, begun with a snapshot
+            write_lock: The writer lock the transaction holds for the slot
         """
-        super().__init__(storage, holds_write_slot=True)
+        super().__init__(storage, write_lock=write_lock)
         self._rdbpy_txn: Any | None = rdbpy_txn
         self._modified_keys: set[Key] = set()
         self._committed = False
@@ -147,6 +160,21 @@ class RocksDBTransaction(
             self._aborted = True
             self._mark_closed()
             self._storage._untrack_transaction(self)
+
+    def __del__(self) -> None:
+        """Last resort: end a transaction dropped without commit or abort.
+
+        The object is unreachable, so nothing else can end it. The weak
+        active set forgets it on its own; the storage's state lock is not
+        taken here, since a collection may run on a thread that holds it.
+        """
+        if getattr(self, "_closed", True):
+            return
+        self._aborted = True
+        try:
+            self._mark_closed()
+        except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
+            pass
 
     def __enter__(self) -> RocksDBTransaction:
         """Enter context manager."""

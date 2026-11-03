@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import weakref
 from typing import TYPE_CHECKING
 
 import rdbpy
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ContextBase",
     "ReadOperationsMixin",
+    "ScanHandle",
     "WriteOperationsMixin",
     "classify_rdbpy",
     "is_missing_file_error",
@@ -45,6 +48,12 @@ _LOCK_TIMEOUT = (rdbpy.TimedOut, rdbpy.LockLimit)
 
 # rocksdb::Status::SubCode::kPathNotFound: an IO error on a file that is gone.
 _SUBCODE_PATH_NOT_FOUND = 9
+
+# Orders the one-shot end of a context between its owner, storage close on
+# another thread and the finalizer, so the writer slot is given back once.
+# Reentrant: a collection triggered inside the section may run a finalizer
+# that ends another context on this same thread.
+_END_LOCK = threading.RLock()
 
 
 def classify_rdbpy(e: BaseException, message: str) -> StorageError:
@@ -85,26 +94,58 @@ def is_missing_file_error(e: BaseException) -> bool:
     return isinstance(e, rdbpy.RocksIOError) and e.subcode == _SUBCODE_PATH_NOT_FOUND
 
 
+class ScanHandle:
+    """A scan's native iterator, closable by the context it was begun on.
+
+    The scan generator keeps the handle in its frame, so the context's
+    weak registry forgets it when the scan ends; the context closes it
+    (freeing the iterator and the files it pins) when it ends first. The
+    generator itself stays suspended and raises ``StorageClosedError`` if
+    resumed, as before.
+    """
+
+    __slots__ = ("__weakref__", "iterator")
+
+    def __init__(self, iterator: Any) -> None:  # noqa: ANN401
+        """Wrap a native rdbpy iterator."""
+        self.iterator = iterator
+
+    def close(self) -> None:
+        """Close the native iterator. Idempotent."""
+        self.iterator.close()
+
+
 class ContextBase:
     """Base class for RocksDB transaction, snapshot and batch contexts.
 
     Tracks open/closed state and, for write contexts, the storage's writer
     slot, which is given back when the context closes. Subclasses own
-    their rdbpy handles and drop them in ``_drop_handles``.
+    their rdbpy handles and drop them in ``_drop_handles``. Scans begun on
+    the context are closed with it, so a suspended scan does not keep a
+    native iterator (and the files it pins) alive past the context.
     """
 
-    __slots__ = ("_closed", "_holds_write_slot", "_storage")
+    __slots__ = ("__weakref__", "_closed", "_holds_write_slot", "_scans", "_storage", "_write_lock")
 
-    def __init__(self, storage: RocksDBStorage, *, holds_write_slot: bool = False) -> None:
+    def __init__(
+        self,
+        storage: RocksDBStorage,
+        *,
+        write_lock: threading.Lock | None = None,
+    ) -> None:
         """Initialize context.
 
         Args:
             storage: Parent storage instance
-            holds_write_slot: True if this context holds the storage's
-                in-process writer slot and must release it on close.
+            write_lock: The writer lock this context holds, if it holds the
+                storage's in-process writer slot. It is given back on close,
+                by identity: a lock the storage replaced since (close, fork)
+                is not touched.
         """
         self._storage = storage
-        self._holds_write_slot = holds_write_slot
+        self._write_lock = write_lock
+        self._holds_write_slot = write_lock is not None
+        self._scans: weakref.WeakSet[ScanHandle] | None = None
         self._closed = False
 
     @property
@@ -128,13 +169,38 @@ class ContextBase:
     def _drop_handles(self) -> None:
         """Forget the rdbpy handles. Overridden by subclasses."""
 
+    def _register_scan(self, scan: ScanHandle) -> None:
+        """Remember a scan's iterator, to close with the context."""
+        with _END_LOCK:
+            if self._scans is None:
+                self._scans = weakref.WeakSet()
+            self._scans.add(scan)
+
+    def _close_scans(self) -> None:
+        """Close every live scan iterator of this context, freeing what it pins."""
+        scans = self._scans
+        if not scans:
+            return
+        for scan in list(scans):
+            try:
+                scan.close()
+            except Exception:  # noqa: S110 (iterator already gone with its parent)
+                pass
+
     def _mark_closed(self) -> None:
-        """Mark context as closed, drop its handles, and give back the writer slot."""
-        self._closed = True
+        """Mark context as closed, close its scans, drop its handles, give back the slot.
+
+        Runs once for the slot however many callers race (the owner's end,
+        storage close on another thread, the finalizer).
+        """
+        with _END_LOCK:
+            self._closed = True
+            holds, self._holds_write_slot = self._holds_write_slot, False
+            lock, self._write_lock = self._write_lock, None
+        self._close_scans()
         self._drop_handles()
-        if self._holds_write_slot:
-            self._holds_write_slot = False
-            self._storage._release_write_slot()
+        if holds:
+            self._storage._release_write_slot(lock)
 
     @property
     def is_closed(self) -> bool:
@@ -173,7 +239,9 @@ class ReadOperationsMixin:
     _get_raw: Callable[[bytes], bytes | None]
     _iterator: Callable[..., Any]
 
-    def _read_raw(self, key: Key, action: str, encoded_key: bytes) -> bytes | None:
+    def _read_raw(
+        self, key: Key, action: str, encoded_key: bytes, read: Callable[[bytes], Any] | None = None
+    ) -> Any:  # noqa: ANN401
         """Point read at the context's snapshot, surviving a stale-manifest secondary.
 
         On a read-only secondary, the read can fail because the secondary's
@@ -181,9 +249,17 @@ class ReadOperationsMixin:
         away. That is recoverable: force a catch-up to the current manifest
         and retry. Any other failure, and any failure at all on a primary,
         is classified and raised immediately.
+
+        Args:
+            key: The key, for the error message
+            action: What the caller does, for the error message
+            encoded_key: The key as the codec encodes it
+            read: The native read, ``_get_raw`` by default
         """
+        if read is None:
+            read = self._get_raw
         try:
-            return self._get_raw(encoded_key)
+            return read(encoded_key)
         except Exception as e:
             last = e
         storage = self._storage
@@ -192,10 +268,24 @@ class ReadOperationsMixin:
                 break
             storage.force_catch_up_with_primary()
             try:
-                return self._get_raw(encoded_key)
+                return read(encoded_key)
             except Exception as e:
                 last = e
         raise classify_rdbpy(last, f"Failed to {action} key {key}") from last
+
+    def _key_present(self, encoded_key: bytes) -> bool:
+        """True if the key is at the context's view, without fetching its value.
+
+        A keys-only cursor seeked to the key reads the key alone, so
+        ``exists`` on a large value costs no more than on a small one
+        (rocksdb has no exact point exists; this is the cheapest it offers).
+        """
+        iterator = self._iterator(keys_only=True, reverse=False)
+        try:
+            iterator.seek(encoded_key)
+            return bool(iterator.valid()) and iterator.key() == encoded_key
+        finally:
+            iterator.close()
 
     def get(self, key: Key) -> Value | Empty:
         """Get value by key.
@@ -230,7 +320,7 @@ class ReadOperationsMixin:
             raise StorageOperationError(f"Failed to decode value for key {key}: {e}") from e
 
     def exists(self, key: Key) -> bool:
-        """Check if key exists.
+        """Check if key exists, without reading its value.
 
         Args:
             key: Key to check
@@ -250,7 +340,7 @@ class ReadOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        return self._read_raw(key, "check", encoded_key) is not None
+        return self._read_raw(key, "check", encoded_key, self._key_present)
 
     def multiget(self, keys: list[Key]) -> dict[Key, Value]:
         """Get multiple keys.
@@ -341,8 +431,9 @@ class WriteOperationsMixin:
     def delete(self, key: Key) -> None:
         """Delete key (idempotent).
 
-        Silent if key doesn't exist (never raises for missing keys), and
-        notifies only when something was there to delete.
+        Silent if key doesn't exist (never raises for missing keys). The
+        key is notified on commit whether or not something was there, as a
+        batch delete does; a subscriber re-reads on wake either way.
 
         Args:
             key: Key to delete
@@ -360,8 +451,6 @@ class WriteOperationsMixin:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
         try:
-            if self._rdbpy_txn.get(encoded_key) is None:
-                return
             self._rdbpy_txn.delete(encoded_key)
         except Exception as e:
             raise classify_rdbpy(e, f"Failed to delete key {key}") from e

@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from logging import getLogger
 from pathlib import Path
@@ -79,6 +80,12 @@ _TXN_OPTION_ALIASES = {
 }
 
 
+def _is_lock_file_error(e: BaseException) -> bool:
+    """True if an open failed on the directory's LOCK file: it is open elsewhere."""
+    text = str(e)
+    return isinstance(e, rdbpy.RocksIOError) and ("LOCK" in text or "lock hold" in text)
+
+
 class RocksDBStorage:
     """RocksDB storage implementation conforming to StorageProtocol.
 
@@ -103,8 +110,12 @@ class RocksDBStorage:
     the task or thread that already holds the slot raises
     ``StorageNestedTransactionError``; a sync begin while another task on
     the same loop holds it raises ``StorageLockTimeoutError`` at once. A
-    sync writer on another thread blocks for up to ``busy_timeout``.
-    Write batches take the slot for the duration of ``write``.
+    sync writer on another thread blocks for up to ``busy_timeout``, except
+    on an event loop thread, where a sync begin or batch write waits at
+    most ``LOOP_THREAD_WAIT_CAP`` for a holder on another thread before
+    raising ``StorageLockTimeoutError`` (retryable), so the loop is never
+    stalled for long. Write batches take the slot for the duration of
+    ``write``.
 
     Process model: single-process. RocksDB locks its directory, so one
     process opens a storage read-write; others open it as a read-only
@@ -204,8 +215,10 @@ class RocksDBStorage:
         self._db: rdbpy.TransactionDB | rdbpy.DB | None = None
         self._state_lock = threading.Lock()
         self._writer = WriterLock("RocksDB")
-        self._active_transactions: set[RocksDBTransaction] = set()
-        self._active_write_batches: set[RocksDBWriteBatch] = set()
+        # Weak: a transaction or batch dropped without an end must be
+        # collectable, the transaction's finalizer then frees the slot.
+        self._active_transactions: weakref.WeakSet[RocksDBTransaction] = weakref.WeakSet()
+        self._active_write_batches: weakref.WeakSet[RocksDBWriteBatch] = weakref.WeakSet()
         self._active_snapshots: set[RocksDBSnapshot] = set()
         self._opened = False
         self._pid = os.getpid()
@@ -241,6 +254,10 @@ class RocksDBStorage:
         options_dict = dict(self._options_dict)
         if "create_if_missing" not in options_dict:
             options_dict["create_if_missing"] = self._create_if_missing
+        if self._read_only:
+            # rocksdb creates the directory on a read-only open too when
+            # asked to; a read-only open of a missing path must leave nothing.
+            options_dict["create_if_missing"] = False
 
         block_table_kwargs = options_dict.pop("block_table", None)
         if block_table_kwargs:
@@ -284,6 +301,12 @@ class RocksDBStorage:
         except TypeError as e:
             raise StorageError(f"Invalid TransactionDB options: {e}") from e
         except Exception as e:
+            if _is_lock_file_error(e):
+                raise StorageError(
+                    "RocksDB is single-process and this database is already open, in this "
+                    "process or another. Open it once and share the storage, or open a "
+                    f"read-only secondary (read_only=True, secondary_path=...): {e}"
+                ) from e
             raise StorageError(f"Failed to open RocksDB TransactionDB: {e}") from e
 
     def _open_read_only_db(self, options: rdbpy.Options) -> None:
@@ -337,13 +360,19 @@ class RocksDBStorage:
         if self._opened:
             return
 
-        # Create directories
-        try:
-            self._path.mkdir(parents=True, exist_ok=True)
-            if self._wal_path is not None:
-                self._wal_path.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            raise StorageError(f"Failed to create database directories: {e}") from e
+        # Create directories, only for an open that may create the database:
+        # a read-only open of a missing path must fail without leaving an
+        # empty directory behind for a later read-write open to adopt.
+        creates = not self._read_only and self._options_dict.get(
+            "create_if_missing", self._create_if_missing
+        )
+        if creates:
+            try:
+                self._path.mkdir(parents=True, exist_ok=True)
+                if self._wal_path is not None:
+                    self._wal_path.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                raise StorageError(f"Failed to create database directories: {e}") from e
 
         options = self._build_options()
 
@@ -367,7 +396,10 @@ class RocksDBStorage:
         iterators, and then nothing is touched and the storage stays open.
         Once the database is closed (rdbpy rolls back its transactions and
         releases its snapshots), open transactions, snapshots and batches
-        are marked ended and the writer slot is given back.
+        are marked ended and the writer slot is replaced: a slot reserved
+        but never taken, or held by a context still finishing elsewhere,
+        does not survive into a reopen, and a writer waiting on it wakes
+        with ``StorageClosedError``.
 
         Raises:
             StorageError: If close fails, e.g. a call is still in flight on
@@ -415,6 +447,8 @@ class RocksDBStorage:
                 write_batch.abort()
             except Exception as e:
                 logger.error(f"Write batch abort failed during close: {e}")
+
+        self._writer.close()
 
     def _forget_inherited(self) -> None:
         """Close in a forked child: forget the parent's handles, free nothing native."""
@@ -590,9 +624,10 @@ class RocksDBStorage:
             raise StorageError(f"Invalid transaction options: {e}") from e
         except Exception as e:
             give_back_slot()
-            raise StorageError(f"Failed to begin transaction: {e}") from e
+            # A database closed under us is StorageClosedError, not a generic failure.
+            raise classify_rdbpy(e, "Failed to begin transaction") from e
 
-        transaction = RocksDBTransaction(self, rdbpy_txn)
+        transaction = RocksDBTransaction(self, rdbpy_txn, self._writer.lock)
         with self._state_lock:
             self._active_transactions.add(transaction)
         return transaction
@@ -665,7 +700,13 @@ class RocksDBStorage:
             give_back_slot()
 
     def _release_write_slot(self, lock: Any = None) -> None:  # noqa: ANN401
-        """Release the in-process writer slot."""
+        """Release the in-process writer slot.
+
+        Args:
+            lock: The lock the caller acquired, if known. Nothing is
+                released when it is no longer the storage's lock (a close
+                or a fork replaced the slot since).
+        """
         self._writer.release(lock)
 
     @contextmanager

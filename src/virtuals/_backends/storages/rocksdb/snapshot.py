@@ -67,7 +67,7 @@ class RocksDBSnapshot(ContextBase, ReadOperationsMixin):
         )
 
     def close(self) -> None:
-        """Close snapshot and release the rocksdb snapshot.
+        """Close snapshot: close its scans, then release the rocksdb snapshot.
 
         Raises:
             StorageError: If close fails
@@ -75,6 +75,7 @@ class RocksDBSnapshot(ContextBase, ReadOperationsMixin):
         if self._closed:
             return
 
+        self._close_scans()  # their iterators pin files past the snapshot otherwise
         snapshot = self._snapshot
         try:
             if snapshot is not None:
