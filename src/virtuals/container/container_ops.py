@@ -29,6 +29,7 @@ from __future__ import annotations
 from logging import getLogger
 from typing import TYPE_CHECKING, cast
 
+from virtuals.loc.constants import DATA_ROOT, METADATA_ROOT
 from virtuals.tkv.filter import LengthFilter, PrefixFilter
 from virtuals.tkv.storage import StorageScanOptions
 from virtuals.types import EMPTY, Empty, Value
@@ -62,7 +63,7 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from virtuals.loc import site as site_
-    from virtuals.tkv.storage import StorageContextType
+    from virtuals.tkv.storage import ReadWriteAccessProtocol, StorageContextType
 
 __all__ = [
     "clear_children",
@@ -223,7 +224,12 @@ def delete_container(site: site_.Site, ctx: StorageContextType) -> None:
 
 
 def delete_descendants(site: site_.Site, ctx: StorageContextType) -> None:
-    """Delete site and all descendants.
+    """Delete site and all descendants, with their metadata.
+
+    For a site in the data tree the mirrored ``/m`` subtree goes too, so a
+    view opened later at the same site (of any type) starts from a clean
+    slate instead of inheriting bookkeeping left by a previous occupant.
+    Two bounded prefix scans, one per tree; no backend has a range delete.
 
     Idempotent: silent if nothing exists at site.
 
@@ -236,18 +242,23 @@ def delete_descendants(site: site_.Site, ctx: StorageContextType) -> None:
     """
     rwctx = require_readwrite_context(ctx)
 
-    # Scan all descendants (including site itself)
+    _delete_subtree(site, rwctx)
+    if site and site[0] == DATA_ROOT:
+        _delete_subtree((METADATA_ROOT, *site[1:]), rwctx)
+
+    logger.debug("Descendants deleted", extra={"site": site})
+
+
+def _delete_subtree(site: site_.Site, rwctx: ReadWriteAccessProtocol) -> None:
+    """Delete every key under ``site`` (``site`` itself included)."""
     prefix = PrefixFilter(prefix=site)
     scan_opts = StorageScanOptions(
         start=site,
         break_filter=prefix,
         filter=prefix,
     )
-
     for key in rwctx.scan(scan_opts).keys():
         rwctx.delete(key)
-
-    logger.debug("Descendants deleted", extra={"site": site})
 
 
 def move_child_subtree(
