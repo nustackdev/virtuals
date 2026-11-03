@@ -773,6 +773,16 @@ def test_set_child_container_as_nested_empty_leaves_no_partial_child(root, view_
         assert len(view) == 1
         assert list(view) == [keep]
         assert not view.open_child(bad, EagerDictView).container.exists()
+    # a lazy iterable is materialized and checked before the first write
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.set_child_container_as(bad, (x for x in [1, {"y": EMPTY}]), EagerListView)
+    assert _rows_under(view) == rows
+    assert bad not in view
+    assert list(view) == [keep]
+    assert not view.open_child(bad, EagerListView).container.exists()
+    # and a clean lazy iterable is stored once, whole
+    view.set_child_container_as(bad, (x for x in [1, 2]), EagerListView)
+    assert view.open_child(bad, EagerListView).extract() == [1, 2]
 
 
 @pytest.mark.parametrize("view_cls", SCA_VIEWS)
@@ -780,6 +790,8 @@ def test_set_child_container_as_nested_empty_on_absent_view_leaves_it_absent(roo
     view = root.open_child("absent", view_cls)
     with pytest.raises(ValueError, match="EMPTY"):
         view.set_child_container_as(_key(view_cls, 1), {"bad": EMPTY}, EagerDictView)
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.set_child_container_as(_key(view_cls, 1), (x for x in [EMPTY]), EagerListView)
     assert not view.container.exists()
     assert _rows_under(view) == []
     assert len(view) == 0

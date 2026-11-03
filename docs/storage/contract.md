@@ -45,20 +45,20 @@ See [notify](notify.md). In short: notify after commit, subscribe ready on retur
 
 ## 6. Existence and EMPTY
 
-- `EMPTY` is the absent sentinel. A read of a missing key returns it. It is never stored: every write door, the container's unsafe put and metadata put included, raises `ValueError` on an EMPTY value, nested EMPTY included, before anything is written. A rejected write on an absent view leaves it absent. Delete the key instead.
+- `EMPTY` is the absent sentinel. A read of a missing key returns it. Doors that check: every public view write (`__setitem__`, `store`, `update`, `append`, `prepend`, `insert`, `insert_before`, `insert_after`, `extend`, `add`, `set_primitive`, `set_child_container_as`), and the container's `put_child_primitive`, `put_child_primitive_unsafe` and `put_metadata`. They raise `ValueError` on an EMPTY value, nested EMPTY included, before anything is written; a lazy iterable is materialized first. A rejected write on an absent view leaves it absent. Delete the key instead. Doors that do not check: the raw storage `tx.put` (layer 1 has no sentinel) and the view's private `_unsafe_primitive_write`.
 - `None` is a stored value. An empty container is not absent: primitive and flat views store `{}` and `[]` as values, collection views exist once their marker row does, even with no children.
 - Navigation is lazy. Building `a.b.c` through `open_child` touches no storage.
-- Existence is one read: `view.container.exists()` reads the marker row. An absent container reads as empty, writes into it create it, subscriptions on it work. A list watch on a non-negative index names a slot and works before the list or the slot exists; a negative index needs the length.
+- Existence is one read: `view.container.exists()` reads the marker row. An absent container reads as empty, writes into it create it, subscriptions on it work. A `ListView` watch on a non-negative index names a slot and works before the list or the slot exists; a negative index needs the length. `ByteArrayView` still resolves every index against its length.
 - Writes into an absent container create it.
 - A key keeps its kind. Writing a compound value over a primitive key, or a primitive over a compound key, raises `ContainerTypeError` and changes nothing. Delete the key first. Compound over compound replaces.
 
 ## 7. Cost
 
 - A point access by key is O(1) for the contract's purposes (one b-tree lookup).
-- No write op of a dict view scans or shifts siblings. Delete is a point delete. Dicts keep no stored length: `len()` is a live count of the children's rows, O(children), and skips each child's subtree. `bool()` is one seek.
+- No write op of a dict view scans or shifts siblings. Delete is a point delete. Dicts keep no stored length: `len()` on DictView, FlatDictView, LightDictView, LogIndexedDictView and FractionalIndexedDictView is a live count of the children's rows, O(children), and skips each child's subtree. `bool()` is one seek. Kh57View and IndexedDictView read a stored count instead (see below).
 - Child iteration is O(children), not O(descendants).
 - Paging returns exactly `limit`: `keys(after=, limit=)` and `keys_reverse(before=, limit=)` on `LogIndexedDictView` and `FractionalIndexedDictView` yield `limit` keys when that many exist, whether or not the cursor row still exists, and read at most `limit + 2` rows.
-- Known exceptions, pinned by tests: `IndexedDictView.__delitem__` rewrites its key list (O(n)) and its `len()` reads a stored length. `ListView` and `ByteArrayView` insert and delete in the middle shift the tail (O(n)). Use `FractionalIndexedDictView` for ordered collections.
+- Known exceptions, pinned by tests: `IndexedDictView.__delitem__` rewrites its key list (O(n)) and its `len()` reads a stored length. `Kh57View` keeps a stored count too (`len()` and `bool()` are one get). `ListView` and `ByteArrayView` insert and delete in the middle shift the tail (O(n)); `ListView` and `SetView` read a stored count. Use `FractionalIndexedDictView` for ordered collections.
 
 ## Key limits
 

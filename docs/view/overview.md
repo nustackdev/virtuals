@@ -232,12 +232,12 @@ events = queue.extract()
 
 The same on every view and every backend. Pinned by `tests/views/test_dict_views_hardening.py`.
 
-- `EMPTY` is never stored. Any write of `EMPTY`, at the top or nested inside a dict or list, raises `ValueError` before anything is written. `__setitem__`, `store`, `update`, `append`, `insert`, `extend`, `add`, `set_primitive` and `set_child_container_as` all check first. A rejected write on an absent view leaves it absent. To remove a key, delete it.
+- `EMPTY` is never stored. Any write of `EMPTY`, at the top or nested inside a dict, list or lazy iterable, raises `ValueError` before anything is written. `__setitem__`, `store`, `update`, `append`, `prepend`, `insert`, `insert_before`, `insert_after`, `extend`, `add`, `set_primitive` and `set_child_container_as` all check first; so do the container's `put_child_primitive`, `put_child_primitive_unsafe` and `put_metadata`. The private `_unsafe_primitive_write` and the raw storage `put` do not. A rejected write on an absent view leaves it absent. To remove a key, delete it.
 - `None` is a value. `view["k"] = None` stores it and `"k" in view` is true.
 - A key keeps its kind. `d["p"] = 1` then `d["p"] = {"z": 1}` raises `ContainerTypeError`, and so does the reverse. Nothing changes. Delete the key, then set it. Compound over compound replaces the whole value.
 - Writes create. Setting into an absent view creates it. A delete of a missing key creates nothing: DictView, FlatDictView and LightDictView are silent, the index views and Kh57View raise `KeyError`.
 - Existence is one read: `view.container.exists()`. Opening a chain of children touches no storage.
-- `len()` counts live rows (O(children)). `bool()` is one seek. Paging with `keys(after=, limit=)` on the log and fractional views returns exactly `limit` keys when they exist.
+- `len()` on DictView, FlatDictView, LightDictView, LogIndexedDictView and FractionalIndexedDictView counts live rows (O(children)); Kh57View, IndexedDictView, ListView and SetView read a stored count. `bool()` is one storage op on every view. Paging with `keys(after=, limit=)` on the log and fractional views returns exactly `limit` keys when they exist.
 - `IndexedDictView` delete and `ListView` insert or delete in the middle are O(n). Use `FractionalIndexedDictView` for ordered collections.
 
 ## How It Uses Layer 2
