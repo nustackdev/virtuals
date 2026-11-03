@@ -39,19 +39,36 @@ every rewritten row (one delete and one put per row) as if those ids had
 moved, though their relative order is unchanged.
 
 Partial states. An insert writes ``__pos__``, then the value, then
-``__order__``, so a failed value write leaves no order row: the id is
-``in`` the view and counted by ``len`` but not iterated; ``append`` (or
-``del``) repairs it. ``items``, ``values`` and ``extract`` skip order rows
-whose data is missing; ``iter`` and ``keys`` do not check (one scan, no
-gets). Setting an id that has data but no position appends it.
-``rebuild_bookkeeping()`` repairs everything in O(n).
+``__order__``; if the value write raises, the position is deleted again
+before the error propagates, so the id is absent (not ``in``, not
+counted, not iterated) and a retry inserts it as if new. A position
+without an order row can still appear through bypass writes; such an id
+is ``in`` the view and counted by ``len`` but not iterated, and a plain
+set does not repair it (the id has data and a position, so set keeps it
+as is): delete it and insert again, or call ``rebuild_bookkeeping()``.
+``items``, ``values`` and ``extract`` skip order rows whose data is
+missing; ``iter`` and ``keys`` do not check (one scan, no gets). Setting
+an id that has data but no position appends it. ``rebuild_bookkeeping()``
+repairs everything in O(n).
 
 Concurrency. Two writers inserting at the same gap get distinct keys
-(random tail) and both land in the gap. The mem backend has no write
-conflicts, so two transactions inserting the same id there both commit
-and the second ``__pos__`` write wins (last-writer-wins, two order rows
-for one id until ``rebuild_bookkeeping()``); sqlite and rocksdb reject
-the second writer.
+(random tail) and both land in the gap. That holds as long as nobody
+respaces: a window respace (only when a fresh key passes
+``MAX_KEY_LENGTH``) deletes and rewrites the order rows of up to
+``RESPACE_WINDOW`` neighbours on each side of its gap, and a concurrent
+insert or move whose neighbour lies inside that window is placed
+relative to a key the respace removes. Both commit (the plain insert
+touches none of the rewritten rows, so no backend sees a conflict); the
+item stays present exactly once, but its position can shift into the
+rewritten range, next to the respacing gap instead of next to its
+neighbour. This is accepted: it needs a key at the cap and a concurrent
+write inside the window, and the alternative (writing the neighbour's
+order row on every insert to force a conflict) would serialize every
+same-gap insert. The mem backend has no write conflicts, so two
+transactions inserting the same id there both commit and the second
+``__pos__`` write wins (last-writer-wins, two order rows for one id
+until ``rebuild_bookkeeping()``); sqlite and rocksdb reject the second
+writer.
 """
 
 from __future__ import annotations
@@ -273,6 +290,13 @@ class FractionalIndexedDictViewBase(
         times, then the whole collection is respaced. Relative order never
         changes; every rewritten row is one order delete, one order put and
         one pos put.
+
+        A concurrent transaction that inserts or moves next to a row inside
+        the window computed its key against an order key this rewrite
+        removes. Nothing conflicts (it writes none of the rewritten rows),
+        so both commit and its item ends up inside the rewritten range,
+        next to this gap, rather than next to its neighbour. Documented in
+        the module docstring; accepted rather than forced into a conflict.
         """
         window = self.RESPACE_WINDOW
         for k in (window, 4 * window, None):
@@ -512,10 +536,11 @@ class FractionalIndexedDictViewBase(
         self._populate_child_container(address, value, view_class=view_class)
 
     def _insert(self, address: Address, value: object, prev: str | None, nxt: str | None) -> None:
-        """Position, then value, then order row, so a failed value write is not iterated.
+        """Position, then value, then order row; a failed value write undoes the position.
 
-        A position whose order row is missing (an earlier insert whose value
-        write failed) is stale and gets overwritten rather than refused.
+        A position whose order row is missing (a bypass write, or a delete
+        that stopped half way) is stale and gets overwritten rather than
+        refused.
         """
         stale = self._position_or_empty(address)
         if not is_empty(stale) and not is_empty(
@@ -523,10 +548,14 @@ class FractionalIndexedDictViewBase(
         ):
             raise ValueError(f"{address!r} is already in the collection")
         okey = self._allot(prev, nxt)
-        self._pos_container().put_child_primitive(
-            address, okey, validate=False, validate_parent=False
-        )
-        self._write_value(address, value)
+        pc = self._pos_container()
+        pc.put_child_primitive(address, okey, validate=False, validate_parent=False)
+        try:
+            self._write_value(address, value)
+        except BaseException:
+            # Leave no position behind: the id must not be `in` or counted.
+            pc.delete_child_primitive_unsafe(address)
+            raise
         self._order_container().put_child_primitive(
             okey, address, validate=False, validate_parent=False
         )
