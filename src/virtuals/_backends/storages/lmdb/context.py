@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, Any
 
 from virtuals.tkv.storage import (
@@ -17,6 +18,11 @@ if TYPE_CHECKING:
     from virtuals.tkv.types import Key, Value
 
     from .storage import LMDBStorage
+
+
+# Guards the check-and-clear of ``_holds_write_slot``: close() may abort a
+# context from another thread while its owner commits it.
+_SLOT_FLAG_LOCK = threading.Lock()
 
 
 __all__ = [
@@ -75,8 +81,9 @@ class ContextBase:
         """Mark context as closed, clear handle, and give back the writer slot."""
         self._closed = True
         self._lmdb_txn = None
-        if self._holds_write_slot:
-            self._holds_write_slot = False
+        with _SLOT_FLAG_LOCK:
+            holds, self._holds_write_slot = self._holds_write_slot, False
+        if holds:
             self._storage._release_write_slot()
 
     @property

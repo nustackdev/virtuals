@@ -676,3 +676,9 @@ def test_to_thread_nested_raises_fast(storage: SQLiteStorage) -> None:
 @pytest.mark.timeout(10)
 def test_asyncio_run_inside_sync_txn_is_nested(storage: SQLiteStorage) -> None:
     cases.asyncio_run_inside_sync_txn_is_nested(storage)
+
+
+@pytest.mark.timeout(10)
+def test_racing_ends_release_slot_once(storage: SQLiteStorage) -> None:
+    tx = storage.begin_transaction()
+    cases.racing_ends_release_once(storage, tx, lambda t: t._end("ROLLBACK"), "_holds_write_lock")

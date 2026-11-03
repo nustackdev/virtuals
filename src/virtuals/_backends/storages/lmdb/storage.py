@@ -6,6 +6,7 @@ MVCC snapshots, and optional change notifications via a publisher.
 
 from __future__ import annotations
 
+import os
 import threading
 from contextlib import contextmanager
 from logging import getLogger
@@ -151,6 +152,7 @@ class LMDBStorage:
         self._active_write_batches: set[LMDBWriteBatch] = set()
         self._active_snapshots: set[LMDBSnapshot] = set()
         self._opened = False
+        self._pid = os.getpid()
 
     @property
     def read_only(self) -> bool:
@@ -197,7 +199,30 @@ class LMDBStorage:
             except Exception as e:
                 raise StorageError(f"Failed to open LMDB environment: {e}") from e
 
+            self._pid = os.getpid()
             self._opened = True
+
+    def _check_fork(self) -> None:
+        """Drop writer state inherited across a fork.
+
+        A writer slot held by a parent thread would never be released in
+        the child. If this process is not the one that opened the storage,
+        the slot is reset and the parent's open contexts are forgotten, not
+        ended: aborting them here would write to the lock file the parent
+        still uses (its reader slots). py-lmdb frees nothing for objects
+        inherited across a fork, and it refuses a second open of the same
+        files in one process, so the child keeps the inherited environment.
+        """
+        if self._pid == os.getpid():
+            return
+        with self._env_lock:
+            if self._pid == os.getpid():
+                return
+            self._active_transactions = set()
+            self._active_write_batches = set()
+            self._active_snapshots = set()
+            self._writer.reset()
+            self._pid = os.getpid()
 
     def close(self) -> None:
         """Close database and release all resources."""
@@ -283,6 +308,7 @@ class LMDBStorage:
     def begin_snapshot(self) -> LMDBSnapshot:
         """Begin read-only snapshot."""
         self._require_open()
+        self._check_fork()
 
         with self._env_lock:
             try:
@@ -306,6 +332,7 @@ class LMDBStorage:
             raise StorageError("Cannot start transaction in read only mode.")
 
         self._require_open()
+        self._check_fork()
 
         lmdb_txn = self._begin_write(write_slot, StorageError, "transaction")
         transaction = LMDBTransaction(self, lmdb_txn)
@@ -333,6 +360,7 @@ class LMDBStorage:
         if self._read_only:
             raise StorageError("Cannot reserve the write slot in read only mode.")
         self._require_open()
+        self._check_fork()
         lock = await self._writer.areserve(self._busy_timeout)
         return LMDBWriteSlot(self, lock)
 
@@ -342,6 +370,7 @@ class LMDBStorage:
             raise StorageError("Cannot start write batch in read only mode.")
 
         self._require_open()
+        self._check_fork()
 
         lmdb_txn = self._begin_write(None, StorageOperationError, "write batch")
         write_batch = LMDBWriteBatch(self, lmdb_txn)

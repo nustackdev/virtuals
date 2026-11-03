@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from typing import TYPE_CHECKING, Any
 
 from virtuals.tkv.storage import (
@@ -19,6 +20,11 @@ if TYPE_CHECKING:
     from virtuals.tkv.types import Key, Value
 
     from .storage import SQLiteStorage
+
+
+# Guards taking the connection and ``_holds_write_lock`` in ``_end``:
+# close() may abort a context from another thread while its owner commits.
+_END_LOCK = threading.Lock()
 
 
 __all__ = [
@@ -91,25 +97,32 @@ class ContextBase:
             raise StorageClosedError("Context handle is invalid")
         return self._conn
 
-    def _end(self, sql: str) -> None:
+    def _end(self, sql: str) -> bool:
         """Run COMMIT or ROLLBACK, then give back the connection and writer slot.
 
         The connection and slot are released even when the statement fails,
         so a failed commit never strands the writer lock. On a failed commit
-        the pool rolls the connection back before reusing it.
+        the pool rolls the connection back before reusing it. Only one of
+        two racing calls (close aborting while the owner commits) takes the
+        connection and the slot, so each is given back once.
+
+        Returns:
+            True if this call ran ``sql``; False if there was no connection
+            (none taken yet, or a racing call took it).
         """
-        conn = self._conn
+        with _END_LOCK:
+            conn, self._conn = self._conn, None
+            holds, self._holds_write_lock = self._holds_write_lock, False
         try:
             if conn is not None:
                 conn.execute(sql)
         finally:
             self._closed = True
-            self._conn = None
             if conn is not None:
                 self._storage._release_connection(conn)
-            if self._holds_write_lock:
-                self._holds_write_lock = False
+            if holds:
                 self._storage._release_write_slot()
+        return conn is not None
 
     @property
     def is_closed(self) -> bool:
