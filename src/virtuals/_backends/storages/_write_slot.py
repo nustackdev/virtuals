@@ -5,13 +5,20 @@ per database at a time. Writers in one process queue on this slot before
 they reach the backend, so threads hand off directly and coroutines wait
 without blocking their event loop.
 
-The slot is fair: waiters form one FIFO queue, threads and coroutines
-alike, and a release hands the slot to the head of the queue instead of
-unlocking into a free-for-all. A coroutine that polled for a free slot
-would never see one next to a thread writing in a loop (the slot is free
-for microseconds between two of its transactions); with the handoff it
-gets the slot after at most one transaction of every waiter ahead of it.
-A late arrival takes a free slot directly only when nobody is queued.
+Threads compete for the lock itself: a sync ``acquire`` blocks in the
+native lock and takes it the instant it is free, with no thread switch per
+release. Coroutines cannot compete that way: one that polled for a free
+slot would never see one next to a thread writing in a loop (the slot is
+free for microseconds between two of its transactions). So coroutines
+join a FIFO queue, and a release hands the slot to the head of that queue
+without unlocking in between. A queued coroutine therefore lands after at
+most one transaction of the current holder. While a coroutine is queued
+and threads are also waiting, releases alternate between a handoff and
+an unlock, so neither side starves. A coroutine waiter whose loop is
+blocked (a long sync call on the loop thread) holds up the queue for as
+long as the loop does not run: the slot is handed to it and only its
+loop can take it. Keep loop callbacks short, as the loop already asks.
+A waiter whose loop closed, or whose future ended, is skipped at handoff.
 
 Lifecycle: a storage's ``close()`` calls ``WriterLock.close()``, which
 replaces the slot. Nothing reserved or taken before survives into a
@@ -106,35 +113,36 @@ def _set_future(future: asyncio.Future) -> None:
 
 
 class _Waiter:
-    """One queued acquirer: a thread woken by an event, or a coroutine by a future.
+    """One queued coroutine, woken through a future on its loop.
 
     ``state`` moves under the writer's guard, exactly once, from
     ``waiting`` to ``granted`` (the slot was handed over: ``lock`` is the
-    lock now held on the waiter's behalf) or ``closed`` (the storage
-    closed). The event or future is only the wake-up; the state is what a
-    waiter that woke for any other reason (timeout, cancellation) reads.
+    lock now held on the waiter's behalf), ``closed`` (the storage
+    closed) or ``abandoned`` (its loop or future was gone at handoff).
+    The future is only the wake-up; the state is what a waiter that woke
+    for any other reason (timeout, cancellation, loop teardown) reads.
     """
 
-    __slots__ = ("event", "future", "lock", "loop", "state")
+    __slots__ = ("future", "lock", "loop", "state")
 
-    def __init__(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
-        self.future: asyncio.Future | None = None if loop is None else loop.create_future()
-        self.event: threading.Event | None = threading.Event() if loop is None else None
+        self.future: asyncio.Future = loop.create_future()
         self.lock: threading.Lock | None = None
-        self.state: Literal["waiting", "granted", "closed"] = "waiting"
+        self.state: Literal["waiting", "granted", "closed", "abandoned"] = "waiting"
 
-    def wake(self) -> None:
-        if self.event is not None:
-            self.event.set()
-            return
-        loop, future = self.loop, self.future
-        if loop is None or future is None:
-            return
+    @property
+    def dead(self) -> bool:
+        """True if nothing can take a grant: the loop closed or the future ended."""
+        return self.loop.is_closed() or self.future.done()
+
+    def wake(self) -> bool:
+        """Schedule the wake-up on the waiter's loop; False if the loop is gone."""
         try:
-            loop.call_soon_threadsafe(_set_future, future)
-        except RuntimeError:  # the loop is closed: nothing left to wake
-            pass
+            self.loop.call_soon_threadsafe(_set_future, self.future)
+        except RuntimeError:  # the loop is closed
+            return False
+        return True
 
 
 class _SlotStorage(Protocol):
@@ -169,7 +177,17 @@ class WriterLock:
     never both.
     """
 
-    __slots__ = ("_guard", "_hold", "_label", "_lock", "_owner", "_waiters")
+    __slots__ = (
+        "_barge_next",
+        "_guard",
+        "_hold",
+        "_label",
+        "_lock",
+        "_owner",
+        "_pending",
+        "_sync_waiting",
+        "_waiters",
+    )
 
     def __init__(self, label: str) -> None:
         """Initialize a free slot.
@@ -185,7 +203,14 @@ class WriterLock:
         self._lock = threading.Lock()
         self._owner: _Owner | None = None
         self._hold: _Hold | None = None
+        # Coroutines waiting for a handoff, in arrival order.
         self._waiters: deque[_Waiter] = deque()
+        # The coroutine the slot was handed to and that has not taken it yet.
+        self._pending: _Waiter | None = None
+        # Threads blocked in the native lock right now.
+        self._sync_waiting = 0
+        # After a handoff, the next release unlocks for the waiting threads.
+        self._barge_next = False
 
     @property
     def lock(self) -> threading.Lock:
@@ -197,13 +222,16 @@ class WriterLock:
 
         Takes no lock: the inherited ones may be held by threads that do
         not exist in this process. Every lock is replaced, and the queue
-        (waiters are parent threads and tasks) is dropped.
+        (waiters are parent tasks) is dropped.
         """
         self._guard = threading.RLock()
         self._lock = threading.Lock()
         self._owner = None
         self._hold = None
         self._waiters = deque()
+        self._pending = None
+        self._sync_waiting = 0
+        self._barge_next = False
 
     def close(self) -> None:
         """Replace the slot, so nothing reserved or taken before survives a reopen.
@@ -212,19 +240,24 @@ class WriterLock:
         recorded holder still there (a reserved slot no transaction took, or
         a context finishing on another thread) loses the slot: its lock is
         released here on its behalf and the holder's own release is a no-op
-        from now on. Every queued waiter wakes with ``StorageClosedError``,
-        at once instead of after ``busy_timeout``. A waiter the slot was
-        handed to just before sees the lock is not the slot any more and
-        raises the same.
+        from now on. The same for a handoff in flight: the lock is released
+        here and the coroutine it was handed to wakes to a closed storage.
+        Every waiter, a thread blocked in the old lock or a queued
+        coroutine, wakes with ``StorageClosedError`` at once instead of
+        after ``busy_timeout``.
         """
         with self._guard:
             old, self._lock = self._lock, threading.Lock()
             had_owner = self._owner is not None
             self._owner = None
             self._hold = None
+            pending, self._pending = self._pending, None
             waiters, self._waiters = self._waiters, deque()
-            if had_owner:
+            self._barge_next = False
+            if had_owner or pending is not None:
                 old.release()
+            if pending is not None:
+                pending.state = "closed"  # woken already; it reads the state, not the lock
             for waiter in waiters:
                 waiter.state = "closed"
                 waiter.wake()
@@ -244,14 +277,18 @@ class WriterLock:
             return False
         return me[1] is None or owner[1] == me[1] or (owner[1] is None and owner[0] == me[0])
 
-    def _held_by(self, me: _Owner, lock: threading.Lock) -> bool:
+    def _held_by(self, me: _Owner, lock: threading.Lock, *, waited: bool = False) -> bool:
         """Record ``me`` as the owner of a fresh hold on ``lock``, marked in this context.
 
         Returns False, recording nothing, when ``lock`` is no longer the
-        slot: ``close`` replaced it while the caller waited on it.
+        slot: ``close`` replaced it while the caller waited on it. With
+        ``waited`` the caller was counted as a blocked thread and is
+        uncounted here, in the same guarded section.
         """
         hold = _Hold(self)
         with self._guard:
+            if waited:
+                self._sync_waiting -= 1
             if lock is not self._lock:
                 return False
             self._owner = me
@@ -300,59 +337,80 @@ class WriterLock:
     # Queue mechanics (every method here runs under ``_guard``)
     # ------------------------------------------------------------------
 
-    def _take_free(self) -> bool:
-        """Take the slot now if it is free and nobody is queued ahead."""
-        return not self._waiters and self._lock.acquire(blocking=False)
-
     def _hand_off(self) -> None:
-        """Pass a held, ownerless slot to the head of the queue, or unlock it.
+        """Pass a held, ownerless slot to the first live queued coroutine, or unlock it.
 
         The lock stays locked across a handoff: ownership moves to the
-        waiter, which records itself as the owner when it wakes.
+        waiter, which records itself as the owner when it wakes. A waiter
+        whose loop closed or whose future ended meanwhile (a task
+        destroyed with its loop, a wait that gave up in the same instant)
+        can never take it, so it is skipped.
         """
         waiters = self._waiters
-        if waiters:
+        while waiters:
             waiter = waiters.popleft()
+            if waiter.state != "waiting" or waiter.dead:
+                waiter.state = "abandoned"
+                continue
             waiter.state = "granted"
             waiter.lock = self._lock
-            waiter.wake()
+            if waiter.wake():
+                self._pending = waiter
+                self._barge_next = True
+                return
+            waiter.state = "abandoned"
+        self._lock.release()
+        self._barge_next = False
+
+    def _release_locked(self) -> None:
+        """Give an ownerless held slot to whoever is next: a queued coroutine, or the threads.
+
+        Hands off to the queue unless the previous release already did and
+        threads are blocked in the lock: then it unlocks once, so threads
+        and coroutines take turns while both are waiting.
+        """
+        if self._waiters and not (self._barge_next and self._sync_waiting):
+            self._hand_off()
         else:
             self._lock.release()
+            self._barge_next = False
 
-    def _pass_on(self, lock: threading.Lock) -> None:
-        """A waiter was granted ``lock`` but will not use it (cancelled): hand it on."""
-        with self._guard:
-            if lock is self._lock:
-                self._hand_off()
-            else:
-                lock.release()  # an old lock: close() replaced the slot, nothing waits on it
+    def _rescue_queue(self) -> None:
+        """A thread stopped waiting: if the lock is free and coroutines are queued, hand it on.
 
-    def _enqueue(
-        self, loop: asyncio.AbstractEventLoop | None
-    ) -> tuple[threading.Lock | None, _Waiter | None]:
-        """Take the slot if free with nobody queued, else join the queue.
-
-        Returns ``(lock, None)`` when taken, ``(None, waiter)`` when queued.
+        An unlock meant for that thread must not leave the queue waiting on
+        a free lock that nobody will release.
         """
+        if self._waiters and self._lock.acquire(blocking=False):
+            self._hand_off()
+
+    def _pass_on(self, waiter: _Waiter) -> None:
+        """A coroutine granted the slot will not use it (cancelled, torn down): hand it on."""
         with self._guard:
-            if self._take_free():
-                return self._lock, None
-            waiter = _Waiter(loop)
-            self._waiters.append(waiter)
-            return None, waiter
+            if waiter.state != "granted":
+                return  # closed: the old lock was released by close()
+            waiter.state = "abandoned"
+            if self._pending is waiter:
+                self._pending = None
+            if waiter.lock is self._lock:
+                self._release_locked()
 
     def _granted(self, me: _Owner, waiter: _Waiter) -> threading.Lock:
-        """Finish an acquire whose waiter is ``granted`` or ``closed``."""
-        lock = waiter.lock
-        if waiter.state != "granted" or lock is None:
-            raise StorageClosedError(_CLOSED_WHILE_WAITING)
-        if not self._held_by(me, lock):
-            lock.release()
-            raise StorageClosedError(_CLOSED_WHILE_WAITING)
+        """Finish an ``areserve`` whose waiter is ``granted`` (or was closed meanwhile)."""
+        hold = _Hold(self)
+        with self._guard:
+            lock = waiter.lock
+            if waiter.state != "granted" or lock is None or lock is not self._lock:
+                raise StorageClosedError(_CLOSED_WHILE_WAITING)
+            if self._pending is waiter:
+                self._pending = None
+            self._owner = me
+            self._hold = hold
+        _mark_held(hold)
         return lock
 
     def acquire(self, timeout: float) -> threading.Lock:
-        """Block for the slot, up to ``timeout`` seconds, behind everyone already queued.
+        """Block for the slot, up to ``timeout`` seconds.
 
         Fails at once with ``StorageNestedTransactionError`` when called
         below the current holder (see ``_is_nested``), and with
@@ -387,31 +445,43 @@ class WriterLock:
         on_loop = asyncio._get_running_loop() is not None
         if on_loop:
             timeout = min(timeout, LOOP_THREAD_WAIT_CAP)
-        lock, waiter = self._enqueue(None)
-        if lock is not None:
-            if not self._held_by(me, lock):
-                lock.release()
-                raise StorageClosedError(_CLOSED_WHILE_WAITING)
-            return lock
-        if waiter is None or waiter.event is None:  # pragma: no cover (typing only)
-            raise StorageError("writer slot queue is inconsistent")
-        if not waiter.event.wait(max(timeout, 0)):
+        lock = self._lock
+        if lock.acquire(blocking=False):  # the uncontended path costs no bookkeeping
+            waited = False
+        else:
             with self._guard:
-                if waiter.state == "waiting":
-                    self._waiters.remove(waiter)
-                    raise self._timed_out(timeout, on_loop=on_loop)
-                # Granted or closed in the last instant: same as a wake.
-        return self._granted(me, waiter)
+                lock = self._lock
+                self._sync_waiting += 1
+            waited = True
+            try:
+                got = lock.acquire(timeout=max(timeout, 0))
+            except BaseException:
+                got = False
+                raise
+            finally:
+                if not got:
+                    # Timed out, or an exception out of the wait (a signal
+                    # handler raising): this thread is gone, so a lock
+                    # unlocked for it must go to the queue instead.
+                    with self._guard:
+                        self._sync_waiting -= 1
+                        self._rescue_queue()
+            if not got:
+                raise self._timed_out(timeout, on_loop=on_loop)
+        if not self._held_by(me, lock, waited=waited):
+            lock.release()
+            raise StorageClosedError(_CLOSED_WHILE_WAITING)
+        return lock
 
     async def areserve(self, timeout: float) -> threading.Lock:
-        """Wait for the slot without blocking the event loop, behind everyone already queued.
+        """Wait for the slot without blocking the event loop, behind the coroutines already queued.
 
         Takes a free slot at once when nobody is queued; otherwise joins
         the queue and is woken on its loop when the slot is handed to it,
         so other coroutines keep running, including the one that holds it.
-        Cancelled while waiting, it holds nothing: a grant that lands in
-        the same instant is handed on to the next waiter. Raises
-        ``StorageClosedError`` if the storage closed while waiting.
+        Cancelled or torn down while waiting, it holds nothing: a grant
+        that lands in the same instant is handed on to the next waiter.
+        Raises ``StorageClosedError`` if the storage closed while waiting.
 
         Returns:
             The lock acquired, to hand to a ``WriteSlot``.
@@ -419,35 +489,37 @@ class WriterLock:
         me = _caller()
         if self._is_nested(me):
             raise self._nested()
-        lock, waiter = self._enqueue(asyncio.get_running_loop())
-        if lock is not None:
-            if not self._held_by(me, lock):
-                lock.release()
-                raise StorageClosedError(_CLOSED_WHILE_WAITING)
-            return lock
-        if waiter is None or waiter.future is None:  # pragma: no cover (typing only)
-            raise StorageError("writer slot queue is inconsistent")
+        loop = asyncio.get_running_loop()
+        with self._guard:
+            if not self._waiters and self._lock.acquire(blocking=False):
+                lock = self._lock
+                if not self._held_by(me, lock):  # pragma: no cover (close under the guard)
+                    lock.release()
+                    raise StorageClosedError(_CLOSED_WHILE_WAITING)
+                return lock
+            waiter = _Waiter(loop)
+            self._waiters.append(waiter)
         try:
             await asyncio.wait_for(waiter.future, max(timeout, 0))
-        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
-            cancelled = isinstance(e, asyncio.CancelledError)
+        except BaseException as e:
+            # Timeout, cancellation, or the coroutine being closed with its
+            # loop: leave the queue, or hand on a grant that just landed.
             with self._guard:
                 state = waiter.state
                 if state == "waiting":
                     self._waiters.remove(waiter)
             if state == "waiting":
-                if cancelled:
-                    raise
-                raise self._timed_out(timeout) from None
-            if cancelled:
-                if state == "granted":
-                    self._pass_on(waiter.lock)  # type: ignore[arg-type]
+                if isinstance(e, asyncio.TimeoutError):
+                    raise self._timed_out(timeout) from None
+                raise
+            if not isinstance(e, asyncio.TimeoutError):
+                self._pass_on(waiter)
                 raise
             # Timed out in the same instant it was granted (ours) or closed (reported below).
         return self._granted(me, waiter)
 
     def release(self, lock: threading.Lock | None = None) -> None:
-        """Release the slot: hand it to the head of the queue, or unlock it.
+        """Release the slot: hand it to a queued coroutine, or unlock it for the threads.
 
         Args:
             lock: The lock the caller acquired, if known. Nothing is
@@ -461,7 +533,7 @@ class WriterLock:
                 raise RuntimeError("release unlocked lock")
             self._owner = None
             self._hold = None
-            self._hand_off()
+            self._release_locked()
 
     def take_slot(
         self, storage: object, write_slot: WriteSlot | None, timeout: float

@@ -1680,3 +1680,15 @@ def test_commit_ended_by_a_racing_close_raises_closed_error(storage: SQLiteStora
     assert tx.is_closed
     with storage.transaction() as t:
         t.put(("k",), b"2")
+
+
+def test_sync_waiter_interrupted_by_signal_leaves_no_ghost(storage) -> None:
+    cases.sync_waiter_interrupted_by_signal_leaves_no_ghost(storage)
+
+
+def test_areserve_task_destroyed_with_its_loop_leaves_no_ghost(storage) -> None:
+    cases.areserve_task_destroyed_with_its_loop_leaves_no_ghost(storage)
+
+
+def test_areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage) -> None:
+    cases.areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage)
