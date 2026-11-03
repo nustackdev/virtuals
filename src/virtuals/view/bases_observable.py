@@ -11,7 +11,7 @@ from __future__ import annotations
 from logging import getLogger
 from typing import TYPE_CHECKING, TypeVar
 
-from virtuals.tkv.filter import LengthFilter, PrefixFilter, WildcardFilter
+from virtuals.tkv.filter import PrefixFilter, WildcardFilter
 from virtuals.tkv.observer import SubscriptionOptions
 
 from .bases import AddressMappingBase
@@ -84,11 +84,13 @@ class ChildObservableBase(AddressMappingBase[A]):
     """
 
     def on_child_change(self, address: A) -> SubscriptionOptions:
-        """Build subscription options for a specific child, not its subtree.
+        """Build subscription options for a specific child and its subtree.
 
-        Matches writes at the child's own key only. A compound child (a dict
-        or shape stored as a subtree) changing deeper needs
-        ``on_descendants_change``.
+        A watch covers what it names: the whole value at the child's
+        address. A primitive child fires on its own row; a compound child
+        (a dict, list or shape stored as a subtree) fires on any write
+        under it too, so a watch on an untyped address needs no knowledge
+        of what is stored there.
 
         Args:
             address: Child address to watch
@@ -104,9 +106,7 @@ class ChildObservableBase(AddressMappingBase[A]):
         """
         normalized = self.normalize_address(address)
         child_full_site = (*self.container.site, normalized)
-        return SubscriptionOptions(
-            filter=PrefixFilter(prefix=child_full_site) & LengthFilter(length=len(child_full_site))
-        )
+        return SubscriptionOptions(filter=PrefixFilter(prefix=child_full_site))
 
     def on_children_change(self) -> SubscriptionOptions:
         """Build subscription options for all direct children, not their subtrees.
