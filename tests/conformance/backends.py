@@ -69,7 +69,10 @@ def _rocksdb(root: Path, lock_timeout: float | None, codec: Any):
 def _mem(root: Path, lock_timeout: float | None, codec: Any):
     from virtuals.storages.mem import InMemoryStorage
 
-    return InMemoryStorage(codec=codec)
+    kwargs: dict[str, Any] = {}
+    if lock_timeout is not None:
+        kwargs["busy_timeout"] = lock_timeout  # in-process slot only, see contract section 4
+    return InMemoryStorage(codec=codec, **kwargs)
 
 
 BACKENDS: dict[str, BackendSpec] = {

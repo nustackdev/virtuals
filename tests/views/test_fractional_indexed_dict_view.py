@@ -1001,14 +1001,14 @@ def test_two_writers_appending(fdict):
     _assert_consistent(view)
 
 
-@pytest.mark.parametrize("backend", ["mem", "rocksdb"])
+@pytest.mark.parametrize("backend", ["rocksdb"])
 def test_window_respace_vs_concurrent_insert_inside_window(backend, tmp_path):
     """A respace can displace a concurrent insert next to a row in its window.
 
     T1 inserts at a hot gap until a window respace fires; T2 inserts after
     a row inside T1's window. T2 writes none of the rows T1 rewrites, so
-    both commit on every multi-writer backend (sqlite and lmdb are
-    single-writer and never see this). The documented outcome: T2's item
+    both commit on every multi-writer backend (sqlite, lmdb and mem
+    are single-writer and never see this). The documented outcome: T2's item
     is present exactly once and the rest of the order is intact; only its
     position may have shifted into the rewritten range.
     """
