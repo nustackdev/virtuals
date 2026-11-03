@@ -71,11 +71,7 @@ def test_subscribe_on_absent_view_fires_on_first_write_and_writes_nothing(bus, v
         view = nav.root(snap).open_child("doc", view_cls)
         assert not view.container.exists()
         whole = view.on_change()
-        # ListView.on_child_change(i) normalizes i against len(), so on an
-        # absent list it raises IndexError; the children watch has no index.
-        child = (
-            view.on_children_change() if view_cls is EagerListView else view.on_child_change("k")
-        )
+        child = view.on_child_change(0 if view_cls is EagerListView else "k")
     assert _rows(storage) == []
     whole_wakes: list = []
     child_wakes: list = []
@@ -122,3 +118,38 @@ def test_subscribe_on_absent_nested_chain_fires_when_the_chain_is_created(bus):
     publisher.flush()
     observer.flush()
     assert len(wakes) == seen
+
+
+def test_list_child_watch_on_absent_list_names_a_slot(bus):
+    """A watch is a filter, not a read: index 3 of an absent list is a valid
+    watch and fires once the list grows to it. Negative indices still need
+    a length, so they raise on an absent list."""
+    storage, publisher, observer = bus
+    nav = Navigator(storage)
+    with storage.snapshot() as snap:
+        lst = nav.root(snap).open_child("l", EagerListView)
+        first = lst.on_child_change(0)
+        fourth = lst.on_child_change(3)
+        with pytest.raises(IndexError):
+            lst.on_child_change(-1)
+    assert _rows(storage) == []
+    first_wakes: list = []
+    fourth_wakes: list = []
+    observer.subscribe(first).bind(first_wakes.append)
+    observer.subscribe(fourth).bind(fourth_wakes.append)
+    with storage.transaction() as tx:
+        nav.root(tx).open_child("l", EagerListView).store([{"a": 1}, 2])
+    publisher.flush()
+    observer.flush()
+    assert _wait_until(lambda: len(first_wakes) >= 1), first_wakes
+    assert fourth_wakes == []
+    with storage.transaction() as tx:
+        lst = nav.root(tx).open_child("l", EagerListView)
+        lst.append(3)
+        lst.append({"d": 4})
+    publisher.flush()
+    observer.flush()
+    assert _wait_until(lambda: len(fourth_wakes) >= 1), fourth_wakes
+    with storage.snapshot() as snap:
+        lst = nav.root(snap).open_child("l", EagerListView)
+        assert lst.on_child_change(-1) == lst.on_child_change(3)
