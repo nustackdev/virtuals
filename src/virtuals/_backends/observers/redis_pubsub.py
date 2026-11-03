@@ -30,13 +30,17 @@ every hash on the prefix (an empty-keys payload) once it can publish again.
 
 Backlog. The listener never blocks on the dispatch queue. When the queue is
 full it parks inbound keys in its own overflow buffer (bounded by the same
-capacity, so at most twice the queue is buffered) and keeps serving
-sub/unsub commands and reading confirmations, so a slow subscriber never
-stalls a subscribe() from another thread or from inside a callback. Only
-once the overflow is full too does it stop reading the socket (backpressure
-into valkey); a SUBSCRIBE confirmation sent in that state is read when the
-backlog clears, so a subscribe() can time out. Subscribe from another thread
-when callbacks can face that much backlog.
+capacity) and keeps serving sub/unsub commands and reading confirmations,
+so a slow subscriber never stalls a subscribe() from another thread or from
+inside a callback. What this observer holds is then at most twice the queue
+plus the worker's batch in hand (`DISPATCH_BATCH_MAX` keys), on top of what
+redis-py and the server buffer for the socket. Only once the overflow is
+full too does it stop reading the socket (backpressure into valkey); a
+SUBSCRIBE confirmation sent in that state is read when the backlog clears,
+so a subscribe() can time out. Subscribe from another thread when callbacks
+can face that much backlog. A keyless wake (reconnect or a publisher's
+drop) is parked at most once per hash until delivered, so W publishers
+dropping in one stall cost one re-read per subscription, not W.
 
 Timeouts. Both connections have a socket and connect timeout and at most one
 transparent redis-py retry, so a stalled server bounds `nu1_reg` (and with it
@@ -728,8 +732,10 @@ class RedisObserver(ObserverBase):
                 self._pubsub.unsubscribe(channel)
             elif action == "resync":
                 # Behind every key parked so far, so the wake follows them.
-                self._overflow.append(_Resync(channel))
-                self._drain_overflow()
+                item = self._resync_item(channel)
+                if item is not None:
+                    self._overflow.append(item)
+                    self._drain_overflow()
         except Exception as e:
             logger.warning("Listener cmd %s(%s) failed: %s", action, channel, e)
             if ack is not None:
@@ -894,8 +900,12 @@ class RedisObserver(ObserverBase):
         if raw_keys:
             self._overflow.extend(_TaggedKey(tuple(k), filter_hash_str) for k in raw_keys)
         elif raw_keys == []:
-            # A publisher that dropped keys asks every hash to re-read.
-            self._overflow.append(_Resync(filter_hash_str))
+            # A publisher that dropped keys asks every hash to re-read. One
+            # wake per hash is pending at a time, whatever the publisher count.
+            item = self._resync_item(filter_hash_str)
+            if item is None:
+                return
+            self._overflow.append(item)
         else:
             logger.warning("Payload without keys on %s ignored", msg.get("channel"))
             return

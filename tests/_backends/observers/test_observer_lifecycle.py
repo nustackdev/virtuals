@@ -349,3 +349,148 @@ def test_in_process_publisher_with_a_timeout_wakes_every_observer_after_a_drop()
         other.disconnect()
         obs.disconnect()
         pub.disconnect()
+
+
+# =============================================================================
+# r2 N1: disconnect() ends delivery, does not merely stop waiting for it
+# =============================================================================
+
+
+def test_disconnect_returns_with_no_callback_after_it_and_connect_works_at_once():
+    """A long backlog with a slow receiver: disconnect() closes every subscription,
+    so no receiver runs after it returns, and the next connect() is not refused."""
+    _, pub, obs = _pair()
+    started: list[float] = []
+    gate = threading.Event()
+    gate.set()
+    try:
+        sub = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("q",))))
+
+        def cb(key):
+            started.append(time.monotonic())
+            time.sleep(0.01)
+
+        sub.bind(cb)
+        pub.notify([("q", i) for i in range(1500)])
+        pub.flush(5)
+        assert _wait_until(lambda: len(started) >= 5)
+        old = obs._dispatch_thread
+        t0 = time.monotonic()
+        obs.disconnect()
+        returned = time.monotonic()
+        assert returned - t0 < 1.0, "disconnect waited out the join instead of ending delivery"
+        assert sub.is_closed
+        assert old is not None and _wait_until(lambda: not old.is_alive(), 1.0)
+        time.sleep(0.2)
+        late = [t for t in started if t > returned]
+        assert late == [], f"{len(late)} receivers ran after disconnect() returned"
+        assert len(started) < 1500
+        obs.connect()  # not refused: the old worker is gone
+        assert obs._dispatch_thread is not old
+    finally:
+        gate.set()
+        obs.disconnect()
+        pub.disconnect()
+
+
+# =============================================================================
+# r2 N5: the worker takes a bounded batch, so the queue shows the backlog
+# =============================================================================
+
+
+def test_worker_takes_at_most_one_batch_off_the_queue_per_round():
+    from virtuals._backends.observers._base import DISPATCH_BATCH_MAX
+
+    _, pub, obs = _pair()
+    sem = threading.Semaphore(0)
+    total = 1000
+    try:
+
+        def cb(key):
+            sem.acquire(timeout=10)
+
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("k",)))).bind(cb)
+        pub.notify([("k", "slow")])
+        pub.flush(5)
+        assert _wait_until(lambda: obs._dispatch_queue.qsize() == 0)
+        pub.notify([("k", i) for i in range(total)])
+        pub.flush(5)
+        assert obs._dispatch_queue.qsize() == total
+        sem.release()  # the worker leaves the slow key and takes its next batch
+        assert _wait_until(lambda: obs._dispatch_queue.qsize() < total)
+        time.sleep(0.1)
+        left = obs._dispatch_queue.qsize()
+        assert left >= total - DISPATCH_BATCH_MAX, f"the worker took {total - left} keys at once"
+    finally:
+        for _ in range(total + 2):
+            sem.release()
+        obs.disconnect()
+        pub.disconnect()
+
+
+# =============================================================================
+# r2 N3: resync wakes coalesce per filter hash until delivered
+# =============================================================================
+
+
+def test_resync_wakes_asked_for_while_one_is_pending_collapse_into_it():
+    """Three publishers dropping in one stall ask three times; each subscription
+    re-reads once. After that wake is delivered the next request wakes again."""
+    tr, pub, obs = _pair()
+    hold = threading.Event()
+    a: list = []
+    b: list = []
+    try:
+
+        def slow(key):
+            hold.wait(10)
+            a.append(key)
+
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("a",)))).bind(slow)
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("b",)))).bind(b.append)
+        pub.notify([("a", 0)])
+        pub.flush(5)
+        assert _wait_until(lambda: obs._dispatch_queue.qsize() == 0)  # worker inside slow()
+        for _ in range(3):
+            tr.resync()  # what each dropping publisher does
+        hold.set()
+        obs.flush(5)
+        time.sleep(0.1)
+        assert a == [("a", 0), None] and b == [None], (a, b)
+        tr.resync()
+        obs.flush(5)
+        assert a == [("a", 0), None, None] and b == [None, None], (a, b)
+    finally:
+        hold.set()
+        obs.disconnect()
+        pub.disconnect()
+
+
+# =============================================================================
+# r2 N4: flush(timeout) returns at the timeout on a full queue
+# =============================================================================
+
+
+def test_flush_honours_its_timeout_on_a_full_dispatch_queue():
+    tr = InMemoryTransport()
+    pub = InMemoryPublisher(tr)
+    obs = InMemoryObserver(tr, dispatch_queue_maxsize=5)
+    pub.connect()
+    obs.connect()
+    hold = threading.Event()
+    try:
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("z",)))).bind(
+            lambda k: hold.wait(10)
+        )
+        filler = threading.Thread(
+            target=lambda: pub.notify([("z", i) for i in range(40)]), daemon=True
+        )
+        filler.start()
+        assert _wait_until(lambda: obs._dispatch_queue.full())
+        t0 = time.monotonic()
+        obs.flush(timeout=0.3)
+        assert time.monotonic() - t0 < 1.0, "flush waited for room instead of its timeout"
+    finally:
+        hold.set()
+        obs.disconnect()
+        pub.disconnect()

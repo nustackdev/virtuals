@@ -378,3 +378,49 @@ def test_listener_outliving_disconnect_blocks_the_next_connect(redis_url, prefix
     assert not old.is_alive()
     obs.connect()
     obs.disconnect()
+
+
+# =============================================================================
+# r2 N3: W dropping publishers cost one keyless wake per subscription, not W
+# =============================================================================
+
+
+def test_resync_wakes_from_several_publishers_collapse_into_one(redis_url, prefix):
+    """Three publishers that all dropped during one stall each send their wake;
+    a subscription whose worker is busy gets one keyless wake, then keyed delivery."""
+    from virtuals._backends.publishers.redis_pubsub import RedisPublisher
+
+    obs, pub = _pair(redis_url, prefix)
+    others = [RedisPublisher(redis_url=redis_url, channel_prefix=prefix) for _ in range(2)]
+    for p in others:
+        p.connect()
+    hold = threading.Event()
+    got: list = []
+    try:
+
+        def slow(key):
+            hold.wait(10)
+            got.append(key)
+
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("a",)))).bind(slow)
+        pub.notify([("a", 0)])
+        pub.flush(5)
+        assert _wait_until(lambda: obs._dispatch_queue.qsize() == 0)  # worker inside slow()
+        for p in (pub, *others):
+            p._send_resync()  # what each publisher does once it can publish again
+        time.sleep(0.3)  # all three wakes have reached the listener before the worker is released
+        hold.set()
+        obs.flush(5)
+        assert _wait_until(lambda: len(got) >= 2)
+        time.sleep(0.2)
+        assert got == [("a", 0), None], got
+        pub.notify([("a", 1)])
+        pub.flush(5)
+        assert _wait_until(lambda: got[-1] == ("a", 1)), got
+        assert got.count(None) == 1
+    finally:
+        hold.set()
+        for p in others:
+            p.disconnect()
+        pub.disconnect()
+        obs.disconnect()
