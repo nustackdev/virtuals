@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, cast
 from virtuals.loc.constants import DATA_ROOT, METADATA_ROOT
 from virtuals.tkv.filter import LengthFilter, PrefixFilter
 from virtuals.tkv.storage import StorageScanOptions
-from virtuals.types import EMPTY, Empty, Value
+from virtuals.types import EMPTY, Empty, Value, is_empty
 
 from .context import (
     require_read_context,
@@ -89,6 +89,7 @@ __all__ = [
     "move_child_subtree",
     "put_child_primitive",
     "put_child_primitive_unsafe",
+    "reject_empty_value",
     "walk_descendants",
 ]
 
@@ -608,6 +609,22 @@ def create_child_container(
     create_container(child_site, structure, protocol, ctx, validate_parent=validate)
 
 
+def reject_empty_value(site: site_.Site, value: object) -> None:
+    """Refuse to store EMPTY: it is the absent sentinel, never a value.
+
+    A stored EMPTY row reads as absent (``get_node_info``) while scans still
+    see it, so the container disagrees with itself. Callers that mean
+    "absent" delete the key instead.
+
+    Raises:
+        ValueError: If ``value`` is EMPTY
+    """
+    if is_empty(value):
+        raise ValueError(
+            f"Cannot store EMPTY at {site}: EMPTY means absent, delete the key instead"
+        )
+
+
 def put_child_primitive(
     parent_site: site_.Site,
     key: site_.SiteSegment,
@@ -631,6 +648,7 @@ def put_child_primitive(
             (e.g. via ensure_created()).
 
     Raises:
+        ValueError: If ``value`` is EMPTY (the absent sentinel is never stored)
         ContainerNotFoundError: If parent doesn't exist (when validate_parent=True)
         ContainerTypeError: If parent is not a container (when validate_parent=True)
             or child is a container (when validate=True)
@@ -641,10 +659,11 @@ def put_child_primitive(
         >>> get_child_primitive(("users",), "alice", tx)
         {"name": "Alice", "age": 30}
     """
+    child_site = (*parent_site, key)
+    reject_empty_value(child_site, value)
+
     if validate_parent:
         validate_is_container(parent_site, ctx)
-
-    child_site = (*parent_site, key)
 
     if validate:
         child_node_info = get_node_info(child_site, ctx)

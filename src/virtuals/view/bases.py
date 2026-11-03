@@ -433,7 +433,12 @@ class ChildNestedSetBase:
         Args:
             address: Child address
             value: Value to store (primitive or container)
+
+        Raises:
+            ValueError: If ``value`` is EMPTY. Checked before the view is
+                materialized, so a rejected write leaves nothing behind.
         """
+        self._reject_empty(address, value)  # type: ignore[attr-defined]
         self.ensure_created()  # type: ignore[attr-defined]
         if self.registry.is_container_type(value):
             # Value is a container type - populate it
@@ -529,6 +534,7 @@ class ChildPrimitiveSetBase:
             address: Child address
             value: Primitive value to store
         """
+        self._reject_empty(address, value)  # type: ignore[attr-defined]
         self.ensure_created()  # type: ignore[attr-defined]
         self._put_child_primitive(address, value)  # type: ignore[attr-defined]
 
@@ -564,6 +570,7 @@ class PrimitiveOpsBase:
         Goes through the view's child bookkeeping, so a new key is counted
         or indexed like any other child.
         """
+        self._reject_empty(address, value)  # type: ignore[attr-defined]
         self.ensure_created()  # type: ignore[attr-defined]
         self._put_child_primitive(address, value)  # type: ignore[attr-defined]
 

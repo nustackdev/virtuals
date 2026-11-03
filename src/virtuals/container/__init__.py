@@ -62,6 +62,7 @@ from .container_ops import (
     move_child_subtree,
     put_child_primitive,
     put_child_primitive_unsafe,
+    reject_empty_value,
     walk_descendants,
 )
 
@@ -209,6 +210,7 @@ __all__ = [  # noqa: RUF022
     "create_child_container",
     "put_child_primitive",
     "put_child_primitive_unsafe",
+    "reject_empty_value",
     "delete_child",
     "delete_child_primitive_unsafe",
     "clear_children",

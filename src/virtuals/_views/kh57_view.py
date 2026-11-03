@@ -211,6 +211,7 @@ class Kh57ViewBase(
         that already know the child layout (Refs via
         :meth:`set_child_container_as`) pass it explicitly.
         """
+        self._reject_empty(encoded, value)
         self.ensure_created()
         # A new child is counted via _on_child_created
         if self.registry.is_container_type(value):
