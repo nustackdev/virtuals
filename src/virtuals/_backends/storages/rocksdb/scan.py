@@ -12,12 +12,8 @@ from virtuals.tkv.storage import (
     StorageScanOptions,
 )
 
-from .context import ScanHandle, classify_rdbpy, is_missing_file_error
+from .context import ScanHandle, classify_rdbpy, is_missing_file_error, secondary_view_lost
 
-
-# Bounded restarts when a secondary scan touches an SST the primary
-# compacted away. Mirrors the point-read retry budget in `context.py`.
-_SCAN_STALE_RETRIES = 6
 
 # Rows fetched per native call. The first batch is small so a scan that
 # stops early (limit, break filter) reads little past its end; later
@@ -77,44 +73,23 @@ class RocksDBScan(ScanProtocol):
         self._options = options
 
     def _iterate_impl(self, iterator_type: _IteratorType) -> Generator[object, None, None]:
-        """Stale-secondary-safe wrapper around `_scan_once`.
+        """Stale-secondary-aware wrapper around `_scan_once`.
 
         A read-only secondary can be pinned to a manifest version that
         references an SST the primary already compacted away; an iterator
-        touching that file raises an IO error. The fix is the same as for
-        point reads: catch up to the current manifest and retry.
-
-        A scan cannot retry a single key, so it restarts the whole pass and
-        skips the items already emitted. This is exact for append-only /
-        immutable ranges (the ledger's per-block tx dicts -- a synced block
-        never changes); for a range mutated concurrently a restart may shift
-        which rows land after the skip, but that is strictly better than
-        crashing the reader, and a secondary scan is already only
-        eventually-consistent across refreshes.
+        touching that file raises an IO error. As for point reads, the
+        storage catches up so the next snapshot reads, and this scan raises
+        the retryable ``StorageTransactionConflictError``: restarting it on
+        the new state would mix two versions into one snapshot's view.
         """
         storage = self._storage
-        yielded = 0
-        attempt = 0
-        while True:
-            skip = yielded
-            try:
-                for item in self._scan_once(iterator_type):
-                    if skip > 0:
-                        skip -= 1
-                        continue
-                    yielded += 1
-                    yield item
-                return
-            except Exception as e:
-                cause = e.__cause__
-                if not (
-                    storage._is_secondary and cause is not None and is_missing_file_error(cause)
-                ):
-                    raise
-                attempt += 1
-                if attempt > _SCAN_STALE_RETRIES:
-                    raise
-                storage.force_catch_up_with_primary()
+        try:
+            yield from self._scan_once(iterator_type)
+        except Exception as e:
+            cause = e.__cause__
+            if storage._is_secondary and cause is not None and is_missing_file_error(cause):
+                raise secondary_view_lost(storage, cause) from cause
+            raise
 
     def _scan_once(self, iterator_type: _IteratorType) -> Generator[object, None, None]:
         """One full iteration pass over the configured range.
@@ -176,10 +151,12 @@ class RocksDBScan(ScanProtocol):
                 batch_size = min(batch_size * 4, _BATCH_MAX)
                 for row in rows:
                     # Rows already fetched outlive the context (and on a
-                    # secondary the shared DB handle outlives the snapshot),
-                    # so check the context before every row, not the cursor.
+                    # secondary the shared DB handle outlives the snapshot,
+                    # and a catch-up retires its view), so check the
+                    # context before every row, not the cursor.
                     if context.is_closed:
                         raise StorageClosedError("Scan used after its context ended")
+                    context._require_active()
                     if need_values:
                         encoded_key, encoded_value = row
                     else:

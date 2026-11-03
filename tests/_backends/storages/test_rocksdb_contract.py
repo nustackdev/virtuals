@@ -488,13 +488,16 @@ def test_closed_storage_error_is_not_retryable(tmp_path: Path) -> None:
 
 
 def test_close_refuses_while_a_thread_is_inside_a_call(tmp_path: Path) -> None:
-    """close() during another thread's native call raises and frees nothing.
+    """close() during another thread's long native call waits busy_timeout, then raises and frees nothing.
 
-    It used to abort that thread's transaction under it (a segfault).
+    It used to abort that thread's transaction under it (a segfault). The
+    call here is a row lock wait longer than ``busy_timeout``, so the
+    retried close never lands and the storage stays open and usable.
     """
     s = RocksDBStorage(
         path=tmp_path / "db",
         codec=BinaryCodec(),
+        busy_timeout=0.3,
         txn_db_options={"transaction_lock_timeout": 1000, "default_lock_timeout": 1000},
     )
     s.open()
@@ -516,8 +519,10 @@ def test_close_refuses_while_a_thread_is_inside_a_call(tmp_path: Path) -> None:
     th.start()
     entered.wait(5)
     time.sleep(0.2)
+    t0 = time.perf_counter()
     with pytest.raises(StorageError, match="in use"):
         s.close()
+    assert 0.25 < time.perf_counter() - t0 < 1.0  # waited busy_timeout, not the whole row lock wait
     th.join(5)
     assert outcome and isinstance(outcome[0], StorageLockTimeoutError)
     raw.rollback()

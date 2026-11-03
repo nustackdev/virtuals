@@ -14,6 +14,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 import weakref
 from typing import TYPE_CHECKING, Any
 
@@ -581,3 +582,181 @@ def test_second_open_explains_single_process(storage: RocksDBStorage) -> None:
         [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60
     )
     assert proc.returncode == 0 and proc.stdout.strip() == "True", proc.stdout + proc.stderr
+
+
+# =============================================================================
+# Round 2: secondary snapshot views, dropped snapshots, close under in-flight calls
+# =============================================================================
+
+
+def _open_secondary(tmp_path: Path, **kwargs: Any) -> tuple[RocksDBStorage, RocksDBStorage]:
+    primary = RocksDBStorage(path=tmp_path / "db", codec=BinaryCodec())
+    primary.open()
+    with primary.transaction() as t:
+        t.put(("a",), 0)
+        t.put(("b",), 0)
+    secondary = RocksDBStorage(
+        path=tmp_path / "db",
+        codec=BinaryCodec(),
+        read_only=True,
+        secondary_path=tmp_path / "secondary",
+        secondary_refresh_interval=0,
+        **kwargs,
+    )
+    secondary.open()
+    return primary, secondary
+
+
+def test_secondary_snapshot_view_is_fixed_while_open(tmp_path: Path) -> None:
+    """A secondary Snapshot reads one state for its life, however many snapshots begin meanwhile."""
+    primary, secondary = _open_secondary(tmp_path)
+    try:
+        for i in range(1, 51):
+            s = secondary.begin_snapshot()
+            a = s.get(("a",))
+            with primary.transaction() as t:
+                t.put(("a",), i)
+                t.put(("b",), i)
+            other = secondary.begin_snapshot()  # refresh interval 0: would catch up
+            other.close()
+            assert s.get(("b",)) == a, f"torn: a={a} b={s.get(('b',))} at round {i}"
+            s.close()
+        with secondary.snapshot() as fresh:  # nothing open: caught up now
+            assert fresh.get(("a",)) == 50 == fresh.get(("b",))
+    finally:
+        secondary.close()
+        primary.close()
+
+
+def test_secondary_forced_catch_up_retires_open_snapshots_with_retryable_error(
+    tmp_path: Path,
+) -> None:
+    """A forced catch-up moves the state; snapshots open then raise the retryable error."""
+    from virtuals.tkv.storage import StorageTransactionConflictError
+
+    primary, secondary = _open_secondary(tmp_path)
+    try:
+        s = secondary.begin_snapshot()
+        scan = s.scan(StorageScanOptions()).keys()
+        assert next(scan) == ("a",)
+        with primary.transaction() as t:
+            t.put(("a",), 1)
+        secondary.force_catch_up_with_primary()
+        with pytest.raises(StorageTransactionConflictError, match="new snapshot"):
+            s.get(("a",))
+        with pytest.raises(StorageTransactionConflictError):
+            next(scan)
+        s.close()
+        with secondary.snapshot() as fresh:
+            assert fresh.get(("a",)) == 1
+    finally:
+        secondary.close()
+        primary.close()
+
+
+def test_secondary_read_on_compacted_file_catches_up_and_raises_retryable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A read that hits a file the primary compacted away: the storage catches up, the snapshot fails retryably."""
+    import rdbpy
+
+    from virtuals._backends.storages.rocksdb import context as ctx_mod
+    from virtuals._backends.storages.rocksdb import scan as scan_mod
+    from virtuals._backends.storages.rocksdb.snapshot import RocksDBSnapshot
+    from virtuals.tkv.storage import StorageTransactionConflictError
+
+    primary, secondary = _open_secondary(tmp_path)
+    stale = rdbpy.RocksIOError("No such file: 000012.sst")
+    stale.subcode = 9  # kPathNotFound
+    fail = [True]
+    real_get_raw = RocksDBSnapshot._get_raw
+
+    def flaky_get_raw(self, encoded_key):
+        if fail and fail.pop():
+            raise stale
+        return real_get_raw(self, encoded_key)
+
+    monkeypatch.setattr(RocksDBSnapshot, "_get_raw", flaky_get_raw)
+    try:
+        s = secondary.begin_snapshot()
+        epoch = secondary._secondary_epoch
+        with pytest.raises(StorageTransactionConflictError, match="compacted"):
+            s.get(("a",))
+        assert secondary._secondary_epoch == epoch + 1  # it caught up
+        with pytest.raises(StorageTransactionConflictError):  # the view is gone for good
+            s.get(("a",))
+        s.close()
+        with secondary.snapshot() as fresh:
+            assert fresh.get(("a",)) == 0
+        # same through a scan
+        s = secondary.begin_snapshot()
+        real_iterator = RocksDBSnapshot._iterator
+
+        def flaky_iterator(self, **kwargs):
+            raise stale
+
+        monkeypatch.setattr(RocksDBSnapshot, "_iterator", flaky_iterator)
+        with pytest.raises(StorageTransactionConflictError, match="compacted"):
+            list(s.scan(StorageScanOptions()).keys())
+        monkeypatch.setattr(RocksDBSnapshot, "_iterator", real_iterator)
+        s.close()
+        assert ctx_mod.secondary_view_lost is scan_mod.secondary_view_lost
+    finally:
+        secondary.close()
+        primary.close()
+
+
+def test_dropped_snapshot_is_collected_and_releases_its_rocksdb_snapshot(
+    storage: RocksDBStorage,
+) -> None:
+    """A snapshot dropped without close() is forgotten and its native snapshot released."""
+    with storage.transaction() as t:
+        t.put(("k",), 0)
+    refs = []
+    for _ in range(50):
+        s = storage.begin_snapshot()
+        s.get(("k",))
+        refs.append(weakref.ref(s))
+        del s
+    gc.collect()
+    assert all(r() is None for r in refs)
+    assert len(storage._active_snapshots) == 0
+    assert storage._db.get_property("rocksdb.num-snapshots") == "0"
+    kept = storage.begin_snapshot()
+    assert storage._db.get_property("rocksdb.num-snapshots") == "1"
+    kept.close()
+
+
+def _hammer_reads(s: RocksDBStorage, go: threading.Event, outcome: list) -> None:
+    snap = s.begin_snapshot()
+    go.set()
+    try:
+        for r in range(200000):
+            snap.get(("k", r % 200))
+        outcome.append("finished")
+    except StorageClosedError:
+        outcome.append("closed")
+
+
+@pytest.mark.timeout(30)
+def test_close_waits_for_a_thread_inside_calls(tmp_path: Path) -> None:
+    """close() with another thread looping native calls lands in a gap instead of refusing."""
+    for i in range(5):
+        s = RocksDBStorage(path=tmp_path / f"db{i}", codec=BinaryCodec(), busy_timeout=5.0)
+        s.open()
+        with s.transaction() as t:
+            for k in range(200):
+                t.put(("k", k), k)
+        go = threading.Event()
+        outcome: list = []
+        th = threading.Thread(target=_hammer_reads, args=(s, go, outcome), daemon=True)
+        th.start()
+        go.wait(5)
+        t0 = time.perf_counter()
+        s.close()  # must not raise
+        took = time.perf_counter() - t0
+        th.join(10)
+        assert took < 2.0, f"close took {took:.2f}s"
+        assert outcome in (["closed"], ["finished"]), outcome
+        with pytest.raises(StorageClosedError):
+            s.begin_snapshot()

@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from virtuals.tkv.storage import (
+    StorageClosedError,
     StorageError,
+    StorageTransactionConflictError,
 )
 
 from .context import ContextBase, ReadOperationsMixin
@@ -25,27 +27,52 @@ class RocksDBSnapshot(ContextBase, ReadOperationsMixin):
 
     Every get and scan reads at that snapshot, so the view is repeatable
     and never shows half of a commit. It takes no lock and never waits on
-    a writer.
+    a writer. Dropped without ``close``, it releases the rocksdb snapshot
+    once collected; ``close`` releases it at once.
 
-    On a read-only secondary rocksdb does not support snapshots: reads
-    there see the secondary's state as of its last catch-up with the
-    primary, which the storage runs when the snapshot begins (throttled by
-    ``secondary_refresh_interval``).
+    On a read-only secondary rocksdb does not support snapshots: the view
+    is the secondary's state as of its last catch-up with the primary,
+    and the storage does not catch up while this snapshot is open, so the
+    view is fixed for its life. It is lost when the storage is forced to
+    catch up anyway (``force_catch_up_with_primary``, or a read that hit a
+    file the primary compacted away): from then on every read here raises
+    the retryable ``StorageTransactionConflictError``, and the caller
+    opens a new snapshot.
     """
 
-    __slots__ = ("_db", "_snapshot")
+    __slots__ = ("_db", "_epoch", "_snapshot")
 
-    def __init__(self, storage: RocksDBStorage, db: Any, snapshot: Any) -> None:  # noqa: ANN401
+    def __init__(
+        self,
+        storage: RocksDBStorage,
+        db: Any,  # noqa: ANN401
+        snapshot: Any,  # noqa: ANN401
+        *,
+        epoch: int | None = None,
+    ) -> None:
         """Initialize snapshot.
 
         Args:
             storage: Parent storage instance
             db: rdbpy DB handle to read through
             snapshot: rdbpy Snapshot pinning the view, or None on a secondary
+            epoch: On a secondary, the storage's catch-up epoch this view
+                belongs to; a later catch-up retires it
         """
         super().__init__(storage)
         self._db: Any | None = db
         self._snapshot: Any | None = snapshot
+        self._epoch = epoch
+
+    def _require_active(self) -> None:
+        """Raise if closed, or if a secondary catch-up retired this view."""
+        if self._closed:
+            raise StorageClosedError("Context is closed")
+        if self._epoch is not None and self._epoch != self._storage._secondary_epoch:
+            raise StorageTransactionConflictError(
+                "Secondary snapshot lost its view: the storage caught up with the primary "
+                "since it began. Open a new snapshot and re-read"
+            )
 
     @property
     def writable(self) -> bool:
@@ -85,6 +112,25 @@ class RocksDBSnapshot(ContextBase, ReadOperationsMixin):
         finally:
             self._mark_closed()
             self._storage._untrack_snapshot(self)
+
+    def __del__(self) -> None:
+        """Last resort: release the rocksdb snapshot of one dropped without ``close``.
+
+        The object is unreachable, so nothing else can end it, and the
+        storage's weak active set forgets it on its own. The storage's
+        state lock is not taken here, since a collection may run on a
+        thread that holds it. A storage closed since has released the
+        snapshot already, so a failing release is ignored.
+        """
+        if getattr(self, "_closed", True):
+            return
+        snapshot = self._snapshot
+        try:
+            self._mark_closed()
+            if snapshot is not None:
+                snapshot.release()
+        except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
+            pass
 
     def __enter__(self) -> RocksDBSnapshot:
         """Enter context manager."""
