@@ -6,10 +6,10 @@ provide `_on_connect / _on_disconnect / _on_subscribe / _on_unsubscribe`
 hooks for backend-specific setup (registering with an in-mem transport,
 HSET on Redis, etc.).
 
-Includes an internal queue + worker so `_dispatch_incoming` is
-fire-and-forget from the transport's POV. That preserves today's
-write-side semantics: a stuck subscriber backs up the OBSERVER's queue,
-not the publisher's worker.
+Includes an internal queue + worker so `_dispatch_incoming` returns as
+soon as the keys are queued: a slow subscriber backs up the OBSERVER's
+queue first. When that queue is full, `_dispatch_incoming` blocks
+(backpressure into the transport) instead of dropping keys.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, Any
 
 from typing_extensions import Self
 
-from virtuals.tkv.filter import filter_hash as _filter_hash
 from virtuals.tkv.observer import (
     ObserverConnectionError,
     Subscription,
@@ -57,11 +56,14 @@ __all__ = [
 
 
 # Default dispatch queue capacity: buffers incoming batches so transport
-# listeners never block on slow subscribers.
+# listeners rarely block on slow subscribers. When full, they block.
 DEFAULT_DISPATCH_QUEUE_MAXSIZE: int = 100_000
 
 # Sentinel to unblock the dispatch worker on Queue.get() during disconnect.
 _STOP_MARKER: object = object()
+
+# How often a producer blocked on a full dispatch queue rechecks for shutdown.
+_PUT_POLL_SECONDS: float = 0.1
 
 
 class ObserverBase:
@@ -157,9 +159,13 @@ class ObserverBase:
     def _dispatch_incoming(self, keys: Iterable[Key], filter_hash: str | None = None) -> None:
         """Transport-facing entry point.
 
-        Enqueues keys onto the dispatch queue so the transport thread never
-        blocks on slow subscribers. If the observer isn't connected yet the
-        call is dropped -- transports must not race the lifecycle.
+        Enqueues keys onto the dispatch queue. When the queue is full the
+        call blocks until the dispatch worker makes room: keys are never
+        dropped silently. Backpressure then reaches the transport (for Redis:
+        the listener stops reading, valkey buffers, and past its pubsub
+        output limit disconnects the client, which is logged and recovered
+        by re-registration). If the observer isn't connected, or disconnects
+        while blocked, the keys are dropped -- that is lifecycle, not load.
 
         `filter_hash` (optional) narrows matching at delivery time to subs
         whose canonical filter hashes to that value. Used by hash-routed
@@ -168,14 +174,22 @@ class ObserverBase:
         """
         if not self._connected:
             return
-        try:
-            for k in keys:
-                if filter_hash is not None:
-                    self._dispatch_queue.put_nowait(_TaggedKey(k, filter_hash))
-                else:
-                    self._dispatch_queue.put_nowait(k)
-        except queue.Full:
-            logger.warning("Observer dispatch queue full; dropping incoming batch")
+        q = self._dispatch_queue
+        for k in keys:
+            item = k if filter_hash is None else _TaggedKey(k, filter_hash)
+            try:
+                q.put_nowait(item)
+                continue
+            except queue.Full:
+                pass
+            while True:
+                try:
+                    q.put(item, timeout=_PUT_POLL_SECONDS)
+                    break
+                except queue.Full:
+                    if self._stop_event.is_set() or not self._connected:
+                        logger.warning("Observer stopping; dropping undelivered keys")
+                        return
 
     def flush(self, timeout: float = 1.0) -> None:
         """Wait for the dispatch queue to drain. Test helper."""
@@ -223,9 +237,8 @@ class ObserverBase:
         for item in batch:
             if isinstance(item, _TaggedKey):
                 key = item.key
-                matched = [
-                    s for s in registry.match(key) if _filter_hash(s.filter) == item.filter_hash
-                ]
+                h = item.filter_hash
+                matched = [s for s in registry.match(key) if s.filter_hash == h]
             else:
                 key = item
                 matched = registry.match(key)
