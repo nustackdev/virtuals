@@ -104,7 +104,20 @@ class RocksDBStorage:
     turns any writer that bypassed the slot into a retryable conflict.
 
     Snapshots: a rocksdb DB snapshot, taken when the Snapshot begins, pins
-    every get and scan in it. They never wait on a writer.
+    every get and scan in it. They never wait on a writer. A snapshot
+    dropped without ``close`` is released once it is collected; close it
+    to free what it pins at once.
+
+    Read-only secondary (``read_only=True, secondary_path=...``): rocksdb
+    has no snapshots there, so a Snapshot's view is the secondary's state
+    as of its last catch-up with the primary. The storage never catches
+    up while a Snapshot is open (the throttled catch-up before a new
+    snapshot is skipped then), so the view is fixed for the snapshot's
+    life. Two things can still move it: ``force_catch_up_with_primary``,
+    and a read that hits an SST file the primary compacted away, which
+    catches up to read at all. Either way every open snapshot loses its
+    view and its next read raises the retryable
+    ``StorageTransactionConflictError``: open a new snapshot and re-read.
 
     Coroutines: the slot belongs to a thread and, on an event loop, to the
     task that took it. Coroutines sharing one loop wait for it with
@@ -126,7 +139,10 @@ class RocksDBStorage:
     owning process. A storage handle must not be used in a forked child.
 
     A transaction, snapshot or scan belongs to one thread: do not share it
-    between threads, and close the storage only once every thread is done.
+    between threads. ``close()`` with a call in flight on another thread
+    waits for a gap between that thread's native calls (rdbpy refuses to
+    close while one is running), up to ``busy_timeout``, then raises
+    ``StorageError`` and leaves the storage open.
     """
 
     process_model: ClassVar[Literal["single", "multi"]] = "single"
@@ -199,6 +215,9 @@ class RocksDBStorage:
 
         self._secondary_refresh_interval = secondary_refresh_interval
         self._last_catchup_monotonic: float = 0.0
+        # Bumped by every catch-up of a secondary: a Snapshot begun under an
+        # older value has lost its view (see ``RocksDBSnapshot``).
+        self._secondary_epoch = 0
 
         # Paths
         self._path = Path(path) if isinstance(path, str) else path
@@ -218,12 +237,13 @@ class RocksDBStorage:
         self._db: rdbpy.TransactionDB | rdbpy.DB | None = None
         self._state_lock = threading.Lock()
         self._writer = WriterLock("RocksDB")
-        # Weak: a transaction or batch dropped without an end must be
-        # collectable, the transaction's finalizer then frees the slot.
+        # Weak: a context dropped without an end must be collectable, its
+        # finalizer then frees the slot or releases the rocksdb snapshot.
         self._active_transactions: weakref.WeakSet[RocksDBTransaction] = weakref.WeakSet()
         self._active_write_batches: weakref.WeakSet[RocksDBWriteBatch] = weakref.WeakSet()
-        self._active_snapshots: set[RocksDBSnapshot] = set()
+        self._active_snapshots: weakref.WeakSet[RocksDBSnapshot] = weakref.WeakSet()
         self._opened = False
+        self._closing = False
         self._pid = os.getpid()
 
     @property
@@ -404,19 +424,23 @@ class RocksDBStorage:
     def close(self) -> None:
         """Close database and release all resources.
 
-        Closes the database first: rdbpy refuses while another thread is
-        inside a call on it or on one of its transactions, snapshots or
-        iterators, and then nothing is touched and the storage stays open.
-        Once the database is closed (rdbpy rolls back its transactions and
-        releases its snapshots), open transactions, snapshots and batches
-        are marked ended and the writer slot is replaced: a slot reserved
-        but never taken, or held by a context still finishing elsewhere,
-        does not survive into a reopen, and a writer waiting on it wakes
-        with ``StorageClosedError``.
+        Closes the database first. rdbpy refuses while another thread is
+        inside a native call on it or on one of its transactions, snapshots
+        or iterators, so the close is retried with a short sleep until it
+        lands in a gap between that thread's calls, for up to
+        ``busy_timeout``; new begins are refused meanwhile. If it never
+        lands, nothing is touched, the storage stays open and
+        ``StorageError`` is raised. Once the database is closed (rdbpy
+        rolls back its transactions and releases its snapshots), open
+        transactions, snapshots and batches are marked ended and the
+        writer slot is replaced: a slot reserved but never taken, or held
+        by a context still finishing elsewhere, does not survive into a
+        reopen, and a writer waiting on it wakes with
+        ``StorageClosedError``.
 
         Raises:
             StorageError: If close fails, e.g. a call is still in flight on
-                another thread
+                another thread for the whole ``busy_timeout``
         """
         if not self._opened:
             return
@@ -426,10 +450,12 @@ class RocksDBStorage:
 
         db = self._db
         if db is not None:
+            self._closing = True
             try:
-                db.close()
-            except Exception as e:
-                raise StorageError(f"Failed to close database: {e}") from e
+                self._close_db(db)
+            except BaseException:
+                self._closing = False
+                raise
 
         with self._state_lock:
             transactions = list(self._active_transactions)
@@ -440,6 +466,7 @@ class RocksDBStorage:
             self._active_snapshots.clear()
             self._db = None
             self._opened = False
+            self._closing = False
 
         # Native state is gone; these only mark the contexts ended and give
         # back the writer slot. A waiter woken by that sees a closed storage.
@@ -462,6 +489,24 @@ class RocksDBStorage:
                 logger.error(f"Write batch abort failed during close: {e}")
 
         self._writer.close()
+
+    def _close_db(self, db: Any) -> None:  # noqa: ANN401
+        """Close the rdbpy handle, retrying while another thread is inside a call on it."""
+        deadline = time.monotonic() + max(self._busy_timeout, 0)
+        delay = 0.0005
+        while True:
+            try:
+                db.close()
+                return
+            except RuntimeError as e:
+                # rdbpy: "DB is in use by another thread". The call in flight
+                # is short; the next try lands in a gap between two calls.
+                if "in use" not in str(e) or time.monotonic() >= deadline:
+                    raise StorageError(f"Failed to close database: {e}") from e
+            except Exception as e:
+                raise StorageError(f"Failed to close database: {e}") from e
+            time.sleep(delay)
+            delay = min(delay * 2, 0.01)
 
     def _forget_inherited(self) -> None:
         """Close in a forked child: forget the parent's handles, free nothing native."""
@@ -554,51 +599,67 @@ class RocksDBStorage:
         db = self._db
 
         if self._is_secondary:
-            self._catch_up_if_due()
-            rdbpy_snapshot = None  # rocksdb: snapshots not supported in secondary mode
-        else:
-            try:
-                rdbpy_snapshot = db.snapshot()
-            except Exception as e:
-                raise classify_rdbpy(e, "Failed to begin snapshot") from e
+            # rocksdb has no snapshots in secondary mode: the view is the
+            # secondary's state, fixed by not catching up while any
+            # snapshot is open. The check and the registration share one
+            # locked section, so two snapshots begun at once cannot both
+            # catch up with the other already open.
+            with self._state_lock:
+                self._require_open()
+                if not self._active_snapshots:
+                    self._catch_up_if_due()
+                snapshot = RocksDBSnapshot(self, db, None, epoch=self._secondary_epoch)
+                self._active_snapshots.add(snapshot)
+            return snapshot
+
+        try:
+            rdbpy_snapshot = db.snapshot()
+        except Exception as e:
+            raise classify_rdbpy(e, "Failed to begin snapshot") from e
 
         snapshot = RocksDBSnapshot(self, db, rdbpy_snapshot)
         with self._state_lock:
-            self._active_snapshots.add(snapshot)
-        return snapshot
+            if self._opened and not self._closing:
+                self._active_snapshots.add(snapshot)
+                return snapshot
+        snapshot.close()
+        raise StorageClosedError("Storage was closed while beginning the snapshot")
 
     def _catch_up_if_due(self) -> None:
-        """Throttled catch-up of a secondary with the primary, before a snapshot."""
+        """Throttled catch-up of a secondary with the primary. Caller holds the state lock."""
         interval = self._secondary_refresh_interval
         if interval is None:
             return
         now = time.monotonic()
         if now - self._last_catchup_monotonic < interval:
             return
-        try:
-            self._db.try_catch_up_with_primary()
-        except Exception as e:
-            raise StorageError(f"Failed to catch up with primary: {e}") from e
-        self._last_catchup_monotonic = now
+        self._catch_up_locked()
 
-    def force_catch_up_with_primary(self) -> None:
-        """Catch up to the primary's current manifest immediately.
-
-        Unlike the throttled catch-up in `begin_snapshot`, this bypasses
-        `secondary_refresh_interval`. It exists to recover from a read that
-        hit an SST file the primary compacted away: the secondary is pinned
-        to an old manifest version that still references the deleted file,
-        and catching up to the current manifest drops that reference. No-op
-        on a primary (non-secondary) storage.
-        """
-        if not self._is_secondary:
-            return
-        self._require_open()
+    def _catch_up_locked(self) -> None:
+        """Catch up with the primary and retire every open snapshot's view. Caller holds the state lock."""
         try:
             self._db.try_catch_up_with_primary()
         except Exception as e:
             raise StorageError(f"Failed to catch up with primary: {e}") from e
         self._last_catchup_monotonic = time.monotonic()
+        self._secondary_epoch += 1
+
+    def force_catch_up_with_primary(self) -> None:
+        """Catch up to the primary's current manifest now, whatever is open.
+
+        Bypasses ``secondary_refresh_interval`` and the open-snapshot hold:
+        every Snapshot open on this secondary loses its view, and its next
+        read raises the retryable ``StorageTransactionConflictError``. The
+        read paths call this when they hit an SST file the primary
+        compacted away (the secondary's manifest version still references
+        it; the current manifest does not), so that a fresh snapshot can
+        read. No-op on a primary (non-secondary) storage.
+        """
+        if not self._is_secondary:
+            return
+        with self._state_lock:
+            self._require_open()
+            self._catch_up_locked()
 
     def begin_transaction(self, *, write_slot: WriteSlot | None = None) -> RocksDBTransaction:
         """Begin read-write transaction, taking the writer slot now.
@@ -820,7 +881,7 @@ class RocksDBStorage:
                 the rocksdb handle (background threads, directory lock)
                 does not survive a fork, so the child must open its own
         """
-        if not self._opened or self._db is None:
+        if not self._opened or self._db is None or self._closing:
             raise StorageClosedError("Storage is not open")
         if self._pid != os.getpid():
             raise StorageError(

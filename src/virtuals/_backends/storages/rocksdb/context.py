@@ -36,6 +36,7 @@ __all__ = [
     "WriteOperationsMixin",
     "classify_rdbpy",
     "is_missing_file_error",
+    "secondary_view_lost",
 ]
 
 
@@ -76,10 +77,22 @@ def classify_rdbpy(e: BaseException, message: str) -> StorageError:
     return StorageOperationError(f"{message}: {e}")
 
 
-# Bounded retries for a read-only secondary whose manifest version still
-# references an SST file the primary has compacted away. Each retry forces a
-# fresh primary catch-up, which advances the secondary past the stale version.
-_SECONDARY_STALE_RETRIES = 6
+def secondary_view_lost(storage: RocksDBStorage, cause: BaseException) -> StorageError:
+    """Catch the secondary up past the file it lost, and say the view is gone.
+
+    Returns the retryable ``StorageTransactionConflictError`` for the
+    caller to raise: a new snapshot reads the current state, this one
+    cannot answer consistently any more. A failed catch-up is reported
+    instead, non-retryable.
+    """
+    try:
+        storage.force_catch_up_with_primary()
+    except StorageError as e:
+        return e
+    return StorageTransactionConflictError(
+        "Secondary snapshot lost its view: the primary compacted away a file it was reading, "
+        f"and the storage caught up to read on. Open a new snapshot and re-read: {cause}"
+    )
 
 
 def is_missing_file_error(e: BaseException) -> bool:
@@ -262,28 +275,24 @@ class ReadOperationsMixin:
     _iterator: Callable[..., Any]
 
     def _read_raw(self, key: Key, action: str, encoded_key: bytes) -> bytes | None:
-        """Point read at the context's snapshot, surviving a stale-manifest secondary.
+        """Point read at the context's snapshot, surfacing a stale-manifest secondary.
 
         On a read-only secondary, the read can fail because the secondary's
         manifest version references an SST the primary already compacted
-        away. That is recoverable: force a catch-up to the current manifest
-        and retry. Any other failure, and any failure at all on a primary,
-        is classified and raised immediately.
+        away. The storage then catches up to the current manifest, so the
+        next snapshot reads, and this one raises the retryable
+        ``StorageTransactionConflictError``: its view is gone, and
+        answering from the new state would tear it (contract section 2).
+        Any other failure, and any failure at all on a primary, is
+        classified and raised as is.
         """
         try:
             return self._get_raw(encoded_key)
         except Exception as e:
-            last = e
-        storage = self._storage
-        for _ in range(_SECONDARY_STALE_RETRIES):
-            if not (storage._is_secondary and is_missing_file_error(last)):
-                break
-            storage.force_catch_up_with_primary()
-            try:
-                return self._get_raw(encoded_key)
-            except Exception as e:
-                last = e
-        raise classify_rdbpy(last, f"Failed to {action} key {key}") from last
+            storage = self._storage
+            if storage._is_secondary and is_missing_file_error(e):
+                raise secondary_view_lost(storage, e) from e
+            raise classify_rdbpy(e, f"Failed to {action} key {key}") from e
 
     def get(self, key: Key) -> Value | Empty:
         """Get value by key.
