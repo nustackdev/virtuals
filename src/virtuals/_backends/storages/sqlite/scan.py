@@ -29,8 +29,27 @@ __all__ = ["SQLiteScan"]
 # past its range, doubles up to the cap so a long scan pays few re-seeks.
 _FIRST_PAGE = 32
 _MAX_PAGE = 1024
-# Page after a `max_depth` skip: the next child is normally the first row.
+# Page after a re-seek out of a subtree that swallowed a whole page: the
+# next useful row is normally the first one.
 _SEEK_PAGE = 4
+
+
+def _first_past(rows: list[tuple], lo: int, bound: object, reverse: bool) -> int:
+    """Index of the first row at or past ``bound`` in scan order, from ``lo``.
+
+    ``rows`` is a fetched page, so it is sorted ascending forward and
+    descending reverse. Returns ``len(rows)`` when no row reaches the bound.
+    """
+    hi = len(rows)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        key = rows[mid][0]
+        past = key <= bound if reverse else key >= bound  # type: ignore[operator]
+        if past:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
 
 
 class _IteratorType(Enum):
@@ -140,20 +159,25 @@ class SQLiteScan(ScanProtocol):
     def _iterate_impl(self, iterator_type: _IteratorType) -> Generator[object, None, None]:
         """Core iteration implementation.
 
-        Pages by key. A ``max_depth`` skip drops the rest of the current
-        page and re-seeks with an inclusive bound at the skip target, on a
-        small page since the next useful row is usually right there.
+        Pages by key. A ``max_depth`` skip bisects the rest of the current
+        page (fetched rows are in scan order, so the first row past the
+        skip bound is a binary search away) and carries on there. Only
+        when the bound lies past the page end does it re-query, inclusive
+        at the bound. The page then shrinks to ``_SEEK_PAGE`` if the page
+        held a single walked row (one wide subtree swallowed it, so the
+        next useful row is right at the bound) and keeps growing otherwise.
         """
         self._context._require_active()
         codec = self._storage.codec
         options = self._options
         need_values = iterator_type != _IteratorType.KEYS
         max_depth = options.max_depth
+        reverse = options.reverse
 
         cols = "k, v" if need_values else "k"
-        order = "DESC" if options.reverse else "ASC"
+        order = "DESC" if reverse else "ASC"
         # First page is inclusive of `start`; later pages exclude the last key.
-        first_op, next_op, far_op = ("<=", "<", ">=") if options.reverse else (">=", ">", "<")
+        first_op, next_op, far_op = ("<=", "<", ">=") if reverse else (">=", ">", "<")
 
         bound, far = self._encoded_bounds()
         op = first_op
@@ -167,8 +191,11 @@ class SQLiteScan(ScanProtocol):
             if not rows:
                 return
 
-            skipped = False
-            for row in rows:
+            n_rows = len(rows)
+            walked = 0  # rows on this page at or above max_depth
+            i = 0
+            while i < n_rows:
+                row = rows[i]
                 try:
                     key = codec.decode_key(row[0])
                 except Exception as e:
@@ -178,12 +205,18 @@ class SQLiteScan(ScanProtocol):
                     return
 
                 if max_depth is not None and len(key) > max_depth:
-                    # Below the walked depth: re-seek past the whole subtree.
-                    bound = options.skip_bound(codec, key)
-                    op = first_op
-                    page = _SEEK_PAGE
-                    skipped = True
+                    # Below the walked depth: jump past the whole subtree.
+                    skip = options.skip_bound(codec, key)
+                    i = _first_past(rows, i + 1, skip, reverse)
+                    if i < n_rows:
+                        continue
+                    if n_rows < page:
+                        return  # the page was the end of the range
+                    bound, op = skip, first_op
+                    page = _SEEK_PAGE if walked <= 1 else min(page * 2, _MAX_PAGE)
                     break
+                walked += 1
+                i += 1
 
                 if options.filter is not None and not options.filter.matches(key):
                     continue
@@ -206,14 +239,11 @@ class SQLiteScan(ScanProtocol):
                     yield (key, value)
 
                 count += 1
-
-            if skipped:
-                continue
-            if len(rows) < page:
-                return
-            bound = rows[-1][0]
-            op = next_op
-            page = min(page * 2, _MAX_PAGE)
+            else:
+                if n_rows < page:
+                    return
+                bound, op = rows[-1][0], next_op
+                page = min(page * 2, _MAX_PAGE)
 
     def keys(self) -> Generator[Key, None, None]:
         """Iterate over keys only."""
