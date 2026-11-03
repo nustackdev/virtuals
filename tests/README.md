@@ -27,7 +27,7 @@ Three files drive the storages and views with random operations against a refere
 CONFORMANCE_MODEL_EXAMPLES=500 .venv/bin/python -m pytest -q -p no:cacheprovider -m slow tests/views/test_views_model.py -k lmdb
 ```
 
-A failure prints the shrunk sequence of steps that reproduces it. Open view bugs are routed around with named `OPEN_M*` flags at the top of `views/test_views_model.py`; delete a flag in the commit that fixes it.
+A failure prints the shrunk sequence of steps that reproduces it.
 
 ## Layout
 

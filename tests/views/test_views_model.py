@@ -56,16 +56,6 @@ from virtuals.tkv.storage import StorageScanOptions
 from virtuals.types import is_empty
 
 
-# ---------------------------------------------------------------------------- open bugs
-#
-# Routed around until the fixes from lane V round 3 (report 33, findings M1,
-# M2, M3) land. Delete each flag and its branch in the commit that fixes it;
-# the rules then cover the case.
-OPEN_M1_SET_COMPOUND_MEMBER = True  # SetView.add of a tuple leaves the set unreadable
-OPEN_M2_FRAC_SELF_MOVE_ABSENT_ID = True  # move_before(x, x) with x absent is a silent no-op
-OPEN_M3_LIST_INSERT_COMPOUND_OVER_PRIMITIVE = True  # ListView.insert of a dict over a primitive
-
-
 # ---------------------------------------------------------------------------- tiers
 
 
@@ -117,7 +107,10 @@ compound_st = st.dictionaries(st.sampled_from(["p", "q"]), prim_st, max_size=2)
 value_st = st.one_of(prim_st, prim_st, compound_st)
 set_prim_st = st.one_of(st.integers(-3, 3), st.sampled_from(["x", "y"]), st.none())
 set_compound_st = st.one_of(st.tuples(st.integers(0, 2)), st.just(frozenset({1})))
-setval_st = set_prim_st if OPEN_M1_SET_COMPOUND_MEMBER else st.one_of(set_prim_st, set_compound_st)
+setval_st = st.one_of(
+    set_prim_st, set_compound_st
+)  # a tuple or frozenset is a member like any other
+unhashable_st = st.sampled_from([[1], {"p": 1}, {1}])  # refused like a python set refuses them
 
 MISSING = object()
 
@@ -526,14 +519,8 @@ class ViewsMachine(RuleBasedStateMachine):
         self.count("frac_move")
         ids = self._fids()
         fn = self.f.move_before if before else self.f.move_after
-        if k == ref and k not in ids and OPEN_M2_FRAC_SELF_MOVE_ABSENT_ID:
-            self.count("frac_move_self_absent_M2")
-            try:
-                fn(k, ref)  # a silent no-op today (M2); KeyError once fixed
-            except KeyError:
-                pass
-        elif k not in ids or ref not in ids:
-            expect(KeyError, lambda: fn(k, ref), "move with absent id")
+        if k not in ids or ref not in ids:
+            expect(KeyError, lambda: fn(k, ref), "move with absent id, self move too")
         elif k == ref:
             try:
                 fn(k, ref)
@@ -658,17 +645,7 @@ class ViewsMachine(RuleBasedStateMachine):
     @rule(i=st.integers(-4, 6), v=value_st)
     def list_insert(self, i, v):
         self.count("list_insert")
-        n = len(self.m_list)
-        at = max(0, n + i) if i < 0 else min(i, n)
-        if (
-            OPEN_M3_LIST_INSERT_COMPOUND_OVER_PRIMITIVE
-            and at < n
-            and kind(self.m_list[at]) == "p"
-            and kind(v) == "c"
-        ):
-            self.count("list_insert_skipped_M3")
-            return
-        self.ls.insert(i, v)
+        self.ls.insert(i, v)  # a compound over a primitive slot included
         self.m_list.insert(i, v)
         self.check_all()
 
@@ -739,13 +716,14 @@ class ViewsMachine(RuleBasedStateMachine):
     @rule(v=setval_st)
     def set_add(self, v):
         self.count("set_add")
-        try:
-            self.s.add(v)
-        except TypeError:
-            # a fix for M1 may refuse compound members instead of storing them opaquely
-            assert isinstance(v, (tuple, frozenset)), v
-        else:
-            self.m_set.add(v)
+        self.s.add(v)
+        self.m_set.add(v)
+        self.check_all()
+
+    @rule(v=unhashable_st)
+    def set_add_unhashable_is_refused(self, v):
+        self.count("set_add_unhashable")
+        expect(TypeError, lambda: self.s.add(v), "add of an unhashable member")
         self.check_all()
 
     @rule(v=setval_st)
@@ -772,7 +750,7 @@ class ViewsMachine(RuleBasedStateMachine):
         self.m_set.clear()
         self.check_all()
 
-    @rule(vs=st.sets(set_prim_st, max_size=4))
+    @rule(vs=st.sets(setval_st, max_size=4))
     def set_store(self, vs):
         self.count("set_store")
         self.s.store(vs)
