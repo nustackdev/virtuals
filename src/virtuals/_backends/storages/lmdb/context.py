@@ -32,17 +32,26 @@ class ContextBase:
     Wraps an lmdb.Transaction handle and tracks open/closed state.
     """
 
-    __slots__ = ("_closed", "_lmdb_txn", "_storage")
+    __slots__ = ("_closed", "_holds_write_slot", "_lmdb_txn", "_storage")
 
-    def __init__(self, storage: LMDBStorage, lmdb_txn: Any) -> None:  # noqa: ANN401
+    def __init__(
+        self,
+        storage: LMDBStorage,
+        lmdb_txn: Any,  # noqa: ANN401
+        *,
+        holds_write_slot: bool = False,
+    ) -> None:
         """Initialize context with storage reference and LMDB transaction.
 
         Args:
             storage: Parent storage instance
             lmdb_txn: LMDB transaction handle
+            holds_write_slot: True if this context holds the storage's
+                in-process writer slot and must release it on close.
         """
         self._storage = storage
         self._lmdb_txn: Any | None = lmdb_txn
+        self._holds_write_slot = holds_write_slot
         self._closed = False
 
     @property
@@ -63,9 +72,12 @@ class ContextBase:
         return self._lmdb_txn
 
     def _mark_closed(self) -> None:
-        """Mark context as closed and clear handle."""
+        """Mark context as closed, clear handle, and give back the writer slot."""
         self._closed = True
         self._lmdb_txn = None
+        if self._holds_write_slot:
+            self._holds_write_slot = False
+            self._storage._release_write_slot()
 
     @property
     def is_closed(self) -> bool:

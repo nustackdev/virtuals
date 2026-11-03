@@ -33,16 +33,16 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
     """Read-write transaction backed by an LMDB write transaction.
 
     LMDB serializes writers at the environment level: only one write
-    transaction may be active per environment at a time. This adapter
-    lets LMDB do that gating; callers see the standard transaction
-    protocol with commit/abort semantics.
+    transaction may be active per environment at a time. In-process
+    writers queue on the storage's writer slot first; the transaction
+    holds it from begin and releases it on commit or abort.
     """
 
     __slots__ = ("_aborted", "_committed", "_modified_keys")
 
     def __init__(self, storage: LMDBStorage, lmdb_txn: object) -> None:
         """Initialize transaction."""
-        super().__init__(storage, lmdb_txn)
+        super().__init__(storage, lmdb_txn, holds_write_slot=True)
         self._modified_keys: set[Key] = set()
         self._committed = False
         self._aborted = False
@@ -69,6 +69,11 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         try:
             txn.commit()
         except Exception as e:
+            # LMDB frees a write transaction whose commit fails, so close
+            # this one too and give back the writer slot.
+            self._aborted = True
+            self._mark_closed()
+            self._storage._untrack_transaction(self)
             logger.error("Transaction commit failed")
             raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
 

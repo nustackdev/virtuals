@@ -40,7 +40,7 @@ class LMDBWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
 
     def __init__(self, storage: LMDBStorage, lmdb_txn: object) -> None:
         """Initialize write batch."""
-        super().__init__(storage, lmdb_txn)
+        super().__init__(storage, lmdb_txn, holds_write_slot=True)
         self._modified_keys: set[Key] = set()
         self._written = False
         self._aborted = False
@@ -67,6 +67,11 @@ class LMDBWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
         try:
             txn.commit()
         except Exception as e:
+            # LMDB frees a write transaction whose commit fails, so close
+            # this batch too and give back the writer slot.
+            self._aborted = True
+            self._mark_closed()
+            self._storage._untrack_write_batch(self)
             logger.error("Write batch write failed")
             raise StorageTransactionError(f"Failed to write batch: {e}") from e
 
