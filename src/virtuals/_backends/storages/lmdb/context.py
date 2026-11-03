@@ -172,11 +172,12 @@ class ContextBase:
     def _finalize_unended_write(self, what: str) -> None:
         """Last resort for a write context dropped without commit or abort.
 
-        Aborts its LMDB transaction on the writer thread (safe from the
-        collecting thread, whichever it is) and gives the slot back, so a
-        forgotten transaction cannot hold the writer lock until close().
-        Takes no lock: nothing else references the context any more, and a
-        collection may run on a thread that holds one of them. Inherited
+        Queues the abort of its LMDB transaction on the writer thread
+        (safe from the collecting thread, whichever it is) and gives the
+        slot back at once, so a forgotten transaction cannot hold the
+        writer lock until close(). Takes no lock and waits on nothing:
+        nothing else references the context any more, and a collection
+        may run on a thread that holds a lock the abort needs. Inherited
         across a fork, the context is left alone (see ``_check_fork``).
         """
         if self._closed or self._pid != os.getpid():
@@ -186,9 +187,9 @@ class ContextBase:
         holds, self._holds_write_slot = self._holds_write_slot, False
         logger.warning(f"LMDB {what} dropped without commit or abort; aborting it")
         try:
-            # Bounded, and skipped when the writer thread is gone or the
-            # interpreter is exiting: a wait there would never end, and
-            # process exit frees LMDB's writer lock and the gate anyway.
+            # Skipped when the writer thread is gone or the interpreter is
+            # exiting: process exit frees LMDB's writer lock and the gate
+            # anyway, and close() ends every live write itself.
             if txn is not None and not self._storage._end_write_from_finalizer(txn):
                 logger.debug(f"LMDB {what} finalizer did not reach the writer thread")
         finally:

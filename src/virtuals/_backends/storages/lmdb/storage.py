@@ -100,7 +100,7 @@ class LMDBWriteSlot(WriteSlot):
     def __del__(self) -> None:
         """Last resort: give back a held slot that became unreachable unreleased.
 
-        Bounded and skipped at interpreter exit (see ``WriterThread.try_run``).
+        The abort is queued, never waited for (see ``WriterThread.try_fire``).
         """
         try:
             if self._state == "held":
@@ -937,8 +937,9 @@ class LMDBStorage:
     def _release_reserved(self, slot: LMDBWriteSlot, *, finalizing: bool = False) -> None:
         """Give back a reserved slot no transaction took: abort its begun txn first.
 
-        From the slot's finalizer the abort is bounded and skipped when the
-        writer thread is gone or the interpreter is exiting.
+        From the slot's finalizer the abort is queued, not waited for, and
+        skipped when the writer thread is gone or the interpreter is
+        exiting; the slot and the gate are given back at once.
         """
         with self._env_lock:
             lmdb_txn, slot._lmdb_txn = slot._lmdb_txn, None
@@ -956,14 +957,14 @@ class LMDBStorage:
         self._release_write_slot(slot._lock)
 
     def _end_write_from_finalizer(self, lmdb_txn: Any) -> bool:  # noqa: ANN401
-        """Abort a dropped write txn on the writer thread, bounded; False if skipped.
+        """Queue the abort of a dropped write txn on the writer thread; False if skipped.
 
-        Skipped means the writer thread is gone (close() stopped it after
-        ending every live write itself) or the interpreter is exiting.
+        Never waits: the collecting thread may hold ``_env_lock``, which
+        the abort needs. Skipped means the writer thread is gone (close()
+        stopped it after ending every live write itself) or the
+        interpreter is exiting.
         """
-        return self._writer_thread.try_run(
-            lambda: self._end_live(lmdb_txn, False), self._busy_timeout
-        )
+        return self._writer_thread.try_fire(lambda: self._end_live(lmdb_txn, False))
 
     @contextmanager
     def transaction(self) -> Iterator[LMDBTransaction]:

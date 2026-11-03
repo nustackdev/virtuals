@@ -1186,16 +1186,16 @@ def test_finalizer_racing_close_leaves_no_live_write(ctx, tmp_path: Path, monkey
 
     st = _open(str(tmp_path), busy_timeout=2.0)
     peer = _peer_can_write_now(ctx, tmp_path)
-    original = WriterThread.try_run
+    original = WriterThread.try_fire
     outcomes: list[bool] = []
 
-    def slow_try_run(self, fn, timeout):
+    def slow_try_fire(self, fn):
         time.sleep(0.3)  # the finalizer is descheduled right after it marked the context closed
-        result = original(self, fn, timeout)
+        result = original(self, fn)
         outcomes.append(result)
         return result
 
-    monkeypatch.setattr(WriterThread, "try_run", slow_try_run)
+    monkeypatch.setattr(WriterThread, "try_fire", slow_try_fire)
 
     def drop() -> None:
         tx = st.begin_transaction()
@@ -1607,4 +1607,54 @@ def test_full_reader_table_is_retryable(tmp_path: Path) -> None:
     finally:
         for snap in snaps:
             snap.close()
+        st.close()
+
+
+# =========================================================================
+# Round 2: finalizers never wait on the writer thread (X4)
+# =========================================================================
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.parametrize("what", ["transaction", "slot"])
+def test_finalizer_under_env_lock_does_not_wait(tmp_path: Path, what: str) -> None:
+    """A collection on a thread holding _env_lock queues the abort and returns at once.
+
+    Before, the finalizer waited for the writer thread, which needs that
+    lock: a busy_timeout stall of every begin, snapshot and close.
+    """
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    gc.disable()
+    try:
+
+        def drop() -> None:
+            if what == "transaction":
+                tx = st.begin_transaction()
+                tx.put(("x",), b"1")
+                tx.get(("x",))  # begun: there is an LMDB transaction to abort
+                cycle = [tx]
+                cycle.append(cycle)
+            else:
+
+                async def reserve() -> None:
+                    slot = await st.areserve_write_slot()
+                    cycle = [slot]
+                    cycle.append(cycle)
+
+                asyncio.run(reserve())
+
+        drop()
+        t0 = time.monotonic()
+        with st._env_lock:
+            gc.collect()
+        assert time.monotonic() - t0 < 0.5  # timing: before, busy_timeout
+        assert not st._writer.lock.locked()
+        with st.transaction() as tx:  # the queued abort ran first, the slot is free
+            tx.put(("y",), b"2")
+        with st.snapshot() as snap:
+            assert snap.get(("x",)) is EMPTY
+            assert snap.get(("y",)) == b"2"
+        assert not st._live_writes
+    finally:
+        gc.enable()
         st.close()
