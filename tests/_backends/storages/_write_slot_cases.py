@@ -1,4 +1,4 @@
-"""Writer slot cases shared by the SQLite and LMDB storage tests.
+"""Writer slot cases shared by the SQLite, LMDB, RocksDB and in-memory storage tests.
 
 Each case takes an open storage with ``busy_timeout`` of a few seconds, so
 a slot left taken shows up as a slow or failed write, not a hang.
@@ -14,7 +14,13 @@ import time
 
 import pytest
 
-from virtuals.tkv.storage import StorageLockTimeoutError, StorageNestedTransactionError
+from virtuals._backends.storages._write_slot import LOOP_THREAD_WAIT_CAP
+from virtuals.tkv.storage import (
+    StorageClosedError,
+    StorageError,
+    StorageLockTimeoutError,
+    StorageNestedTransactionError,
+)
 from virtuals.tkv.types import EMPTY
 
 
@@ -341,3 +347,190 @@ def close_during_commit_keeps_one_outcome(storage, tx, during_commit) -> None:
     with storage.snapshot() as snap:
         assert snap.get(KEY) == b"committed"
     _write_fast(storage)
+
+
+def reserved_slot_does_not_survive_close(storage) -> None:
+    """A slot reserved and never taken is dropped by close(); the reopened storage writes at once."""
+
+    async def main() -> None:
+        slot = await storage.areserve_write_slot()
+        storage.close()
+        storage.open()
+        assert not storage._writer.lock.locked()
+        with pytest.raises(StorageError, match="stale"):
+            storage.begin_transaction(write_slot=slot)
+        assert not slot.held
+        slot.release()  # no-op: never touches the fresh slot
+        assert not storage._writer.lock.locked()
+        t0 = time.monotonic()
+        storage.begin_transaction().abort()
+        (await storage.areserve_write_slot()).release()
+        assert time.monotonic() - t0 < FAST
+
+    asyncio.run(main())
+    _write_fast(storage)
+
+
+def waiter_on_stale_slot_wakes_on_close(storage) -> None:
+    """close() frees a slot a reserved-but-untaken WriteSlot holds, so a blocked writer moves on."""
+    slot = asyncio.run(storage.areserve_write_slot())  # holds the slot, no transaction takes it
+    outcome: dict = {}
+
+    def waiter() -> None:
+        t0 = time.monotonic()
+        try:
+            storage.begin_transaction().abort()
+            outcome["began"] = True
+        except Exception as e:
+            outcome["error"] = type(e)
+        outcome["secs"] = time.monotonic() - t0
+
+    t = threading.Thread(target=waiter)
+    t.start()
+    time.sleep(0.05)
+    storage.close()
+    t.join(2)
+    assert not t.is_alive()
+    assert outcome.get("error") is StorageClosedError, outcome
+    assert outcome["secs"] < 1.0  # did not wait out busy_timeout
+    storage.open()
+    slot.release()  # stale: touches nothing
+    assert not storage._writer.lock.locked()
+    _write_fast(storage)
+
+
+def writer_waiting_across_close_gets_closed_error(storage) -> None:
+    """A sync writer blocked behind a holder when close() runs wakes closed, owning nothing."""
+    holder = storage.begin_transaction()
+    outcome: dict = {}
+
+    def waiter() -> None:
+        try:
+            outcome["txn"] = storage.begin_transaction()
+        except Exception as e:
+            outcome["error"] = type(e)
+
+    t = threading.Thread(target=waiter)
+    t.start()
+    time.sleep(0.05)
+    storage.close()  # aborts the holder, frees the old lock, swaps in a new one
+    t.join(2)
+    assert not t.is_alive()
+    assert outcome == {"error": StorageClosedError}
+    assert holder.is_closed
+    storage.open()
+    x = storage.begin_transaction()
+    assert storage._writer._owner is not None and storage._writer._owner[0] == threading.get_ident()
+    busy_timeout, storage._busy_timeout = storage._busy_timeout, 0.2
+    try:
+        with pytest.raises(StorageLockTimeoutError):
+            _in_thread(storage.begin_transaction)  # exactly one writer on the reopened storage
+    finally:
+        storage._busy_timeout = busy_timeout
+    x.put(KEY, b"x")
+    x.commit()
+    with storage.snapshot() as snap:
+        assert snap.get(KEY) == b"x"
+
+
+def dropped_transaction_frees_slot(storage) -> None:
+    """A transaction dropped without commit or abort gives the slot back once collected."""
+
+    def drop() -> None:
+        t = storage.begin_transaction()
+        t.put(KEY, b"dropped")  # neither committed nor aborted: goes out of scope
+
+    th = threading.Thread(target=drop)
+    th.start()
+    th.join()
+    gc.collect()
+    t0 = time.monotonic()
+    with storage.transaction() as tx:
+        tx.put(KEY, b"next")
+    assert time.monotonic() - t0 < FAST
+    with storage.snapshot() as snap:
+        assert snap.get(KEY) == b"next"
+    drop()  # on this thread too: the finished hold's mark must not read as nested
+    gc.collect()
+    _write_fast(storage)
+
+
+def sync_begin_on_loop_thread_is_bounded(storage, ctx: str) -> None:
+    """A sync begin or batch write on the loop thread, while a thread holds the slot, waits at most the cap.
+
+    It raises the retryable ``StorageLockTimeoutError`` pointing at
+    ``areserve_write_slot``, and the loop is never stalled for longer.
+    """
+    holding, release = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with storage.transaction() as t:
+            t.put(KEY, b"thread")
+            holding.set()
+            release.wait(5)
+
+    th = threading.Thread(target=holder)
+    th.start()
+    assert holding.wait(5)
+
+    async def main() -> tuple[float, float]:
+        gap, last = 0.0, time.perf_counter()
+        stop = asyncio.Event()
+
+        async def ticker() -> None:
+            nonlocal gap, last
+            while not stop.is_set():
+                await asyncio.sleep(0.002)
+                now = time.perf_counter()
+                gap, last = max(gap, now - last), now
+
+        tick = asyncio.create_task(ticker())
+        await asyncio.sleep(0.01)
+        t0 = time.perf_counter()
+        with pytest.raises(StorageLockTimeoutError, match="areserve_write_slot"):
+            if ctx == "transaction":
+                storage.begin_transaction()
+            else:
+                batch = storage.begin_write_batch()  # LMDB takes the slot here
+                batch.put(KEY, b"batch")
+                batch.write()  # the others take it here
+        waited = time.perf_counter() - t0
+        stop.set()
+        await tick
+        return waited, gap
+
+    try:
+        waited, gap = asyncio.run(main())
+    finally:
+        release.set()
+        th.join()
+    assert waited < LOOP_THREAD_WAIT_CAP + 0.1, waited  # the cap bounds it, not busy_timeout
+    assert gap < 0.2, gap
+    _write_fast(storage)
+
+
+def context_end_after_slot_reset_touches_nothing(storage, tx) -> None:
+    """A context ending after the slot was replaced (fork reset) releases by identity only."""
+    storage._writer.reset()  # as a forked child does
+    tx.abort()  # the fresh lock is not the one this context held
+    assert not storage._writer.lock.locked()
+    _write_fast(storage)
+
+
+def _in_thread(fn, timeout: float = 5.0):
+    """Run ``fn`` on a thread, join it, return its result (or raise its error)."""
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["result"] = fn()
+        except BaseException as e:
+            box["error"] = e
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join(timeout)
+    assert not t.is_alive(), "thread did not finish"
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
