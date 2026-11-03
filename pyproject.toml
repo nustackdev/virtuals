@@ -84,6 +84,7 @@ dev = [
     "pytest-timeout>=2.1.0",
     "pytest-benchmark>=4.0.0",
     "hypothesis>=6.0.0",
+    "valkeylite>=9.1.2",
 ]
 
 # ============================================================================
@@ -93,6 +94,9 @@ dev = [
 where = ["src"]
 include = ["virtuals*"]
 namespaces = false
+
+[tool.setuptools.package-data]
+"virtuals._backends.notify" = ["*.lua"]
 
 # =============================================================
 # Coverage

@@ -1,9 +1,10 @@
 """Fixtures for _backends tests. Mirrors tests/tkv/conftest.py."""
 
-import os
 import uuid
 
 import pytest
+
+from tests.support.valkey import redis_url_or_private
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -11,26 +12,17 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "redis: Tests requiring redis-py + msgpack installed and a reachable "
-        "redis server (TEST_REDIS_URL env, default redis://localhost:6380).",
+        "redis server (TEST_REDIS_URL env, else a private valkeylite server).",
     )
 
 
 @pytest.fixture(scope="session")
-def redis_url() -> str:
-    """URL for the test redis server. Skips the test if unreachable or deps missing."""
-    url = os.environ.get("TEST_REDIS_URL", "redis://localhost:6380")
-    try:
-        import msgpack  # noqa: F401
-        import redis  # noqa: F401
-    except ImportError as e:
-        pytest.skip(f"redis extras not installed: {e}")
-    try:
-        import redis as _r
+def redis_url(tmp_path_factory: pytest.TempPathFactory):
+    """URL for the test redis server: TEST_REDIS_URL if set, else a private valkey.
 
-        _r.from_url(url).ping()
-    except Exception as e:
-        pytest.skip(f"redis unreachable at {url}: {e}")
-    return url
+    Skips only if the redis extras (or valkeylite, without TEST_REDIS_URL) are missing.
+    """
+    yield from redis_url_or_private(tmp_path_factory)
 
 
 @pytest.fixture
