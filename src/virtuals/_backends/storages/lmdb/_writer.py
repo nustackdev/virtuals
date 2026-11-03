@@ -111,7 +111,12 @@ class WriterThread:
             self._stopped = False
 
     def _submit(
-        self, fn: Callable[[], Any], future: Future, undo: Callable[[Any], None] | None
+        self,
+        fn: Callable[[], Any],
+        future: Future,
+        undo: Callable[[Any], None] | None,
+        then: Callable[[Any], Any] | None = None,
+        done: Future | None = None,
     ) -> None:
         """Queue a job, starting the thread if needed.
 
@@ -131,7 +136,7 @@ class WriterThread:
                 )
                 self._thread = thread
                 thread.start()
-            self._queue.put((fn, future, undo))
+            self._queue.put((fn, future, undo, then, done))
 
     def _on_thread(self) -> bool:
         return threading.current_thread() is self._thread
@@ -142,24 +147,35 @@ class WriterThread:
             job = jobs.get()
             if job is None:
                 return
-            fn, future, undo = job
+            fn, future, undo, then, done = job
             try:
                 result = fn()
             except BaseException as e:
                 if future.set_running_or_notify_cancel():
                     future.set_exception(e)
+                if done is not None:
+                    done.set_exception(e)
                 continue
             # The requester may have given up while ``fn`` ran. Marking the
             # future running after the call makes that race explicit: either
             # the requester's cancel wins and ``undo`` takes the result back
             # (an abandoned begin is aborted at once), or the result lands.
-            if future.set_running_or_notify_cancel():
-                future.set_result(result)
-            elif undo is not None:
+            if not future.set_running_or_notify_cancel():
+                if undo is not None:
+                    try:
+                        undo(result)
+                    except Exception as e:
+                        logger.error(f"Undo of an abandoned LMDB writer call failed: {e}")
+                continue
+            future.set_result(result)
+            if then is not None:
+                # The second stage runs right here, on the result the
+                # requester now owns: no second hop, and no cancel can
+                # reach it (a commit is never abandoned half way).
                 try:
-                    undo(result)
-                except Exception as e:
-                    logger.error(f"Undo of an abandoned LMDB writer call failed: {e}")
+                    done.set_result(then(result))  # type: ignore[union-attr]
+                except BaseException as e:
+                    done.set_exception(e)  # type: ignore[union-attr]
 
     def fire(self, fn: Callable[[], Any]) -> None:
         """Run ``fn`` on the writer thread; nobody waits for it. Dropped after ``stop``."""
@@ -196,6 +212,38 @@ class WriterThread:
                 ) from None
             return future.result()
 
+    def run_staged(
+        self,
+        fn: Callable[[], Any],
+        then: Callable[[Any], Any],
+        *,
+        timeout: float,
+        undo: Callable[[Any], None],
+    ) -> Any:  # noqa: ANN401
+        """Run ``fn`` and then ``then(result)`` on the writer thread, one hop.
+
+        The wait is bounded only while ``fn`` is in flight: a timeout then
+        abandons it (``undo`` runs on its result when it lands) and raises
+        ``StorageLockTimeoutError``. Once ``fn`` has landed, ``then`` runs
+        to the end and the caller waits for it. For a write-only
+        transaction ``fn`` is the begin and ``then`` replays and commits,
+        so a begin behind a writer outside virtuals stays bounded while a
+        commit is never cut short.
+        """
+        if self._on_thread():
+            return then(fn())
+        begun: Future = Future()
+        done: Future = Future()
+        self._submit(fn, begun, undo, then, done)
+        try:
+            return done.result(timeout)
+        except FutureTimeoutError:
+            if begun.cancel():
+                raise StorageLockTimeoutError(
+                    f"Timed out after {timeout}s waiting for LMDB's writer lock"
+                ) from None
+            return done.result()
+
     def try_run(self, fn: Callable[[], Any], timeout: float) -> bool:
         """``run`` for finalizers: only if the thread is alive, bounded, never at exit.
 
@@ -215,7 +263,7 @@ class WriterThread:
             if thread is None or not thread.is_alive():
                 return False
             future: Future = Future()
-            self._queue.put((fn, future, None))
+            self._queue.put((fn, future, None, None, None))
         try:
             future.result(timeout)
         except FutureTimeoutError:

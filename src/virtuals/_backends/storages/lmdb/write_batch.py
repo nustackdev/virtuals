@@ -7,19 +7,23 @@ from typing import TYPE_CHECKING
 
 from virtuals.tkv.storage import (
     StorageClosedError,
+    StorageLockTimeoutError,
+    StorageNestedTransactionError,
+    StorageOperationError,
+    StorageTransactionConflictError,
     StorageTransactionError,
     WriteBatchProtocol,
 )
 
-from .context import ContextBase, WriteOperationsMixin
+from .context import ContextBase
 
 
 if TYPE_CHECKING:
-    import threading
     from types import TracebackType
 
-    from virtuals.tkv.types import Key
+    from virtuals.tkv.types import Key, Value
 
+    from .context import Pending
     from .storage import LMDBStorage
 
 
@@ -29,44 +33,63 @@ __all__ = ["LMDBWriteBatch"]
 logger = getLogger(__name__)
 
 
-class LMDBWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
-    """Write-only batch backed by an LMDB write transaction.
+class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
+    """Write-only batch, buffered in Python and applied in one write transaction.
 
-    LMDB has no distinct batch API - a write transaction is already the
-    batch primitive. This class exposes it as a write-only surface
-    (no read methods) matching the WriteBatchProtocol contract.
+    Like the SQLite and RocksDB batches, puts and deletes collect in memory
+    (last op per key wins) and touch LMDB only at ``write``, which takes
+    the writer slot and the cross-process gate, then begins, replays and
+    commits in one writer-thread job. Building a batch holds no lock, so a
+    slow build keeps no writer waiting, in this process or another.
     """
 
-    __slots__ = ("_aborted", "_modified_keys", "_written")
+    __slots__ = ("_aborted", "_modified_keys", "_ops", "_written")
 
-    def __init__(
-        self, storage: LMDBStorage, lmdb_txn: object, write_lock: threading.Lock | None = None
-    ) -> None:
+    def __init__(self, storage: LMDBStorage) -> None:
         """Initialize write batch."""
-        super().__init__(storage, lmdb_txn, holds_write_slot=True, write_lock=write_lock)
+        super().__init__(storage, None)
+        self._ops: Pending = {}
         self._modified_keys: set[Key] = set()
         self._written = False
         self._aborted = False
-
-    def __del__(self) -> None:
-        """Abort a batch dropped unended, so it cannot hold the writer lock."""
-        try:
-            if not self._closed:
-                self._aborted = True
-                self._finalize_unended_write("write batch")
-        except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
-            pass
 
     @property
     def writable(self) -> bool:
         """Always True for write batches."""
         return True
 
-    def write(self) -> None:
-        """Write batch and make changes permanent.
+    def put(self, key: Key, value: Value) -> None:
+        """Queue a put."""
+        if self._closed:
+            raise StorageClosedError("Context is closed")
+        codec = self._storage.codec
+        try:
+            encoded_key = codec.encode_key(key)
+            encoded_value = codec.encode_value(value)
+        except Exception as e:
+            raise StorageOperationError(f"Failed to encode key/value for {key}: {e}") from e
+        self._ops[encoded_key] = (key, encoded_value)
+        self._modified_keys.add(key)
 
-        LMDB's commit runs on the storage's writer thread, the one that
-        began the batch, so this may be called from any thread.
+    def delete(self, key: Key) -> None:
+        """Queue a delete (idempotent; no-op on missing key)."""
+        if self._closed:
+            raise StorageClosedError("Context is closed")
+        codec = self._storage.codec
+        try:
+            encoded_key = codec.encode_key(key)
+        except Exception as e:
+            raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
+        self._ops[encoded_key] = (key, None)
+        self._modified_keys.add(key)
+
+    def write(self) -> None:
+        """Apply the batch in one write transaction and make it permanent.
+
+        Waits for the writer slot and the gate outside the batch's call
+        lock, so a ``close()`` aborting the batch meanwhile is not held up
+        by that wait; once both are held the batch is checked again and
+        applied under the lock.
         """
         with self._call_lock:
             if self._closed:
@@ -79,58 +102,75 @@ class LMDBWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
                 logger.error("Cannot write, batch already aborted")
                 raise StorageTransactionError("Write batch already aborted")
 
-            txn = self._require_active()
-            try:
-                self._storage._end_write(txn, commit=True)
-            except Exception as e:
-                # LMDB frees a write transaction whose commit fails, so close
-                # this batch too and give back the writer slot.
-                self._aborted = True
-                self._mark_closed()
-                failure: Exception | None = e
+        storage = self._storage
+        try:
+            if self._ops:
+                lock = storage._take_write_slot()
+                try:
+                    with self._call_lock:
+                        if self._closed:
+                            raise StorageClosedError("Write batch was closed while writing")
+                        ops = self._ops
+                        missing = storage._commit_pending(ops)
+                        for encoded_key in missing:
+                            self._modified_keys.discard(ops[encoded_key][0])
+                        self._finish()
+                finally:
+                    storage._release_write_slot(lock)
             else:
-                failure = None
-                self._written = True
-                self._mark_closed()
-
-        if failure is not None:
-            self._storage._untrack_write_batch(self)
+                with self._call_lock:
+                    if self._closed:
+                        raise StorageClosedError("Write batch was closed while writing")
+                    self._finish()  # nothing to apply: just ends the batch
+        except Exception as e:
+            with self._call_lock:
+                if not self._closed:
+                    self._aborted = True
+                    self._ops = {}
+                    self._mark_closed()
+            storage._untrack_write_batch(self)
             logger.error("Write batch write failed")
-            raise StorageTransactionError(f"Failed to write batch: {failure}") from failure
+            if isinstance(
+                e,
+                (
+                    StorageLockTimeoutError,
+                    StorageNestedTransactionError,
+                    StorageClosedError,
+                    StorageTransactionConflictError,
+                ),
+            ):
+                raise
+            raise StorageTransactionError(f"Failed to write batch: {e}") from e
 
-        logger.info("Write batch written")
-        self._storage._notify_batch(self._modified_keys)
-        self._storage._untrack_write_batch(self)
+        logger.debug("Write batch written")
+        storage._notify_batch(self._modified_keys)
+        storage._untrack_write_batch(self)
+
+    def _finish(self) -> None:
+        """Mark the batch written and closed. Under ``_call_lock``."""
+        self._ops = {}
+        self._written = True
+        self._mark_closed()
 
     def abort(self) -> None:
-        """Abort write batch and discard changes.
+        """Abort write batch and discard its buffered writes.
 
-        Safe from any thread, including while the owner is inside a call:
-        the abort waits for that call, then ends the batch on the writer
-        thread. A second abort, or one racing a write, is a no-op.
+        Safe from any thread: a batch never holds the slot or an LMDB
+        transaction outside ``write``, and an abort racing a write waits
+        for it and is then a no-op.
         """
         if self._closed:
-            # Unlocked on purpose, see LMDBTransaction.abort.
             logger.debug("Abort called on closed write batch")
             return
         with self._call_lock:
             if self._closed:
                 return
-            txn = self._require_active()
-            failure: Exception | None = None
-            try:
-                self._storage._end_write(txn, commit=False)
-                logger.info("Write batch aborted")
-            except Exception as e:
-                logger.error("Write batch abort failed")
-                failure = e
-            finally:
-                self._aborted = True
-                self._mark_closed()
+            self._aborted = True
+            self._ops = {}
+            self._mark_closed()
+            logger.debug("Write batch aborted")
 
         self._storage._untrack_write_batch(self)
-        if failure is not None:
-            raise StorageTransactionError(f"Failed to abort write batch: {failure}") from failure
 
     def __enter__(self) -> LMDBWriteBatch:
         """Enter context manager."""
