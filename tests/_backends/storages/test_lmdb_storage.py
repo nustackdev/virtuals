@@ -25,6 +25,7 @@ from virtuals.tkv.storage import (
     StorageError,
     StorageLockTimeoutError,
     StorageNestedTransactionError,
+    StorageOperationError,
     StorageScanOptions,
 )
 from virtuals.tkv.types import EMPTY
@@ -411,20 +412,39 @@ class _SignalInsideCommit:
 
 
 @pytest.mark.timeout(10)
-@pytest.mark.parametrize("ctx", ["transaction", "write_batch"])
-def test_abort_racing_commit_keeps_one_outcome(storage: LMDBStorage, ctx: str) -> None:
-    """An abort from another thread while the owner commits waits, then is a no-op."""
-    tx = storage.begin_transaction() if ctx == "transaction" else storage.begin_write_batch()
-    tx.put(("k",), b"committed")
+@pytest.mark.parametrize("ctx", ["transaction", "pending", "write_batch"])
+def test_abort_racing_commit_keeps_one_outcome(storage: LMDBStorage, ctx: str, monkeypatch) -> None:
+    """An abort from another thread while the owner commits waits, then is a no-op.
+
+    ``transaction`` is a begun one (the commit hop); ``pending`` and
+    ``write_batch`` go through the one-job commit on the writer thread.
+    """
     inside = threading.Event()
-    raw, tx._lmdb_txn = tx._lmdb_txn, _SignalInsideCommit(tx._lmdb_txn, inside)
-    with storage._env_lock:  # the live set tracks handles by identity: track the wrapper
-        storage._live_writes.discard(raw)
-        storage._live_writes.add(tx._lmdb_txn)
+    if ctx == "transaction":
+        tx = storage.begin_transaction()
+        tx.put(("k",), b"committed")
+        tx.get(("k",))  # begun
+        raw, tx._lmdb_txn = tx._lmdb_txn, _SignalInsideCommit(tx._lmdb_txn, inside)
+        with storage._env_lock:  # the live set tracks handles by identity: track the wrapper
+            storage._live_writes.discard(raw)
+            storage._live_writes.add(tx._lmdb_txn)
+    else:
+        tx = storage.begin_transaction() if ctx == "pending" else storage.begin_write_batch()
+        tx.put(("k",), b"committed")
+        original = LMDBStorage._apply_and_commit
+
+        def slow(self, lmdb_txn, pending):
+            inside.set()
+            time.sleep(0.1)
+            return original(self, lmdb_txn, pending)
+
+        monkeypatch.setattr(LMDBStorage, "_apply_and_commit", slow)
     errors: list[BaseException] = []
 
     def abort_from_elsewhere() -> None:
-        inside.wait(5)
+        if not inside.wait(5):
+            errors.append(AssertionError("the commit never signalled"))
+            return
         try:
             tx.abort()
         except BaseException as e:
@@ -432,14 +452,15 @@ def test_abort_racing_commit_keeps_one_outcome(storage: LMDBStorage, ctx: str) -
 
     t = threading.Thread(target=abort_from_elsewhere)
     t.start()
-    if ctx == "transaction":
-        tx.commit()
-        assert (tx._committed, tx._aborted) == (True, False)
-    else:
+    if ctx == "write_batch":
         tx.write()
         assert (tx._written, tx._aborted) == (True, False)
+    else:
+        tx.commit()
+        assert (tx._committed, tx._aborted) == (True, False)
     t.join(5)
     assert not errors, errors
+    assert inside.is_set()
     with storage.snapshot() as snap:
         assert snap.get(("k",)) == b"committed"
     storage.begin_transaction().commit()
@@ -1848,3 +1869,140 @@ def test_writes_keep_flowing_under_spinning_reader_threads(tmp_path: Path) -> No
         st.close()
     assert n >= 100, n  # timing: thousands when the convoy is broken, single digits when not
     assert worst < 0.25, worst  # timing: a few ms when broken, around a second when not
+
+
+# =========================================================================
+# Round 2 review: a child reopens the path (F2), a queued abort at fork (F3), bad keys (F4)
+# =========================================================================
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.parametrize("mid_write", [False, True], ids=["idle", "mid-write"])
+def test_forked_child_reopens_the_path(storage: LMDBStorage, mid_write: bool) -> None:
+    """A child closes the inherited storage and opens the path again, same object or a new one.
+
+    The open adopts the parked environment (py-lmdb allows one per path per
+    process); a mid-write inheritance keeps refusing writes through it; the
+    parent's snapshot slot survives all of it.
+    """
+    with storage.transaction() as tx:
+        tx.put(("a",), b"1")
+    snap = storage.begin_snapshot()
+    txnid = str(snap._lmdb_txn.id())
+    held, go = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with storage.transaction() as tx:
+            tx.put(("parent",), b"1")
+            held.set()
+            go.wait()
+
+    t = threading.Thread(target=holder)
+    if mid_write:
+        t.start()
+        held.wait()
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+
+            def write(st: LMDBStorage, key: str) -> str:
+                try:
+                    with st.transaction() as tx:
+                        tx.put((key,), b"1")
+                    return "ok"
+                except StorageError as e:
+                    if type(e) is StorageError and "fork" in str(e):
+                        return "poisoned"
+                    return f"other: {e}"
+
+            storage.close()
+            storage.open()
+            r1 = write(storage, "c1")
+            storage.close()
+            fresh = LMDBStorage(
+                path=storage._path, codec=BinaryCodec(), map_size=MAP, busy_timeout=2.0
+            )
+            fresh.open()
+            r2 = write(fresh, "c2")
+            with fresh.snapshot() as s:
+                seen = s.get(("a",))
+            fresh.close()
+            expect = "poisoned" if mid_write else "ok"
+            code = 0 if (r1, r2, seen) == (expect, expect, b"1") else 2
+        finally:
+            os._exit(code)
+    if mid_write:
+        time.sleep(0.05)
+        go.set()
+        t.join()
+    assert _wait_child(pid, 15.0) == 0
+    assert any(row[2] == txnid for row in _slot_rows(storage))
+    with storage.snapshot() as s:
+        expected = (EMPTY, EMPTY) if mid_write else (b"1", b"1")
+        assert (s.get(("c1",)), s.get(("c2",))) == expected
+    snap.close()
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_fork_with_a_queued_abort_poisons_the_child(storage: LMDBStorage) -> None:
+    """A begun txn dropped while the writer thread is busy: slot free, LMDB's mutex held.
+
+    The child must get the clear "inherited mid-write" error, not py-lmdb's.
+    """
+    with storage.transaction() as tx:
+        tx.put(("base",), b"1")
+    gc.disable()
+    try:
+
+        def drop() -> None:
+            a = storage.begin_transaction()
+            a.put(("a",), b"A")
+            a.get(("a",))  # begun
+            cycle = [a]
+            cycle.append(cycle)
+
+        drop()
+        storage._writer_thread.fire(lambda: time.sleep(0.5))  # the abort queues behind this
+        gc.collect()
+        assert not storage._writer.lock.locked()
+        assert storage._live_writes
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                try:
+                    with storage.transaction() as tx:
+                        tx.put(("child",), b"1")
+                except StorageError as e:
+                    code = 0 if type(e) is StorageError and "fork" in str(e) else 2
+            finally:
+                os._exit(code)
+        assert _wait_child(pid, 15.0) == 0
+    finally:
+        gc.enable()
+    with storage.transaction() as tx:  # the parent's queued abort ran, the mutex is free
+        tx.put(("p",), b"1")
+    with storage.snapshot() as s:
+        assert s.get(("a",)) is EMPTY
+        assert s.get(("child",)) is EMPTY
+
+
+@pytest.mark.timeout(10)
+def test_bad_key_fails_at_put_in_a_pending_transaction(storage: LMDBStorage) -> None:
+    """A key LMDB would refuse fails at put (and delete), as it did when puts were eager."""
+    big = ("x" * 700,)
+    with storage.transaction() as tx:
+        with pytest.raises(StorageOperationError, match="LMDB takes"):
+            tx.put(big, b"1")
+        with pytest.raises(StorageOperationError):
+            tx.delete(big)
+        tx.put(("ok",), b"1")  # the transaction is still usable
+    with storage.snapshot() as s:
+        assert s.get(("ok",)) == b"1"
+    batch = storage.begin_write_batch()
+    with pytest.raises(StorageOperationError):
+        batch.put(big, b"1")
+    batch.abort()

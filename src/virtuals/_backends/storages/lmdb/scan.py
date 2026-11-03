@@ -12,7 +12,7 @@ from virtuals.tkv.storage import (
     StorageScanOptions,
 )
 
-from .context import yield_to_writer
+from .context import WRITER_BACKOFF_STEPS, yield_to_writer
 
 
 if TYPE_CHECKING:
@@ -87,6 +87,7 @@ class LMDBScan(ScanProtocol):
 
         writer_thread = self._storage._writer_thread
         yielded_at = 0.0
+        backoff_left = WRITER_BACKOFF_STEPS  # the whole scan's budget, not per row
         try:
             with lock:
                 positioned = self._seek(cursor, options, start_key_encoded)
@@ -95,9 +96,11 @@ class LMDBScan(ScanProtocol):
             while positioned:
                 if limit is not None and count >= limit:
                     break
-                if writer_thread._wait_since or writer_thread._gate_since:
+                if writer_thread._wait_since or writer_thread._soft_since:
                     # a writer starved of the GIL by readers like this one
-                    yielded_at = yield_to_writer(writer_thread, yielded_at)
+                    yielded_at, backoff_left = yield_to_writer(
+                        writer_thread, yielded_at, backoff_left
+                    )
                 with lock:
                     context._require_active()
                     row = self._next_row(cursor, options, codec, need_values)

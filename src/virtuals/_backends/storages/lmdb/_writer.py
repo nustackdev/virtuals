@@ -90,7 +90,7 @@ class WriterThread:
     transaction per environment).
     """
 
-    __slots__ = ("_gate_since", "_lock", "_name", "_queue", "_stopped", "_thread", "_wait_since")
+    __slots__ = ("_lock", "_name", "_queue", "_soft_since", "_stopped", "_thread", "_wait_since")
 
     def __init__(self, name: str) -> None:
         """Initialize an idle writer thread.
@@ -105,36 +105,41 @@ class WriterThread:
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
         self._stopped = False
-        # When the oldest waiting requester handed its job over, 0.0 when
-        # none waits. Read by the storage's readers, see ``_yield_to_writer``:
-        # a job in flight for longer than it should take means the thread,
-        # or the requester it answers, cannot get the GIL back from threads
-        # spinning on short py-lmdb calls (CPython's convoy effect). Written
-        # by requesters only; a late clear by one of two overlapping
-        # requesters is harmless, the other clears its own stamp.
+        # When the writer side last made progress on a job that someone
+        # waits for, 0.0 when none is in flight. Read by the storage's
+        # readers (see ``yield_to_writer``): a stamp that ages past what a
+        # hand-off or a short LMDB call takes means the thread, or the
+        # requester it answers, cannot get the GIL back from threads
+        # spinning on short py-lmdb calls (CPython's convoy effect). The
+        # requester sets it when it queues the job and clears it once it
+        # has its result; the thread refreshes it at every boundary where
+        # it will need the GIL back (job pickup, after the begin, every
+        # ``PROGRESS_EVERY`` replayed ops, before handing the result over).
+        # One slot per storage: an overlapping requester (close() ending
+        # leftovers beside a finalizer) may clear the other's stamp, which
+        # costs that one job its protection, and readers of one storage
+        # never yield to another storage's writer. Both accepted.
         self._wait_since = 0.0
-        # The same for the storage's gate calls (``flock`` releases the GIL
-        # too), which readers answer with the nudge tier only: a gate wait
-        # lasts as long as a peer process's transaction, legitimately.
-        self._gate_since = 0.0
+        # A GIL-free call that takes its time for a good reason (the fsync
+        # commit, or the gate's flock behind a peer process's transaction).
+        # Readers answer it with the nudge tier only: the GIL is needed
+        # back once, at the end, not throughout.
+        self._soft_since = 0.0
 
-    def _stamp(self) -> float:
+    def _stamp(self) -> None:
+        self._wait_since = time.monotonic()
+
+    def _unstamp(self) -> None:
+        self._wait_since = 0.0
+
+    def _stamp_soft(self) -> float:
         stamp = time.monotonic()
-        self._wait_since = stamp
+        self._soft_since = stamp
         return stamp
 
-    def _unstamp(self, stamp: float) -> None:
-        if self._wait_since == stamp:
-            self._wait_since = 0.0
-
-    def _stamp_gate(self) -> float:
-        stamp = time.monotonic()
-        self._gate_since = stamp
-        return stamp
-
-    def _unstamp_gate(self, stamp: float) -> None:
-        if self._gate_since == stamp:
-            self._gate_since = 0.0
+    def _unstamp_soft(self, stamp: float) -> None:
+        if self._soft_since == stamp:
+            self._soft_since = 0.0
 
     def start(self) -> None:
         """Accept jobs (again): the storage is open. The thread itself starts lazily."""
@@ -148,6 +153,7 @@ class WriterThread:
         undo: Callable[[Any], None] | None,
         then: Callable[[Any], Any] | None = None,
         done: Future | None = None,
+        waited: bool = True,
     ) -> None:
         """Queue a job, starting the thread if needed.
 
@@ -155,7 +161,8 @@ class WriterThread:
         between the two would strand the job on a queue nobody serves.
         After ``stop`` nothing is accepted until ``start``: a job that
         started a fresh thread then would run against an environment
-        being closed.
+        being closed. ``waited`` says a requester waits for the result and
+        will clear the progress stamp itself.
         """
         with self._lock:
             if self._stopped:
@@ -167,18 +174,24 @@ class WriterThread:
                 )
                 self._thread = thread
                 thread.start()
-            self._queue.put((fn, future, undo, then, done))
+            self._queue.put((fn, future, undo, then, done, waited))
 
     def _on_thread(self) -> bool:
         return threading.current_thread() is self._thread
 
-    @staticmethod
-    def _loop(jobs: queue.SimpleQueue) -> None:
+    def _loop(self, jobs: queue.SimpleQueue) -> None:
         while True:
             job = jobs.get()
             if job is None:
                 return
-            fn, future, undo, then, done = job
+            fn, future, undo, then, done, waited = job
+            # A waited job keeps the requester's stamp through its short
+            # steps (pickup, begin, hand-off): each is a point where the
+            # GIL is needed back, and one continuous age covers them all.
+            # Long work (a replay, the commit) refreshes or softens it
+            # itself. A job nobody waits for stamps and clears its own.
+            if not waited:
+                self._stamp()
             try:
                 result = fn()
             except BaseException as e:
@@ -186,6 +199,8 @@ class WriterThread:
                     future.set_exception(e)
                 if done is not None:
                     done.set_exception(e)
+                if not waited:
+                    self._unstamp()
                 continue
             # The requester may have given up while ``fn`` ran. Marking the
             # future running after the call makes that race explicit: either
@@ -197,6 +212,7 @@ class WriterThread:
                         undo(result)
                     except Exception as e:
                         logger.error(f"Undo of an abandoned LMDB writer call failed: {e}")
+                self._unstamp()
                 continue
             future.set_result(result)
             if then is not None:
@@ -207,11 +223,13 @@ class WriterThread:
                     done.set_result(then(result))  # type: ignore[union-attr]
                 except BaseException as e:
                     done.set_exception(e)  # type: ignore[union-attr]
+            if not waited:
+                self._unstamp()
 
     def fire(self, fn: Callable[[], Any]) -> None:
         """Run ``fn`` on the writer thread; nobody waits for it. Dropped after ``stop``."""
         try:
-            self._submit(fn, Future(), None)
+            self._submit(fn, Future(), None, waited=False)
         except StorageClosedError:
             pass  # close() ended every begun transaction itself
 
@@ -233,7 +251,7 @@ class WriterThread:
         if self._on_thread():
             return fn()  # a job calling back in (e.g. a finalizer); never wait on ourselves
         future: Future = Future()
-        stamp = self._stamp()
+        self._stamp()  # queued: the thread needs the GIL to pick it up
         try:
             self._submit(fn, future, undo)
             try:
@@ -245,7 +263,7 @@ class WriterThread:
                     ) from None
                 return future.result()
         finally:
-            self._unstamp(stamp)
+            self._unstamp()
 
     def run_staged(
         self,
@@ -269,7 +287,7 @@ class WriterThread:
             return then(fn())
         begun: Future = Future()
         done: Future = Future()
-        stamp = self._stamp()
+        self._stamp()
         try:
             self._submit(fn, begun, undo, then, done)
             try:
@@ -281,7 +299,7 @@ class WriterThread:
                     ) from None
                 return done.result()
         finally:
-            self._unstamp(stamp)
+            self._unstamp()
 
     def try_fire(self, fn: Callable[[], Any]) -> bool:
         """``fire`` for finalizers: queued, never waited for, never at exit.
@@ -302,7 +320,7 @@ class WriterThread:
             fn()
             return True
         try:
-            self._submit(fn, Future(), None)
+            self._submit(fn, Future(), None, waited=False)
         except StorageClosedError:
             return False
         return True
@@ -321,7 +339,7 @@ class WriterThread:
         cancel of the wait ever loses a result.
         """
         future: Future = Future()
-        stamp = self._stamp()
+        self._stamp()
         try:
             self._submit(fn, future, undo)
             try:
@@ -336,7 +354,7 @@ class WriterThread:
                 )
             return future.result()
         finally:
-            self._unstamp(stamp)
+            self._unstamp()
 
     def _undo_later(self, future: Future, undo: Callable[[Any], None]) -> None:
         """Queue ``undo`` of a landed result on the writer thread, never here.
