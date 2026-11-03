@@ -79,12 +79,20 @@ _NESTED_MESSAGE = (
 _storages: weakref.WeakSet[InMemoryStorage] = weakref.WeakSet()
 """Every live storage in this process (weak), for the fork hooks below."""
 
+_fork_lock = threading.Lock()
+"""Serializes forks: held from ``_before_fork`` to ``_after_fork_in_parent``."""
+
 _fork_held: list[threading.Lock] = []
 """Store locks taken by ``_before_fork``, released again in the parent."""
 
 
 def _before_fork() -> None:
-    """Hold every store lock across the fork, so no commit is half applied in the child."""
+    """Hold every store lock across the fork, so no commit is half applied in the child.
+
+    Forking from a thread that itself holds a store lock (inside a key
+    comparison during apply, say) deadlocks here; fork from elsewhere.
+    """
+    _fork_lock.acquire()
     for storage in list(_storages):
         lock = storage._store.lock
         lock.acquire()
@@ -92,14 +100,17 @@ def _before_fork() -> None:
 
 
 def _after_fork_in_parent() -> None:
-    """Give the store locks back."""
+    """Give the store locks back and let the next fork proceed."""
     while _fork_held:
         _fork_held.pop().release()
+    _fork_lock.release()
 
 
 def _after_fork_in_child() -> None:
     """Fresh locks in the child: a parent thread may hold the inherited ones forever."""
+    global _fork_lock
     _fork_held.clear()
+    _fork_lock = threading.Lock()
     for storage in list(_storages):
         storage._reset_locks()
 
@@ -200,7 +211,10 @@ class InMemoryStorage:
 
         The writer slot is replaced too, so a slot reserved but not yet
         taken, or a transaction still finishing on another thread, cannot
-        hold or free the slot of the reopened storage.
+        hold or free the slot of the reopened storage. The old lock is
+        released here on behalf of such a holder (its own release is a
+        no-op from now on), so a writer blocked on it wakes at once and
+        moves on instead of waiting out ``busy_timeout``.
         """
         if not self._opened:
             return
@@ -229,8 +243,14 @@ class InMemoryStorage:
             self._active_transactions.clear()
             self._active_snapshots.clear()
             self._active_write_batches.clear()
+            old_lock = self._write_lock
             self._write_lock = threading.Lock()
-            self._write_owner = None
+            if self._write_owner is not None:
+                # A recorded owner means a holder whose release is now a
+                # no-op. A waiter that only just acquired the old lock has
+                # no owner record and releases it itself in _claim_slot.
+                self._write_owner = None
+                old_lock.release()
             self._opened = False
         self._store.reset()
 
@@ -461,10 +481,11 @@ class InMemoryStorage:
                 released when it is no longer the storage's lock (a fork
                 or ``close`` replaced the slot since).
         """
-        if lock is not None and lock is not self._write_lock:
-            return
-        self._write_owner = None
-        self._write_lock.release()
+        with self._state_lock:
+            if lock is not None and lock is not self._write_lock:
+                return
+            self._write_owner = None
+            self._write_lock.release()
 
     def _reset_locks(self) -> None:
         """Fresh locks and no slot owner, for a forked child.
