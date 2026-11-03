@@ -471,3 +471,33 @@ def test_drop_right_before_disconnect_sends_the_wake_in_the_drain():
     p._record_drop(1, PublisherOperationError("late drop"))
     p.disconnect()
     assert p.resyncs == 1
+
+
+# =============================================================================
+# r2 N2: the stalled fast path is per connection
+# =============================================================================
+
+
+def test_stalled_fast_path_does_not_survive_a_reconnect():
+    """A publisher that dropped while stalled and is connected again starts with
+    a fresh queue: its first full-queue notify() waits the timeout, not zero."""
+    p = _Gated(fail=True, queue_maxsize=1, notify_timeout=0.3)
+    p.gate.set()
+    p.connect()
+    try:
+        p.notify(("a",))  # in flight, failing and retrying
+        time.sleep(0.05)
+        p.notify(("b",))  # queued
+        p.notify(("c",))  # dropped after the timeout: stalled from here
+        assert p._stalled
+        p.disconnect()  # the drain fails too: no send ever cleared the flag
+        p.connect()
+        assert not p._stalled
+        p.notify(("d",))
+        time.sleep(0.05)
+        p.notify(("e",))
+        t0 = time.monotonic()
+        p.notify(("f",))
+        assert 0.25 < time.monotonic() - t0 < 0.6, "dropped at once on a fresh connection"
+    finally:
+        p.disconnect()
