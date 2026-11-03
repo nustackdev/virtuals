@@ -355,6 +355,8 @@ class WriterGate:
         self.wake_waiters(StorageClosedError("Storage was closed while waiting for the write lock"))
         with self._mu:
             fd, self._fd = self._fd, None
+            self._generation += 1  # a wait in flight on the old descriptor touches nothing
+            self._waiting = False
         if fd is not None:
             # A blocking wait still in flight on this descriptor holds its
             # own reference: the lock it may land goes away with it, and
@@ -419,7 +421,7 @@ class WriterGate:
             except OSError as e:
                 error = StorageError(f"Failed to take the LMDB writer gate: {e}")
             with self._mu:
-                if generation != self._generation:
+                if generation != self._generation or fd != self._fd:
                     continue  # the gate was closed meanwhile: that lock died with its file
                 self._waiting = False
                 consumer, self._consumer = self._consumer, None
