@@ -856,33 +856,58 @@ class _FailingWriteView(EagerFractionalIndexedDictView):
         super()._write_value(address, value)
 
 
-def test_failed_value_write_leaves_no_order_row(broot):
+def test_failed_value_write_leaves_no_trace(broot):
     view = broot.open_child("lst", _FailingWriteView)
     view.store({"a": 1, "b": 2})
     with pytest.raises(RuntimeError, match="boom"):
         view.insert_after("a", "x", "boom")
-    # Position only: counted and contained, never iterated, no data.
-    assert "x" in view
+    # The position written before the value is rolled back: x is absent.
+    assert "x" not in view
+    assert len(view) == 2
     assert list(view) == ["a", "b"]
     assert list(view.items()) == [("a", 1), ("b", 2)]
     assert view.extract() == {"a": 1, "b": 2}
+    assert view.get("x") is None
     with pytest.raises(KeyError):
         view["x"]
-    # The stale position does not block a retry; the retry lands where asked.
+    with pytest.raises(KeyError):
+        view.position("x")
+    with pytest.raises(KeyError):
+        del view["x"]
+    _assert_consistent(view)
+    # A retry inserts it as if new and lands where asked.
     view.insert_after("a", "x", 3)
     assert list(view) == ["a", "x", "b"]
     assert view["x"] == 3
     _assert_consistent(view)
 
 
-def test_failed_value_write_then_delete_cleans_up(broot):
+def test_failed_value_write_then_set_appends(broot):
     view = broot.open_child("lst", _FailingWriteView)
     view.store({"a": 1})
     with pytest.raises(RuntimeError):
-        view.append("x", "boom")
-    del view["x"]
+        view.prepend("x", "boom")
     assert "x" not in view
-    assert len(view) == 1
+    # No stale position, so a plain set treats x as new and appends it.
+    view["x"] = 2
+    assert list(view) == ["a", "x"]
+    assert view["x"] == 2
+    _assert_consistent(view)
+
+
+def test_stale_position_without_order_row_is_repaired_by_rebuild(fdict):
+    """A bypass write can leave pos without order; set does not fix that."""
+    view = fdict("lst", {"a": 1, "b": 2})
+    view._pos_container().put_child_primitive("x", "zz", validate=False, validate_parent=False)
+    view._data_container().put_child_primitive("x", 3)
+    assert "x" in view
+    assert len(view) == 3
+    assert list(view) == ["a", "b"]
+    view["x"] = 4
+    assert list(view) == ["a", "b"]
+    view.rebuild_bookkeeping()
+    assert list(view) == ["a", "b", "x"]
+    assert view["x"] == 4
     _assert_consistent(view)
 
 
@@ -974,6 +999,61 @@ def test_two_writers_appending(fdict):
     assert view.first() == "a"
     assert set(list(view)[1:]) == {"x", "y"}
     _assert_consistent(view)
+
+
+@pytest.mark.parametrize("backend", ["mem", "rocksdb"])
+def test_window_respace_vs_concurrent_insert_inside_window(backend, tmp_path):
+    """A respace can displace a concurrent insert next to a row in its window.
+
+    T1 inserts at a hot gap until a window respace fires; T2 inserts after
+    a row inside T1's window. T2 writes none of the rows T1 rewrites, so
+    both commit on every multi-writer backend (sqlite and lmdb are
+    single-writer and never see this). The documented outcome: T2's item
+    is present exactly once and the rest of the order is intact; only its
+    position may have shifted into the rewritten range.
+    """
+    storage = _open_storage(backend, tmp_path)
+    try:
+        with storage.transaction() as tx:
+            view = Navigator(storage).root(tx).open_child("lst", _CountingRespaceView)
+            view.store([f"r{i}" for i in range(20)] + ["h"] + [f"s{i}" for i in range(20)])
+            # Fill the gap after h until the next fresh key would pass the cap.
+            i = 0
+            while True:
+                view.insert_after("h", f"c{i}")
+                if len(view.position(f"c{i}")) >= view.MAX_KEY_LENGTH - 3:
+                    break
+                i += 1
+        t1 = storage.begin_transaction()
+        t2 = storage.begin_transaction()
+        try:
+            v1 = Navigator(storage).root(t1).open_child("lst", _CountingRespaceView)
+            v2 = Navigator(storage).root(t2).open_child("lst", _CountingRespaceView)
+            _CountingRespaceView.respaces = []
+            n = 0
+            while not _CountingRespaceView.respaces:
+                v1.insert_after("h", f"y{n}")
+                n += 1
+            order_t1 = list(v1)
+            ref = order_t1[order_t1.index("h") - 2]  # inside T1's window below h
+            v2.insert_after(ref, "Z")
+            t1.commit()
+            t2.commit()
+        except BaseException:
+            for t in (t1, t2):
+                t.abort()
+            raise
+        with storage.snapshot() as sn:
+            view = Navigator(storage).root(sn).open_child("lst", _CountingRespaceView)
+            got = list(view)
+            assert got.count("Z") == 1
+            assert len(view) == len(got)
+            assert [x for x in got if x != "Z"] == order_t1
+            assert view["Z"] is True
+            assert view.position("Z") == next(ok for ok, a in view.positions() if a == "Z")
+            _assert_consistent(view)
+    finally:
+        storage.close()
 
 
 # ============================================================================
