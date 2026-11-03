@@ -98,7 +98,17 @@ namespaces = false
 [tool.setuptools.package-data]
 "virtuals._backends.notify" = ["*.lua"]
 
-# =============================================================
+# ============================================================================
+# Tests - pytest
+# ============================================================================
+[tool.pytest.ini_options]
+# The slow tier (model-based soak cases) is excluded by default; `-m slow` runs it.
+addopts = "-m 'not slow'"
+markers = [
+    "slow: soak tier of the model-based tests, about a minute per backend; excluded by default, run with -m slow",
+]
+
+# ============================================================================
 # Coverage
 # ============================================================================
 [tool.coverage.run]
