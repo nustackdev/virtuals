@@ -47,12 +47,21 @@ class InMemoryTransaction(
     never scan pay nothing for it.
     """
 
-    __slots__ = ("_aborted", "_committed", "_modified_keys", "_pending", "_pending_index", "_slot")
+    __slots__ = (
+        "_aborted",
+        "_committed",
+        "_generation",
+        "_modified_keys",
+        "_pending",
+        "_pending_index",
+        "_slot",
+    )
 
     def __init__(self, storage: InMemoryStorage, slot: threading.Lock) -> None:
         """Begin over an already acquired writer slot ``slot``."""
         super().__init__(storage)
         self._slot = slot
+        self._generation = storage._store.generation
         self._pending: dict[Encoded, Entry] = {}
         self._pending_index: SortedKeys[Encoded] | None = None
         self._modified_keys: set[Key] = set()
@@ -102,9 +111,12 @@ class InMemoryTransaction(
     def commit(self) -> None:
         """Apply the write set atomically, release the slot and notify.
 
-        The write set lands as a whole or not at all, and the slot is
-        released on every outcome, including KeyboardInterrupt or
-        SystemExit raised while applying.
+        The slot is released on every outcome, including KeyboardInterrupt
+        or SystemExit raised while applying. The write set lands as a
+        whole or not at all for exceptions the store raises; see
+        ``VersionedStore.apply`` for the limits under asynchronous
+        interrupts. Raises ``StorageClosedError`` if the storage was
+        closed since the transaction began.
         """
         if not self._claim_end():
             logger.error("Cannot commit, transaction is closed")
@@ -113,14 +125,14 @@ class InMemoryTransaction(
         modified = self._modified_keys
         try:
             if self._pending:
-                self._storage._store.apply(self._pending, modified)
+                self._storage._store.apply(self._pending, modified, self._generation)
         except BaseException as e:
             self._aborted = True
             self._end()
             logger.error("Transaction commit failed")
-            if isinstance(e, Exception):
-                raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
-            raise
+            if isinstance(e, StorageClosedError) or not isinstance(e, Exception):
+                raise
+            raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
 
         self._committed = True
         self._end()

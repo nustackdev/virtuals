@@ -30,6 +30,8 @@ from collections import deque
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, TypeAlias
 
+from virtuals.tkv.storage import StorageClosedError
+
 from .sorted_keys import SortedKeys
 
 
@@ -152,6 +154,9 @@ class VersionedStore:
     def __init__(self) -> None:
         """Start empty at sequence 0."""
         self.lock = threading.Lock()
+        # Bumped by every reset. Contexts begun against an older generation
+        # cannot commit into, or release pins of, the store that replaced it.
+        self.generation = 0
         self._live: dict[Any, Entry] = {}
         self._index: SortedKeys[Any] = SortedKeys()
         self._seq = 0
@@ -164,11 +169,12 @@ class VersionedStore:
         # Open snapshots: pinned seq -> count. Insertion order is seq order.
         self._pins: dict[int, int] = {}
         # Pins released by garbage collection, applied at the next locked operation.
-        self._deferred: deque[int] = deque()
+        self._deferred: deque[tuple[int, int]] = deque()
 
     def reset(self) -> None:
-        """Drop everything, keeping the lock."""
+        """Drop everything and start a new generation, keeping the lock."""
         with self.lock:
+            self.generation += 1
             self._live = {}
             self._index = SortedKeys()
             self._seq = 0
@@ -206,29 +212,32 @@ class VersionedStore:
     # Snapshot reads
     # ------------------------------------------------------------------
 
-    def pin(self) -> int:
-        """Register an open snapshot at the current sequence and return it."""
+    def pin(self) -> tuple[int, int]:
+        """Register an open snapshot at the current sequence; returns its ``(generation, seq)`` token."""
         with self.lock:
             if self._deferred:
                 self._drain()
             seq = self._seq
             self._pins[seq] = self._pins.get(seq, 0) + 1
-            return seq
+            return self.generation, seq
 
-    def unpin(self, seq: int) -> None:
-        """Release a snapshot pinned at ``seq`` and drop versions nobody needs."""
+    def unpin(self, token: tuple[int, int]) -> None:
+        """Release a pin and drop versions nobody needs."""
         with self.lock:
-            self._release(seq)
+            self._release(token)
             if self._deferred:
                 self._drain()
             self._trim()
 
-    def unpin_later(self, seq: int) -> None:
+    def unpin_later(self, token: tuple[int, int]) -> None:
         """Release a pin at the next locked operation. Lock-free, safe from a finalizer."""
-        self._deferred.append(seq)
+        self._deferred.append(token)
 
-    def _release(self, seq: int) -> None:
-        """Drop one pin at ``seq``; no trim."""
+    def _release(self, token: tuple[int, int]) -> None:
+        """Drop one pin; no trim. A token from before a reset is ignored."""
+        generation, seq = token
+        if generation != self.generation:
+            return
         count = self._pins.get(seq, 0) - 1
         if count > 0:
             self._pins[seq] = count
@@ -302,19 +311,26 @@ class VersionedStore:
     # Commit
     # ------------------------------------------------------------------
 
-    def apply(self, ops: dict[Any, Entry], modified: set[Key]) -> int:
+    def apply(self, ops: dict[Any, Entry], modified: set[Key], generation: int) -> int:
         """Apply a write set atomically and return the new sequence.
 
         ``ops`` maps encoded key to ``(key, value)`` or ``(key, DELETED)``.
         Keys of deletes that removed an existing row are added to
         ``modified`` (deleting an absent key changes nothing).
+        ``generation`` is the store generation the writer began against;
+        a mismatch (the storage was closed since) raises
+        ``StorageClosedError`` and changes nothing.
 
-        All or nothing: if anything raises part way (a key the index
-        cannot compare, KeyboardInterrupt), every change made so far is
-        undone before the exception leaves, and the sequence is not
-        advanced.
+        All or nothing for exceptions raised while applying (a key the
+        index cannot compare): every change made so far is undone before
+        the exception leaves, and the sequence is not advanced. An
+        asynchronous interrupt such as KeyboardInterrupt from a signal can
+        land between any two bytecodes, so a clean rollback is not
+        guaranteed for those.
         """
         with self.lock:
+            if generation != self.generation:
+                raise StorageClosedError("Storage was closed since this write began")
             if self._deferred:
                 self._drain()
                 self._trim()
@@ -341,8 +357,8 @@ class VersionedStore:
                     if record:
                         entries = history.get(enc)
                         if entries is None:
+                            history_index.add(enc)  # may raise; must come before the record
                             history[enc] = [(seq, old)]
-                            history_index.add(enc)
                         else:
                             entries.append((seq, old))
                         log.append((seq, enc))

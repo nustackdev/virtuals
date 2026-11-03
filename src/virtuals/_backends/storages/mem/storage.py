@@ -77,17 +77,39 @@ _NESTED_MESSAGE = (
 
 
 _storages: weakref.WeakSet[InMemoryStorage] = weakref.WeakSet()
-"""Every storage made in this process, so a forked child can reset their locks."""
+"""Every live storage in this process (weak), for the fork hooks below."""
+
+_fork_held: list[threading.Lock] = []
+"""Store locks taken by ``_before_fork``, released again in the parent."""
 
 
-def _reset_locks_in_child() -> None:
-    """After a fork: fresh locks in the child, since a parent thread may hold the old ones."""
+def _before_fork() -> None:
+    """Hold every store lock across the fork, so no commit is half applied in the child."""
+    for storage in list(_storages):
+        lock = storage._store.lock
+        lock.acquire()
+        _fork_held.append(lock)
+
+
+def _after_fork_in_parent() -> None:
+    """Give the store locks back."""
+    while _fork_held:
+        _fork_held.pop().release()
+
+
+def _after_fork_in_child() -> None:
+    """Fresh locks in the child: a parent thread may hold the inherited ones forever."""
+    _fork_held.clear()
     for storage in list(_storages):
         storage._reset_locks()
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_reset_locks_in_child)
+    os.register_at_fork(
+        before=_before_fork,
+        after_in_parent=_after_fork_in_parent,
+        after_in_child=_after_fork_in_child,
+    )
 
 
 def _caller() -> _Owner:
@@ -209,8 +231,8 @@ class InMemoryStorage:
             self._active_write_batches.clear()
             self._write_lock = threading.Lock()
             self._write_owner = None
+            self._opened = False
         self._store.reset()
-        self._opened = False
 
     def __enter__(self) -> InMemoryStorage:
         """Enter context manager."""
@@ -307,6 +329,7 @@ class InMemoryStorage:
         Raises:
             StorageNestedTransactionError: If this task already holds the slot.
             StorageLockTimeoutError: If the slot is not free within ``busy_timeout``.
+            StorageClosedError: If the storage is closed while waiting.
         """
         if self._read_only:
             raise StorageError("Cannot reserve the write slot in read only mode.")
@@ -315,10 +338,14 @@ class InMemoryStorage:
         me = _caller()
         if self._write_owner == me:
             raise StorageNestedTransactionError(_NESTED_MESSAGE)
-        lock = self._write_lock
         deadline = time.monotonic() + max(self._busy_timeout, 0)
         delay = _SLOT_POLL_MIN
-        while not lock.acquire(blocking=False):
+        while True:
+            lock = self._write_lock
+            if lock.acquire(blocking=False):
+                if self._claim_slot(lock, me):
+                    return InMemoryWriteSlot(self, lock)
+                continue  # the slot was replaced by close(); try the current one
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise StorageLockTimeoutError(
@@ -326,8 +353,6 @@ class InMemoryStorage:
                 )
             await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, _SLOT_POLL_MAX)
-        self._write_owner = me
-        return InMemoryWriteSlot(self, lock)
 
     def begin_write_batch(self) -> InMemoryWriteBatch:
         """Begin a write-only batch. Takes no lock until ``write``."""
@@ -397,12 +422,36 @@ class InMemoryStorage:
                 "finish. Wait for the slot with areserve_write_slot instead"
             )
         lock = self._write_lock
-        if not lock.acquire(timeout=max(self._busy_timeout, 0)):
-            raise StorageLockTimeoutError(
-                f"Timed out after {self._busy_timeout}s waiting for the write lock"
-            )
-        self._write_owner = me
-        return lock
+        if lock.acquire(blocking=False) and self._claim_slot(lock, me):
+            return lock  # uncontended fast path
+        deadline = time.monotonic() + max(self._busy_timeout, 0)
+        while True:
+            lock = self._write_lock
+            if not lock.acquire(timeout=max(deadline - time.monotonic(), 0)):
+                raise StorageLockTimeoutError(
+                    f"Timed out after {self._busy_timeout}s waiting for the write lock"
+                )
+            if self._claim_slot(lock, me):
+                return lock
+            # The slot was replaced by close() while we waited; wait on the current one.
+
+    def _claim_slot(self, lock: threading.Lock, me: _Owner) -> bool:
+        """Record ``me`` as owner of ``lock`` if it is still the storage's open slot.
+
+        Otherwise ``lock`` is a slot ``close()`` replaced while the caller
+        waited on it: it is released, nothing is recorded, and False is
+        returned so the caller retries on the current slot. Raises
+        ``StorageClosedError`` instead when the storage is closed.
+        """
+        with self._state_lock:
+            if lock is self._write_lock and self._opened:
+                self._write_owner = me
+                return True
+            closed = not self._opened
+        lock.release()
+        if closed:
+            raise StorageClosedError("Storage was closed while waiting for the write lock")
+        return False
 
     def _release_write_slot(self, lock: threading.Lock | None = None) -> None:
         """Release the writer slot.

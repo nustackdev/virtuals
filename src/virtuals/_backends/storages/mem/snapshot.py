@@ -29,7 +29,8 @@ class InMemorySnapshot(ContextBase, ReadOperationsMixin, SnapshotProtocol):
 
     The pin is released by ``close``, or when a snapshot is dropped
     without one, so a leaked snapshot cannot make the store retain
-    versions forever. ``_pin`` is a one-shot token: whoever pops it (an
+    versions forever. The token carries the store generation, so a
+    release landing after a close and reopen touches nothing. ``_pin`` is a one-shot token: whoever pops it (an
     explicit close on any thread, or garbage collection) releases the
     pin, exactly once. Garbage collection may run on a thread that holds
     the store lock, so that path only queues the release for the store to
@@ -38,11 +39,11 @@ class InMemorySnapshot(ContextBase, ReadOperationsMixin, SnapshotProtocol):
 
     __slots__ = ("__weakref__", "_pin", "_seq")
 
-    def __init__(self, storage: InMemoryStorage, seq: int) -> None:
-        """Bind the snapshot to ``storage`` at pinned sequence ``seq``."""
+    def __init__(self, storage: InMemoryStorage, token: tuple[int, int]) -> None:
+        """Bind the snapshot to ``storage`` with its ``(generation, seq)`` pin token."""
         super().__init__(storage)
-        self._seq = seq
-        self._pin = [seq]
+        self._seq = token[1]
+        self._pin = [token]
 
     @property
     def writable(self) -> bool:
@@ -63,10 +64,10 @@ class InMemorySnapshot(ContextBase, ReadOperationsMixin, SnapshotProtocol):
         """Close the snapshot and let the store drop versions only it needed. Idempotent."""
         self._closed = True
         try:
-            seq = self._pin.pop()  # atomic: exactly one closer gets the token
+            token = self._pin.pop()  # atomic: exactly one closer gets the token
         except IndexError:
             return
-        self._storage._store.unpin(seq)
+        self._storage._store.unpin(token)
         self._storage._untrack_snapshot(self)
 
     def __del__(self) -> None:
@@ -74,10 +75,10 @@ class InMemorySnapshot(ContextBase, ReadOperationsMixin, SnapshotProtocol):
         pin = getattr(self, "_pin", None)
         if pin:
             try:
-                seq = pin.pop()
+                token = pin.pop()
             except IndexError:
                 return
-            self._storage._store.unpin_later(seq)
+            self._storage._store.unpin_later(token)
 
     def __enter__(self) -> InMemorySnapshot:
         """Enter context manager."""

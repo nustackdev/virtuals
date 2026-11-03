@@ -38,11 +38,12 @@ class InMemoryWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
     for just as long as it takes to apply the batch.
     """
 
-    __slots__ = ("_aborted", "_modified_keys", "_pending", "_written")
+    __slots__ = ("_aborted", "_generation", "_modified_keys", "_pending", "_written")
 
     def __init__(self, storage: InMemoryStorage) -> None:
         """Begin an empty batch."""
         super().__init__(storage)
+        self._generation = storage._store.generation
         self._pending: dict[Encoded, Entry] = {}
         self._modified_keys: set[Key] = set()
         self._written = False
@@ -65,7 +66,7 @@ class InMemoryWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
             if self._pending:
                 lock = storage._acquire_write_slot()
                 try:
-                    storage._store.apply(self._pending, modified)
+                    storage._store.apply(self._pending, modified, self._generation)
                 finally:
                     storage._release_write_slot(lock)
         except BaseException as e:
@@ -73,11 +74,11 @@ class InMemoryWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
             self._pending.clear()
             storage._untrack_write_batch(self)
             logger.error("Write batch write failed")
-            if isinstance(e, (StorageLockTimeoutError, StorageNestedTransactionError)):
+            if isinstance(
+                e, (StorageLockTimeoutError, StorageNestedTransactionError, StorageClosedError)
+            ) or not isinstance(e, Exception):
                 raise
-            if isinstance(e, Exception):
-                raise StorageTransactionError(f"Failed to write batch: {e}") from e
-            raise
+            raise StorageTransactionError(f"Failed to write batch: {e}") from e
 
         self._written = True
         self._pending.clear()

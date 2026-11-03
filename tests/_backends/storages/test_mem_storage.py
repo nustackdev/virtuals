@@ -19,6 +19,7 @@ from bisect import bisect_left, bisect_right
 import pytest
 
 from virtuals._backends.storages.mem import InMemoryStorage
+from virtuals._backends.storages.mem.sorted_keys import SortedKeys
 from virtuals._backends.storages.mem.storage import InMemoryStorage as _Base
 from virtuals._backends.storages.sqlite import SQLiteStorage
 from virtuals.codecs import BinaryCodec, NoOpCodec, TextCodec
@@ -662,15 +663,23 @@ def test_close_racing_commit_releases_slot_once() -> None:
     in_apply, go = threading.Event(), threading.Event()
     real_apply = s._store.apply
 
-    def slow_apply(ops, modified):
+    def slow_apply(ops, modified, generation):
         in_apply.set()
         go.wait(2)
-        return real_apply(ops, modified)
+        return real_apply(ops, modified, generation)
 
     s._store.apply = slow_apply
     tx = s.begin_transaction()
     tx.put(X, 1)
-    committer = threading.Thread(target=tx.commit)
+    outcome: dict = {}
+
+    def commit() -> None:
+        try:
+            tx.commit()
+        except Exception as e:
+            outcome["error"] = type(e)
+
+    committer = threading.Thread(target=commit)
     committer.start()
     assert in_apply.wait(2)
     closer = threading.Thread(target=s.close)
@@ -680,7 +689,9 @@ def test_close_racing_commit_releases_slot_once() -> None:
     committer.join(2)
     closer.join(2)
     s._store.apply = real_apply
-    assert tx.is_closed and tx._committed and not tx._aborted
+    # The commit claimed its end first, so close() did not abort it; applying
+    # into the reset store is refused and the transaction ends exactly once.
+    assert tx.is_closed and tx._aborted and outcome == {"error": StorageClosedError}
 
     s.open()
     assert not s._write_lock.locked()
@@ -755,7 +766,7 @@ def test_base_exception_in_commit_ends_transaction(storage: InMemoryStorage) -> 
     tx.put(X, 1)
     real_apply = storage._store.apply
 
-    def boom(ops, modified):
+    def boom(ops, modified, generation):
         raise KeyboardInterrupt
 
     storage._store.apply = boom
@@ -823,6 +834,7 @@ def test_fork_child_gets_fresh_locks(storage: InMemoryStorage) -> None:
 
     threading.Thread(target=hold, daemon=True).start()
     assert held.wait(2)
+    threading.Timer(0.05, release.set).start()  # the fork hook waits for the store lock
     pid = os.fork()
     if pid == 0:  # child
         code = 4
@@ -872,6 +884,180 @@ def test_mistyped_start_encoded_raises_storage_error() -> None:
         with s.transaction() as tx:
             with pytest.raises(StorageOperationError, match="Failed to scan"):
                 list(tx.scan(StorageScanOptions(start_encoded=b"a", reverse=True)).keys())
+
+
+def test_writer_waiting_across_close_never_keeps_the_old_slot() -> None:
+    """A sync writer blocked on the slot when close() runs must not wake up owning a stale lock."""
+    s = InMemoryStorage(codec=NoOpCodec(), busy_timeout=0.1)
+    s.open()
+    holder = s.begin_transaction()
+    outcome: dict = {}
+
+    def waiter() -> None:
+        try:
+            outcome["txn"] = s.begin_transaction()
+        except Exception as e:
+            outcome["error"] = type(e)
+
+    t = threading.Thread(target=waiter)
+    t.start()
+    time.sleep(0.02)
+    s.close()  # aborts the holder, frees the old lock, swaps in a new one
+    t.join(2)
+    assert outcome == {"error": StorageClosedError}
+    assert holder.is_closed
+    s.open()
+    x = s.begin_transaction()
+    assert s._write_owner is not None and s._write_owner[0] == threading.get_ident()
+    with pytest.raises(StorageLockTimeoutError):
+        _in_thread(s.begin_transaction)  # exactly one writer on the reopened storage
+    x.put(X, "x")
+    x.commit()
+    assert _get(s, X) == "x"
+    s.close()
+
+
+def test_async_waiter_across_close_never_clobbers_owner() -> None:
+    s = InMemoryStorage(codec=NoOpCodec(), busy_timeout=1.0)
+    s.open()
+    holder = s.begin_transaction()
+    outcome: dict = {}
+
+    def loop_thread() -> None:
+        async def main() -> None:
+            try:
+                await s.areserve_write_slot()
+            except Exception as e:
+                outcome["error"] = type(e)
+
+        asyncio.run(main())
+
+    t = threading.Thread(target=loop_thread)
+    t.start()
+    time.sleep(0.02)
+    s.close()
+    t.join(3)
+    assert outcome == {"error": StorageClosedError}
+    assert holder.is_closed
+    s.open()
+    x = s.begin_transaction()
+    assert s._write_owner[0] == threading.get_ident()
+    x.abort()
+    s.close()
+
+
+def test_commit_claimed_before_close_cannot_land_in_reopened_storage() -> None:
+    s = InMemoryStorage(codec=NoOpCodec(), busy_timeout=0.5)
+    s.open()
+    gate, entered = threading.Event(), threading.Event()
+    real_apply = s._store.apply
+
+    def slow_apply(ops, modified, generation):
+        entered.set()
+        gate.wait(2)
+        return real_apply(ops, modified, generation)
+
+    s._store.apply = slow_apply
+    a = s.begin_transaction()
+    a.put(("old",), 1)
+    outcome: dict = {}
+
+    def commit() -> None:
+        try:
+            a.commit()
+        except Exception as e:
+            outcome["error"] = type(e)
+
+    t = threading.Thread(target=commit)
+    t.start()
+    assert entered.wait(2)
+    stale_snapshot = s.begin_snapshot()
+    s.close()
+    s.open()
+    fresh = s.begin_snapshot()  # pinned at seq 0 of the new generation
+    gate.set()
+    t.join(2)
+    assert outcome == {"error": StorageClosedError}
+    stale_snapshot.close()  # a pin token from the old generation touches nothing
+    assert s._store._pins == {0: 1}
+    with s.transaction() as tx:
+        tx.put(("new",), 2)
+    with s.snapshot() as snap:
+        assert snap.get(("old",)) is EMPTY
+        assert snap.get(("new",)) == 2
+    assert fresh.get(("new",)) is EMPTY  # its versions were kept
+    fresh.close()
+    s.close()
+
+
+def test_history_index_failure_leaves_no_orphan_record() -> None:
+    with InMemoryStorage(codec=_RawCodec()) as s:
+        with s.transaction() as t:
+            t.put((1,), "int")
+        snap1 = s.begin_snapshot()
+        with s.transaction() as t:
+            t.delete((1,))  # the int key now lives only in history
+        snap2 = s.begin_snapshot()  # sees an empty store
+        with pytest.raises(StorageTransactionError):
+            with s.transaction() as t:
+                t.put(("a",), "x")  # live index accepts it, history index cannot order it
+        store = s._store
+        assert "a" not in store._history
+        assert list(store._history_index) == [1]
+        assert len(store._undo_log) == 1
+        snap1.close()
+        assert store._history == {} and list(store._history_index) == []
+        with s.transaction() as t:
+            t.put(("a",), 5)  # recorded for snap2
+        assert snap2.get(("a",)) is EMPTY
+        assert list(snap2.scan(StorageScanOptions()).items()) == []
+        snap2.close()
+        assert store._history == {}
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_fork_waits_for_an_in_flight_commit(storage: InMemoryStorage) -> None:
+    """A child forked while a commit is applying sees all of it or none of it."""
+    entered, gate = threading.Event(), threading.Event()
+    trigger = storage.codec.encode_key(("k", 5))
+
+    class GatedIndex(SortedKeys):
+        """Stalls apply half way through, while it holds the store lock."""
+
+        __slots__ = ()
+
+        def add(self, key) -> None:
+            if key == trigger:
+                entered.set()
+                gate.wait(3)
+            super().add(key)
+
+    storage._store._index = GatedIndex()
+
+    def writer() -> None:
+        with storage.transaction() as tx:
+            for i in range(10):
+                tx.put(("k", i), i)
+
+    threading.Thread(target=writer, daemon=True).start()
+    assert entered.wait(2)
+    threading.Timer(0.1, gate.set).start()  # the fork hook waits on the store lock until then
+    pid = os.fork()
+    if pid == 0:  # child
+        try:
+            with storage.snapshot() as snap:
+                n = len(list(snap.scan(StorageScanOptions()).items()))
+            os._exit(0 if n == 10 else 7)
+        except BaseException:
+            os._exit(5)
+    killer = threading.Timer(3.0, lambda: os.kill(pid, 9))
+    killer.start()
+    try:
+        _, status = os.waitpid(pid, 0)
+    finally:
+        killer.cancel()
+        gate.set()
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
 
 
 # =========================================================================
