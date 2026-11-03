@@ -671,8 +671,10 @@ class SQLiteStorage:
         """
         self._check_fork()
         self._require_writable_after_fork()
-        give_back_slot = self._writer.take(self, write_slot, self._busy_timeout)
-        writer_lock = self._writer.lock
+        # The lock taken, read from the take itself: a close() replacing the
+        # slot between the take and a later read would hand the context a
+        # lock it never held.
+        writer_lock, give_back_slot = self._writer.take_slot(self, write_slot, self._busy_timeout)
 
         conn = write_slot._detach_conn() if write_slot is not None else None
         if conn is not None:
