@@ -8,6 +8,8 @@ rocksdb; op counts run on the seeking backends only.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from tests.support.counting import (
     BACKENDS,
@@ -1271,3 +1273,143 @@ def test_fractional_paging_on_a_deleted_cursor_raises(root):
     with pytest.raises(KeyError):
         list(view.keys(after="k4", limit=3))
     assert list(view.keys(after="k3", limit=3)) == ["k5", "k6", "k7"]
+
+
+# ============================================================================
+# SET MEMBER KEYS: stable for ordered members, canonical for unordered (review S4 to S6)
+# ============================================================================
+
+LEGACY_MEMBER_KEYS = [
+    # sha256(pickle.dumps(value, protocol=4))[:64], as every release up to d8ee856 wrote it
+    (1, "018f5c4626b56e8489da7abb6c8b62331933c42c35d1342037a5242b8ed148f6"),
+    (-7, "0643eb8bb54381dc608e300b72fc878501ea0736a7d2245b1f1d434956c439a8"),
+    (2**70, "4636a968bc0033c904811e102c53babe8ab88a9f6e294566b61c40edc8f202be"),
+    ("x", "e0c27ef51d001d2d87fcc4bd80d352bbee3f02aeb2d4afaefc41e065023bbb69"),
+    ("", "8e2a8bd996c29b99c909664ee51eb5ee3b2358306a4269d5b69dd99075e6dd85"),
+    ("ünï", "eaf0c6b552fe62468d7692dc69b6506fd0d6f08c756d0a72391001c6d96dbe17"),
+    (b"raw", "2f74412bb456938aacd9f0939cd4907129b897503bcb84c397fc156d1d73b075"),
+    (b"", "53b733953fb825c982984407c97cd225bf2a1be0613a8675da94eb8625acbcff"),
+    ((1, "a", None), "623bee0d9b9105e157d831fbcfb7afb113ab91c4b2c9b85a5acae004f644f5a1"),
+    (((1, 2), (3,)), "b5687a69aa6e1cd548c06265b40526d73f3aecad968fe18e2a48a609d97eba22"),
+    (None, "9c298d589a2158eb513cb52191144518a2acab2cb0c04f1df14fca0f712fa4a1"),
+    (3.5, "31ca616a2c9e6a40025ac55abe5c9c28d3f334b0bf8cd4c4d74e0dfd161dbc9e"),
+    (True, "112bda3b495d867b6a98c899fac7c25eb60ca4b6e6fe5ec7ab9299f93e8274bc"),
+]
+
+
+@pytest.mark.parametrize(("member", "key"), LEGACY_MEMBER_KEYS, ids=repr)
+def test_set_member_key_is_byte_identical_to_the_old_formula_for_ordered_members(member, key):
+    """Keys written by d8ee856 code stay readable: int, str, bytes, tuple, None and friends."""
+    from virtuals._views import FrozenSetView
+    from virtuals._views._member_key import member_key
+
+    assert member_key(member) == key
+    assert SetView._make_key(None, member) == key
+    assert FrozenSetView._make_key(None, member) == key
+
+
+def test_set_member_key_of_an_unordered_member_ignores_build_order():
+    from virtuals._views._member_key import member_key
+
+    a = frozenset(["a", "b", "c", "d"])
+    b = frozenset(["d", "c", "b", "a"])
+    assert member_key(a) == member_key(b)
+    assert member_key(("t", a, 1)) == member_key(("t", b, 1))
+    assert member_key(frozenset({a, 1})) == member_key(frozenset({1, b}))
+    assert member_key(a) != member_key(frozenset("abc"))
+    assert member_key(frozenset()) != member_key(())
+
+
+def test_set_legacy_members_in_storage_stay_members(root):
+    """A row written under the old key is the same member today."""
+    view = root.open_child("s", SetView)
+    view.ensure_created()
+    for member, key in LEGACY_MEMBER_KEYS:
+        view._put_child_primitive(key, member)
+    assert len(view) == len(LEGACY_MEMBER_KEYS)
+    for member, _ in LEGACY_MEMBER_KEYS:
+        assert member in view
+        view.add(member)  # no duplicate
+    assert len(view) == len(LEGACY_MEMBER_KEYS)
+    view.discard(2**70)
+    assert len(view) == len(LEGACY_MEMBER_KEYS) - 1
+
+
+@pytest.mark.parametrize("backend_name", ("sqlite", "lmdb"))
+def test_set_frozenset_members_match_across_spawned_processes(backend_name, tmp_path):
+    """One process adds frozenset members, another (different hash seed) sees them and
+    adds them again without a duplicate."""
+    import multiprocessing as mp
+    import os
+
+    from tests.support import set_members
+
+    ctx = mp.get_context("spawn")
+    results = []
+    for seed, fn in (("1", set_members.add_members), ("2", set_members.check_and_add_again)):
+        os.environ["PYTHONHASHSEED"] = seed
+        try:
+            with ctx.Pool(1) as pool:
+                results.append(pool.apply(fn, (backend_name, str(tmp_path))))
+        finally:
+            os.environ.pop("PYTHONHASHSEED", None)
+    report = results[1]
+    assert all(report["seen"].values()), report
+    assert report["len"] == len(set_members.MEMBERS), report
+    assert set(report["members"]) == set(set_members.MEMBERS), report
+
+
+def test_set_equal_frozensets_built_in_different_orders_are_one_member(root):
+    view = root.open_child("s", SetView)
+    view.add(frozenset(["a", "b", "c", "d"]))
+    view.add(frozenset(["d", "c", "b", "a"]))
+    assert len(view) == 1
+    assert frozenset("dcba") in view
+    view.discard(frozenset("abcd"))
+    assert len(view) == 0
+
+
+@pytest.mark.parametrize("member", [lambda: 1, ("t", lambda: 1), threading.Lock()])
+def test_set_unpicklable_member_is_rejected_before_any_write(root, member):
+    """Hashable but not picklable: rejected like an unhashable one, nothing written."""
+    from virtuals._views import FrozenSetView
+
+    view = root.open_child("absent", SetView)
+    with pytest.raises(Exception, match=r"pickle|Lock"):
+        view.add(member)
+    _assert_absent(view)
+    with pytest.raises(Exception, match=r"pickle|Lock"):
+        view.store(["a", member])
+    _assert_absent(view)
+    view.add("a")
+    with pytest.raises(Exception, match=r"pickle|Lock"):
+        view.store(["b", member], replace=False)
+    assert set(view) == {"a"}
+    fs = root.open_child("fs", FrozenSetView)
+    with pytest.raises(Exception, match=r"pickle|Lock"):
+        fs.store(["a", member])
+    _assert_absent(fs)
+
+
+def test_set_add_replaces_a_member_an_old_write_left_as_a_child_container(root):
+    """Before members were opaque rows a tuple member became a child container and the
+    set could not be iterated. add() of that member repairs it, the count stays right."""
+    view = root.open_child("s", SetView)
+    view.add("x")
+    view._populate_child_container(view._make_key((1, 2)), {"a": 1})  # the old layout
+    assert len(view) == 2
+    assert (1, 2) in view
+    with pytest.raises(ContainerTypeError):
+        list(view)
+    view.add((1, 2))
+    assert len(view) == 2
+    assert set(view) == {"x", (1, 2)}
+    view.store([(1, 2), "y"], replace=False)
+    assert set(view) == {"x", "y", (1, 2)}
+    assert len(view) == 3
+
+
+def test_kh57_backend_delete_on_absent_view_does_not_create_it(root):
+    view = root.open_child("absent", EagerKh57View)
+    view._delete_encoded(7)
+    _assert_absent(view)
