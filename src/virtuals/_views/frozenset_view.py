@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
-import pickle  # nosec: F401
 from collections.abc import Set as SetABC
 from typing import TYPE_CHECKING, ClassVar
 
-from virtuals.container import ContainerProtocol, ContainerStructure
+from virtuals._views._member_key import member_key
+from virtuals.container import ContainerProtocol, ContainerStructure, ContainerTypeError
 from virtuals.types import is_empty
 from virtuals.view import (
     ChildNestedSetBase,
@@ -72,9 +71,7 @@ class FrozenSetView(
         Returns:
             Key for storage
         """
-        pickled = pickle.dumps(value, protocol=4)  # Use fixed protocol
-        # Returns int for use in hash tables, or use .hexdigest() for string
-        return hashlib.sha256(pickled).hexdigest()[:64]
+        return member_key(value)
 
     @classmethod
     def is_address_static(cls, address: object) -> bool:
@@ -180,10 +177,11 @@ class FrozenSetView(
             value: Iterable to store
             replace: If True, clear existing content first; if False, union
         """
-        members = list(value)
-        for item in members:  # every member checked before any write
+        keyed = []
+        for item in value:  # every member checked and keyed before any write
             self._reject_empty_in(item)
             hash(item)  # TypeError for list, dict, set: unhashable type
+            keyed.append((self._make_key(item), item))  # pickles: raises on a lambda or a lock
         self.ensure_created()
         if replace:
             self.container.clear_children()
@@ -191,8 +189,14 @@ class FrozenSetView(
 
         # One opaque row per member, never a child container (a tuple member
         # reads back as a tuple). A new member is counted via _on_child_created.
-        for item in members:
-            self._put_child_primitive(self._make_key(item), item)
+        # A member that an older write left as a child container is replaced.
+        for key, item in keyed:
+            try:
+                self._put_child_primitive(key, item)
+            except ContainerTypeError:
+                self.container.delete_child(key)
+                self._decrement_length()
+                self._put_child_primitive(key, item)
 
 
 SetABC.register(FrozenSetView)

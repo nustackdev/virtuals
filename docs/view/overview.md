@@ -236,7 +236,7 @@ The same on every view and every backend. Pinned by `tests/views/test_dict_views
 - `None` is a value. `view["k"] = None` stores it and `"k" in view` is true.
 - A key keeps its kind. `d["p"] = 1` then `d["p"] = {"z": 1}` raises `ContainerTypeError`, and so does the reverse. Nothing changes. Delete the key, then set it. Compound over compound replaces the whole value.
 - Writes create. Setting into an absent view creates it. A delete of a missing key creates nothing: DictView, FlatDictView and LightDictView are silent, the index views and Kh57View raise `KeyError`. Nor does any write that raises or changes nothing: an out-of-range `del` or set on a list or bytearray, `remove` or `discard` of a non-member, `extend([])`, `update({})`, `clear()`.
-- A set member is an opaque hashable value. A tuple or frozenset is stored as one row and reads back as is; a list, dict or set raises `TypeError` before any write, as a Python set would.
+- A set member is an opaque hashable value. A tuple or frozenset is stored as one row and reads back as is; a list, dict or set raises `TypeError` before any write, as a Python set would, and so does a member that does not pickle. A frozenset member is keyed by its sorted contents, so equal sets match from any process.
 - `update` applies its keys in order. A kind change on one key raises there and leaves the keys before it written and the rest unwritten; abort the transaction, or delete the key first.
 - `LazyListView` and `LazyDictView` have no `pop`: read, then `del`, or use the eager view.
 - Existence is one read: `view.container.exists()`. Opening a chain of children touches no storage.

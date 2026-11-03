@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
-import pickle  # nosec: F401
 from collections.abc import MutableSet
 from typing import TYPE_CHECKING, ClassVar
 
-from virtuals.container import ContainerProtocol, ContainerStructure
+from virtuals._views._member_key import member_key
+from virtuals.container import ContainerProtocol, ContainerStructure, ContainerTypeError
 from virtuals.types import is_empty
 from virtuals.view import (
     ChildNestedSetBase,
@@ -55,7 +54,7 @@ class SetView(
     - __contains__, __len__, __iter__
 
     Implementation:
-    - Uses string representation of values as keys
+    - Keys are a hash of the member's canonical pickle (see ``_member_key``)
     - Stores actual values for extraction
 
     Type Parameters:
@@ -82,9 +81,7 @@ class SetView(
         Returns:
             Key for storage
         """
-        pickled = pickle.dumps(value, protocol=4)  # Use fixed protocol
-        # Returns int for use in hash tables, or use .hexdigest() for string
-        return hashlib.sha256(pickled).hexdigest()[:64]
+        return member_key(value)
 
     @classmethod
     def is_address_static(cls, address: object) -> bool:
@@ -95,25 +92,34 @@ class SetView(
         """Normalize value address to an internal storage key."""
         return self._make_key(address)
 
-    def _check_member(self, value: object) -> None:
-        """Reject what a Python set would: EMPTY anywhere, or an unhashable value.
+    def _check_member(self, value: object) -> str:
+        """Reject what a Python set would, and return the member's key.
 
-        Raises before anything is written, so a rejected add leaves nothing
-        behind. A tuple or frozenset is a member like any other.
+        EMPTY anywhere, an unhashable value (list, dict, set) and a value
+        that does not pickle all raise here, before anything is written,
+        so a rejected add leaves nothing behind. A tuple or frozenset is a
+        member like any other.
         """
         self._reject_empty_in(value)
         hash(value)  # TypeError for list, dict, set: unhashable type
+        return self._make_key(value)  # pickles: raises on a lambda, a lock, a generator
 
-    def _put_member(self, value: object) -> None:
-        """Write one member as a single opaque row under its hashed key.
+    def _put_member(self, key: str, value: object) -> None:
+        """Write one member as a single opaque row under its key.
 
         Members never become child containers, whatever their Python type:
         a tuple member reads back as a tuple, and iteration stays a
         primitive read per row. Caller must have checked the member and
         ensured the view exists. A new member is counted via
-        ``_on_child_created``.
+        ``_on_child_created``. A set written before members were opaque
+        rows may hold this member as a child container; it is replaced.
         """
-        self._put_child_primitive(self._make_key(value), value)
+        try:
+            self._put_child_primitive(key, value)
+        except ContainerTypeError:
+            self.container.delete_child(key)
+            self._decrement_length()  # the row written next counts it again
+            self._put_child_primitive(key, value)
 
     def add(self, value: object) -> None:
         """Add value to set.
@@ -122,9 +128,9 @@ class SetView(
             value: Value to add. Must be hashable, like a Python set member;
                 a list, dict or set raises ``TypeError`` before any write.
         """
-        self._check_member(value)
+        key = self._check_member(value)
         self.ensure_created()
-        self._put_member(value)
+        self._put_member(key, value)
 
     def remove(self, value: object) -> None:
         """Remove value from set.
@@ -262,15 +268,13 @@ class SetView(
             value: Iterable to store
             replace: If True, clear existing content first; if False, union
         """
-        members = list(value)
-        for item in members:  # every member checked before any write
-            self._check_member(item)
+        keyed = [(self._check_member(item), item) for item in value]  # all checked before any write
         self.ensure_created()
         if replace:
             self.clear()
 
-        for item in members:
-            self._put_member(item)
+        for key, item in keyed:
+            self._put_member(key, item)
 
 
 MutableSet.register(SetView)

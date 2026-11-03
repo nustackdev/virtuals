@@ -240,9 +240,9 @@ class Kh57ViewBase(
 
     def _delete_encoded(self, encoded: int) -> None:
         """Remove the child at `encoded` if present. Silent on miss."""
-        self.ensure_created()
-        if not self.container.exists_child(encoded):
+        if not self.container.exists_child(encoded):  # False under an absent view
             return
+        self.ensure_created()
         self.container.delete_child(encoded)
         self._decrement_length()
 
