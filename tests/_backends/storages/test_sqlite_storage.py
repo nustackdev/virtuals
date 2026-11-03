@@ -726,3 +726,20 @@ def test_handoff_then_writers_on_same_worker(storage: SQLiteStorage) -> None:
 def test_spawned_task_waits(storage: SQLiteStorage) -> None:
     cases.spawned_task_waits(storage)
 
+
+@pytest.mark.timeout(10)
+def test_close_during_commit_keeps_one_outcome(storage: SQLiteStorage) -> None:
+    tx = storage.begin_transaction()
+
+    def during_commit(fn) -> None:
+        def trace(sql: str) -> None:
+            if sql == "COMMIT":
+                fn()
+
+        tx._conn.set_trace_callback(trace)
+
+    try:
+        cases.close_during_commit_keeps_one_outcome(storage, tx, during_commit)
+    finally:
+        for conn in storage._idle:
+            conn.set_trace_callback(None)

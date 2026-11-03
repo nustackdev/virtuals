@@ -95,14 +95,21 @@ class SQLiteTransaction(
             logger.debug("Abort called on closed transaction")
             return
 
+        # Only the call that takes the connection ends the transaction. If a
+        # racing commit took it, this abort rolled nothing back and the
+        # transaction keeps the commit's outcome.
+        rolled_back = True
         try:
-            self._end("ROLLBACK")
-            logger.debug("Transaction aborted")
+            rolled_back = self._end("ROLLBACK")
+            if rolled_back:
+                logger.debug("Transaction aborted")
         except Exception as e:
+            # The connection went back to the pool, which rolls it back.
             logger.error("Transaction abort failed")
             raise StorageTransactionAbortedError(f"Failed to abort transaction: {e}") from e
         finally:
-            self._aborted = True
+            if rolled_back:
+                self._aborted = True
             self._storage._untrack_transaction(self)
 
     def __enter__(self) -> SQLiteTransaction:

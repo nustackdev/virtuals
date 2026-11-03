@@ -313,3 +313,31 @@ def spawned_task_waits(storage) -> None:
         assert snap.get(KEY) == b"child"
     _write_fast(storage)
 
+
+def close_during_commit_keeps_one_outcome(storage, tx, during_commit) -> None:
+    """close() aborting while the owner commits: committed, not also aborted.
+
+    ``during_commit`` arranges for ``fn`` to run inside the commit, after
+    it has claimed the transaction.
+    """
+    tx.put(KEY, b"committed")
+    errors: list[BaseException] = []
+
+    def abort_from_close() -> None:
+        def run() -> None:
+            try:
+                tx.abort()
+            except BaseException as e:
+                errors.append(e)
+
+        t = threading.Thread(target=run)
+        t.start()
+        t.join()
+
+    during_commit(abort_from_close)
+    tx.commit()
+    assert not errors, errors
+    assert (tx._committed, tx._aborted) == (True, False)
+    with storage.snapshot() as snap:
+        assert snap.get(KEY) == b"committed"
+    _write_fast(storage)
