@@ -17,7 +17,11 @@ import pytest
 from tests._backends.storages import _write_slot_cases as cases
 from virtuals._backends.storages.lmdb import LMDBStorage, LMDBWriteSlot
 from virtuals.codecs import BinaryCodec
-from virtuals.tkv.storage import StorageLockTimeoutError, StorageNestedTransactionError
+from virtuals.tkv.storage import (
+    StorageError,
+    StorageLockTimeoutError,
+    StorageNestedTransactionError,
+)
 from virtuals.tkv.types import EMPTY
 
 
@@ -271,7 +275,16 @@ def test_racing_ends_release_slot_once(storage: LMDBStorage) -> None:
 
 @pytest.mark.timeout(10)
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
-def test_fork_child_can_write(storage: LMDBStorage) -> None:
+@pytest.mark.parametrize("child_thread", [False, True], ids=["forking-thread", "new-thread"])
+def test_fork_during_write_child_write_fails_clearly(
+    storage: LMDBStorage, child_thread: bool
+) -> None:
+    """A child forked while a parent thread holds a write gets a clear error.
+
+    From a new child thread, LMDB's inherited writer state would refuse the
+    write with a cryptic error, from the forking thread it would wait on
+    the dead holder; the storage refuses every write and says why instead.
+    """
     held, go = threading.Event(), threading.Event()
 
     def holder() -> None:  # another parent thread holds the slot at fork
@@ -286,19 +299,76 @@ def test_fork_child_can_write(storage: LMDBStorage) -> None:
     pid = os.fork()
     if pid == 0:  # child
         code = 1
-        try:
-            with storage.transaction() as ctx:
-                ctx.put(("child",), b"1")
+
+        def clear(begin) -> bool:
+            try:
+                begin()
+            except StorageError as e:
+                return type(e) is StorageError and "fork" in str(e)
+            return False
+
+        def child() -> None:
+            nonlocal code
+            go.wait(0.2)  # never set here: the parent's commit cannot reach the child
+            if not (
+                clear(storage.begin_transaction)
+                and clear(storage.begin_write_batch)
+                and clear(lambda: asyncio.run(storage.areserve_write_slot()))
+            ):
+                return
+            storage.close()  # returns, does not hang on the inherited env
             code = 0
+
+        try:
+            if child_thread:
+                x = threading.Thread(target=child)
+                x.start()
+                x.join()
+            else:
+                child()
         finally:
             os._exit(code)
     time.sleep(0.05)
-    go.set()  # the parent commit frees LMDB's own writer lock for the child
+    go.set()
     t.join()
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0
     with storage.snapshot() as snap:
-        assert snap.get(("child",)) == b"1"
+        assert snap.get(("parent",)) == b"1"
+    storage.begin_transaction().commit()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.parametrize("child_thread", [False, True], ids=["forking-thread", "new-thread"])
+def test_fork_without_write_child_writes(storage: LMDBStorage, child_thread: bool) -> None:
+    """With no write in progress at fork, the child writes from any thread."""
+    with storage.transaction() as tx:
+        tx.put(("parent",), b"1")
+    pid = os.fork()
+    if pid == 0:  # child
+        code = 1
+
+        def child() -> None:
+            nonlocal code
+            for value in (b"1", b"2"):
+                with storage.transaction() as ctx:
+                    ctx.put(("child",), value)
+            code = 0
+
+        try:
+            if child_thread:
+                x = threading.Thread(target=child)
+                x.start()
+                x.join()
+            else:
+                child()
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    with storage.snapshot() as snap:
+        assert snap.get(("child",)) == b"2"
     storage.begin_transaction().commit()
 
 
