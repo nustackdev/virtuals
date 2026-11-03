@@ -7,13 +7,14 @@ a slot left taken shows up as a slow or failed write, not a hang.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gc
 import threading
 import time
 
 import pytest
 
-from virtuals.tkv.storage import StorageNestedTransactionError
+from virtuals.tkv.storage import StorageLockTimeoutError, StorageNestedTransactionError
 from virtuals.tkv.types import EMPTY
 
 
@@ -220,3 +221,95 @@ def racing_ends_release_once(storage, tx, end, flag: str) -> None:
     assert len(releases) == 1
     assert not storage._writer.lock.locked()
     _write_fast(storage)
+
+
+def handoff_worker_is_not_nested(storage) -> None:
+    """A pool worker that took a handed-off slot is not the owner for later jobs.
+
+    The slot is reserved on the loop and taken in a ``run_in_executor`` job
+    (the worker's own context), then kept held. Another job on that same
+    worker must wait for the slot (here: time out), not fail as nested.
+    Driven on the writer slot directly, so it holds on LMDB too, where the
+    transaction itself could not finish off its thread.
+    """
+    writer = storage._writer
+
+    async def main() -> tuple[str, float]:
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(1) as ex:
+            slot = await storage.areserve_write_slot()
+            give_back = await loop.run_in_executor(
+                ex, lambda: writer.take(storage, slot, storage._busy_timeout)
+            )
+
+            def other() -> tuple[str, float]:
+                t0 = time.monotonic()
+                try:
+                    writer.acquire(0.2)
+                except StorageLockTimeoutError:
+                    return "timeout", time.monotonic() - t0
+                except StorageNestedTransactionError:
+                    return "nested", time.monotonic() - t0
+                writer.release()
+                return "acquired", time.monotonic() - t0
+
+            try:
+                return await loop.run_in_executor(ex, other)
+            finally:
+                give_back()
+                slot.release()
+
+    outcome, waited = asyncio.run(main())
+    assert outcome == "timeout"
+    assert waited >= 0.15
+    _write_fast(storage)
+
+
+def handoff_then_writers_on_same_worker(storage) -> None:
+    """After a handed-off transaction, two unrelated writers on its worker both land."""
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(1) as ex:
+            slot = await storage.areserve_write_slot()
+            tx = await loop.run_in_executor(ex, lambda: storage.begin_transaction(write_slot=slot))
+            await loop.run_in_executor(ex, lambda: (tx.put(KEY, b"handoff"), tx.commit()))
+
+            def write(value: bytes) -> None:
+                with storage.transaction() as t:
+                    t.put(KEY, value)
+
+            for value in (b"one", b"two"):
+                await asyncio.wait_for(loop.run_in_executor(ex, write, value), FAST)
+
+    asyncio.run(main())
+    with storage.snapshot() as snap:
+        assert snap.get(KEY) == b"two"
+    _write_fast(storage)
+
+
+def spawned_task_waits(storage) -> None:
+    """A task spawned by the slot holder carries its context but waits, not nested."""
+
+    async def main() -> None:
+        slot = await storage.areserve_write_slot()
+        tx = storage.begin_transaction(write_slot=slot)
+
+        async def child() -> None:
+            with await storage.areserve_write_slot() as s:
+                t = storage.begin_transaction(write_slot=s)
+                t.put(KEY, b"child")
+                t.commit()
+
+        task = asyncio.create_task(child())
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        tx.put(KEY, b"parent")
+        tx.commit()
+        await asyncio.wait_for(task, FAST)
+
+    asyncio.run(main())
+    with storage.snapshot() as snap:
+        assert snap.get(KEY) == b"child"
+    _write_fast(storage)
+

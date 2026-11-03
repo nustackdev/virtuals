@@ -300,3 +300,19 @@ def test_fork_child_can_write(storage: LMDBStorage) -> None:
     with storage.snapshot() as snap:
         assert snap.get(("child",)) == b"1"
     storage.begin_transaction().commit()
+
+
+@pytest.mark.timeout(10)
+def test_handoff_worker_is_not_nested(storage: LMDBStorage) -> None:
+    cases.handoff_worker_is_not_nested(storage)
+
+
+@pytest.mark.timeout(10)
+def test_handoff_then_writers_on_same_worker(storage: LMDBStorage) -> None:
+    cases.handoff_then_writers_on_same_worker(storage)
+
+
+@pytest.mark.timeout(10)
+def test_spawned_task_waits(storage: LMDBStorage) -> None:
+    cases.spawned_task_waits(storage)
+

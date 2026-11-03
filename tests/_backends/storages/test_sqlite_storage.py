@@ -9,6 +9,7 @@ read-only opens and reopening after close.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import random
 import subprocess
 import sys
@@ -682,3 +683,46 @@ def test_asyncio_run_inside_sync_txn_is_nested(storage: SQLiteStorage) -> None:
 def test_racing_ends_release_slot_once(storage: SQLiteStorage) -> None:
     tx = storage.begin_transaction()
     cases.racing_ends_release_once(storage, tx, lambda t: t._end("ROLLBACK"), "_holds_write_lock")
+
+
+@pytest.mark.timeout(10)
+def test_handoff_worker_is_not_nested(storage: SQLiteStorage) -> None:
+    cases.handoff_worker_is_not_nested(storage)
+
+
+@pytest.mark.timeout(10)
+def test_handoff_worker_unrelated_writer_waits(storage: SQLiteStorage) -> None:
+    """The full repro: the handed-off txn commits on the loop, the other writer then lands."""
+
+    async def main() -> float:
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(1) as ex:
+            slot = await storage.areserve_write_slot()
+            tx = await loop.run_in_executor(ex, lambda: storage.begin_transaction(write_slot=slot))
+            tx.put(("k",), b"1")
+
+            def other() -> float:
+                t0 = time.monotonic()
+                with storage.transaction() as t:
+                    t.put(("k",), b"2")
+                return time.monotonic() - t0
+
+            waiter = loop.run_in_executor(ex, other)
+            await asyncio.sleep(0.2)
+            tx.commit()
+            return await waiter
+
+    assert asyncio.run(main()) >= 0.15
+    with storage.snapshot() as snap:
+        assert snap.get(("k",)) == b"2"
+
+
+@pytest.mark.timeout(10)
+def test_handoff_then_writers_on_same_worker(storage: SQLiteStorage) -> None:
+    cases.handoff_then_writers_on_same_worker(storage)
+
+
+@pytest.mark.timeout(10)
+def test_spawned_task_waits(storage: SQLiteStorage) -> None:
+    cases.spawned_task_waits(storage)
+
