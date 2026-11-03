@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import rdbpy
+
 from virtuals.tkv.storage import (
     ScanProtocol,
     StorageClosedError,
+    StorageError,
     StorageLockTimeoutError,
     StorageOperationError,
     StorageScanOptions,
@@ -28,23 +31,40 @@ __all__ = [
     "ContextBase",
     "ReadOperationsMixin",
     "WriteOperationsMixin",
+    "classify_rdbpy",
+    "is_missing_file_error",
 ]
 
 
-def _classify_rdbpy(key: Key, action: str, e: Exception) -> StorageOperationError:
-    """Map an rdbpy exception to the right storage exception.
+# Conflicts rocksdb reports on a write or a commit: the key moved after the
+# transaction's snapshot (Busy, Deadlock is a Busy), the memtable history
+# was too short to validate (TryAgain), or the transaction expired.
+_CONFLICT = (rdbpy.Busy, rdbpy.TryAgain, rdbpy.Expired)
+# A lock wait exceeded its timeout, or the lock table is full.
+_LOCK_TIMEOUT = (rdbpy.TimedOut, rdbpy.LockLimit)
 
-    rdbpy surfaces RocksDB statuses as plain `Exception` with a bytes
-    message; we sniff for the canonical status strings and map to
-    typed errors so policy spans (e.g. RetryOnConflict) can target them.
+# rocksdb::Status::SubCode::kPathNotFound: an IO error on a file that is gone.
+_SUBCODE_PATH_NOT_FOUND = 9
+
+
+def classify_rdbpy(e: BaseException, message: str) -> StorageError:
+    """Map an rdbpy exception onto the storage exception hierarchy.
+
+    Mapping is by exception class (rdbpy types every rocksdb status), so
+    the retryable classes ``RetryOnConflict`` targets are exact:
+    Busy / Deadlock / TryAgain / Expired become
+    ``StorageTransactionConflictError``, TimedOut / LockLimit become
+    ``StorageLockTimeoutError``. rdbpy raises ``RuntimeError`` for a handle
+    whose parent ended (transaction committed, storage closed), which is
+    ``StorageClosedError`` here. Everything else is an operation error.
     """
-    msg = str(e)
-    lower = msg.lower()
-    if "timeout waiting to lock" in lower or "lock timeout" in lower:
-        return StorageLockTimeoutError(f"Failed to {action} key {key}: {e}")
-    if "busy" in lower or "conflict" in lower or "deadlock" in lower:
-        return StorageTransactionConflictError(f"Failed to {action} key {key}: {e}")
-    return StorageOperationError(f"Failed to {action} key {key}: {e}")
+    if isinstance(e, _CONFLICT):
+        return StorageTransactionConflictError(f"{message}: {e}")
+    if isinstance(e, _LOCK_TIMEOUT):
+        return StorageLockTimeoutError(f"{message}: {e}")
+    if isinstance(e, RuntimeError):
+        return StorageClosedError(f"{message}: {e}")
+    return StorageOperationError(f"{message}: {e}")
 
 
 # Bounded retries for a read-only secondary whose manifest version still
@@ -53,39 +73,38 @@ def _classify_rdbpy(key: Key, action: str, e: Exception) -> StorageOperationErro
 _SECONDARY_STALE_RETRIES = 6
 
 
-def _is_missing_file_error(e: Exception) -> bool:
+def is_missing_file_error(e: BaseException) -> bool:
     """True if a read failed because it touched a now-deleted SST file.
 
     This is the signature of a read-only secondary pinned to a manifest
     version older than the primary's current one: the primary compacted and
     deleted the file, but the secondary's view still references it. A
-    catch-up to the current manifest drops the reference.
+    catch-up to the current manifest drops the reference. rocksdb reports
+    it as an IO error with the path-not-found subcode.
     """
-    return "no such file or directory" in str(e).lower()
+    return isinstance(e, rdbpy.RocksIOError) and e.subcode == _SUBCODE_PATH_NOT_FOUND
 
 
 class ContextBase:
-    """Base class for RocksDB transaction/snapshot contexts.
+    """Base class for RocksDB transaction, snapshot and batch contexts.
 
-    Provides common functionality for state management, validation, and
-    resource cleanup. All contexts wrap a RocksDB transaction handle.
+    Tracks open/closed state and, for write contexts, the storage's writer
+    slot, which is given back when the context closes. Subclasses own
+    their rdbpy handles and drop them in ``_drop_handles``.
     """
 
-    __slots__ = ("_closed", "_rdbpy_txn", "_storage")
+    __slots__ = ("_closed", "_holds_write_slot", "_storage")
 
-    def __init__(
-        self,
-        storage: RocksDBStorage,
-        rdbpy_txn: Any,  # noqa: ANN401
-    ) -> None:
-        """Initialize context with storage reference and RocksDB transaction.
+    def __init__(self, storage: RocksDBStorage, *, holds_write_slot: bool = False) -> None:
+        """Initialize context.
 
         Args:
             storage: Parent storage instance
-            rdbpy_txn: RocksDB transaction handle
+            holds_write_slot: True if this context holds the storage's
+                in-process writer slot and must release it on close.
         """
         self._storage = storage
-        self._rdbpy_txn: Any | None = rdbpy_txn
+        self._holds_write_slot = holds_write_slot
         self._closed = False
 
     @property
@@ -97,25 +116,25 @@ class ContextBase:
         """
         return self._storage
 
-    def _require_active(self) -> object:
-        """Validate context is active and return transaction handle.
-
-        Returns:
-            Active RocksDB transaction handle
+    def _require_active(self) -> None:
+        """Validate context is active.
 
         Raises:
-            StorageClosedError: If context is closed or invalid
+            StorageClosedError: If context is closed
         """
         if self._closed:
             raise StorageClosedError("Context is closed")
-        if self._rdbpy_txn is None:
-            raise StorageClosedError("Context handle is invalid")
-        return self._rdbpy_txn
+
+    def _drop_handles(self) -> None:
+        """Forget the rdbpy handles. Overridden by subclasses."""
 
     def _mark_closed(self) -> None:
-        """Mark context as closed and clear handle."""
+        """Mark context as closed, drop its handles, and give back the writer slot."""
         self._closed = True
-        self._rdbpy_txn = None
+        self._drop_handles()
+        if self._holds_write_slot:
+            self._holds_write_slot = False
+            self._storage._release_write_slot()
 
     @property
     def is_closed(self) -> bool:
@@ -140,7 +159,10 @@ class ReadOperationsMixin:
     """Mixin providing read operations for RocksDB contexts.
 
     Implements point access (get, exists), batch access (multiget),
-    and range access (scan) operations.
+    and range access (scan) operations over two hooks the context
+    provides: ``_get_raw(encoded_key)`` and ``_iterator(keys_only, reverse)``.
+    Both read at the context's snapshot: a transaction's own snapshot
+    merged with its pending writes, or a Snapshot's DB snapshot.
     """
 
     __slots__ = ()
@@ -148,6 +170,8 @@ class ReadOperationsMixin:
     # Type hints for mixed-in attributes
     _storage: RocksDBStorage
     _require_active: Any  # Method from ContextBase
+    _get_raw: Callable[[bytes], bytes | None]
+    _iterator: Callable[..., Any]
 
     def _read_with_catchup(self, key: Key, action: str, op: Callable[[], object]) -> object:
         """Run a read `op`, surviving a stale-manifest secondary.
@@ -155,20 +179,21 @@ class ReadOperationsMixin:
         On a read-only secondary, `op` can fail because the secondary's
         manifest version references an SST the primary already compacted
         away. That is recoverable: force a catch-up to the current manifest
-        and retry. Any other failure -- and any failure at all on a primary
-        -- is classified and raised immediately, exactly as before.
+        and retry. Any other failure, and any failure at all on a primary,
+        is classified and raised immediately.
         """
         storage = self._storage
+        message = f"Failed to {action} key {key}"
         last: Exception | None = None
         for _ in range(_SECONDARY_STALE_RETRIES):
             try:
                 return op()
             except Exception as e:
-                if not (storage._is_secondary and _is_missing_file_error(e)):
-                    raise _classify_rdbpy(key, action, e) from e
+                if not (storage._is_secondary and is_missing_file_error(e)):
+                    raise classify_rdbpy(e, message) from e
                 last = e
                 storage.force_catch_up_with_primary()
-        raise _classify_rdbpy(key, action, last) from last  # type: ignore[arg-type]
+        raise classify_rdbpy(last, message) from last  # type: ignore[arg-type]
 
     def get(self, key: Key) -> Value | Empty:
         """Get value by key.
@@ -184,24 +209,19 @@ class ReadOperationsMixin:
             StorageOperationError: If operation fails
             StorageClosedError: If context is closed
         """
-        txn = self._require_active()
+        self._require_active()
         codec = self._storage.codec
 
-        # Encode key for RocksDB
         try:
             encoded_key = codec.encode_key(key)
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        # Retrieve from RocksDB. `_read_with_catchup` absorbs a stale-manifest
-        # secondary (an SST the primary compacted away) by catching up + retrying.
-        encoded_value = self._read_with_catchup(key, "get", lambda: txn.get(encoded_key))
+        encoded_value = self._read_with_catchup(key, "get", lambda: self._get_raw(encoded_key))
 
-        # Handle not found - return EMPTY instead of raising
         if encoded_value is None:
             return EMPTY
 
-        # Decode value
         try:
             return codec.decode_value(encoded_value)
         except Exception as e:
@@ -220,7 +240,7 @@ class ReadOperationsMixin:
             StorageOperationError: If check fails
             StorageClosedError: If context is closed
         """
-        txn = self._require_active()
+        self._require_active()
         codec = self._storage.codec
 
         try:
@@ -228,7 +248,7 @@ class ReadOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        return self._read_with_catchup(key, "check", lambda: txn.get(encoded_key) is not None)
+        return self._read_with_catchup(key, "check", lambda: self._get_raw(encoded_key) is not None)
 
     def multiget(self, keys: list[Key]) -> dict[Key, Value]:
         """Get multiple keys.
@@ -267,16 +287,15 @@ class ReadOperationsMixin:
         """
         from .scan import RocksDBScan
 
-        # Validate context is active before creating scan
         self._require_active()
 
         return RocksDBScan(self, options)  # type: ignore[arg-type]
 
 
 class WriteOperationsMixin:
-    """Mixin providing write operations for RocksDB contexts.
+    """Mixin providing write operations for RocksDB transactions.
 
-    Implements point writes (put, delete).
+    Implements point writes (put, delete) on the rdbpy transaction.
     Tracks modified keys for notification on commit.
     """
 
@@ -285,6 +304,7 @@ class WriteOperationsMixin:
     # Type hints for mixed-in attributes
     _storage: RocksDBStorage
     _require_active: Any  # Method from ContextBase
+    _rdbpy_txn: Any
     _modified_keys: set[Key]  # Initialized in __init__
 
     def put(self, key: Key, value: Value) -> None:
@@ -296,31 +316,31 @@ class WriteOperationsMixin:
 
         Raises:
             StorageOperationError: If write fails
+            StorageTransactionConflictError: If the key moved after the
+                transaction's snapshot (another writer bypassed the slot)
             StorageClosedError: If context is closed
         """
-        txn = self._require_active()
+        self._require_active()
         codec = self._storage.codec
 
-        # Encode key and value
         try:
             encoded_key = codec.encode_key(key)
             encoded_value = codec.encode_value(value)
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key/value for {key}: {e}") from e
 
-        # Write to RocksDB
         try:
-            txn.put(encoded_key, encoded_value)
+            self._rdbpy_txn.put(encoded_key, encoded_value)
         except Exception as e:
-            raise _classify_rdbpy(key, "put", e) from e
+            raise classify_rdbpy(e, f"Failed to put key {key}") from e
 
-        # Track modification for notifications
         self._modified_keys.add(key)
 
     def delete(self, key: Key) -> None:
         """Delete key (idempotent).
 
-        Silent if key doesn't exist (never raises for missing keys).
+        Silent if key doesn't exist (never raises for missing keys), and
+        notifies only when something was there to delete.
 
         Args:
             key: Key to delete
@@ -329,7 +349,7 @@ class WriteOperationsMixin:
             StorageOperationError: If deletion fails
             StorageClosedError: If context is closed
         """
-        txn = self._require_active()
+        self._require_active()
         codec = self._storage.codec
 
         try:
@@ -337,18 +357,11 @@ class WriteOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
-        # Check if key exists
         try:
-            exists = txn.get(encoded_key) is not None
-
-            if not exists:
-                # Key doesn't exist, silently do nothing
+            if self._rdbpy_txn.get(encoded_key) is None:
                 return
-
-            # Delete the key
-            txn.delete_single(encoded_key)
+            self._rdbpy_txn.delete(encoded_key)
         except Exception as e:
-            raise _classify_rdbpy(key, "delete", e) from e
+            raise classify_rdbpy(e, f"Failed to delete key {key}") from e
 
-        # Track modification for notifications
         self._modified_keys.add(key)

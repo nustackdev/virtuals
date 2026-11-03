@@ -12,12 +12,18 @@ from virtuals.tkv.storage import (
     StorageScanOptions,
 )
 
-from .context import _is_missing_file_error
+from .context import classify_rdbpy, is_missing_file_error
 
 
 # Bounded restarts when a secondary scan touches an SST the primary
 # compacted away. Mirrors the point-read retry budget in `context.py`.
 _SCAN_STALE_RETRIES = 6
+
+# Rows fetched per native call. The first batch is small so a scan that
+# stops early (limit, break filter) reads little past its end; later
+# batches grow so a long scan pays one native call per hundreds of rows.
+_BATCH_FIRST = 8
+_BATCH_MAX = 1024
 
 
 if TYPE_CHECKING:
@@ -41,15 +47,17 @@ class _IteratorType(Enum):
 
 
 class RocksDBScan(ScanProtocol):
-    """Optimized scan iterator implementation conforming to ScanProtocol.
+    """Scan iterator implementation conforming to ScanProtocol.
 
-    Provides Pythonic iteration interface over a range of keys.
+    Provides Pythonic iteration interface over a range of keys, read at the
+    context's snapshot (a transaction's own, merged with its pending
+    writes, or a Snapshot's).
 
     Key optimizations:
-    1. Uses iterkeys() when only keys needed (no value I/O from disk), in
-       both directions
-    2. Uses iteritems() when values needed
-    3. Seeks straight to the start bound (seek / seek_for_prev)
+    1. Key-only cursors when only keys are needed (no value I/O from disk),
+       in both directions
+    2. Seeks straight to the start bound (seek / seek_for_prev)
+    3. Rows come in native batches, so Python pays per batch, not per row
     4. Uses filter/break_filter for flexible key filtering
     """
 
@@ -98,7 +106,10 @@ class RocksDBScan(ScanProtocol):
                     yield item
                 return
             except Exception as e:
-                if not (storage._is_secondary and _is_missing_file_error(e)):
+                cause = e.__cause__
+                if not (
+                    storage._is_secondary and cause is not None and is_missing_file_error(cause)
+                ):
                     raise
                 attempt += 1
                 if attempt > _SCAN_STALE_RETRIES:
@@ -121,7 +132,8 @@ class RocksDBScan(ScanProtocol):
         Yields:
             Keys, values, or (key, value) tuples based on iterator_type
         """
-        txn = self._context._require_active()
+        context = self._context
+        context._require_active()
         codec = self._storage.codec
         options = self._options
 
@@ -140,70 +152,73 @@ class RocksDBScan(ScanProtocol):
                 raise StorageOperationError(f"Failed to encode start key: {e}") from e
 
         try:
-            iterator = txn.iteritems() if need_values else txn.iterkeys()
-        except RuntimeError as e:
-            raise StorageClosedError(f"Scan context is closed: {e}") from e
+            iterator = context._iterator(keys_only=not need_values, reverse=options.reverse)  # type: ignore[attr-defined]
         except Exception as e:
-            raise StorageOperationError(f"Failed to create iterator: {e}") from e
+            raise classify_rdbpy(e, "Failed to create iterator") from e
 
-        self._seek(iterator, options.reverse, start_key_encoded)
+        try:
+            self._seek(iterator, options.reverse, start_key_encoded)
 
-        count = 0
-        max_depth = options.max_depth
-        context = self._context
+            count = 0
+            max_depth = options.max_depth
+            first_batch = _BATCH_FIRST
+            if options.limit is not None:
+                first_batch = max(1, min(first_batch, options.limit))
+            batch_size = first_batch
+            while True:
+                rows = self._next_batch(iterator, batch_size)
+                if not rows:
+                    return
+                batch_size = min(batch_size * 4, _BATCH_MAX)
+                for row in rows:
+                    # Rows already fetched outlive the context (and on a
+                    # secondary the shared DB handle outlives the snapshot),
+                    # so check the context before every row, not the cursor.
+                    if context.is_closed:
+                        raise StorageClosedError("Scan used after its context ended")
+                    if need_values:
+                        encoded_key, encoded_value = row
+                    else:
+                        encoded_key, encoded_value = row, None
 
-        while True:
-            # A secondary's snapshot wraps the shared DB handle, so closing the
-            # snapshot does not invalidate the iterator; check the context.
-            if context.is_closed:
-                raise StorageClosedError("Scan used after its context ended")
-            entry = self._read(iterator)
-            if entry is None:
-                break
-            if need_values:
-                encoded_key, encoded_value = entry
-            else:
-                encoded_key, encoded_value = entry, None
+                    try:
+                        key = codec.decode_key(encoded_key)
+                    except Exception as e:
+                        raise StorageOperationError(f"Failed to decode key: {e}") from e
 
-            try:
-                key = codec.decode_key(encoded_key)
-            except Exception as e:
-                raise StorageOperationError(f"Failed to decode key: {e}") from e
+                    if options.break_filter is not None and not options.break_filter.matches(key):
+                        return
 
-            if options.break_filter is not None and not options.break_filter.matches(key):
-                break
+                    if max_depth is not None and len(key) > max_depth:
+                        # Below the walked depth: one seek over the whole subtree,
+                        # dropping the rest of this batch.
+                        self._seek(iterator, options.reverse, options.skip_bound(codec, key))
+                        batch_size = first_batch
+                        break
 
-            if max_depth is not None and len(key) > max_depth:
-                # Below the walked depth: one seek over the whole subtree.
-                self._seek(iterator, options.reverse, options.skip_bound(codec, key))
-                continue
+                    if options.filter is not None and not options.filter.matches(key):
+                        continue
 
-            if options.filter is not None and not options.filter.matches(key):
-                if not self._advance(iterator, options.reverse):
-                    break
-                continue
+                    if options.limit is not None and count >= options.limit:
+                        return
 
-            if options.limit is not None and count >= options.limit:
-                break
+                    value = None
+                    if need_values and encoded_value is not None:
+                        try:
+                            value = codec.decode_value(encoded_value)
+                        except Exception as e:
+                            raise StorageOperationError(f"Failed to decode value: {e}") from e
 
-            value = None
-            if need_values and encoded_value is not None:
-                try:
-                    value = codec.decode_value(encoded_value)
-                except Exception as e:
-                    raise StorageOperationError(f"Failed to decode value: {e}") from e
+                    if iterator_type == _IteratorType.KEYS:
+                        yield key
+                    elif iterator_type == _IteratorType.VALUES:
+                        yield value
+                    else:
+                        yield (key, value)
 
-            if iterator_type == _IteratorType.KEYS:
-                yield key
-            elif iterator_type == _IteratorType.VALUES:
-                yield value
-            else:
-                yield (key, value)
-
-            count += 1
-
-            if not self._advance(iterator, options.reverse):
-                break
+                    count += 1
+        finally:
+            iterator.close()
 
     @staticmethod
     def _seek(iterator: Any, reverse: bool, start_key_encoded: bytes | None) -> None:  # noqa: ANN401
@@ -211,7 +226,7 @@ class RocksDBScan(ScanProtocol):
 
         Forward lands on the first key >= start, reverse on the last key
         <= start (`seek_for_prev`). An empty range leaves the iterator
-        invalid, which `_read` reports as exhausted.
+        invalid, which the first batch reports as exhausted.
         """
         try:
             if reverse:
@@ -223,41 +238,19 @@ class RocksDBScan(ScanProtocol):
                 iterator.seek(start_key_encoded)
             else:
                 iterator.seek_to_first()
-        except RuntimeError as e:
-            raise StorageClosedError(f"Scan used after its context ended: {e}") from e
         except Exception as e:
-            raise StorageOperationError(f"Failed during scan: {e}") from e
+            raise classify_rdbpy(e, "Failed during scan") from e
 
     @staticmethod
-    def _read(iterator: Any) -> Any:  # noqa: ANN401
-        """Current entry (key, or (key, value)), or None when exhausted."""
+    def _next_batch(iterator: Any, n: int) -> list:  # noqa: ANN401
+        """Up to ``n`` rows from the cursor in its direction; empty when exhausted."""
         try:
-            return iterator.get()
-        except ValueError:
-            return None
-        except RuntimeError as e:
-            raise StorageClosedError(f"Scan used after its context ended: {e}") from e
+            return iterator.next_batch(n)
         except Exception as e:
-            raise StorageOperationError(f"Failed during scan: {e}") from e
-
-    @staticmethod
-    def _advance(iterator: Any, reverse: bool) -> bool:  # noqa: ANN401
-        """Step forward or backward. Returns False on exhaustion."""
-        try:
-            if reverse:
-                iterator.skip_back()
-            else:
-                iterator.skip()
-        except ValueError:
-            return False
-        except RuntimeError as e:
-            raise StorageClosedError(f"Scan used after its context ended: {e}") from e
-        except Exception as e:
-            raise StorageOperationError(f"Failed during scan: {e}") from e
-        return True
+            raise classify_rdbpy(e, "Failed during scan") from e
 
     def keys(self) -> Generator[Key, None, None]:
-        """Iterate over keys only - uses iterkeys() for minimal I/O.
+        """Iterate over keys only - a key-only cursor for minimal I/O.
 
         Yields:
             Keys in scan range
@@ -270,7 +263,7 @@ class RocksDBScan(ScanProtocol):
         )
 
     def values(self) -> Generator[Value, None, None]:
-        """Iterate over values only - must use iteritems().
+        """Iterate over values only.
 
         Yields:
             Values in scan range
@@ -283,7 +276,7 @@ class RocksDBScan(ScanProtocol):
         )
 
     def items(self) -> Generator[tuple[Key, Value], None, None]:
-        """Iterate over (key, value) tuples - uses iteritems().
+        """Iterate over (key, value) tuples.
 
         Yields:
             Tuples of (key, value) for each item in scan range

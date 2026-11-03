@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from logging import getLogger
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from virtuals.tkv.storage import (
     StorageClosedError,
@@ -32,24 +32,23 @@ logger = getLogger(__name__)
 class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
     """Write-only batch implementation for RocksDB.
 
-    Provides efficient bulk write operations using rdbpy.WriteBatch.
-    Does not support read operations - optimized for write-heavy workloads.
+    Buffers puts and deletes in an rdbpy.WriteBatch and applies them in one
+    atomic write. The batch takes the storage's writer slot only for the
+    duration of ``write``, so it queues behind transactions and never
+    lands in the middle of one.
     """
 
-    __slots__ = ("_aborted", "_modified_keys", "_written")
+    __slots__ = ("_aborted", "_modified_keys", "_rdbpy_batch", "_written")
 
-    def __init__(
-        self,
-        storage: RocksDBStorage,
-        rdbpy_batch: object,
-    ) -> None:
+    def __init__(self, storage: RocksDBStorage, rdbpy_batch: Any) -> None:  # noqa: ANN401
         """Initialize write batch.
 
         Args:
             storage: Parent storage instance
             rdbpy_batch: RocksDB write batch handle
         """
-        super().__init__(storage, rdbpy_batch)
+        super().__init__(storage)
+        self._rdbpy_batch: Any | None = rdbpy_batch
         self._modified_keys: set[Key] = set()
         self._written = False
         self._aborted = False
@@ -58,6 +57,9 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
     def writable(self) -> bool:
         """Always True for write batches."""
         return True
+
+    def _drop_handles(self) -> None:
+        self._rdbpy_batch = None
 
     def put(self, key: Key, value: Value) -> None:
         """Put key-value pair into batch.
@@ -70,23 +72,20 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
             StorageOperationError: If write fails
             StorageClosedError: If batch is closed
         """
-        batch = self._require_active()
+        self._require_active()
         codec = self._storage.codec
 
-        # Encode key and value
         try:
             encoded_key = codec.encode_key(key)
             encoded_value = codec.encode_value(value)
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key/value for {key}: {e}") from e
 
-        # Add to batch
         try:
-            batch.put(encoded_key, encoded_value)
+            self._rdbpy_batch.put(encoded_key, encoded_value)  # type: ignore[union-attr]
         except Exception as e:
             raise StorageOperationError(f"Failed to put key {key}: {e}") from e
 
-        # Track modification for notifications
         self._modified_keys.add(key)
 
     def delete(self, key: Key) -> None:
@@ -101,7 +100,7 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
             StorageOperationError: If deletion fails
             StorageClosedError: If batch is closed
         """
-        batch = self._require_active()
+        self._require_active()
         codec = self._storage.codec
 
         try:
@@ -110,21 +109,24 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
         try:
-            # Add delete to batch
-            batch.delete(encoded_key)
+            self._rdbpy_batch.delete(encoded_key)  # type: ignore[union-attr]
         except Exception as e:
             raise StorageOperationError(f"Failed to delete key {key}: {e}") from e
 
-        # Track modification for notifications
         self._modified_keys.add(key)
 
     def write(self) -> None:
         """Write batch and make changes permanent.
 
-        Sends notifications for all modified keys after successful write.
+        Takes the writer slot, applies the batch atomically, releases the
+        slot. Sends notifications for all modified keys after a successful
+        write.
 
         Raises:
-            StorageTransactionError: If write fails
+            StorageLockTimeoutError: If the writer slot is not free in time
+            StorageNestedTransactionError: If this task or thread already
+                holds a write transaction on the storage
+            StorageTransactionError: If the write fails
             StorageClosedError: If already written or aborted
         """
         if self._closed:
@@ -137,49 +139,32 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
             logger.error("Cannot write, batch already aborted")
             raise StorageTransactionError("Write batch already aborted")
 
-        batch = self._require_active()
+        batch = self._rdbpy_batch
         self._storage._require_open()
 
-        # Write to RocksDB
         try:
-            self._storage._db.write(batch, disable_wal=self._storage._disable_wal)
-        except Exception as e:
+            self._storage._write_batch(batch)
+        except Exception:
             logger.error("Write batch write failed")
-            raise StorageTransactionError(f"Failed to write batch: {e}") from e
+            raise
 
-        logger.info("Write batch written")
+        logger.debug("Write batch written")
 
-        # Mark as written before notifications
         self._written = True
         self._mark_closed()
-
-        # Notify observers (batch)
         self._storage._notify_batch(self._modified_keys)
-
-        # Remove from active batches
-        self._storage._remove_write_batch(self)
+        self._storage._untrack_write_batch(self)
 
     def abort(self) -> None:
-        """Abort write batch and discard changes.
-
-        Raises:
-            StorageTransactionError: If abort fails
-            StorageClosedError: If batch is closed
-        """
+        """Abort write batch and discard changes."""
         if self._closed:
-            # Already closed, nothing to do
             logger.debug("Abort called on closed write batch")
             return
 
-        try:
-            logger.info("Write batch aborted")
-
-            self._aborted = True
-            self._mark_closed()
-            self._storage._remove_write_batch(self)
-        except Exception as e:
-            logger.error("Write batch abort failed")
-            raise StorageTransactionError(f"Failed to abort write batch: {e}") from e
+        self._aborted = True
+        self._mark_closed()
+        self._storage._untrack_write_batch(self)
+        logger.debug("Write batch aborted")
 
     def __enter__(self) -> RocksDBWriteBatch:
         """Enter context manager."""
@@ -197,12 +182,9 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
         Otherwise, write the batch.
         """
         if exc_type is not None:
-            # Exception occurred - abort
             try:
                 self.abort()
             except Exception:
                 logger.error("Write batch abort failed")
-        else:
-            # No exception - write if not already done
-            if not self._written and not self._aborted:
-                self.write()
+        elif not self._written and not self._aborted:
+            self.write()
