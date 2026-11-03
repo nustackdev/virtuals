@@ -92,11 +92,19 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
             pending = self._pending
             if pending is None:
                 raise StorageClosedError("Context handle is invalid")
-            txn, missing = self._storage._begin_pending(pending)
+            storage = self._storage
+            if not pending:  # read first: just the begin, nothing to replay
+                txn = storage._writer_thread.run(
+                    storage._begin_lmdb_write,
+                    timeout=storage._hop_timeout(),
+                    undo=storage._abort_abandoned,
+                )
+            else:
+                txn, missing = storage._begin_pending(pending)
+                for encoded_key in missing:
+                    self._modified_keys.discard(pending[encoded_key][0])
             self._lmdb_txn = txn
             self._pending = None
-            for encoded_key in missing:
-                self._modified_keys.discard(pending[encoded_key][0])
         return txn
 
     def commit(self) -> None:

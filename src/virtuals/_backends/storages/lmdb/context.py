@@ -22,6 +22,7 @@ held from ``begin_transaction`` on, so no peer commits in between.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 import time
@@ -40,6 +41,8 @@ from virtuals.tkv.types import EMPTY, Empty
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from virtuals.tkv.types import Key, Value
 
     from .storage import LMDBStorage
@@ -53,53 +56,71 @@ _SLOT_FLAG_LOCK = threading.Lock()
 # so often that a thread woken to take it (the writer thread after a job
 # lands on its queue or after each of its C calls, or the requester after
 # its result) loses the race every time and never times out into a drop
-# request (CPython's convoy effect, bpo-7946). Two tiers, both only while
-# a writer job is in flight: past ``WRITER_STARVED_AFTER`` each reader
-# sleeps ``WRITER_YIELD`` once per ``WRITER_YIELD_EVERY`` of its own time
-# (a nudge: at most a fifth of its throughput, and nothing during a commit
-# that is merely fsyncing); past ``WRITER_BLOCKED_AFTER`` it stays off the
-# GIL in ``WRITER_YIELD`` steps until the job is through, at most
-# ``WRITER_BACKOFF_STEPS`` per call, so a writer stuck for another reason
-# (behind a writer outside virtuals) slows readers down but never holds
-# them.
+# request (CPython's convoy effect, bpo-7946). The writer side keeps a
+# progress stamp (``WriterThread._wait_since``) that it refreshes at every
+# point where it will need the GIL back, and a soft stamp for a call that
+# is long for a good reason (the fsync commit, a gate wait behind a peer
+# process). Two tiers, both only while such a stamp is set: once it is
+# ``WRITER_STARVED_AFTER`` old each reader sleeps ``WRITER_YIELD`` once per
+# ``WRITER_YIELD_EVERY`` of its own time (a nudge: at most a fifth of its
+# throughput, and only while the writer is waiting); once the progress
+# stamp is ``WRITER_BLOCKED_AFTER`` old (never the soft one) the reader
+# stays off the GIL in ``WRITER_YIELD`` steps until the writer moves, at
+# most ``WRITER_BACKOFF_STEPS`` per call or per scan, and never on an
+# event loop thread, so a writer stuck for another reason (behind a writer
+# outside virtuals) slows readers down but never holds them. The writer
+# thread refreshes the stamp every ``PROGRESS_EVERY`` ops of a replay, so a
+# large write-only commit is progress, not starvation.
 WRITER_STARVED_AFTER = 0.001
 WRITER_YIELD_EVERY = 0.001
 WRITER_BLOCKED_AFTER = 0.01
 WRITER_BACKOFF_STEPS = 10
 WRITER_YIELD = 0.0002
+PROGRESS_EVERY = 256
 
 
-def yield_to_writer(writer_thread: Any, yielded_at: float) -> float:  # noqa: ANN401
+def yield_to_writer(
+    writer_thread: Any,  # noqa: ANN401
+    yielded_at: float,
+    backoff_left: int,
+) -> tuple[float, int]:
     """Give a starved writer job the GIL; see the tiers above.
 
     Args:
         writer_thread: The storage's ``WriterThread``.
         yielded_at: When this caller last yielded.
+        backoff_left: Back-off steps this caller may still spend.
 
     Returns:
-        The new ``yielded_at``.
+        The new ``yielded_at`` and ``backoff_left``.
     """
     now = time.monotonic()
     wait_since = writer_thread._wait_since
     if wait_since:
         age = now - wait_since
-        if age > WRITER_BLOCKED_AFTER:
-            for _ in range(WRITER_BACKOFF_STEPS):
+        if age > WRITER_BLOCKED_AFTER and backoff_left > 0 and asyncio._get_running_loop() is None:
+            while backoff_left > 0:
+                backoff_left -= 1
                 time.sleep(WRITER_YIELD)
                 wait_since = writer_thread._wait_since
                 now = time.monotonic()
                 if not wait_since or now - wait_since <= WRITER_BLOCKED_AFTER:
                     break
-            return now
+            return now, backoff_left
+        starved = age > WRITER_STARVED_AFTER
     else:
-        gate_since = writer_thread._gate_since
-        if not gate_since:
-            return yielded_at
-        age = now - gate_since
-    if age > WRITER_STARVED_AFTER and now - yielded_at > WRITER_YIELD_EVERY:
+        soft_since = writer_thread._soft_since
+        if not soft_since:
+            return yielded_at, backoff_left
+        # The same threshold as the progress stamp: the gate's flock calls
+        # need it this low (measured: 5ms here loses most of the writer
+        # win in a snapshot-get-close loop), and a commit's fsync at this
+        # threshold costs a concurrent long scan nothing measurable.
+        starved = now - soft_since > WRITER_STARVED_AFTER
+    if starved and now - yielded_at > WRITER_YIELD_EVERY:
         time.sleep(WRITER_YIELD)
-        return now
-    return yielded_at
+        return now, backoff_left
+    return yielded_at, backoff_left
 
 
 def _after_fork_in_child() -> None:
@@ -127,22 +148,32 @@ logger = getLogger(__name__)
 Pending = dict[bytes, "tuple[Key, bytes | None]"]
 
 
-def replay_pending(lmdb_txn: Any, pending: Pending) -> set[bytes]:  # noqa: ANN401
+def replay_pending(
+    lmdb_txn: Any,  # noqa: ANN401
+    pending: Pending,
+    progress: Callable[[], None] | None = None,
+) -> set[bytes]:
     """Apply buffered writes to a begun LMDB write txn.
 
     Returns the encoded keys whose delete found nothing, so the caller can
     leave them out of the keys it notifies as modified. Errors propagate
-    as raised by py-lmdb (a full map, most likely).
+    as raised by py-lmdb (a full map, most likely). ``progress`` is called
+    every ``PROGRESS_EVERY`` ops (the writer thread's stamp refresh).
     """
     put = lmdb_txn.put
     delete = lmdb_txn.delete
     missing: set[bytes] = set()
+    n = 0
     for encoded_key, (_, encoded_value) in pending.items():
         if encoded_value is None:
             if not delete(encoded_key):
                 missing.add(encoded_key)
         else:
             put(encoded_key, encoded_value)
+        if progress is not None:
+            n += 1
+            if n % PROGRESS_EVERY == 0:
+                progress()
     return missing
 
 
@@ -301,8 +332,10 @@ class ReadOperationsMixin:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
         writer_thread = self._storage._writer_thread
-        if writer_thread._wait_since or writer_thread._gate_since:
-            self._yielded_at = yield_to_writer(writer_thread, self._yielded_at)
+        if writer_thread._wait_since or writer_thread._soft_since:
+            self._yielded_at, _ = yield_to_writer(
+                writer_thread, self._yielded_at, WRITER_BACKOFF_STEPS
+            )
         with self._call_lock:
             txn = self._require_active()
             try:
@@ -328,8 +361,10 @@ class ReadOperationsMixin:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
         writer_thread = self._storage._writer_thread
-        if writer_thread._wait_since or writer_thread._gate_since:
-            self._yielded_at = yield_to_writer(writer_thread, self._yielded_at)
+        if writer_thread._wait_since or writer_thread._soft_since:
+            self._yielded_at, _ = yield_to_writer(
+                writer_thread, self._yielded_at, WRITER_BACKOFF_STEPS
+            )
         with self._call_lock:
             txn = self._require_active()
             try:
@@ -393,6 +428,7 @@ class WriteOperationsMixin:
                 raise StorageClosedError("Context is closed")
             pending = self._pending
             if pending is not None:
+                self._storage._check_key(encoded_key, key)  # fail here, not at the replay
                 pending[encoded_key] = (key, encoded_value)
             else:
                 txn = self._require_active()
@@ -425,6 +461,7 @@ class WriteOperationsMixin:
                 raise StorageClosedError("Context is closed")
             pending = self._pending
             if pending is not None:
+                self._storage._check_key(encoded_key, key)
                 pending[encoded_key] = (key, None)
                 existed = True  # settled when the pending writes are replayed
             else:

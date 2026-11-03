@@ -60,27 +60,31 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
 
     def put(self, key: Key, value: Value) -> None:
         """Queue a put."""
-        if self._closed:
-            raise StorageClosedError("Context is closed")
         codec = self._storage.codec
         try:
             encoded_key = codec.encode_key(key)
             encoded_value = codec.encode_value(value)
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key/value for {key}: {e}") from e
-        self._ops[encoded_key] = (key, encoded_value)
+        with self._call_lock:  # a put racing write() from another thread waits for it
+            if self._closed:
+                raise StorageClosedError("Context is closed")
+            self._storage._check_key(encoded_key, key)
+            self._ops[encoded_key] = (key, encoded_value)
         self._modified_keys.add(key)
 
     def delete(self, key: Key) -> None:
         """Queue a delete (idempotent; no-op on missing key)."""
-        if self._closed:
-            raise StorageClosedError("Context is closed")
         codec = self._storage.codec
         try:
             encoded_key = codec.encode_key(key)
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
-        self._ops[encoded_key] = (key, None)
+        with self._call_lock:
+            if self._closed:
+                raise StorageClosedError("Context is closed")
+            self._storage._check_key(encoded_key, key)
+            self._ops[encoded_key] = (key, None)
         self._modified_keys.add(key)
 
     def write(self) -> None:
