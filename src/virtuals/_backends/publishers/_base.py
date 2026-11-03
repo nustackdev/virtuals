@@ -231,6 +231,9 @@ class PublisherBase:
             # Fresh queue on each connect so re-connect doesn't inherit stale items.
             q = self._queue = queue.Queue(maxsize=self._queue_maxsize)
             self._drain_failed = False
+            # Per connection: a fresh queue has room, so writers wait for it
+            # again. `_resync_pending` survives, the wake is still owed.
+            self._stalled = False
 
             self._on_connect()
 
