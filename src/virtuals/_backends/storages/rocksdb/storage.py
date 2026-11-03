@@ -110,14 +110,19 @@ class RocksDBStorage:
 
     Read-only secondary (``read_only=True, secondary_path=...``): rocksdb
     has no snapshots there, so a Snapshot's view is the secondary's state
-    as of its last catch-up with the primary. The storage never catches
+    as of its last catch-up with the primary. The storage does not catch
     up while a Snapshot is open (the throttled catch-up before a new
     snapshot is skipped then), so the view is fixed for the snapshot's
-    life. Two things can still move it: ``force_catch_up_with_primary``,
-    and a read that hits an SST file the primary compacted away, which
-    catches up to read at all. Either way every open snapshot loses its
+    life, up to ``secondary_max_staleness``: once the last catch-up is
+    older than that, the next snapshot begin catches up anyway, so
+    overlapping readers cannot freeze the replica. Three things move an
+    open view: that staleness bound, ``force_catch_up_with_primary``, and
+    a read that hits an SST file the primary compacted away, which
+    catches up to read at all. Each time every open snapshot loses its
     view and its next read raises the retryable
     ``StorageTransactionConflictError``: open a new snapshot and re-read.
+    The catch-up runs under the storage's state lock, so a snapshot begin
+    on another thread waits for it (milliseconds on a large manifest).
 
     Coroutines: the slot belongs to a thread and, on an event loop, to the
     task that took it. Coroutines sharing one loop wait for it with
@@ -157,6 +162,7 @@ class RocksDBStorage:
         read_only: bool = False,
         secondary_path: Path | str | None = None,
         secondary_refresh_interval: float | None = 0.05,
+        secondary_max_staleness: float | None = None,
         wal_path: Path | str | None = None,
         options: dict[str, Any] | None = None,
         txn_db_options: dict[str, Any] | None = None,
@@ -178,8 +184,14 @@ class RocksDBStorage:
             secondary_refresh_interval: Minimum interval in seconds between
                 try_catch_up_with_primary() calls on secondary DBs. Catch-up
                 runs lazily inside begin_snapshot when the last catch-up is
-                older than this. Set to 0 to catch up on every snapshot, or
-                None to never catch up (callers drive freshness manually).
+                older than this, and only while no snapshot is open. Set to
+                0 to catch up on every snapshot, or None to never catch up
+                (callers drive freshness manually).
+            secondary_max_staleness: Seconds after which a snapshot begin
+                catches up even though snapshots are open, retiring their
+                views (see the class docstring). None means
+                ``max(1.0, 20 * secondary_refresh_interval)``, or never when
+                the refresh interval is None.
             wal_path: Optional separate WAL directory
             options: ``rdbpy.Options`` kwargs. ``block_cache_mb`` (an int)
                 and ``block_table`` (a dict of block table kwargs) are also
@@ -214,6 +226,9 @@ class RocksDBStorage:
             raise ValueError("Secondary dbs can only be opened in readonly mode.")
 
         self._secondary_refresh_interval = secondary_refresh_interval
+        if secondary_max_staleness is None and secondary_refresh_interval is not None:
+            secondary_max_staleness = max(1.0, 20 * secondary_refresh_interval)
+        self._secondary_max_staleness = secondary_max_staleness
         self._last_catchup_monotonic: float = 0.0
         # Bumped by every catch-up of a secondary: a Snapshot begun under an
         # older value has lost its view (see ``RocksDBSnapshot``).
@@ -608,6 +623,8 @@ class RocksDBStorage:
                 self._require_open()
                 if not self._active_snapshots:
                     self._catch_up_if_due()
+                else:
+                    self._catch_up_if_stale()
                 snapshot = RocksDBSnapshot(self, db, None, epoch=self._secondary_epoch)
                 self._active_snapshots.add(snapshot)
             return snapshot
@@ -632,6 +649,19 @@ class RocksDBStorage:
             return
         now = time.monotonic()
         if now - self._last_catchup_monotonic < interval:
+            return
+        self._catch_up_locked()
+
+    def _catch_up_if_stale(self) -> None:
+        """Catch up past the staleness bound although snapshots are open. Caller holds the state lock.
+
+        Their views retire with the retryable error; without this, readers
+        whose snapshots always overlap would never see new data.
+        """
+        bound = self._secondary_max_staleness
+        if bound is None or self._secondary_refresh_interval is None:
+            return
+        if time.monotonic() - self._last_catchup_monotonic < bound:
             return
         self._catch_up_locked()
 

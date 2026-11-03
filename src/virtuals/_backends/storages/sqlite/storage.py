@@ -457,10 +457,11 @@ class SQLiteStorage:
         conn, writer_lock = self._begin_write_connection(write_slot)
         transaction = SQLiteTransaction(self, conn, writer_lock)
         with self._state_lock:
-            if self._opened:
+            # Open, and the slot taken is still the slot: a close (and a
+            # reopen) since the begin did not see this transaction.
+            if self._opened and writer_lock is self._writer.lock:
                 self._active_transactions.add(transaction)
                 return transaction
-        # close() ran while this begin waited and did not see it.
         transaction.abort()
         raise StorageClosedError("Storage was closed while beginning the transaction")
 
