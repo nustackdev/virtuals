@@ -102,7 +102,7 @@ def read(view):
 | `Deletable` | `__delitem__` | Remove by address |
 | `Clearable` | `clear()` | Remove all |
 | `Observable` | `on_change()` | Watch all changes |
-| `ChildObservable` | `on_child_change(addr)` | Watch specific child |
+| `ChildObservable` | `on_child_change(addr)` | Watch one child and everything under it |
 | `DescendantsObservable` | `on_descendents_change(*pattern)` | Watch pattern-matched descendants |
 
 ### Reactive protocols (per collection module)

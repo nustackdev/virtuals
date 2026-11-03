@@ -114,9 +114,10 @@ Pattern: `_private/` for implementations, top-level for public re-exports.
 virtuals/
 ├── tkv/                    # core protocols (storage, codec, observer, filter, types)
 ├── _backends/              # private implementations
-│   ├── storages/           #   mem, rocksdb
+│   ├── storages/           #   mem, sqlite, lmdb, rocksdb
 │   ├── codecs/             #   json, msgpack, pickle, passthrough
 │   ├── observers/          #   mem, redis_pubsub
+│   ├── publishers/         #   mem, redis_pubsub
 │   └── key_codecs/         #   binary, string
 ├── storages/               # public alias
 ├── codecs/                 # public alias
@@ -145,17 +146,22 @@ Views that support nested containers have eager/lazy facets (see `docs/collectio
 | `FlatDictView` | Dict with primitive-only values | no |
 | `FlatListView` | List with primitive-only values | no |
 | `LightDictView` | Minimal dict (no metadata) | no |
+| `EagerLogIndexedDictView` / `LazyLogIndexedDictView` | Dict in insertion order, pageable | yes |
+| `EagerFractionalIndexedDictView` / `LazyFractionalIndexedDictView` | Ordered collection keyed by id, O(1) insert and move | yes |
+| `EagerKh57View` / `LazyKh57View` | Dict keyed by kh57-encoded ints | yes |
 | `TupleView` | Immutable ordered sequence | no |
 | `ByteArrayView` | Binary data | no |
 
 ## Backends
 
-| Backend | When | Install |
-| ------- | ---- | ------- |
-| In-memory | Testing, ephemeral, caching | built-in |
-| RocksDB | Persistent, high-performance | `virtuals-py[rocksdb]` |
+| Backend | Process model | When | Install |
+| ------- | ------------- | ---- | ------- |
+| In-memory | single | Testing, ephemeral, caching | built-in |
+| SQLite | multi | Persistent, shared by several processes (nuspace stores) | built-in |
+| LMDB | multi | Persistent, local disk, fastest reads | `virtuals-py[lmdb]` |
+| RocksDB | single | Persistent, one owning process | `virtuals-py[rocksdb]` |
 
-Adding a backend = implementing ~4 methods.
+Every backend passes the same conformance suite; the rules are in [storage/contract.md](storage/contract.md). Notifications are in [storage/notify.md](storage/notify.md).
 
 ## Why This Architecture?
 

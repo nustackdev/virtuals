@@ -41,83 +41,65 @@ All keys are equal. No concept of hierarchy:
 
 ### Backend Agnostic
 
-Works with any ordered KV store:
+Works with any ordered KV store. Shipped backends:
 
-- LMDB (B-tree)
-- RocksDB (LSM-tree)
-- In-memory sorted dict
-- SQLite with compound keys
+- SQLite (one `WITHOUT ROWID` table, multi-process)
+- LMDB (B-tree, multi-process, local disk only)
+- RocksDB (LSM-tree, single-process)
+- In-memory sorted dict (single-process)
 
 Key size limits are the backend's own. LMDB rejects an encoded key above
 511 bytes (the whole site, every segment included), which surfaces as a
 `StorageOperationError` on put; SQLite, RocksDB and the in-memory store take
 longer keys. Int key segments must fit int64 on every backend that uses the
 binary codec. Deeply nested sites and long key segments hit the LMDB limit
-first.
+first. The per backend table is in [contract](contract.md).
 
 ## Operations
 
-### 1. Point Access (single key)
+Every operation runs inside a context: a `Snapshot` (read only), a `Transaction` (read and write) or a `WriteBatch` (write only). See [context](context.md).
 
 ```python
-value = tx.get(key)                    # Read
-tx.put(key, value)                     # Write
-deleted = tx.delete(key)               # Delete
-exists = tx.exists(key)                # Check
+with storage.snapshot() as snap:        # read only, binds at open
+    value = snap.get(key)               # Value or EMPTY
+    found = snap.exists(key)
+    many = snap.multiget([k1, k2])      # dict, missing keys hold EMPTY
+
+with storage.transaction() as tx:       # read and write, commit on exit
+    tx.put(key, value)
+    tx.delete(key)                      # silent when the key is missing
+    tx.get(key)                         # sees the pending put
+
+with storage.batch_write() as batch:    # write only, applied on exit
+    batch.put(key, value)
+    batch.delete(other)
 ```
 
-### 2. Scan Access (range iteration)
+The plain forms are `begin_snapshot()`, `begin_transaction()` and `begin_write_batch()`; each returns a context with `commit()` or `write()` and `abort()`. A transaction aborted by an exception inside the block leaves no key.
+
+### Scan
 
 ```python
-# Scan all keys in range [start, end)
-options = ScanOptions(
-    start=("users", "a"),
-    end=("users", "z"),
+from virtuals.tkv.filter import PrefixFilter
+from virtuals.tkv.storage import StorageScanOptions
+
+prefix = PrefixFilter(prefix=("users",))
+options = StorageScanOptions(
+    start=("users",),
+    break_filter=prefix,    # stop once past the prefix
+    filter=prefix,          # skip rows that do not match
     reverse=False,
     limit=100,
 )
-
 for key, value in tx.scan(options).items():
-    print(key, value)
+    ...
 ```
 
-The scan operation:
+The backend seeks to `start` and streams rows in key order. `break_filter` ends the scan, `filter` skips rows, `max_depth` jumps over whole subtrees so a child listing costs O(children). See [scan](scan.md) and [filtering](filtering.md).
 
-- Leverages lexicographic ordering
-- Efficient: backend seeks to start position
-- No concept of "prefix" or "children" - just range [start, end)
+### Transactions
 
-### 3. Batch Access (multiple keys)
-
-```python
-# Read multiple keys efficiently
-results = tx.multiget([key1, key2, key3])
-
-# Write multiple keys
-tx.multiput({key1: val1, key2: val2})
-
-# Delete multiple keys
-tx.multidelete([key1, key2, key3])
-```
-
-### 4. Transactions (orthogonal)
-
-```python
-# Read-only snapshot
-with storage.begin() as tx:
-    value = tx.get(key)
-
-# Read-write transaction
-with storage.begin(write=True) as tx:
-    tx.put(key, value)
-    tx.commit()  # or tx.abort()
-```
-
-Transactions provide:
-
-- Snapshot isolation
-- ACID guarantees
-- Automatic commit/abort on context exit
+Transactions are serializable, snapshots bind at open and are never torn. One writer at a time per storage; a second writer waits on an in-process slot, or for the file lock across processes, up to `busy_timeout`. Waits that run out raise `StorageLockTimeoutError`, commit conflicts raise `StorageTransactionConflictError`; both are retryable. On an event loop, coroutines reserve the slot with `areserve_write_slot()` so the loop is never blocked. The full rules, including the process model per backend, are in [contract](contract.md). Notifications after commit are in [notify](notify.md).
 
 ## Why Tuples?
 
@@ -132,15 +114,13 @@ for key in db.all_keys():
         yield key
 
 # KV: efficient range scan
-scan = tx.scan(ScanOptions(
-    start=("users",),
-    end=("users", "￿"),  # "￿" is max unicode char
-))
+prefix = PrefixFilter(prefix=("users",))
+scan = tx.scan(StorageScanOptions(start=("users",), break_filter=prefix, filter=prefix))
 for key in scan.keys():
     yield key
 ```
 
-Backend can seek directly to `("users",)` and iterate until `("users", "￿")`.
+Backend seeks directly to `("users",)` and stops at the first key past the prefix.
 
 ### Natural Hierarchical Encoding
 
@@ -218,7 +198,7 @@ Backend must provide:
 
 - Ordered key-value storage
 - Range iteration (seek to position, iterate forward/backward)
-- Transactions (snapshot isolation)
+- Serializable transactions and snapshots that bind at open
 
 Most modern KV stores provide this (LMDB, RocksDB, etc).
 
@@ -226,6 +206,6 @@ Most modern KV stores provide this (LMDB, RocksDB, etc).
 
 - Point access: O(log N) - tree lookup
 - Range scan: O(log N + M) - seek + iterate M results
-- Batch operations: O(K log N) - K individual operations, possibly pipelined
+- multiget: O(K log N) - K lookups
 
 Where N = total keys, M = results, K = batch size.

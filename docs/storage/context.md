@@ -85,6 +85,7 @@ Transactions may observe and mutate storage within a single context.
 - Context capabilities are **strict**, not advisory
 - No operation performs implicit reads or writes
 - Missing keys are never exceptional at this layer
+- `EMPTY` is a read result, never a stored value. Views reject it on write (see [contract](contract.md), section 6)
 - Semantics are identical across backends
 
 Higher layers may adapt these contexts into more ergonomic forms.
