@@ -35,12 +35,6 @@ DROPPED_TXN = (
 
 # case name -> backend (or "backend-param" for one parametrization) -> (strict, reason)
 KNOWN_FAILURES: dict[str, dict[str, tuple[bool, str]]] = {
-    "test_s1_dropped_transaction_frees_slot": {
-        "lmdb": (True, DROPPED_TXN.format(owner="P1 lmdb")),
-    },
-    "test_s4_late_release_after_close_and_reopen_frees_nothing": {
-        "lmdb": (True, "fixed in P1, release by identity"),
-    },
     "test_s4_cross_process_lock_wait_does_not_block_loop": {
         "lmdb": (True, LMDB_XPROC_LOOP),
     },

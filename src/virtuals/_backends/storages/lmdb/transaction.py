@@ -16,6 +16,7 @@ from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin
 
 
 if TYPE_CHECKING:
+    import threading
     from types import TracebackType
 
     from virtuals.tkv.types import Key
@@ -40,12 +41,23 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
 
     __slots__ = ("_aborted", "_committed", "_modified_keys")
 
-    def __init__(self, storage: LMDBStorage, lmdb_txn: object) -> None:
+    def __init__(
+        self, storage: LMDBStorage, lmdb_txn: object, write_lock: threading.Lock | None = None
+    ) -> None:
         """Initialize transaction."""
-        super().__init__(storage, lmdb_txn, holds_write_slot=True)
+        super().__init__(storage, lmdb_txn, holds_write_slot=True, write_lock=write_lock)
         self._modified_keys: set[Key] = set()
         self._committed = False
         self._aborted = False
+
+    def __del__(self) -> None:
+        """Abort a transaction dropped unended, so it cannot hold the writer lock."""
+        try:
+            if not self._closed:
+                self._aborted = True
+                self._finalize_unended_write("transaction")
+        except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
+            pass
 
     @property
     def writable(self) -> bool:
@@ -99,9 +111,15 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         the abort waits for that call, then ends the transaction on the
         writer thread. A second abort, or one racing a commit, is a no-op.
         """
+        if self._closed:
+            # Unlocked on purpose: the flag only ever turns True, after the
+            # LMDB transaction has ended, so this abort has nothing to do.
+            # close() calls here while the owner may be inside its commit's
+            # slot release; waiting for that lock would wait on close itself.
+            logger.debug("Abort called on closed transaction")
+            return
         with self._call_lock:
             if self._closed:
-                logger.debug("Abort called on closed transaction")
                 return
             txn = self._require_active()
             failure: Exception | None = None
