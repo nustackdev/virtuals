@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import gc
 import random
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from virtuals.codecs import BinaryCodec
 from virtuals.tkv import StorageScanOptions
 from virtuals.tkv.filter import LengthFilter, PrefixFilter
 from virtuals.tkv.storage import (
+    StorageClosedError,
     StorageError,
     StorageLockTimeoutError,
     StorageNestedTransactionError,
@@ -695,6 +697,37 @@ _HOLDER = textwrap.dedent(
 )
 
 
+_TRY_WRITE = textwrap.dedent(
+    """
+    import sys
+    from virtuals._backends.storages.sqlite import SQLiteStorage
+    from virtuals.codecs import BinaryCodec
+    from virtuals.tkv.storage import StorageLockTimeoutError
+
+    s = SQLiteStorage(path=sys.argv[1], codec=BinaryCodec(), busy_timeout=0.05)
+    s.open()
+    try:
+        with s.transaction() as tx:
+            tx.put(("other",), b"1")
+        print("wrote", flush=True)
+    except StorageLockTimeoutError:
+        print("busy", flush=True)
+    s.close()
+    """
+)
+
+
+def _other_process_write(db_path: Path) -> str:
+    out = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", _TRY_WRITE, str(db_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    return out.stdout.strip()
+
+
 def test_killed_writer_releases_lock(db_path: Path) -> None:
     """A writer killed mid-transaction leaves no stuck lock and no partial write."""
     with SQLiteStorage(path=db_path, codec=BinaryCodec(), busy_timeout=0.2) as s:
@@ -720,6 +753,197 @@ def test_killed_writer_releases_lock(db_path: Path) -> None:
             assert tx.get(("uncommitted",)) is EMPTY
             tx.put(("after",), b"1")
         assert time.monotonic() - t0 < 1.0
+
+
+# =========================================================================
+# close() against contexts in use on other threads
+# =========================================================================
+
+
+_CLOSE_BUSY = textwrap.dedent(
+    """
+    import json, sys, threading, time
+    from virtuals._backends.storages.sqlite import SQLiteStorage
+    from virtuals.codecs import BinaryCodec
+    from virtuals.tkv import StorageScanOptions
+    from virtuals.tkv.storage import StorageClosedError
+
+    root, rounds, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+    outcomes = {}
+    for i in range(rounds):
+        s = SQLiteStorage(path=f"{root}/db{i}.sqlite", codec=BinaryCodec(), busy_timeout=2.0)
+        s.open()
+        with s.transaction() as tx:
+            for k in range(300):
+                tx.put(("k", k), b"v" * 50)
+        go = threading.Event()
+        result = []
+
+        def worker():
+            ctx = s.begin_snapshot() if mode == "snap" else s.begin_transaction()
+            go.set()
+            try:
+                for r in range(20000):
+                    if mode == "txn":
+                        ctx.put(("w", r), b"x")
+                    ctx.get(("k", r % 300))
+                    if r % 50 == 0:
+                        list(ctx.scan(StorageScanOptions(limit=40)).keys())
+                result.append("finished")
+            except StorageClosedError:
+                result.append("closed")
+            except BaseException as e:
+                result.append(type(e).__name__)
+
+        th = threading.Thread(target=worker, daemon=True)
+        th.start()
+        go.wait()
+        time.sleep(0.0005 * (i % 7))
+        t0 = time.perf_counter()
+        s.close()
+        took = time.perf_counter() - t0
+        th.join(10)
+        key = (result[0] if result else "hung") + (" slow-close" if took > 1 else "")
+        outcomes[key] = outcomes.get(key, 0) + 1
+        s.open()
+        s.begin_transaction().commit()
+        s.close()
+    print(json.dumps(outcomes))
+    """
+)
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("mode", ["txn", "snap"])
+def test_close_during_in_flight_statements_never_crashes(tmp_path: Path, mode: str) -> None:
+    """close() while another thread is inside a statement on a context: no crash, ever.
+
+    Runs in a subprocess with faulthandler so a regression is a failed
+    child, not a dead test run. The worker hammers get, put and scan on
+    its context while the main thread closes the storage at varied
+    offsets; close waits for the in-flight statement and the worker's
+    next call sees the context closed.
+    """
+    rounds = 20
+    out = subprocess.run(  # noqa: S603
+        [sys.executable, "-X", "faulthandler", "-c", _CLOSE_BUSY, str(tmp_path), str(rounds), mode],
+        capture_output=True,
+        text=True,
+        timeout=100,
+        check=False,
+    )
+    assert out.returncode == 0, f"child died (rc={out.returncode}):\n{out.stderr[-2000:]}"
+    import json
+
+    outcomes = json.loads(out.stdout.strip().splitlines()[-1])
+    assert set(outcomes) <= {"finished", "closed"}, outcomes
+    assert sum(outcomes.values()) == rounds
+
+
+@pytest.mark.timeout(10)
+def test_batch_closed_while_waiting_at_begin_writes_nothing(storage: SQLiteStorage) -> None:
+    """close() aborts a batch blocked at begin behind a writer: its write raises, nothing lands."""
+    holder = storage.begin_transaction()
+    holder.put(("held",), b"1")
+    batch = storage.begin_write_batch()
+    batch.put(("batched",), b"1")
+    errors: list[BaseException] = []
+    started = threading.Event()
+
+    def write() -> None:
+        started.set()
+        try:
+            batch.write()
+        except BaseException as e:
+            errors.append(e)
+
+    t = threading.Thread(target=write)
+    t.start()
+    started.wait()
+    time.sleep(0.05)  # the batch is now waiting for the slot
+    storage.close()  # aborts holder (frees the slot) and the batch
+    t.join(5)
+    assert not t.is_alive()
+    assert errors and isinstance(errors[0], StorageClosedError), errors
+    storage.open()
+    with storage.snapshot() as snap:
+        assert snap.get(("batched",)) is EMPTY
+        assert snap.get(("held",)) is EMPTY
+    storage.begin_transaction().commit()  # slot free
+
+
+@pytest.mark.timeout(10)
+def test_scan_yields_nothing_after_close(storage: SQLiteStorage) -> None:
+    """A page already fetched is not handed out once the context or storage closed."""
+    _fill(storage, [(i,) for i in range(100)])
+    snap = storage.begin_snapshot()
+    items = snap.scan(StorageScanOptions()).items()
+    next(items)
+    snap.close()
+    with pytest.raises(StorageClosedError):
+        next(items)
+
+    tx = storage.begin_transaction()
+    keys = tx.scan(StorageScanOptions()).keys()
+    next(keys)
+    storage.close()
+    with pytest.raises(StorageClosedError):
+        next(keys)
+    storage.open()
+
+
+@pytest.mark.timeout(10)
+def test_dropped_transaction_is_collected_and_frees_slot(
+    storage: SQLiteStorage, db_path: Path
+) -> None:
+    """A transaction dropped without commit or abort frees the write lock once collected.
+
+    Both locks: the in-process slot (the next writer here lands fast) and
+    the file lock (another process can write).
+    """
+
+    def drop() -> None:
+        t = storage.begin_transaction()
+        t.put(("k",), b"dropped")  # neither committed nor aborted: goes out of scope
+
+    th = threading.Thread(target=drop)
+    th.start()
+    th.join()
+    gc.collect()
+    assert not storage._active_transactions
+    t0 = time.monotonic()
+    with storage.transaction() as tx:
+        tx.put(("k",), b"next")
+    assert time.monotonic() - t0 < 0.2
+    drop()  # on this thread too: the finished hold must not read as nested
+    gc.collect()
+    assert _other_process_write(db_path) == "wrote"
+    with storage.snapshot() as snap:
+        assert snap.get(("k",)) == b"next"
+
+
+@pytest.mark.timeout(10)
+def test_dropped_snapshot_is_collected_and_unpins_wal(storage: SQLiteStorage) -> None:
+    """A snapshot dropped without close gives its read transaction up once collected."""
+    with storage.transaction() as tx:
+        tx.put(("k",), b"1")
+
+    def drop() -> None:
+        snap = storage.begin_snapshot()
+        assert snap.get(("k",)) == b"1"
+
+    drop()
+    gc.collect()
+    assert not storage._active_snapshots
+    with storage.transaction() as tx:
+        tx.put(("k",), b"2")
+    conn = storage._acquire_connection()
+    try:
+        # A pinned reader would make a TRUNCATE checkpoint report busy.
+        busy, _, _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        assert busy == 0
+    finally:
+        storage._release_connection(conn)
 
 
 # =========================================================================
@@ -809,17 +1033,42 @@ def test_spawned_task_waits(storage: SQLiteStorage) -> None:
 
 @pytest.mark.timeout(10)
 def test_close_during_commit_keeps_one_outcome(storage: SQLiteStorage) -> None:
+    """close() aborting while the owner commits: committed, not also aborted.
+
+    The abort runs on another thread, started from inside the COMMIT
+    statement (a trace callback). It waits on the context lock until the
+    commit is through, then finds nothing left to end.
+    """
     tx = storage.begin_transaction()
+    tx.put(cases.KEY, b"committed")
+    errors: list[BaseException] = []
+    threads: list[threading.Thread] = []
 
-    def during_commit(fn) -> None:
-        def trace(sql: str) -> None:
-            if sql == "COMMIT":
-                fn()
+    def abort() -> None:
+        try:
+            tx.abort()
+        except BaseException as e:
+            errors.append(e)
 
-        tx._conn.set_trace_callback(trace)
+    def trace(sql: str) -> None:
+        if sql == "COMMIT":
+            t = threading.Thread(target=abort)
+            t.start()
+            threads.append(t)
+            time.sleep(0.05)  # let the abort reach the context lock mid-commit
 
+    assert tx._conn is not None
+    tx._conn.set_trace_callback(trace)
     try:
-        cases.close_during_commit_keeps_one_outcome(storage, tx, during_commit)
+        tx.commit()
+        for t in threads:
+            t.join(5)
+        assert threads and not any(t.is_alive() for t in threads)
+        assert not errors, errors
+        assert (tx._committed, tx._aborted) == (True, False)
+        with storage.snapshot() as snap:
+            assert snap.get(cases.KEY) == b"committed"
+        storage.begin_transaction().commit()  # slot released exactly once
     finally:
         for conn in storage._idle:
             conn.set_trace_callback(None)

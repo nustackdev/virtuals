@@ -50,6 +50,19 @@ class SQLiteSnapshot(ContextBase, ReadOperationsMixin):
         finally:
             self._storage._untrack_snapshot(self)
 
+    def __del__(self) -> None:
+        """Last resort: release a snapshot dropped without close.
+
+        Its read transaction pins the WAL (no checkpoint can pass it) for
+        as long as the connection lives, so the connection is closed here.
+        """
+        if getattr(self, "_closed", True):
+            return
+        try:
+            self._finalize()
+        except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
+            pass
+
     def __enter__(self) -> SQLiteSnapshot:
         """Enter context manager."""
         return self
