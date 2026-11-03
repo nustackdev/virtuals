@@ -11,6 +11,13 @@ caller's thread, serialized per context by ``_call_lock``, with the future
 handoffs giving the needed happens-before. Re-check this against liblmdb
 on any bump (``mdb_txn_renew0``, ``mdb_txn_end``, and that no data path
 touches ``me_txkey``-style thread-local state for write transactions).
+
+Lazy begin. A write transaction's LMDB handle is begun on the writer thread
+only when it is first needed: at the first read, or at commit. Until then
+its puts and deletes collect in ``_pending`` (last op per key wins) and
+``replay_pending`` applies them in order to the begun handle. The view is
+the same either way, since the writer slot and the cross-process gate are
+held from ``begin_transaction`` on, so no peer commits in between.
 """
 
 from __future__ import annotations
@@ -54,10 +61,34 @@ __all__ = [
     "ContextBase",
     "ReadOperationsMixin",
     "WriteOperationsMixin",
+    "replay_pending",
 ]
 
 
 logger = getLogger(__name__)
+
+
+# Encoded key -> (key, encoded value), or (key, None) for a delete.
+Pending = dict[bytes, "tuple[Key, bytes | None]"]
+
+
+def replay_pending(lmdb_txn: Any, pending: Pending) -> set[bytes]:  # noqa: ANN401
+    """Apply buffered writes to a begun LMDB write txn.
+
+    Returns the encoded keys whose delete found nothing, so the caller can
+    leave them out of the keys it notifies as modified. Errors propagate
+    as raised by py-lmdb (a full map, most likely).
+    """
+    put = lmdb_txn.put
+    delete = lmdb_txn.delete
+    missing: set[bytes] = set()
+    for encoded_key, (_, encoded_value) in pending.items():
+        if encoded_value is None:
+            if not delete(encoded_key):
+                missing.add(encoded_key)
+        else:
+            put(encoded_key, encoded_value)
+    return missing
 
 
 class ContextBase:
@@ -248,18 +279,26 @@ class ReadOperationsMixin:
         """Create scan iterator with configured options."""
         from .scan import LMDBScan
 
-        self._require_active()
+        with self._call_lock:
+            self._require_active()  # begins a pending write transaction
         return LMDBScan(self, options)  # type: ignore[arg-type]
 
 
 class WriteOperationsMixin:
-    """Mixin providing write operations for LMDB contexts."""
+    """Write operations for the LMDB transaction.
+
+    While the transaction is pending (its LMDB handle not yet begun) puts
+    and deletes collect in ``_pending`` on the caller's thread; once it is
+    begun they go to the handle directly, on the caller's thread as well.
+    """
 
     __slots__ = ()
 
     # Type hints for mixed-in attributes
     _storage: LMDBStorage
     _call_lock: threading.Lock
+    _closed: bool
+    _pending: Pending | None
     _require_active: Any  # Method from ContextBase
     _modified_keys: set[Key]  # Initialized in __init__
 
@@ -274,11 +313,17 @@ class WriteOperationsMixin:
             raise StorageOperationError(f"Failed to encode key/value for {key}: {e}") from e
 
         with self._call_lock:
-            txn = self._require_active()
-            try:
-                txn.put(encoded_key, encoded_value)
-            except Exception as e:
-                raise StorageOperationError(f"Failed to put key {key}: {e}") from e
+            if self._closed:
+                raise StorageClosedError("Context is closed")
+            pending = self._pending
+            if pending is not None:
+                pending[encoded_key] = (key, encoded_value)
+            else:
+                txn = self._require_active()
+                try:
+                    txn.put(encoded_key, encoded_value)
+                except Exception as e:
+                    raise StorageOperationError(f"Failed to put key {key}: {e}") from e
 
         self._modified_keys.add(key)
 
@@ -292,11 +337,18 @@ class WriteOperationsMixin:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
         with self._call_lock:
-            txn = self._require_active()
-            try:
-                existed = txn.delete(encoded_key)
-            except Exception as e:
-                raise StorageOperationError(f"Failed to delete key {key}: {e}") from e
+            if self._closed:
+                raise StorageClosedError("Context is closed")
+            pending = self._pending
+            if pending is not None:
+                pending[encoded_key] = (key, None)
+                existed = True  # settled when the pending writes are replayed
+            else:
+                txn = self._require_active()
+                try:
+                    existed = txn.delete(encoded_key)
+                except Exception as e:
+                    raise StorageOperationError(f"Failed to delete key {key}: {e}") from e
 
         if existed:
             self._modified_keys.add(key)

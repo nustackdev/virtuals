@@ -67,8 +67,10 @@ def test_same_thread_second_writer_raises_nested(storage: LMDBStorage) -> None:
     t0 = time.monotonic()
     with pytest.raises(StorageNestedTransactionError, match="wait on itself"):
         storage.begin_transaction()
+    batch = storage.begin_write_batch()  # takes the slot at write, like every backend
+    batch.put(("b",), b"1")
     with pytest.raises(StorageNestedTransactionError):
-        storage.begin_write_batch()
+        batch.write()
     assert time.monotonic() - t0 < 0.5
     tx.abort()
     storage.begin_transaction().commit()  # slot released by the abort
@@ -273,6 +275,7 @@ def test_asyncio_run_inside_sync_txn_is_nested(storage: LMDBStorage) -> None:
 @pytest.mark.timeout(10)
 def test_racing_ends_release_slot_once(storage: LMDBStorage) -> None:
     tx = storage.begin_transaction()
+    tx.get(("n",))  # begins the LMDB transaction
     # End LMDB's side once, on the thread that began it; the race is in giving back the slot.
     storage._writer_thread.run(tx._lmdb_txn.abort)
     cases.racing_ends_release_once(storage, tx, lambda t: t._mark_closed(), "_holds_write_slot")
@@ -1197,6 +1200,7 @@ def test_finalizer_racing_close_leaves_no_live_write(ctx, tmp_path: Path, monkey
     def drop() -> None:
         tx = st.begin_transaction()
         tx.put(("x",), b"1")
+        tx.get(("x",))  # begun: the finalizer has an LMDB transaction to abort
         del tx
 
     t = threading.Thread(target=drop)
@@ -1290,4 +1294,163 @@ def test_gate_helper_never_locks_a_reused_descriptor_number(tmp_path: Path, monk
             tx.put(("a",), b"1")
     finally:
         os.close(peer)
+        st.close()
+
+
+# =========================================================================
+# Round 2: batches buffer until write, transactions begin lazily (B8, X10, B9)
+# =========================================================================
+
+
+@pytest.mark.timeout(20)
+def test_open_batch_holds_no_slot_and_no_gate(ctx, tmp_path: Path) -> None:
+    """A batch being built blocks neither a thread nor a peer; a sync txn inside it is not nested."""
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    peer = _peer_can_write_now(ctx, tmp_path)
+    try:
+        batch = st.begin_write_batch()
+        batch.put(("b",), b"1")
+        assert not st._writer.lock.locked()
+        assert not st._gate_held
+        with st.transaction() as tx:  # same thread, batch open: like every other backend
+            tx.put(("t",), b"1")
+        took: list[float] = []
+
+        def other() -> None:
+            t0 = time.monotonic()
+            with st.transaction() as tx:
+                tx.put(("o",), b"1")
+            took.append(time.monotonic() - t0)
+
+        th = threading.Thread(target=other)
+        th.start()
+        th.join(5)
+        assert took and took[0] < 1.0, took  # timing
+        peer()
+        batch.write()
+        with st.snapshot() as snap:
+            assert snap.get(("b",)) == b"1"
+            assert snap.get(("t",)) == b"1"
+            assert snap.get(("o",)) == b"1"
+            assert snap.get(("peer",)) == b"1"
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(10)
+def test_batch_last_op_per_key_wins_and_notifies_real_changes(storage: LMDBStorage) -> None:
+    """Buffered ops coalesce per key; a delete that found nothing is not notified."""
+    seen: list[set] = []
+
+    class Pub:
+        def notify(self, keys) -> None:
+            seen.append(set(keys))
+
+    storage._publisher = Pub()
+    with storage.transaction() as tx:
+        tx.put(("a",), b"1")
+        tx.put(("c",), b"1")
+    seen.clear()
+    with storage.batch_write() as b:
+        b.put(("a",), b"2")
+        b.delete(("a",))
+        b.put(("a",), b"3")  # last op wins
+        b.put(("b",), b"1")
+        b.delete(("b",))  # absent before and after: no change to tell
+        b.delete(("c",))  # existed
+        b.delete(("zz",))  # never existed
+    with storage.snapshot() as snap:
+        assert snap.get(("a",)) == b"3"
+        assert snap.get(("b",)) is EMPTY
+        assert snap.get(("c",)) is EMPTY
+    assert seen == [{("a",), ("c",)}]
+
+
+@pytest.mark.timeout(10)
+def test_write_only_transaction_is_one_writer_hop(storage: LMDBStorage, monkeypatch) -> None:
+    """A transaction that never reads, and a batch, reach the writer thread once; a read makes it two."""
+    from virtuals._backends.storages.lmdb._writer import WriterThread
+
+    hops: list[int] = []
+    original = WriterThread._submit
+
+    def counting(self, *args, **kwargs):
+        hops.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(WriterThread, "_submit", counting)
+    with storage.transaction() as tx:
+        tx.put(("a",), b"1")
+        tx.delete(("zz",))
+    assert len(hops) == 1
+    hops.clear()
+    with storage.batch_write() as b:
+        b.put(("a",), b"2")
+    assert len(hops) == 1
+    hops.clear()
+    with storage.transaction() as tx:
+        tx.put(("a",), b"3")
+        assert tx.get(("a",)) == b"3"  # the read begins the LMDB txn and replays the put
+        tx.put(("b",), b"1")
+        assert tx.exists(("b",))
+    assert len(hops) == 2
+    hops.clear()
+    tx = storage.begin_transaction()
+    tx.put(("x",), b"1")
+    tx.abort()
+    assert hops == []  # a pending transaction aborts without touching LMDB
+    assert not storage._live_writes
+    assert not storage._writer.lock.locked()
+    with storage.snapshot() as snap:
+        assert snap.get(("a",)) == b"3"
+        assert snap.get(("x",)) is EMPTY
+
+
+@pytest.mark.timeout(10)
+def test_pending_transaction_reads_and_scans_its_writes(storage: LMDBStorage) -> None:
+    """Writes buffered before the first read are visible to get, multiget and scan."""
+    with storage.transaction() as tx:
+        for i in (1, 2, 3):
+            tx.put(("k", i), str(i).encode())
+    with storage.transaction() as tx:
+        tx.delete(("k", 2))
+        tx.put(("k", 4), b"4")
+        tx.put(("k", 1), b"11")
+        assert list(tx.scan(StorageScanOptions()).keys()) == [("k", 1), ("k", 3), ("k", 4)]
+        assert tx.multiget([("k", 1), ("k", 2), ("k", 4)]) == {("k", 1): b"11", ("k", 4): b"4"}
+        tx.put(("k", 5), b"5")  # after the begin: straight to the handle
+        assert tx.get(("k", 5)) == b"5"
+    with storage.snapshot() as snap:
+        assert list(snap.scan(StorageScanOptions()).items()) == [
+            (("k", 1), b"11"),
+            (("k", 3), b"3"),
+            (("k", 4), b"4"),
+            (("k", 5), b"5"),
+        ]
+
+
+@pytest.mark.timeout(20)
+def test_pending_transaction_holds_the_gate(ctx, tmp_path: Path) -> None:
+    """The view is fixed at begin_transaction: no peer commits before the lazy LMDB begin."""
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    ready, go = ctx.Event(), ctx.Event()
+    out = tmp_path / "peer.json"
+    peer = ctx.Process(target=_peer_write, args=(str(tmp_path), 0.3, ready, go, str(out)))
+    peer.start()
+    assert ready.wait(20)
+    try:
+        tx = st.begin_transaction()
+        assert tx._lmdb_txn is None  # pending
+        assert st._gate_held
+        go.set()
+        peer.join(10)
+        assert json.loads(out.read_text())["result"] == "StorageLockTimeoutError"
+        tx.put(("mine",), b"1")
+        tx.commit()
+        with st.snapshot() as snap:
+            assert snap.get(("peer",)) is EMPTY
+            assert snap.get(("mine",)) == b"1"
+    finally:
+        if peer.is_alive():
+            peer.kill()
         st.close()
