@@ -1,6 +1,6 @@
 # storage conformance suite
 
-The kv contract (task-161 `contract-kv.md`) as executable cases. Every case runs once per backend: sqlite, lmdb, rocksdb, mem. A backend variant ships only if it passes here.
+The kv contract (task-161 `contract-kv.md`) as executable cases. Every case runs once per backend: sqlite, lmdb, rocksdb, mem; section 5 also once per transport. A backend variant ships only if it passes here.
 
 ## run
 
@@ -62,6 +62,16 @@ Races are forced, not hoped for. In lost update a pause sits between each read a
 | `test_s4_reserved_slot_does_not_survive_close` | 4 | a slot reserved and never taken is gone after close and reopen: the next writer lands within 200ms, the stale slot is refused with a non-retryable error |
 | `test_s4_cross_process_lock_wait_does_not_block_loop` | 4 | a slot writer waiting for a write lock held by another process never blocks the loop for 200ms (multi-process backends only) |
 | `test_s4_close_during_in_flight_call_never_crashes` | 4 | close() racing a thread inside a call on a txn or snapshot (20 rounds in a faulthandler subprocess) never crashes: close waits or refuses, the worker finishes or gets a `StorageError` |
+| `test_s4_end_on_another_thread_frees_writers_in_process` | 4 | a txn begun on a worker thread and ended on the main thread frees the slot: a new thread writes promptly |
+| `test_s4_end_on_another_thread_frees_peer_process` | 4 | same, and a peer process writes promptly (multi-process backends only) |
+| `test_s4_close_with_live_worker_transaction_frees_peer_process` | 4 | close() on the main thread while a worker holds a txn: a peer process still writes (multi-process backends only) |
+| `test_s5_wake_follows_the_commit` | 5 | a receiver woken by a change reads that commit or a later one |
+| `test_s5_nothing_on_rollback` | 5 | abort, an exception in the body and an empty transaction wake nobody |
+| `test_s5_write_batch_notifies` | 5 | a write batch's puts and deletes are delivered like a transaction's |
+| `test_s5_one_wake_per_subscription_per_commit` | 5 | a key matching two subscriptions with different filters wakes each once |
+| `test_s5_subscribe_ready_on_return` | 5 | the very next commit after subscribe() returns is delivered, no window |
+| `test_s5_watch_covers_the_subtree` | 5 | a prefix watch gets the row and everything under it, not a sibling whose name only starts the same |
+| `test_s5_resync_on_reconnect` | 5 | writes made while the observer is cut off are recovered by one keyless wake (redis transport only) |
 | `test_s7_storage_delete_is_point_delete` | 7 | `txn.delete` of one key handles one key inside the backend at 10 and 1000 siblings |
 | `test_s7_storage_delete_time_flat` | 7 | median `txn.delete` time grows under 10x from 100 to 10k siblings |
 | `test_s7_view_dict_delete_is_point_delete` | 7 | deleting one dict view key handles as many keys at 10 as at 1000 siblings |
@@ -74,23 +84,12 @@ Out of scope: multi-store transactions (one Transaction over several storages, c
 
 ## known failures
 
-Strict xfails: an unexpected pass fails the run, so delete the row in the commit that fixes it.
+Strict xfails: an unexpected pass fails the run, so delete the row in the commit that fixes it. The table below is `known_failures.py` as of this commit; the file is the source of truth.
 
 | case | backend | owner |
 |---|---|---|
-| lost update threads, write skew, insert race, scan write skew | rocksdb, mem | lane K, lane D |
-| nested transaction, nested batch write | rocksdb, mem | lane K, lane D |
-| repeatable read, never torn, binds at open (get, scan), commit atomic to snapshots | rocksdb, mem | lane K, lane D |
-| cross-process contention | lmdb | lmdb writer slot follow-up: a cross-process writer waits inside lmdb unbounded (contract section 4) |
-| late release after close and reopen frees nothing | lmdb | P1 (lmdb): contexts release the slot without lock identity |
-| dropped transaction frees slot | lmdb | P1 (lmdb): strong active set and no transaction finalizer, so a dropped txn holds the slot until close |
-| cross-process lock wait does not block loop | lmdb | P1 lmdb: begin with a slot waits inside lmdb on the loop (audit 06 F7) |
-| close during in-flight call never crashes | lmdb (both, not strict: probabilistic) | P1 lmdb: segfault (audit 06 F2) |
-| scan after context close, scan after storage close | lmdb, mem | P1 lmdb: `StorageOperationError`; P2 mem: yields the buffered page (audit 06 F10) |
-| coroutine writers serialize (slot, plain) | rocksdb, mem | lane K, lane D |
-| coroutine writers do not block loop (slot, plain) | rocksdb | lane K |
-| view dict delete is point delete | all | lane B |
+| scan after context close, scan after storage close | mem | the mem scan keeps yielding a page it buffered before close; lane V round 2 (mem) |
 
-Not marked: `test_s1_interrupted_writer_frees_storage` fails on sqlite (transaction) and lmdb (transaction, batch write) until the writer slot fix that aborts on `BaseException` merges. The sqlite batch takes its lock only at write, so it holds nothing when interrupted.
+Section 5 runs every case on both transports (in-memory, redis). The resync case is skipped on the in-memory transport, which has no connection to lose. The multi-process cases skip on rocksdb and mem, which declare a single-process model.
 
 On rocksdb and mem the second writer in the never-waits case does not block, and the case still checks only the snapshot. On backends without a writer slot the `slot` and `plain` section 4 variants run the same path.
