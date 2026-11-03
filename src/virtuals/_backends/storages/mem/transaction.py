@@ -45,9 +45,16 @@ class InMemoryTransaction(
     ``_pending_index`` orders the pending keys for scans; it is built on
     the first scan and kept in step from then on, so transactions that
     never scan pay nothing for it.
+
+    Commit or abort on every path is the contract. A transaction dropped
+    without either is aborted by its finalizer once it is unreachable, so
+    a forgotten transaction cannot hold the writer slot until the storage
+    closes; that may be much later than the drop, e.g. when a traceback
+    keeps it alive.
     """
 
     __slots__ = (
+        "__weakref__",
         "_aborted",
         "_committed",
         "_generation",
@@ -93,7 +100,12 @@ class InMemoryTransaction(
         pending = self._pending
         overlay: list[tuple[Any, Any]] = []
         for enc in index.page(bound, inclusive=inclusive, reverse=reverse, n=n, stop=stop):
-            entry = pending[enc]
+            entry = pending.get(enc)
+            if entry is None:
+                # An abort on another thread (storage close) emptied the
+                # write set under this page; the caller's next check
+                # raises StorageClosedError.
+                continue
             overlay.append((enc, ABSENT if entry[1] is DELETED else entry))
         return merge_pages(base, overlay, n, reverse)
 
@@ -145,9 +157,26 @@ class InMemoryTransaction(
             logger.debug("Abort called on closed transaction")
             return
         self._aborted = True
+        self._pending_index = None
         self._pending.clear()
         self._end()
         logger.debug("Transaction aborted")
+
+    def __del__(self) -> None:
+        """Last resort: free the writer slot of a transaction dropped without an end.
+
+        The object is unreachable, so nothing else can end it; the slot is
+        given back without the state lock (a collection may run on a thread
+        that holds it) and the weak active set forgets it on its own.
+        """
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        self._aborted = True
+        try:
+            self._storage._release_write_slot(self._slot)
+        except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
+            pass
 
     def __enter__(self) -> InMemoryTransaction:
         """Enter context manager."""

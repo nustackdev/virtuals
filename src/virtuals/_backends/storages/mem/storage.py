@@ -3,11 +3,11 @@
 Ephemeral key-value storage for tests, prototypes and per-process state,
 meeting the same contract as the persistent adapters:
 
-- Serializable transactions. One writer at a time through an in-process
-  writer slot (the SQLite shape: a lock with a thread-and-task owner, a
-  bounded sync wait, and an async wait that never blocks the event loop).
-  A transaction reads committed state plus its own writes and commits
-  atomically.
+- Serializable transactions. One writer at a time through the writer slot
+  shared with the SQLite, LMDB and RocksDB backends (a lock with a
+  thread-and-task owner, a bounded sync wait, and an async wait that never
+  blocks the event loop). A transaction reads committed state plus its own
+  writes and commits atomically.
 - Real snapshots. A snapshot is pinned at the commit sequence it opened
   at and reads multi-version state, so it is repeatable and never torn.
   Nothing is copied on begin.
@@ -21,10 +21,8 @@ on close.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import threading
-import time
 import weakref
 from contextlib import contextmanager
 from logging import getLogger
@@ -34,12 +32,11 @@ from virtuals.tkv.storage import (
     SnapshotProtocol,
     StorageClosedError,
     StorageError,
-    StorageLockTimeoutError,
-    StorageNestedTransactionError,
     TransactionProtocol,
     WriteBatchProtocol,
 )
 
+from .._write_slot import WriterLock
 from .snapshot import InMemorySnapshot
 from .store import VersionedStore
 from .transaction import InMemoryTransaction
@@ -64,17 +61,6 @@ logger = getLogger(__name__)
 
 DEFAULT_BUSY_TIMEOUT = 60.0  # seconds
 
-# Poll interval bounds for a coroutine waiting on the writer slot (seconds).
-_SLOT_POLL_MIN = 0.0005
-_SLOT_POLL_MAX = 0.005
-
-_Owner = tuple[int, "asyncio.Task | None"]
-
-_NESTED_MESSAGE = (
-    "This task or thread already holds the write lock on this in-memory storage; "
-    "a second write transaction here would wait on itself"
-)
-
 
 _storages: weakref.WeakSet[InMemoryStorage] = weakref.WeakSet()
 """Every live storage in this process (weak), for the fork hooks below."""
@@ -89,8 +75,12 @@ _fork_held: list[threading.Lock] = []
 def _before_fork() -> None:
     """Hold every store lock across the fork, so no commit is half applied in the child.
 
-    Forking from a thread that itself holds a store lock (inside a key
-    comparison during apply, say) deadlocks here; fork from elsewhere.
+    Forking from a thread that itself holds a store lock deadlocks here.
+    The store lock is held only inside store operations, so that thread
+    can only be inside a key comparison or a codec callback that forks
+    (an encoded key type whose ordering spawns a process, say); fork from
+    elsewhere. Forking from a thread that holds the writer slot, or while
+    another thread waits for it, is fine: the child gets fresh locks.
     """
     _fork_lock.acquire()
     for storage in list(_storages):
@@ -123,15 +113,6 @@ if hasattr(os, "register_at_fork"):
     )
 
 
-def _caller() -> _Owner:
-    """Who is asking for the writer slot: this thread, and its running task if any."""
-    try:
-        task = asyncio.current_task()
-    except RuntimeError:  # no running event loop on this thread
-        task = None
-    return threading.get_ident(), task
-
-
 class InMemoryStorage:
     """In-memory storage conforming to ``StorageProtocol``.
 
@@ -140,9 +121,16 @@ class InMemoryStorage:
     ``busy_timeout`` and then raises ``StorageLockTimeoutError``. On an
     event loop, wait with ``areserve_write_slot`` and hand the slot to
     ``begin_transaction(write_slot=...)``; a sync begin on a thread whose
-    loop peer holds the slot fails fast rather than stalling the loop.
-    Beginning a second write transaction from the slot's own holder raises
+    loop peer holds the slot fails fast rather than stalling the loop, and
+    one waiting for a holder on another thread is capped at
+    ``LOOP_THREAD_WAIT_CAP``. Beginning a second write transaction from the
+    slot's own holder (the same task or thread, a ``to_thread`` worker
+    below it, or an ``asyncio.run`` inside it) raises
     ``StorageNestedTransactionError``, which is not retryable.
+
+    Fork: a child forked while any thread holds or waits for the writer
+    slot gets fresh locks and writes at once. Fork only from a thread that
+    is not inside a store operation (see ``_before_fork``).
 
     Attributes:
         codec: Codec for key and value encoding. Views read it directly.
@@ -174,15 +162,12 @@ class InMemoryStorage:
         self._opened = False
 
         self._state_lock = threading.Lock()
-        # In-process writer slot. A plain Lock (not RLock): it may be
-        # released from a different thread than the one that took it.
-        # Mirrors the SQLite slot; keep the two in step until a shared one is lifted.
-        self._write_lock = threading.Lock()
-        self._write_owner: _Owner | None = None
+        self._writer = WriterLock("in-memory")
 
-        self._active_transactions: set[InMemoryTransaction] = set()
-        # Weak: a snapshot dropped without close() must be collectable, its
-        # finalizer then releases the pin.
+        # Weak: a transaction or snapshot dropped without commit, abort or
+        # close must be collectable, its finalizer then frees the writer
+        # slot or the version pin.
+        self._active_transactions: weakref.WeakSet[InMemoryTransaction] = weakref.WeakSet()
         self._active_snapshots: weakref.WeakSet[InMemorySnapshot] = weakref.WeakSet()
         self._active_write_batches: set[InMemoryWriteBatch] = set()
         _storages.add(self)
@@ -206,12 +191,11 @@ class InMemoryStorage:
     def close(self) -> None:
         """Close storage. Active contexts are aborted or closed, all data is dropped.
 
-        The writer slot is replaced too, so a slot reserved but not yet
-        taken, or a transaction still finishing on another thread, cannot
-        hold or free the slot of the reopened storage. The old lock is
-        released here on behalf of such a holder (its own release is a
-        no-op from now on), so a writer blocked on it wakes at once and
-        moves on instead of waiting out ``busy_timeout``.
+        The writer slot is replaced too (``WriterLock.close``), so a slot
+        reserved but not yet taken, or a transaction still finishing on
+        another thread, cannot hold or free the slot of the reopened
+        storage, and a writer blocked on it wakes at once with
+        ``StorageClosedError`` instead of waiting out ``busy_timeout``.
         """
         if not self._opened:
             return
@@ -240,15 +224,8 @@ class InMemoryStorage:
             self._active_transactions.clear()
             self._active_snapshots.clear()
             self._active_write_batches.clear()
-            old_lock = self._write_lock
-            self._write_lock = threading.Lock()
-            if self._write_owner is not None:
-                # A recorded owner means a holder whose release is now a
-                # no-op. A waiter that only just acquired the old lock has
-                # no owner record and releases it itself in _claim_slot.
-                self._write_owner = None
-                old_lock.release()
             self._opened = False
+        self._writer.close()
         self._store.reset()
 
     def __enter__(self) -> InMemoryStorage:
@@ -316,19 +293,13 @@ class InMemoryStorage:
             raise StorageError("Cannot start transaction in read only mode.")
         self._require_open()
 
-        if write_slot is not None:
-            lock = write_slot._take(self)
-        else:
-            lock = self._acquire_write_slot()
+        give_back_slot = self._writer.take(self, write_slot, self._busy_timeout)
         try:
-            transaction = InMemoryTransaction(self, lock)
+            transaction = InMemoryTransaction(self, self._writer.lock)
             with self._state_lock:
                 self._active_transactions.add(transaction)
         except BaseException:
-            if write_slot is not None:
-                write_slot._give_back()
-            else:
-                self._release_write_slot(lock)
+            give_back_slot()
             raise
         return transaction
 
@@ -351,25 +322,8 @@ class InMemoryStorage:
         if self._read_only:
             raise StorageError("Cannot reserve the write slot in read only mode.")
         self._require_open()
-
-        me = _caller()
-        if self._write_owner == me:
-            raise StorageNestedTransactionError(_NESTED_MESSAGE)
-        deadline = time.monotonic() + max(self._busy_timeout, 0)
-        delay = _SLOT_POLL_MIN
-        while True:
-            lock = self._write_lock
-            if lock.acquire(blocking=False):
-                if self._claim_slot(lock, me):
-                    return InMemoryWriteSlot(self, lock)
-                continue  # the slot was replaced by close(); try the current one
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise StorageLockTimeoutError(
-                    f"Timed out after {self._busy_timeout}s waiting for the write lock"
-                )
-            await asyncio.sleep(min(delay, remaining))
-            delay = min(delay * 2, _SLOT_POLL_MAX)
+        lock = await self._writer.areserve(self._busy_timeout)
+        return InMemoryWriteSlot(self, lock)
 
     def begin_write_batch(self) -> InMemoryWriteBatch:
         """Begin a write-only batch. Takes no lock until ``write``."""
@@ -420,56 +374,6 @@ class InMemoryStorage:
     # Writer slot
     # =========================================================================
 
-    def _acquire_write_slot(self) -> threading.Lock:
-        """Block for the writer slot, up to ``busy_timeout``, and return its lock.
-
-        Fails at once when the slot is held from this same thread: by this
-        task or thread (a nested transaction, which would wait on itself),
-        or by another coroutine on this thread's loop, which cannot run to
-        release it while this thread blocks.
-        """
-        me = _caller()
-        owner = self._write_owner
-        if owner is not None and owner[0] == me[0]:
-            if owner == me:
-                raise StorageNestedTransactionError(_NESTED_MESSAGE)
-            raise StorageLockTimeoutError(
-                "Another task on this thread's event loop holds the write lock on this "
-                "in-memory storage; blocking for it here would stall the loop it needs to "
-                "finish. Wait for the slot with areserve_write_slot instead"
-            )
-        lock = self._write_lock
-        if lock.acquire(blocking=False) and self._claim_slot(lock, me):
-            return lock  # uncontended fast path
-        deadline = time.monotonic() + max(self._busy_timeout, 0)
-        while True:
-            lock = self._write_lock
-            if not lock.acquire(timeout=max(deadline - time.monotonic(), 0)):
-                raise StorageLockTimeoutError(
-                    f"Timed out after {self._busy_timeout}s waiting for the write lock"
-                )
-            if self._claim_slot(lock, me):
-                return lock
-            # The slot was replaced by close() while we waited; wait on the current one.
-
-    def _claim_slot(self, lock: threading.Lock, me: _Owner) -> bool:
-        """Record ``me`` as owner of ``lock`` if it is still the storage's open slot.
-
-        Otherwise ``lock`` is a slot ``close()`` replaced while the caller
-        waited on it: it is released, nothing is recorded, and False is
-        returned so the caller retries on the current slot. Raises
-        ``StorageClosedError`` instead when the storage is closed.
-        """
-        with self._state_lock:
-            if lock is self._write_lock and self._opened:
-                self._write_owner = me
-                return True
-            closed = not self._opened
-        lock.release()
-        if closed:
-            raise StorageClosedError("Storage was closed while waiting for the write lock")
-        return False
-
     def _release_write_slot(self, lock: threading.Lock | None = None) -> None:
         """Release the writer slot.
 
@@ -478,11 +382,7 @@ class InMemoryStorage:
                 released when it is no longer the storage's lock (a fork
                 or ``close`` replaced the slot since).
         """
-        with self._state_lock:
-            if lock is not None and lock is not self._write_lock:
-                return
-            self._write_owner = None
-            self._write_lock.release()
+        self._writer.release(lock)
 
     def _reset_locks(self) -> None:
         """Fresh locks and no slot owner, for a forked child.
@@ -492,8 +392,7 @@ class InMemoryStorage:
         process-wide fork hook, not under any lock.
         """
         self._state_lock = threading.Lock()
-        self._write_lock = threading.Lock()
-        self._write_owner = None
+        self._writer.reset()
         self._store.lock = threading.Lock()
 
     # =========================================================================

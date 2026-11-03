@@ -690,7 +690,7 @@ def test_close_racing_commit_releases_slot_once() -> None:
     assert tx.is_closed and tx._aborted and outcome == {"error": StorageClosedError}
 
     s.open()
-    assert not s._write_lock.locked()
+    assert not s._writer.lock.locked()
     holder = s.begin_transaction()
     with pytest.raises(StorageLockTimeoutError):
         _in_thread(s.begin_transaction)  # the slot is really held by exactly one writer
@@ -720,7 +720,7 @@ def test_commit_and_abort_race_end_once(storage: InMemoryStorage) -> None:
         b.join()
         assert not errors
         assert tx.is_closed and tx._committed != tx._aborted
-        assert not storage._write_lock.locked()
+        assert not storage._writer.lock.locked()
 
 
 def test_leaked_snapshot_releases_its_pin(storage: InMemoryStorage) -> None:
@@ -744,12 +744,12 @@ def test_reserved_slot_does_not_survive_close() -> None:
         slot = await s.areserve_write_slot()
         s.close()
         s.open()
-        assert not s._write_lock.locked() and s._write_owner is None
+        assert not s._writer.lock.locked() and s._writer._owner is None
         with pytest.raises(StorageError, match="stale"):
             s.begin_transaction(write_slot=slot)
         assert not slot.held
         slot.release()  # no-op, never touches the fresh slot
-        assert not s._write_lock.locked()
+        assert not s._writer.lock.locked()
         s.begin_transaction().abort()
         (await s.areserve_write_slot()).release()
         s.close()
@@ -769,7 +769,7 @@ def test_base_exception_in_commit_ends_transaction(storage: InMemoryStorage) -> 
     with pytest.raises(KeyboardInterrupt):
         tx.commit()
     storage._store.apply = real_apply
-    assert tx.is_closed and not storage._write_lock.locked()
+    assert tx.is_closed and not storage._writer.lock.locked()
     assert _get(storage, X) is EMPTY
     storage.begin_transaction().abort()
 
@@ -805,7 +805,7 @@ def test_failed_apply_leaves_state_untouched() -> None:
         tx.put((1,), 0)  # int against str keys: the index raises part way through
         with pytest.raises(StorageTransactionError):
             tx.commit()
-        assert tx.is_closed and not s._write_lock.locked()
+        assert tx.is_closed and not s._writer.lock.locked()
         assert s._store._seq == seq
         assert dict(s._store._live) == {"a": (("a",), 1), "b": (("b",), 2)}
         assert list(s._store._index) == ["a", "b"]
@@ -904,7 +904,7 @@ def test_writer_waiting_across_close_never_keeps_the_old_slot() -> None:
     assert holder.is_closed
     s.open()
     x = s.begin_transaction()
-    assert s._write_owner is not None and s._write_owner[0] == threading.get_ident()
+    assert s._writer._owner is not None and s._writer._owner[0] == threading.get_ident()
     with pytest.raises(StorageLockTimeoutError):
         _in_thread(s.begin_transaction)  # exactly one writer on the reopened storage
     x.put(X, "x")
@@ -939,7 +939,7 @@ def test_waiter_on_lock_held_by_stale_slot_wakes_on_close() -> None:
     assert outcome["secs"] < 1.0  # did not wait out busy_timeout
     s.open()
     slot.release()  # stale: touches nothing
-    assert not s._write_lock.locked() and s._write_owner is None
+    assert not s._writer.lock.locked() and s._writer._owner is None
     x = s.begin_transaction()
     s._busy_timeout = 0.05
     with pytest.raises(StorageLockTimeoutError):
@@ -972,7 +972,7 @@ def test_async_waiter_across_close_never_clobbers_owner() -> None:
     assert holder.is_closed
     s.open()
     x = s.begin_transaction()
-    assert s._write_owner[0] == threading.get_ident()
+    assert s._writer._owner[0] == threading.get_ident()
     x.abort()
     s.close()
 
