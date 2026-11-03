@@ -19,6 +19,7 @@ from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin
 
 if TYPE_CHECKING:
     import threading
+    from collections.abc import Iterable
     from types import TracebackType
 
     from virtuals.tkv.types import Key
@@ -52,7 +53,7 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
     A transaction from ``areserve_write_slot`` starts begun.
     """
 
-    __slots__ = ("_aborted", "_committed", "_modified_keys", "_pending")
+    __slots__ = ("_aborted", "_committed", "_interrupted", "_modified_keys", "_pending")
 
     def __init__(
         self, storage: LMDBStorage, lmdb_txn: object, write_lock: threading.Lock | None = None
@@ -63,6 +64,7 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         self._modified_keys: set[Key] = set()
         self._committed = False
         self._aborted = False
+        self._interrupted = False  # a commit was left by an interrupt with its outcome open
 
     def __del__(self) -> None:
         """Abort a transaction dropped unended, so it cannot hold the writer lock."""
@@ -123,12 +125,22 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
                 raise StorageTransactionError("Transaction already aborted")
 
             pending = self._pending
+            # Interrupted while the commit is in flight (a signal), the
+            # commit still runs to its end on the writer thread, and
+            # ``settle`` finishes this bookkeeping from there; the
+            # interrupt itself propagates as is. Interrupted before the
+            # begin landed, nothing is committed and the transaction stays
+            # pending for the abort that follows.
             try:
                 if pending is not None:
-                    missing = self._storage._commit_pending(pending)
+                    missing = self._storage._commit_pending(
+                        pending, settle=lambda missing: self._settle(pending, missing, late=True)
+                    )
                 else:
                     txn = self._require_active()
-                    self._storage._end_write(txn, commit=True)
+                    self._storage._end_write(
+                        txn, commit=True, settle=lambda _: self._settle(None, (), late=True)
+                    )
                     missing = ()
             except Exception as e:
                 # LMDB frees a write transaction whose commit fails, so close
@@ -137,13 +149,12 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
                 self._pending = None
                 self._mark_closed()
                 failure: Exception | None = e
+            except BaseException:
+                self._interrupted = True  # the abort that follows lets the commit settle first
+                raise
             else:
                 failure = None
-                for encoded_key in missing:
-                    self._modified_keys.discard(pending[encoded_key][0])  # type: ignore[index]
-                self._pending = None
-                self._committed = True
-                self._mark_closed()
+                self._settle(pending, missing)
 
         if failure is not None:
             self._storage._untrack_transaction(self)
@@ -155,6 +166,31 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         logger.debug("Transaction committed")
         self._storage._notify_batch(self._modified_keys)
         self._storage._untrack_transaction(self)
+
+    def _settle(
+        self, pending: Pending | None, missing: Iterable[bytes], *, late: bool = False
+    ) -> None:
+        """Bookkeeping of a commit that landed: the keys, the flags, the slot.
+
+        Under ``_call_lock`` on the committing thread, or ``late`` from the
+        writer thread after the committing thread was interrupted: then
+        it also notifies and untracks, since the interrupted ``commit``
+        never got to. The abort that usually follows an interrupt waits
+        for this to land and is then a no-op; an interrupt raised as a
+        plain ``Exception`` (a handler's choice) is taken for a failed
+        commit by ``commit`` instead, which releases the slot early and
+        marks the transaction aborted, and this then marks it committed
+        too, which it is.
+        """
+        for encoded_key in missing:
+            self._modified_keys.discard(pending[encoded_key][0])  # type: ignore[index]
+        self._pending = None
+        self._committed = True
+        self._mark_closed()
+        if late:
+            logger.warning("LMDB transaction committed after its commit was interrupted")
+            self._storage._notify_batch(self._modified_keys)
+            self._storage._untrack_transaction(self)
 
     def abort(self) -> None:
         """Abort transaction and discard all changes.
@@ -174,12 +210,17 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
             logger.debug("Abort called on closed transaction")
             return
         with self._call_lock:
+            if self._interrupted:
+                # A commit left by an interrupt may still be landing on the
+                # writer thread; it settles there, ahead of any job queued
+                # here, so after this the transaction is committed or not.
+                self._storage._drain_writer()
             if self._closed:
                 return
             failure: Exception | None = None
             try:
-                if self._pending is None:
-                    txn = self._require_active()
+                txn = self._lmdb_txn
+                if self._pending is None and txn is not None:
                     self._storage._end_write(txn, commit=False)
                 logger.debug("Transaction aborted")
             except Exception as e:
@@ -187,7 +228,8 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
                 failure = e
             finally:
                 self._pending = None
-                self._aborted = True
+                if not self._committed:
+                    self._aborted = True
                 self._mark_closed()
 
         self._storage._untrack_transaction(self)

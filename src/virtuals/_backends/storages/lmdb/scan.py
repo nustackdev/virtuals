@@ -59,10 +59,11 @@ class LMDBScan(ScanProtocol):
         Every cursor call runs under the context's call lock, released
         across yields, so ``close()`` from another thread can end the
         context between two rows and never under a cursor call. The next
-        step then raises ``StorageClosedError``.
+        step then raises ``StorageClosedError``. The lock is read from the
+        context at every step: a forked child gets a fresh one with the
+        context closed, and must not block on the parent's.
         """
         context = self._context
-        lock = context._call_lock
         codec = self._storage.codec
         options = self._options
 
@@ -78,7 +79,7 @@ class LMDBScan(ScanProtocol):
             except Exception as e:
                 raise StorageOperationError(f"Failed to encode start key: {e}") from e
 
-        with lock:
+        with context._call_lock:
             txn = context._require_active()
             try:
                 cursor = txn.cursor()
@@ -89,7 +90,7 @@ class LMDBScan(ScanProtocol):
         yielded_at = 0.0
         backoff_left = WRITER_BACKOFF_STEPS  # the whole scan's budget, not per row
         try:
-            with lock:
+            with context._call_lock:
                 positioned = self._seek(cursor, options, start_key_encoded)
             count = 0
             limit = options.limit
@@ -101,7 +102,7 @@ class LMDBScan(ScanProtocol):
                     yielded_at, backoff_left = yield_to_writer(
                         writer_thread, yielded_at, backoff_left
                     )
-                with lock:
+                with context._call_lock:
                     context._require_active()
                     row = self._next_row(cursor, options, codec, need_values)
                 if row is None:
@@ -116,13 +117,14 @@ class LMDBScan(ScanProtocol):
                     yield (key, value)
 
                 count += 1
-                with lock:
+                with context._call_lock:
                     context._require_active()
                     positioned = self._advance(cursor, options.reverse)
         finally:
             # Best effort: the transaction frees its cursors when it ends.
             # Non-blocking, since a generator may be finalized while this
             # thread holds the lock (a collection inside a call).
+            lock = context._call_lock
             if lock.acquire(blocking=False):
                 try:
                     cursor.close()
