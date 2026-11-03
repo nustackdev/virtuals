@@ -10,6 +10,7 @@ from virtuals._views.fractional_index import (
     BASE_62_DIGITS,
     generate_key_between,
     generate_n_keys_between,
+    generate_n_suffixed_keys_between,
     generate_suffixed_key_between,
     validate_order_key,
 )
@@ -131,7 +132,7 @@ def test_random_inserts_keep_order_and_uniqueness(gen, seed):
 
 @pytest.mark.parametrize("gen", [generate_key_between, generate_suffixed_key_between])
 def test_repeated_insert_at_same_gap_grows_slowly(gen):
-    """Inserting right after a fixed key again and again: about one char per 6."""
+    """Inserting right after a fixed key again and again: about one char per 4 to 6."""
     a = gen(None, None)
     b = gen(a, None)
     keys = [a, b]
@@ -196,7 +197,55 @@ def test_suffixed_key_below_prefix_bound():
         for _ in range(200):
             k = generate_suffixed_key_between(a, b)
             _between(k, a, b)
-            assert not k.startswith(plain) or a is not None
+            assert not k.startswith(plain)
+
+
+def _hot_gap_bound(n):
+    """The key ``n`` inserts deep after a fixed head: long, just above the head."""
+    head = generate_suffixed_key_between(None, None)
+    keys = [head]
+    for _ in range(n):
+        keys.insert(1, generate_suffixed_key_between(keys[0], keys[1] if len(keys) > 1 else None))
+    return head, keys[1]
+
+
+def test_suffixed_key_next_to_long_bound_stays_short():
+    """A long upper bound above a short integer does not drag the key along."""
+    head, deep = _hot_gap_bound(400)
+    assert len(deep) > 60
+    below_head = generate_suffixed_key_between(None, head)
+    for a in (None, below_head):
+        k = generate_suffixed_key_between(a, deep)
+        _between(k, a, deep)
+        assert len(k) <= 8
+
+
+@pytest.mark.parametrize("n", [0, 1, 2, 3, 17, 34])
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [(None, None), ("a0V", None), (None, "a0V"), ("a0", "a1"), ("a0abcd", "a0abce"), ("Zz", "a0")],
+)
+def test_n_suffixed_keys_between(a, b, n):
+    keys = generate_n_suffixed_keys_between(a, b, n)
+    assert len(keys) == n
+    assert keys == sorted(keys)
+    assert len(set(keys)) == n
+    for k in keys:
+        _between(k, a, b)
+
+
+def test_n_suffixed_keys_are_short_next_to_long_bound():
+    """A respace window bounded by a long key on one side gets short keys."""
+    head, deep = _hot_gap_bound(480)
+    below_head = generate_suffixed_key_between(None, head)
+    for lo in (None, below_head):
+        keys = generate_n_suffixed_keys_between(lo, deep, 34)
+        assert keys == sorted(keys)
+        for k in keys:
+            _between(k, lo, deep)
+        assert max(len(k) for k in keys) <= 12
+    keys = generate_n_suffixed_keys_between(None, None, 200)
+    assert max(len(k) for k in keys) <= 8
 
 
 def test_suffixed_keys_from_same_neighbours_differ():
