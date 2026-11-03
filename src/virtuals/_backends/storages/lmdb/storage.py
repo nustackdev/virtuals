@@ -29,7 +29,7 @@ from virtuals.tkv.storage import (
 
 from .._write_slot import LOOP_THREAD_WAIT_CAP, WriterLock, WriteSlot
 from ._writer import WriterGate, WriterThread
-from .context import replay_pending
+from .context import replay_pending, yield_to_writer
 from .snapshot import LMDBSnapshot
 from .transaction import LMDBTransaction
 from .write_batch import LMDBWriteBatch
@@ -310,6 +310,11 @@ class LMDBStorage:
 
         self._env: lmdb.Environment | None = None
         self._env_lock = threading.RLock()
+        # Snapshots begin, register and unregister under their own lock, so
+        # reader threads never queue writers behind an env.begin() in
+        # flight (a Python lock held across a C call is a GIL convoy, see
+        # yield_to_writer). Taken before _env_lock wherever both are held.
+        self._snap_lock = threading.RLock()
         # Weak: a context nobody ended is collected. A snapshot's read
         # transaction then ends under py-lmdb, freeing its shared reader
         # slot instead of pinning it (and the pages it saw) until close();
@@ -332,6 +337,7 @@ class LMDBStorage:
         self._forked = False  # inherited across a fork: the env is the parent's
         self._forked_during_write = False
         self._last_reader_check = 0.0
+        self._snapshot_yielded_at = 0.0  # shared by every thread opening snapshots; benign races
         _storages.add(self)
 
     @property
@@ -432,6 +438,7 @@ class LMDBStorage:
     def _reset_locks_after_fork(self) -> None:
         """Replace locks a parent thread may hold at the fork (``register_at_fork``)."""
         self._env_lock = threading.RLock()
+        self._snap_lock = threading.RLock()
         self._writer_thread.forget()
         if self._gate is not None:
             self._gate.reset_after_fork()
@@ -456,7 +463,7 @@ class LMDBStorage:
         """
         if self._pid == os.getpid():
             return
-        with self._env_lock:
+        with self._snap_lock, self._env_lock:
             if self._pid == os.getpid():
                 return
             self._forked = True
@@ -525,7 +532,7 @@ class LMDBStorage:
             return
         self._check_fork()  # never end contexts inherited from the parent
 
-        with self._env_lock:
+        with self._snap_lock, self._env_lock:
             if not self._opened:
                 return
             self._opened = False
@@ -575,7 +582,7 @@ class LMDBStorage:
         self._writer.close()  # a reserved slot nobody took does not survive the reopen
         stopped = self._writer_thread.stop(self._busy_timeout)
 
-        with self._env_lock:
+        with self._snap_lock, self._env_lock:  # no snapshot begin in flight under env.close()
             if self._gate is not None:
                 self._gate.close()  # drops the gate if a reserved slot still held it
             self._gate_held = False
@@ -647,8 +654,11 @@ class LMDBStorage:
         """Begin read-only snapshot."""
         self._require_open()
         self._check_fork()
+        writer_thread = self._writer_thread
+        if writer_thread._wait_since or writer_thread._gate_since:  # see yield_to_writer
+            self._snapshot_yielded_at = yield_to_writer(writer_thread, self._snapshot_yielded_at)
 
-        with self._env_lock:
+        with self._snap_lock:
             self._require_open()
             try:
                 lmdb_txn = self._begin_read()
@@ -737,7 +747,7 @@ class LMDBStorage:
         LMDB remaps in place, which is only safe while this process has no
         transaction over the old mapping.
         """
-        with self._env_lock:
+        with self._snap_lock, self._env_lock:
             env = self._env
             if env is None:
                 raise StorageClosedError("Storage is not open")
@@ -836,7 +846,11 @@ class LMDBStorage:
         lock = await self._writer.areserve(self._busy_timeout)
         try:
             if self._gate is not None:
-                await self._gate.aacquire(deadline - time.monotonic())
+                stamp = self._writer_thread._stamp_gate()
+                try:
+                    await self._gate.aacquire(deadline - time.monotonic())
+                finally:
+                    self._writer_thread._unstamp_gate(stamp)
                 self._gate_held = True
             # With the gate held the begin is not a wait on a virtuals peer,
             # so it gets the full timeout (a writer outside virtuals bounds).
@@ -882,6 +896,7 @@ class LMDBStorage:
         on_loop = asyncio._get_running_loop() is not None
         if on_loop:
             timeout = min(timeout, LOOP_THREAD_WAIT_CAP)
+        stamp = self._writer_thread._stamp_gate()  # flock releases the GIL: see yield_to_writer
         try:
             self._gate.acquire(timeout)
         except StorageLockTimeoutError:
@@ -893,6 +908,8 @@ class LMDBStorage:
                 f"{LOOP_THREAD_WAIT_CAP}s so the loop is not stalled. Wait for the slot "
                 "with areserve_write_slot instead"
             ) from None
+        finally:
+            self._writer_thread._unstamp_gate(stamp)
         self._gate_held = True
 
     def _hop_timeout(self) -> float:
@@ -999,7 +1016,11 @@ class LMDBStorage:
         if self._gate_held:
             self._gate_held = False
             if self._gate is not None:
-                self._gate.release()
+                stamp = self._writer_thread._stamp_gate()
+                try:
+                    self._gate.release()
+                finally:
+                    self._writer_thread._unstamp_gate(stamp)
 
     def _release_write_slot(self, lock: Any = None) -> None:  # noqa: ANN401
         """Release the cross-process gate, then the in-process writer slot."""
@@ -1115,7 +1136,7 @@ class LMDBStorage:
 
     def _untrack_snapshot(self, snapshot: LMDBSnapshot) -> None:
         """Remove snapshot from active set."""
-        with self._env_lock:
+        with self._snap_lock:
             self._active_snapshots.discard(snapshot)
 
     def _untrack_write_batch(self, write_batch: LMDBWriteBatch) -> None:

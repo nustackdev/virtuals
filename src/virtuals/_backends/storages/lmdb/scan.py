@@ -12,6 +12,8 @@ from virtuals.tkv.storage import (
     StorageScanOptions,
 )
 
+from .context import yield_to_writer
+
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -83,6 +85,8 @@ class LMDBScan(ScanProtocol):
             except Exception as e:
                 raise StorageOperationError(f"Failed to create cursor: {e}") from e
 
+        writer_thread = self._storage._writer_thread
+        yielded_at = 0.0
         try:
             with lock:
                 positioned = self._seek(cursor, options, start_key_encoded)
@@ -91,6 +95,9 @@ class LMDBScan(ScanProtocol):
             while positioned:
                 if limit is not None and count >= limit:
                     break
+                if writer_thread._wait_since or writer_thread._gate_since:
+                    # a writer starved of the GIL by readers like this one
+                    yielded_at = yield_to_writer(writer_thread, yielded_at)
                 with lock:
                     context._require_active()
                     row = self._next_row(cursor, options, codec, need_values)
