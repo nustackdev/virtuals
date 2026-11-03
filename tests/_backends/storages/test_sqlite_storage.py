@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from tests._backends.storages import _write_slot_cases as cases
-from virtuals._backends.storages.sqlite import SQLiteStorage
+from virtuals._backends.storages.sqlite import SQLiteStorage, SQLiteWriteSlot
 from virtuals.codecs import BinaryCodec
 from virtuals.tkv import StorageScanOptions
 from virtuals.tkv.filter import LengthFilter, PrefixFilter
@@ -487,8 +487,16 @@ def test_unused_slot_is_released(storage: SQLiteStorage) -> None:
 
 
 def test_failed_begin_returns_slot_to_holder(storage: SQLiteStorage) -> None:
+    """A begin that fails after taking the slot hands it back to the holder.
+
+    The slot normally carries a begun connection, so begin cannot fail on
+    one; here the connection is taken away first (what close() does), so
+    begin falls back to the pool, which is made to fail.
+    """
+
     async def main() -> None:
         slot = await storage.areserve_write_slot()
+        storage._release_connection(slot._detach_conn())
         real = storage._acquire_connection
 
         def broken() -> sqlite3.Connection:
@@ -698,6 +706,142 @@ _HOLDER = textwrap.dedent(
 )
 
 
+_HOLD_THEN_RELEASE = textwrap.dedent(
+    """
+    import sys, time
+    from virtuals._backends.storages.sqlite import SQLiteStorage
+    from virtuals.codecs import BinaryCodec
+
+    s = SQLiteStorage(path=sys.argv[1], codec=BinaryCodec())
+    s.open()
+    tx = s.begin_transaction()
+    tx.put(("held",), b"x")
+    print("held", flush=True)
+    time.sleep(float(sys.argv[2]))
+    tx.commit()
+    s.close()
+    print("released", flush=True)
+    """
+)
+
+
+def _hold_in_other_process(db_path: Path, hold: float) -> subprocess.Popen:
+    """Start a process that holds the file write lock for ``hold`` seconds."""
+    proc = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", _HOLD_THEN_RELEASE, str(db_path), str(hold)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    assert proc.stdout.readline().strip() == "held"
+    return proc
+
+
+class _Ticker:
+    """Longest gap between two turns of the event loop, measured by a task."""
+
+    def __init__(self, tick: float = 0.005) -> None:
+        self.tick = tick
+        self.gap = 0.0
+        self.ticks = 0
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task | None = None
+
+    async def _run(self) -> None:
+        last = time.perf_counter()
+        while not self._stop.is_set():
+            await asyncio.sleep(self.tick)
+            now = time.perf_counter()
+            self.gap = max(self.gap, now - last)
+            last = now
+            self.ticks += 1
+
+    async def __aenter__(self) -> _Ticker:
+        self._task = asyncio.create_task(self._run())
+        await asyncio.sleep(0)
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self._stop.set()
+        assert self._task is not None
+        await self._task
+
+
+@pytest.mark.timeout(20)
+def test_cross_process_lock_wait_does_not_block_loop(storage: SQLiteStorage, db_path: Path) -> None:
+    """Another process holds the write lock: the slot waits for it off the loop."""
+    hold = 0.5
+    proc = _hold_in_other_process(db_path, hold)
+
+    async def main() -> tuple[float, float, int]:
+        try:
+            async with _Ticker() as ticker:
+                t0 = time.perf_counter()
+                slot = await storage.areserve_write_slot()
+                waited = time.perf_counter() - t0
+                tx = storage.begin_transaction(write_slot=slot)
+                tx.put(("loop",), b"1")
+                tx.commit()
+            return waited, ticker.gap, ticker.ticks
+        finally:
+            proc.wait(10)
+
+    waited, gap, ticks = asyncio.run(main())
+    assert waited >= hold * 0.6, f"got the lock after {waited:.3f}s, holder held it {hold}s"
+    assert gap < 0.1, f"loop blocked for {gap * 1000:.0f}ms during a cross-process lock wait"
+    assert ticks >= int(waited / 0.005 * 0.5), f"ticker ran {ticks} times in {waited:.3f}s"
+    with storage.snapshot() as snap:
+        assert snap.get(("loop",)) == b"1"
+        assert snap.get(("held",)) == b"x"
+
+
+@pytest.mark.timeout(20)
+def test_cross_process_lock_wait_times_out_without_blocking_loop(db_path: Path) -> None:
+    """The file lock wait is bounded by busy_timeout and surfaces as a lock timeout."""
+    proc = _hold_in_other_process(db_path, 5.0)
+    s = SQLiteStorage(path=db_path, codec=BinaryCodec(), busy_timeout=0.3)
+    s.open()
+    try:
+
+        async def main() -> tuple[float, float]:
+            async with _Ticker() as ticker:
+                t0 = time.perf_counter()
+                with pytest.raises(StorageLockTimeoutError, match="write lock"):
+                    await s.areserve_write_slot()
+                return time.perf_counter() - t0, ticker.gap
+
+        elapsed, gap = asyncio.run(main())
+        assert 0.25 < elapsed < 2.0
+        assert gap < 0.1, f"loop blocked for {gap * 1000:.0f}ms"
+        # Nothing is held: the slot is free and the pooled connection is idle.
+        assert not s._writer.lock.locked()
+        assert all(not c.in_transaction for c in s._idle)
+    finally:
+        proc.kill()
+        proc.wait(10)
+        s.close()
+
+
+@pytest.mark.timeout(20)
+def test_cancel_during_file_lock_wait_holds_nothing(storage: SQLiteStorage, db_path: Path) -> None:
+    proc = _hold_in_other_process(db_path, 1.0)
+    try:
+
+        async def main() -> None:
+            task = asyncio.create_task(storage.areserve_write_slot())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not storage._writer.lock.locked()
+            assert all(not c.in_transaction for c in storage._idle)
+
+        asyncio.run(main())
+    finally:
+        proc.wait(10)
+    storage.begin_transaction().commit()
+
+
 _TRY_WRITE = textwrap.dedent(
     """
     import sys
@@ -727,6 +871,39 @@ def _other_process_write(db_path: Path) -> str:
         check=True,
     )
     return out.stdout.strip()
+
+
+@pytest.mark.timeout(30)
+def test_reserved_slot_holds_file_lock_until_released(
+    storage: SQLiteStorage, db_path: Path
+) -> None:
+    """A reserved slot owns the file lock (other processes wait) and release gives it back."""
+
+    async def main() -> None:
+        slot = await storage.areserve_write_slot()
+        assert _other_process_write(db_path) == "busy"
+        slot.release()
+        assert _other_process_write(db_path) == "wrote"
+
+    asyncio.run(main())
+
+
+@pytest.mark.timeout(30)
+def test_close_takes_file_lock_back_from_reserved_slot(db_path: Path) -> None:
+    """close() gives back a reserved slot's connection even while the slot object lives."""
+    s = SQLiteStorage(path=db_path, codec=BinaryCodec(), busy_timeout=1.0)
+    s.open()
+
+    async def main() -> SQLiteWriteSlot:
+        return await s.areserve_write_slot()
+
+    slot = asyncio.run(main())
+    s.close()
+    assert _other_process_write(db_path) == "wrote"
+    slot.release()  # no connection left to give back, no error
+    s.open()
+    s.begin_transaction().commit()
+    s.close()
 
 
 def test_killed_writer_releases_lock(db_path: Path) -> None:
@@ -1082,6 +1259,34 @@ def test_fork_without_write_child_writes(
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         storage._release_connection(conn)
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_fork_with_reserved_slot_child_refuses_stale_slot(storage: SQLiteStorage) -> None:
+    """A slot reserved before the fork cannot begin a transaction in the child."""
+
+    async def main() -> int:
+        slot = await storage.areserve_write_slot()
+
+        def child() -> int:
+            try:
+                storage.begin_transaction(write_slot=slot)
+            except StorageError as e:
+                if "fork" not in str(e):
+                    return 2
+            else:
+                return 3
+            slot.release()  # no-op on a stale slot, never touches the parent's lock
+            storage.close()
+            return 0
+
+        code = _child_exits_with(child, False)
+        storage.begin_transaction(write_slot=slot).commit()  # the parent's slot still works
+        return code
+
+    assert asyncio.run(main()) == 0
+    storage.begin_transaction().commit()
 
 
 # =========================================================================
