@@ -236,3 +236,317 @@ def test_container_put_child_primitive_rejects_empty(root):
     with pytest.raises(ValueError, match="EMPTY"):
         view.container.put_child_primitive("e", EMPTY, validate=False, validate_parent=False)
     assert list(view) == ["a"]
+
+
+# ============================================================================
+# ERASE THEN LEN: every dict view, same transaction and a fresh one
+# ============================================================================
+
+
+@pytest.mark.parametrize("view_cls", DICT_VIEWS)
+def test_erase_then_len_agrees_everywhere(storage, view_cls):
+    keys = [_key(view_cls, i) for i in range(3)]
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        for i, key in enumerate(keys):
+            view[key] = i
+        del view[keys[1]]
+        assert len(view) == 2
+        assert list(view) == [keys[0], keys[2]]
+        assert keys[1] not in view
+        assert bool(view)
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        assert len(view) == 2
+        assert sorted(view, key=str) == sorted([keys[0], keys[2]], key=str)
+        assert keys[1] not in view
+        del view[keys[0]]
+        del view[keys[2]]
+        assert len(view) == 0
+        assert not view
+        assert list(view) == []
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        assert len(view) == 0
+        assert not view
+        assert view.container.exists()
+
+
+@pytest.mark.parametrize("view_cls", NESTED_VIEWS)
+def test_erase_compound_entry_then_len(storage, view_cls):
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        view["a"] = 1
+        view["b"] = {"x": {"y": {"z": 1}}, "w": [1, 2, 3]}
+        assert len(view) == 2
+        del view["b"]
+        assert len(view) == 1
+        assert "b" not in view
+        assert list(view.items()) == [("a", 1)]
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        assert len(view) == 1
+        assert view.get("b", "dflt") == "dflt"
+        # Nothing of the old subtree is left under the key.
+        child = view.open_child("b", EagerDictView)
+        assert not child.container.exists()
+        assert len(child) == 0
+
+
+@pytest.mark.parametrize("view_cls", [v for v in DICT_VIEWS if hasattr(v, "pop")])
+def test_pop_then_len(storage, view_cls):
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        keys = [_key(view_cls, i) for i in range(3)]
+        view.update(dict.fromkeys(keys, 7))
+        assert view.pop(keys[0]) == 7
+        assert view.pop(_key(view_cls, 9), "dflt") == "dflt"
+        assert len(view) == 2
+        assert list(view) == keys[1:]
+
+
+# ============================================================================
+# KEY EDGES: unicode, separators, int extremes, True/1 (contract: point ops)
+# ============================================================================
+
+EDGE_STR_KEYS = [
+    "",
+    "0",
+    "a/b",
+    "a\x00b",
+    "\x01",
+    "é",
+    "😀",
+    "*",
+    "__data__",
+    "__len__",
+    " ",
+    "a.b",
+]
+EDGE_INT_KEYS = [0, -1, 1, 2**31, -(2**31), 2**63 - 1, -(2**63)]
+KH57_INT_KEYS = [0, 1, 2**31, 2**40]  # kh57 keys are non-negative
+
+
+def _read(view, key):
+    """The value at ``key`` as a Python value (lazy facets hand back views)."""
+    value = view[key]
+    return value.extract() if hasattr(value, "extract") else value
+
+
+@pytest.mark.parametrize("view_cls", DICT_VIEWS)
+def test_edge_keys_round_trip(storage, view_cls):
+    keys = KH57_INT_KEYS if view_cls is EagerKh57View else [*EDGE_STR_KEYS, *EDGE_INT_KEYS]
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        for i, key in enumerate(keys):
+            view[key] = i
+        assert len(view) == len(keys)
+        for i, key in enumerate(keys):
+            assert key in view
+            assert view[key] == i
+        assert sorted(view, key=repr) == sorted(keys, key=repr)
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        assert len(view) == len(keys)
+        assert dict(view.items()) == {k: i for i, k in enumerate(keys)}
+        for key in keys[::2]:
+            del view[key]
+        assert len(view) == len(keys) - len(keys[::2])
+        for key in keys[::2]:
+            assert key not in view
+        for key in keys[1::2]:
+            assert key in view
+
+
+@pytest.mark.parametrize("view_cls", NESTED_VIEWS)
+def test_edge_keys_as_nested_container_names(storage, view_cls):
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        for key in EDGE_STR_KEYS:
+            view[key] = {"v": key, "nested": {key: 1}}
+        assert len(view) == len(EDGE_STR_KEYS)
+        for key in EDGE_STR_KEYS:
+            assert _read(view, key) == {"v": key, "nested": {key: 1}}
+        del view["a/b"]
+        del view["a\x00b"]
+        assert len(view) == len(EDGE_STR_KEYS) - 2
+        assert sorted(view) == sorted(k for k in EDGE_STR_KEYS if k not in ("a/b", "a\x00b"))
+
+
+def test_separator_in_key_does_not_leak_into_siblings(root):
+    """``a/b`` is one key, never the child ``b`` of a key ``a``."""
+    view = root.open_child("d", EagerDictView)
+    view["a"] = {"b": 1}
+    view["a/b"] = 2
+    assert sorted(view) == ["a", "a/b"]
+    assert view["a"] == {"b": 1}
+    assert view["a/b"] == 2
+    del view["a"]
+    assert list(view) == ["a/b"]
+    assert view["a/b"] == 2
+
+
+@pytest.mark.parametrize("view_cls", (EagerDictView, FlatDictView, EagerFractionalIndexedDictView))
+def test_out_of_range_int_key_is_rejected_cleanly(root, view_cls, backend):
+    """Ints past int64 do not fit a key: the same clear error on every op and backend."""
+    from virtuals.tkv.storage.exceptions import StorageOperationError
+
+    view = root.open_child("d", view_cls)
+    view["a"] = 1
+    with pytest.raises(StorageOperationError, match="out of supported range"):
+        view[2**64 + 5] = 1
+    with pytest.raises(StorageOperationError, match="out of supported range"):
+        2**64 + 5 in view  # noqa: B015
+    assert list(view) == ["a"]
+
+
+@pytest.mark.parametrize("view_cls", (EagerDictView, FlatDictView, EagerFractionalIndexedDictView))
+def test_true_and_one_are_the_same_key(root, view_cls):
+    """Python dict semantics: ``True == 1``, one key. The stored key reads back as ``1``."""
+    view = root.open_child("d", view_cls)
+    view[1] = "int"
+    view[True] = "bool"
+    assert len(view) == 1
+    assert view[1] == "bool"
+    assert view[True] == "bool"
+    assert True in view
+    assert list(view) == [1]
+    # The key's Python type is the codec's business: the binary codec reads
+    # back an int, mem keeps the last object written. They compare equal.
+    assert next(iter(view)) == 1
+    del view[True]
+    assert 1 not in view
+    assert len(view) == 0
+
+
+# ============================================================================
+# DEEP NESTING AND LARGE VALUES
+# ============================================================================
+
+
+def test_deep_nesting_round_trip(storage, backend):
+    """40 levels of dicts: write through views, read back whole, delete the root."""
+    depth = 40
+    value = {"leaf": 1}
+    for i in reversed(range(depth)):
+        value = {f"l{i}": value}
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("deep", EagerDictView)
+        view.store(value)
+        cur = view
+        for i in range(depth):
+            cur = cur.open_child(f"l{i}", EagerDictView)
+        assert cur["leaf"] == 1
+        cur["leaf2"] = 2
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("deep", EagerDictView)
+        got = view.extract()
+        cur = got
+        for i in range(depth):
+            cur = cur[f"l{i}"]
+        assert cur == {"leaf": 1, "leaf2": 2}
+        assert len(view) == 1
+        del view["l0"]
+        assert len(view) == 0
+        assert not view.open_child("l0", EagerDictView).container.exists()
+
+
+def test_deep_nesting_past_the_lmdb_key_limit(storage, backend):
+    """lmdb rejects encoded keys above 511 bytes; the other backends take them.
+
+    The limit is lmdb's own (``MDB_BAD_VALSIZE``) and surfaces as a generic
+    StorageOperationError on put. Documented here and in the
+    FractionalIndexedDictView module notes; nothing in the lmdb backend
+    names it yet.
+    """
+    from virtuals.tkv.storage.exceptions import StorageOperationError
+
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("deep", EagerDictView)
+        cur = view
+        for i in range(120):
+            cur = cur.open_child(f"level{i:03d}", EagerDictView)
+        if backend == "lmdb":
+            with pytest.raises(StorageOperationError):
+                cur["leaf"] = 1
+        else:
+            cur["leaf"] = 1
+            assert cur["leaf"] == 1
+
+
+@pytest.mark.parametrize("view_cls", (EagerDictView, FlatDictView))
+def test_long_key_past_the_lmdb_key_limit(root, view_cls, backend):
+    from virtuals.tkv.storage.exceptions import StorageOperationError
+
+    view = root.open_child("d", view_cls)
+    view["a"] = 1
+    key = "k" * 600
+    if backend == "lmdb":
+        with pytest.raises(StorageOperationError):
+            view[key] = 1
+        assert list(view) == ["a"]
+    else:
+        view[key] = 1
+        assert key in view
+        assert len(view) == 2
+        del view[key]
+        assert list(view) == ["a"]
+
+
+@pytest.mark.parametrize("view_cls", (EagerDictView, FlatDictView, EagerLogIndexedDictView))
+def test_large_values_round_trip(storage, view_cls):
+    blob = bytes(range(256)) * (4 * 2**12)  # 4 MiB
+    text = "é😀" * (2**19)  # 1 M chars, 3 MiB utf-8
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("big", view_cls)
+        view["blob"] = blob
+        view["text"] = text
+        view["small"] = 1
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("big", view_cls)
+        assert view["blob"] == blob
+        assert view["text"] == text
+        assert len(view) == 3
+        view["blob"] = b""
+        assert view["blob"] == b""
+        del view["text"]
+        assert sorted(view) == ["blob", "small"]
+
+
+# ============================================================================
+# COST: bool is one seek on every dict view, len never reads the data
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "view_cls",
+    (EagerDictView, FlatDictView, EagerLogIndexedDictView, EagerFractionalIndexedDictView),
+)
+def test_bool_is_one_seek_on_every_live_counted_view(costed, view_cls):
+    storage, counts = costed
+    costs = {}
+    for n in (10, 1000):
+        with storage.transaction() as tx:
+            view = Navigator(storage).root(tx).open_child("d", view_cls)
+            view.store({f"k{i}": {"a": i} if view_cls is not FlatDictView else i for i in range(n)})
+        costs[n] = measure(storage, counts, lambda root: bool(root.open_child("d", view_cls)))
+    assert costs[10] == costs[1000], costs
+    assert costs[10]["scan"] == 1, costs
+    assert costs[10]["scan_rows"] <= 2, costs
+
+
+@pytest.mark.parametrize(
+    "view_cls",
+    (EagerDictView, EagerLogIndexedDictView, EagerFractionalIndexedDictView),
+)
+def test_len_scans_children_not_descendants(costed, view_cls):
+    storage, counts = costed
+    n = 20
+    costs = {}
+    for width in (5, 200):
+        with storage.transaction() as tx:
+            view = Navigator(storage).root(tx).open_child("d", view_cls)
+            view.store({f"k{i}": {f"f{j}": j for j in range(width)} for i in range(n)})
+        costs[width] = measure(storage, counts, lambda root: len(root.open_child("d", view_cls)))
+    assert costs[5] == costs[200], costs
+    assert costs[5]["scan_rows"] <= 2 * n + 2, costs
