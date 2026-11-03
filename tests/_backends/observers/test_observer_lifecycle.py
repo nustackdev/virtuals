@@ -269,3 +269,83 @@ def test_failed_connect_runs_the_disconnect_hook():
     assert obs._dispatch_thread is None
     obs.disconnect()  # no-op
     assert obs.closed == 1
+
+
+# =============================================================================
+# review M2: the in-process pair never drops silently
+# =============================================================================
+
+
+def test_in_process_publisher_blocks_by_default_and_never_drops():
+    tr = InMemoryTransport()
+    pub = InMemoryPublisher(tr, queue_maxsize=2)
+    obs = InMemoryObserver(tr, dispatch_queue_maxsize=2)
+    pub.connect()
+    obs.connect()
+    gate = threading.Event()
+    got: list = []
+    try:
+
+        def slow(k):
+            gate.wait(10)
+            got.append(k)
+
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("k",)))).bind(slow)
+        done = threading.Event()
+        keys = [("k", i) for i in range(40)]
+
+        def writer():
+            pub.notify(keys)
+            done.set()
+
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+        assert not done.wait(1.5), "the in-process publisher dropped instead of blocking"
+        gate.set()
+        assert done.wait(5)
+        pub.flush(5)
+        obs.flush(5)
+        assert got == keys
+        assert pub.dropped_keys == 0
+    finally:
+        gate.set()
+        obs.disconnect()
+        pub.disconnect()
+
+
+def test_in_process_publisher_with_a_timeout_wakes_every_observer_after_a_drop():
+    tr = InMemoryTransport()
+    pub = InMemoryPublisher(tr, queue_maxsize=2, notify_timeout=0.2)
+    obs = InMemoryObserver(tr, dispatch_queue_maxsize=2)
+    other = InMemoryObserver(tr)
+    pub.connect()
+    obs.connect()
+    other.connect()
+    gate = threading.Event()
+    got: list = []
+    other_got: list = []
+    try:
+
+        def slow(k):
+            gate.wait(10)
+            got.append(k)
+
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("k",)))).bind(slow)
+        other.subscribe(SubscriptionOptions(filter=PrefixFilter(("x",)))).bind(other_got.append)
+        t0 = time.monotonic()
+        pub.notify([("k", i) for i in range(40)])
+        assert time.monotonic() - t0 < 1.0
+        assert pub.dropped_keys > 0
+        gate.set()
+        # once the transport moves again, every observer on it gets a keyless wake
+        assert _wait_until(lambda: got.count(None) == 1 and other_got == [None], 5), (
+            got,
+            other_got,
+        )
+        with pytest.raises(Exception, match="dropped"):
+            pub.flush(2)
+    finally:
+        gate.set()
+        other.disconnect()
+        obs.disconnect()
+        pub.disconnect()
