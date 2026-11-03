@@ -242,6 +242,21 @@ def test_dict_scan_cost_scales_with_children_not_descendants(storage, counts, op
         assert costs[500][name] <= 2, costs
 
 
+@pytest.mark.parametrize("view_cls", [EagerDictView, FlatDictView])
+def test_bool_scans_at_most_one_child(storage, counts, view_cls):
+    """``if d:`` stops at the first child: one row past the marker, whatever the size."""
+    value = _prim if view_cls is FlatDictView else _compound(50)
+    costs = {}
+    for n in SIZES:
+        _fill(storage, view_cls, n, value)
+        costs[n] = _measure(storage, counts, lambda root: bool(root.open_child("d", view_cls)))
+
+    assert costs[SIZES[0]] == costs[SIZES[-1]], costs
+    assert costs[SIZES[0]]["scan"] == 1, costs
+    # the site's own marker row, then the first child
+    assert costs[SIZES[0]]["scan_rows"] <= 2, costs
+
+
 def test_flat_dict_scan_cost_is_linear_in_keys(storage, counts):
     costs = {}
     for n in SIZES:

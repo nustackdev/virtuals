@@ -300,6 +300,19 @@ class Container:
         """
         return container_ops.count_children(self.site, self.ctx, validate=validate)
 
+    def has_children(self, *, validate: bool = False) -> bool:
+        """Whether at least one direct child exists. Costs one row, not a count.
+
+        Args:
+            validate: If True, validate this is a container (default False)
+
+        Raises:
+            ContainerNotFoundError: If this container doesn't exist (when validate=True)
+            ContainerTypeError: If site is not a container (when validate=True)
+            StorageInterfaceError: If context doesn't support reads
+        """
+        return container_ops.has_children(self.site, self.ctx, validate=validate)
+
     # ========================================================================
     # CHILDREN: CREATE (Write operations)
     # ========================================================================
