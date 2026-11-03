@@ -8,6 +8,7 @@ hand off directly and coroutines wait without blocking their event loop.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import threading
 import time
 import weakref
@@ -34,6 +35,34 @@ _SLOT_POLL_MAX = 0.005
 _Owner = tuple[int, "weakref.ref[asyncio.Task] | None"]
 
 
+class _Hold:
+    """One acquisition of a writer slot, marked in the context that took it."""
+
+    __slots__ = ("writer",)
+
+    def __init__(self, writer: WriterLock) -> None:
+        self.writer = writer
+
+    @property
+    def current(self) -> bool:
+        return self.writer._hold is self
+
+
+# The holds taken in this execution context. ``asyncio.to_thread``, new
+# tasks and ``asyncio.run`` copy the context, so a call made below the
+# holder sees its mark; an unrelated job on a reused pool worker does not.
+# A mark outlives its hold harmlessly: it only counts while it is the
+# writer's current hold.
+_HELD: contextvars.ContextVar[tuple[_Hold, ...]] = contextvars.ContextVar(
+    "virtuals_write_slot_held", default=()
+)
+
+
+def _mark_held(hold: _Hold) -> None:
+    """Mark ``hold`` in this context, dropping marks of ended holds."""
+    _HELD.set((*(h for h in _HELD.get() if h.current), hold))
+
+
 def _caller() -> _Owner:
     """Who is asking for the writer slot: this thread, and its running task if any.
 
@@ -55,14 +84,21 @@ class _SlotStorage(Protocol):
 class WriterLock:
     """A storage's writer slot: one in-process writer at a time.
 
-    The slot belongs to a thread and, on an event loop, to the task that
-    took it. A slot reserved with ``areserve`` passes to whoever begins the
-    transaction with it, so a transaction begun in a worker thread is owned
-    by that thread. It is a plain Lock (not an RLock), so it may be released
-    from a different thread than the one that took it.
+    Mutual exclusion is the lock alone. It is a plain Lock (not an RLock),
+    so it may be released from a different thread than the one that took it.
+
+    Nesting is told apart from waiting by execution context: ``acquire`` and
+    ``areserve`` mark the hold in the caller's context, and a begin that
+    sees the current hold's mark runs below the holder, so it would wait on
+    itself. A ``to_thread`` worker or an ``asyncio.run`` started inside an
+    open transaction carries the mark; another task, or an unrelated job on
+    a pool worker that once ran a handed-off transaction, does not. Limit:
+    ``run_in_executor`` runs jobs in the worker's own context, so a
+    transaction begun by a plain ``acquire`` in such a job and left open
+    after it returns marks that worker until it ends.
     """
 
-    __slots__ = ("_label", "_lock", "_owner")
+    __slots__ = ("_hold", "_label", "_lock", "_owner")
 
     def __init__(self, label: str) -> None:
         """Initialize a free slot.
@@ -73,6 +109,7 @@ class WriterLock:
         self._label = label
         self._lock = threading.Lock()
         self._owner: _Owner | None = None
+        self._hold: _Hold | None = None
 
     @property
     def lock(self) -> threading.Lock:
@@ -83,17 +120,29 @@ class WriterLock:
         """Forget any holder, e.g. in a forked child where it can never release."""
         self._lock = threading.Lock()
         self._owner = None
+        self._hold = None
 
     def _is_nested(self, me: _Owner) -> bool:
         """True if ``me`` can never get the slot because it already holds it.
 
-        That is the owner itself, or any caller on a thread whose owner is
-        that thread outside any task: a thread holding a sync write
-        transaction cannot release it while it is blocked in a nested call,
-        such as an ``asyncio.run`` begun inside it.
+        The caller must run below the current hold (its context carries the
+        mark). Then it is nested when it is outside any task (a sync call or
+        a ``to_thread`` worker below the holder), is the owning task itself,
+        or is a task on the owner's thread while the owner is that thread
+        outside any task (an ``asyncio.run`` inside a sync transaction). A
+        task spawned by the owning task carries the mark but is a waiter.
         """
-        owner = self._owner
-        return owner is not None and owner[0] == me[0] and (owner == me or owner[1] is None)
+        hold, owner = self._hold, self._owner
+        if hold is None or owner is None or hold not in _HELD.get():
+            return False
+        return me[1] is None or owner[1] == me[1] or (owner[1] is None and owner[0] == me[0])
+
+    def _held_by(self, me: _Owner) -> None:
+        """Record ``me`` as the owner of a fresh hold, marked in this context."""
+        hold = _Hold(self)
+        self._owner = me
+        self._hold = hold
+        _mark_held(hold)
 
     def _nested(self) -> StorageNestedTransactionError:
         return StorageNestedTransactionError(
@@ -107,17 +156,17 @@ class WriterLock:
     def acquire(self, timeout: float) -> None:
         """Block for the slot, up to ``timeout`` seconds.
 
-        Fails at once when the slot is held from this same thread: by this
-        task, or by this thread outside any task, with
-        ``StorageNestedTransactionError``; by another coroutine on this
-        thread's loop with ``StorageLockTimeoutError``, since that holder
-        cannot run to release it while this thread blocks.
+        Fails at once with ``StorageNestedTransactionError`` when called
+        below the current holder (see ``_is_nested``), and with
+        ``StorageLockTimeoutError`` when another task on this thread's loop
+        holds it, since that holder cannot run to release it while this
+        thread blocks.
         """
         me = _caller()
         if self._is_nested(me):
             raise self._nested()
         owner = self._owner
-        if owner is not None and owner[0] == me[0]:
+        if owner is not None and owner[0] == me[0] and owner[1] is not None:
             raise StorageLockTimeoutError(
                 f"Another task on this thread's event loop holds the write lock on this "
                 f"{self._label} storage; blocking for it here would stall the loop it "
@@ -125,7 +174,7 @@ class WriterLock:
             )
         if not self._lock.acquire(timeout=max(timeout, 0)):
             raise self._timed_out(timeout)
-        self._owner = me
+        self._held_by(me)
 
     async def areserve(self, timeout: float) -> threading.Lock:
         """Wait for the slot without blocking the event loop.
@@ -151,7 +200,7 @@ class WriterLock:
                 raise self._timed_out(timeout)
             await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, _SLOT_POLL_MAX)
-        self._owner = me
+        self._held_by(me)
         return lock
 
     def release(self, lock: threading.Lock | None = None) -> None:
@@ -165,6 +214,7 @@ class WriterLock:
         if lock is not None and lock is not self._lock:
             return
         self._owner = None
+        self._hold = None
         self._lock.release()
 
     def take(
@@ -175,7 +225,11 @@ class WriterLock:
         With ``write_slot`` the slot is already held and is taken over, and
         its owner becomes the caller: the thread (and task) running the
         transaction, which may differ from the one that reserved it, e.g. a
-        slot reserved on the loop and handed to ``asyncio.to_thread``.
+        slot reserved on the loop and handed to ``asyncio.to_thread``. The
+        hold keeps the mark of the context that reserved it, which a
+        ``to_thread`` worker or a task spawned there carries; a taker that
+        is a task is marked too. A plain thread taker is not, since its
+        context may be a pool worker's own, shared with unrelated jobs.
         Otherwise it is acquired, waiting up to ``timeout``.
 
         Returns:
@@ -186,7 +240,10 @@ class WriterLock:
         if write_slot is not None:
             write_slot._take(storage)
             previous = self._owner
-            self._owner = _caller()
+            me = _caller()
+            self._owner = me
+            if me[1] is not None and self._hold is not None:
+                _mark_held(self._hold)
 
             def give_back() -> None:
                 self._owner = previous
@@ -212,10 +269,11 @@ class WriteSlot:
     the holder's ``release`` still frees it.
 
     Use it as a context manager (``with await storage.areserve_write_slot()
-    as slot:``) so a slot no transaction took is released however the block
-    exits, cancellation included. As a backstop, a held slot that is garbage
-    collected is released too: once unreachable, nothing can ever hand it to
-    a transaction or release it.
+    as slot:``), or hand it to a transaction or ``release`` it explicitly
+    on every path: that is required. The finalizer is a last resort that
+    releases a held slot only once it is unreachable, which may be much
+    later, e.g. a cancelled task's traceback keeps it alive for as long as
+    the task object lives, and every other writer waits until then.
     """
 
     __slots__ = ("_lock", "_state", "_storage")
@@ -253,7 +311,7 @@ class WriteSlot:
         self.release()
 
     def __del__(self) -> None:
-        """Release a held slot dropped without ``release``."""
+        """Last resort: release a held slot that became unreachable unreleased."""
         try:
             self.release()
         except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
