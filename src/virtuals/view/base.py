@@ -326,6 +326,7 @@ def _view_for_structure(registry: ViewRegistry, structure: ContainerStructure) -
         builtins = (
             _views.ByteArrayView,
             _views.EagerDictView,
+            _views.EagerFractionalIndexedDictView,
             _views.EagerIndexedDictView,
             _views.EagerKh57View,
             _views.EagerListView,
