@@ -136,8 +136,14 @@ class DictViewBase(
         self._set_child_value(address, value)
 
     def __delitem__(self, address: str | int) -> None:
-        """Delete key (and its subtree). Silent if the key is missing."""
-        self.ensure_created()
+        """Delete key (and its subtree). Silent if the key is missing.
+
+        A delete never materializes the view: on an absent view it is a
+        no-op after one existence read, so nothing is written and no
+        parent bookkeeping fires.
+        """
+        if not self.container.exists():
+            return
         self.container.delete_child(address)
 
     def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:

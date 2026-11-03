@@ -95,10 +95,10 @@ class LightDictView(
         Args:
             key: Key to delete
 
-        Raises:
-            KeyError: If key not found
+        Silent if the key is missing; an absent view stays absent.
         """
-        self.ensure_created()
+        if not self.container.exists():
+            return
         self.container.delete_child(key)
 
     def __contains__(self, key: str | int) -> bool:

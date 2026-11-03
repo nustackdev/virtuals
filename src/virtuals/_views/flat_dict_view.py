@@ -96,12 +96,13 @@ class FlatDictView(
         self._put_child_primitive(key, value)
 
     def __delitem__(self, key: str | int) -> None:
-        """Delete key. Silent if the key is missing.
+        """Delete key. Silent if the key is missing; an absent view stays absent.
 
         Args:
             key: Key to delete
         """
-        self.ensure_created()
+        if not self.container.exists():
+            return
         self.container.delete_child(key)
 
     def __contains__(self, key: str | int) -> bool:
