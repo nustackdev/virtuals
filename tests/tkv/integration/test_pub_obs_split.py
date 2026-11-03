@@ -40,9 +40,7 @@ def test_new_pair_end_to_end(redis_url, unique_channel_prefix, redis_cleanup):
 
     try:
         hits: list = []
-        sub = obs.subscribe(
-            SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
-        )
+        sub = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("users",))))
         sub.bind(lambda k: hits.append(k))
 
         # subscribe() returned: the registration is live, write at once.
@@ -56,9 +54,7 @@ def test_new_pair_end_to_end(redis_url, unique_channel_prefix, redis_cleanup):
         obs.disconnect()
 
 
-def test_new_pair_zero_interest_no_publishes(
-    redis_url, unique_channel_prefix, redis_cleanup
-):
+def test_new_pair_zero_interest_no_publishes(redis_url, unique_channel_prefix, redis_cleanup):
     """No observers anywhere -> new publisher never PUBLISHes."""
     import redis as _redis
 
@@ -85,9 +81,7 @@ def test_new_pair_zero_interest_no_publishes(
             pass
 
 
-def test_new_pair_local_delivery_via_transport(
-    redis_url, unique_channel_prefix, redis_cleanup
-):
+def test_new_pair_local_delivery_via_transport(redis_url, unique_channel_prefix, redis_cleanup):
     """Same-process Publisher + Observer: local write reaches local sub via Redis.
 
     In the split design there is no local shortcut path; the write travels

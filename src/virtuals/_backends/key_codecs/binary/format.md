@@ -31,12 +31,12 @@
 3. **Compiler Optimizations**
 
    ```python
-   boundscheck=False      # No array bounds checking
-   wraparound=False       # No negative indexing
-   cdivision=True         # C division semantics
-   initializedcheck=False # No initialization checks
-   nonecheck=False        # No None checks
-   overflowcheck=False    # Manual overflow handling
+   boundscheck = False  # No array bounds checking
+   wraparound = False  # No negative indexing
+   cdivision = True  # C division semantics
+   initializedcheck = False  # No initialization checks
+   nonecheck = False  # No None checks
+   overflowcheck = False  # Manual overflow handling
    ```
 
 4. **Integer Encoding**
@@ -109,8 +109,10 @@ This preserves ordering:
 ```python
 # Pass 1: Calculate exact size
 for component in key:
-    if int: size += 1 + 8 + 1
-    if str: size += 1 + len(utf8_bytes) + 1
+    if int:
+        size += 1 + 8 + 1
+    if str:
+        size += 1 + len(utf8_bytes) + 1
 
 # Pass 2: Allocate and fill
 buffer = allocate(size)

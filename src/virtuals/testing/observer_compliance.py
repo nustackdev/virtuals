@@ -582,9 +582,7 @@ class ObserverCompliance:
         def callback(key):
             notifications.append(key)
 
-        sub = bundle.observer.subscribe(
-            SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
-        )
+        sub = bundle.observer.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("users",))))
         sub.bind(callback)
 
         with bundle.storage.transaction() as tx:
@@ -601,9 +599,7 @@ class ObserverCompliance:
         def callback(key):
             notifications.append(key)
 
-        sub = bundle.observer.subscribe(
-            SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
-        )
+        sub = bundle.observer.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("users",))))
         sub.bind(callback)
 
         with bundle.storage.transaction() as tx:
@@ -629,9 +625,7 @@ class ObserverCompliance:
         def callback(key):
             notifications.append(key)
 
-        sub = bundle.observer.subscribe(
-            SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
-        )
+        sub = bundle.observer.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("users",))))
         sub.bind(callback)
 
         # Delete the key
@@ -649,9 +643,7 @@ class ObserverCompliance:
         def callback(key):
             notifications.append(key)
 
-        sub = bundle.observer.subscribe(
-            SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
-        )
+        sub = bundle.observer.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("users",))))
         sub.bind(callback)
         sub.close()
 
@@ -700,9 +692,7 @@ class ObserverCompliance:
         def callback(key):
             notifications.append(key)
 
-        sub = bundle.observer.subscribe(
-            SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
-        )
+        sub = bundle.observer.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("users",))))
         sub.bind(callback)
 
         with bundle.storage.transaction() as tx:
@@ -731,9 +721,7 @@ class ObserverCompliance:
         def callback2(key):
             notifications2.append(key)
 
-        sub = bundle.observer.subscribe(
-            SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
-        )
+        sub = bundle.observer.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("users",))))
         sub.bind(callback1)
         sub.bind(callback2)
 
@@ -773,9 +761,7 @@ class ObserverCompliance:
         def callback(key):
             notifications.append(key)
 
-        sub = bundle.observer.subscribe(
-            SubscriptionOptions(filter=PrefixFilter(prefix=("users",)))
-        )
+        sub = bundle.observer.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("users",))))
         sub.bind(callback)
 
         tx = bundle.storage.begin_transaction()

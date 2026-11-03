@@ -3,6 +3,11 @@
 Sends batches onto a shared InMemoryTransport. The transport fans out to
 every registered observer listener synchronously on this publisher's
 worker thread.
+
+There is no stalled server to protect a writer against, so notify() keeps
+pure backpressure by default (`notify_timeout=None`: it blocks until the
+queue has room, never drops). With a timeout set, a drop is followed by a
+resync fan-out on the transport, so every observer on it re-reads.
 """
 
 from __future__ import annotations
@@ -34,12 +39,16 @@ class InMemoryPublisher(PublisherBase):
         transport: InMemoryTransport,
         *,
         queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
+        notify_timeout: float | None = None,
     ) -> None:
-        super().__init__(queue_maxsize=queue_maxsize)
+        super().__init__(queue_maxsize=queue_maxsize, notify_timeout=notify_timeout)
         self._transport = transport
 
     def _publish_batch(self, batch: list[Key]) -> None:
         self._transport.publish(batch)
+
+    def _send_resync(self) -> None:
+        self._transport.resync()
 
 
 if TYPE_CHECKING:

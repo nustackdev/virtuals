@@ -390,3 +390,84 @@ def test_failed_connect_and_drop_leave_no_client(own_valkey):
         assert _wait_until(lambda: len(probe.client_list()) == before, 2)
     finally:
         probe.close()
+
+
+# =============================================================================
+# review M3: a drop recorded while the wake is in flight keeps its own wake
+# =============================================================================
+
+
+def test_drop_recorded_during_a_resync_send_gets_its_own_wake():
+    p = _Gated(fail=True, delay=0.01, publish_retry_seconds=0.1)
+    p.connect()
+    real = p._send_resync
+    once = [True]
+
+    def racing():
+        real()
+        if once[0]:  # a writer's notify() times out while the wake is on the wire
+            once[0] = False
+            p._record_drop(1, PublisherOperationError("late drop"))
+
+    p._send_resync = racing
+    try:
+        p.notify(("k", 1))
+        with pytest.raises(PublisherOperationError):
+            p.flush(timeout=2)
+        p.fail = False
+        assert _wait_until(lambda: p.resyncs == 1, 3)
+        assert p._resync_pending, "the late drop was cleared with the first wake"
+        assert _wait_until(lambda: p.resyncs == 2, 3)
+        time.sleep(0.3)
+        assert p.resyncs == 2
+    finally:
+        p.disconnect()
+
+
+# =============================================================================
+# review m2: a stall costs the first commit the timeout, later ones nothing
+# =============================================================================
+
+
+def test_stalled_queue_drops_later_calls_at_once_until_the_worker_sends():
+    p = _Gated(queue_maxsize=1, notify_timeout=0.3)
+    p.connect()
+    try:
+        p.notify(("a",))  # in flight, gated
+        time.sleep(0.05)
+        p.notify(("b",))  # queued
+        t0 = time.monotonic()
+        p.notify(("c",))  # first drop: waits the timeout
+        first = time.monotonic() - t0
+        assert 0.25 < first < 0.6, first
+        t0 = time.monotonic()
+        for i in range(10):
+            p.notify(("d", i))
+        assert time.monotonic() - t0 < 0.05, "later writers waited again"
+        assert p.dropped_keys == 11
+        p.gate.set()  # the worker sends again: writers wait for room again
+        assert _wait_until(lambda: sorted(p.sent) == [("a",), ("b",)], 2)
+        p.gate.clear()
+        p.notify(("e",))
+        time.sleep(0.05)
+        p.notify(("f",))
+        t0 = time.monotonic()
+        p.notify(("g",))
+        assert 0.25 < time.monotonic() - t0 < 0.6
+    finally:
+        p.gate.set()
+        p.disconnect()
+
+
+# =============================================================================
+# review m6: a drop just before disconnect still wakes
+# =============================================================================
+
+
+def test_drop_right_before_disconnect_sends_the_wake_in_the_drain():
+    p = _Gated(delay=0.01, queue_maxsize=1, notify_timeout=0.1)
+    p.connect()
+    p.gate.set()
+    p._record_drop(1, PublisherOperationError("late drop"))
+    p.disconnect()
+    assert p.resyncs == 1

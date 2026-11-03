@@ -262,12 +262,24 @@ def test_hash_or_absorbing_pass_all_matches_pass_all():
 @pytest.mark.parametrize(
     "f,key,expected",
     [
-        (And(filters=(PrefixFilter(prefix=("users",)), LengthFilter(length=3))), ("users", "a", "b"), True),
-        (And(filters=(PrefixFilter(prefix=("users",)), LengthFilter(length=3))), ("users", "a"), False),
+        (
+            And(filters=(PrefixFilter(prefix=("users",)), LengthFilter(length=3))),
+            ("users", "a", "b"),
+            True,
+        ),
+        (
+            And(filters=(PrefixFilter(prefix=("users",)), LengthFilter(length=3))),
+            ("users", "a"),
+            False,
+        ),
         (Or(filters=(PrefixFilter(prefix=("a",)), PrefixFilter(prefix=("b",)))), ("a", "x"), True),
         (Or(filters=(PrefixFilter(prefix=("a",)), PrefixFilter(prefix=("b",)))), ("c",), False),
         (PrefixFilter(prefix=()), ("anything",), True),  # canonicalizes to PassAll
-        (WildcardFilter(pattern=(WILDCARD, WILDCARD)), ("a", "b"), True),  # canonicalizes to LengthFilter(2)
+        (
+            WildcardFilter(pattern=(WILDCARD, WILDCARD)),
+            ("a", "b"),
+            True,
+        ),  # canonicalizes to LengthFilter(2)
         (WildcardFilter(pattern=(WILDCARD, WILDCARD)), ("a",), False),
     ],
 )

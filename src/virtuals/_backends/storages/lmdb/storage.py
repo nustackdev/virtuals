@@ -41,8 +41,7 @@ try:
     import lmdb
 except ImportError as e:
     raise ImportError(
-        "LMDB python bindings are required for LMDBStorage. "
-        "Install via: [uv] pip install lmdb"
+        "LMDB python bindings are required for LMDBStorage. Install via: [uv] pip install lmdb"
     ) from e
 
 

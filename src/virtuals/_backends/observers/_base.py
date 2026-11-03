@@ -314,6 +314,18 @@ class ObserverBase:
         if self._connected:
             self._enqueue(_Resync(filter_hash))
 
+    def _dispatch_resync_all(self) -> None:
+        """Queue one keyless resync wake per filter hash with a local subscription.
+
+        A transport calls this when a publisher on it dropped keys: nobody
+        knows which filters they matched, so every subscription re-reads.
+        """
+        registry = self._registry
+        if not self._connected or registry is None:
+            return
+        for h in {s.filter_hash for s in registry.subscriptions()}:
+            self._enqueue(_Resync(h))
+
     def _enqueue_nowait(self, item: object) -> bool:
         """Put `item` on the dispatch queue if there is room. False when full."""
         try:
