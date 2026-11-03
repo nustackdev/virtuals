@@ -26,6 +26,7 @@ Three-layer architecture for child operations:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from logging import getLogger
 from typing import TYPE_CHECKING, cast
 
@@ -79,6 +80,7 @@ __all__ = [
     "get_child_primitive",
     "get_child_primitive_unsafe",
     "get_child_type",
+    "has_children",
     "iter_child_keys",
     "iter_child_primitive_values",
     "iter_child_values",
@@ -532,6 +534,44 @@ def count_children(
     for _ in require_read_context(ctx).scan(_child_scan_options(site)).keys():
         counter += 1
     return counter
+
+
+def has_children(
+    site: site_.Site,
+    ctx: StorageContextType,
+    validate: bool = False,
+) -> bool:
+    """Whether site has at least one direct child.
+
+    One child scan stopped at its first hit, so it visits at most the
+    site's own row and one child whatever the container's size.
+
+    Args:
+        site: Container site
+        ctx: Storage context (transaction, snapshot or write batch)
+        validate: If True, validate site is a container (default False)
+
+    Returns:
+        True if at least one direct child exists
+
+    Raises:
+        ContainerNotFoundError: If container doesn't exist (when validate=True)
+        ContainerTypeError: If site is not a container (when validate=True)
+        StorageInterfaceError: If context doesn't support read access
+    """
+    if validate:
+        validate_is_container(site, ctx)
+
+    options = replace(_child_scan_options(site), limit=1)
+    keys = require_read_context(ctx).scan(options).keys()
+    try:
+        next(keys)
+    except StopIteration:
+        return False
+    else:
+        return True
+    finally:
+        keys.close()
 
 
 # ============================================================================

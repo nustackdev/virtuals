@@ -153,6 +153,10 @@ class LiveChildrenCountBase:
         """
         return sum(1 for _ in self.container.iter_child_keys())
 
+    def __bool__(self) -> bool:
+        """True if any child exists. One row, so ``if view:`` never counts."""
+        return self.container.has_children()
+
 
 class AddressMappingBase(Generic[A]):
     """Base for converting view-level addresses to container keys.

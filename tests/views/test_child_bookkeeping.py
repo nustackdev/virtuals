@@ -315,6 +315,20 @@ def test_dict_len_is_live_and_ignores_stale_counter(root_view):
     assert len(rows) == 3
 
 
+@pytest.mark.parametrize("view_type", (EagerDictView, LazyDictView, FlatDictView, LightDictView))
+def test_dict_truthiness_follows_children(root_view, view_type):
+    """``bool(d)`` is live like ``len(d)``, and ignores a stale counter."""
+    d = root_view.open_child("d", view_type)
+    assert not d
+    d.ensure_created()
+    d.container.put_metadata("__len__", 99)
+    assert not d
+    d["a"] = 1
+    assert d
+    del d["a"]
+    assert not d
+
+
 def test_dict_len_counts_unsafe_writes(root_view):
     view = root_view.ensure_child("d", EagerDictView)
     view._unsafe_primitive_write("a", 1)
