@@ -190,11 +190,14 @@ def _release_connection(
     pubsub: object,
     redis_sub: object,
     redis_: object,
+    unsubscribe: bool = False,
 ) -> None:
     """Stop the threads and close everything one connect() opened.
 
     Module level and free of `self`: it runs from disconnect() and, for an
-    observer dropped without disconnect(), from its finalizer.
+    observer dropped without disconnect(), from its finalizer. The finalizer
+    does no round trip (closing the socket unsubscribes server side); only
+    disconnect() sends the UNSUBSCRIBE.
     """
     stop.set()
     if wake_w is not None:
@@ -202,9 +205,9 @@ def _release_connection(
             wake_w.send(b"\0")
         except (BlockingIOError, OSError):
             pass
-    if pubsub is not None:
+    if pubsub is not None and unsubscribe:
         try:
-            pubsub.unsubscribe()
+            pubsub.unsubscribe()  # type: ignore[attr-defined]
         except Exception as e:
             logger.warning("Error unsubscribing pubsub: %s", e)
     _close_quietly("pubsub", pubsub)
@@ -439,22 +442,26 @@ class RedisObserver(ObserverBase):
         self._rereg_q.put(None)
         self._wake_listener()
 
-        for t in (self._listener_thread, self._maint_thread):
+        for attr in ("_listener_thread", "_maint_thread"):
+            t = getattr(self, attr)
             if t is not None and t.is_alive():
                 t.join(timeout=_THREAD_JOIN_SECONDS)
                 if t.is_alive():
+                    # Kept: the next connect() refuses while it is alive.
                     logger.warning(
                         "Redis observer thread %s still running after %.1fs; it exits on its own",
                         t.name,
                         _THREAD_JOIN_SECONDS,
                     )
-        self._listener_thread = None
-        self._maint_thread = None
+                    continue
+            setattr(self, attr, None)
 
         if self._conn_finalizer is not None:
             self._conn_finalizer.detach()
             self._conn_finalizer = None
-        _release_connection(self._obs_stop_event, None, self._pubsub, self._redis_sub, self._redis)
+        _release_connection(
+            self._obs_stop_event, None, self._pubsub, self._redis_sub, self._redis, unsubscribe=True
+        )
         self._pubsub = None
         self._redis_sub = None
         self._redis = None
@@ -719,6 +726,10 @@ class RedisObserver(ObserverBase):
                     ack = None
             elif action == "unsub":
                 self._pubsub.unsubscribe(channel)
+            elif action == "resync":
+                # Behind every key parked so far, so the wake follows them.
+                self._overflow.append(_Resync(channel))
+                self._drain_overflow()
         except Exception as e:
             logger.warning("Listener cmd %s(%s) failed: %s", action, channel, e)
             if ack is not None:
@@ -821,14 +832,20 @@ class RedisObserver(ObserverBase):
             return False
 
         # 2. Parked keys first, so they stay ahead of anything read now. With
-        #    a backlog this is also where the step waits (for queue room).
-        self._drain_overflow(wait=_OVERFLOW_POLL_SECONDS)
+        #    a backlog this is also where the step waits (for queue room),
+        #    unless a SUBSCRIBE awaits its confirmation: then the listener
+        #    reads back to back, so the confirmation is not paced by the
+        #    backlog ahead of it.
+        pending = bool(self._pending)
+        self._drain_overflow(wait=0.0 if pending else _OVERFLOW_POLL_SECONDS)
         # Past the overflow cap the socket is left unread (backpressure into
         # valkey), unless a SUBSCRIBE awaits its confirmation: that must be
         # read whatever the backlog, so subscribe() never depends on
-        # callback queue room. The extra buffering is bounded by the inbound
-        # rate over the subscribe timeout.
-        room = len(self._overflow) < self._dispatch_queue_maxsize or bool(self._pending)
+        # callback queue room. In that state the overflow can absorb what
+        # the server buffered for this client, so the real bound is valkey's
+        # pubsub output buffer limit; past it valkey disconnects the client,
+        # which degrades to a reconnect and a resync wake.
+        room = len(self._overflow) < self._dispatch_queue_maxsize or pending
 
         # 3. Take one message if redis-py has one and there is room for it,
         #    else sleep until there is one, a command is queued, or (with keys
@@ -843,11 +860,14 @@ class RedisObserver(ObserverBase):
                 stop.wait(0.5)
                 return None
         if msg is None:
-            # With keys parked the drain above already waited; just poll the
-            # sockets so commands and confirmations are not delayed.
-            return self._wait_spec(
-                watch_pubsub=room, timeout=0.0 if self._overflow else _LISTENER_IDLE_SECONDS
-            )
+            # With keys parked the drain above already waited (or, with a
+            # SUBSCRIBE pending, must not wait long): poll the sockets so
+            # commands and confirmations are not delayed.
+            if not self._overflow:
+                timeout = _LISTENER_IDLE_SECONDS
+            else:
+                timeout = _OVERFLOW_POLL_SECONDS if pending else 0.0
+            return self._wait_spec(watch_pubsub=room, timeout=timeout)
 
         mtype = msg.get("type")
         channel = msg["channel"]
@@ -870,12 +890,15 @@ class RedisObserver(ObserverBase):
         # Hash-scoped dispatch prevents duplicate delivery when a key matches
         # multiple registered filters (arriving on multiple notif channels),
         # and drops the router's over-delivery (hints are a superset).
-        raw_keys = payload.get("keys", [])
+        raw_keys = payload.get("keys")
         if raw_keys:
             self._overflow.extend(_TaggedKey(tuple(k), filter_hash_str) for k in raw_keys)
-        else:
+        elif raw_keys == []:
             # A publisher that dropped keys asks every hash to re-read.
             self._overflow.append(_Resync(filter_hash_str))
+        else:
+            logger.warning("Payload without keys on %s ignored", msg.get("channel"))
+            return
         self._drain_overflow()
 
     # -- Maintenance thread ---------------------------------------------------
@@ -894,8 +917,9 @@ class RedisObserver(ObserverBase):
         logger.info("Re-registered filter hash %s after reconnect", h)
         self._mark_ready(h, gen)
         # Routed again: wake each local sub once so it re-reads whatever was
-        # written while the hash was not routed.
-        self._dispatch_resync(h)
+        # written while the hash was not routed. Through the listener, so
+        # the wake queues behind keys it read before the reconnect.
+        self._dispatch_pubsub_cmd("resync", h, wait=False)
         return True
 
     def _mark_ready(self, h: str, gen: int) -> None:

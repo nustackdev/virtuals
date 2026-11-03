@@ -299,3 +299,82 @@ def test_dropped_observer_is_collected_and_releases_everything(redis_url, prefix
     finally:
         pub.disconnect()
         probe.close()
+
+
+# =============================================================================
+# review M1: subscribe behind a large backlog (hundreds of messages)
+# =============================================================================
+
+
+def test_subscribe_behind_hundreds_of_backlog_messages_returns_fast(redis_url, prefix):
+    """The confirmation sits behind every message valkey buffered; with a
+    SUBSCRIBE pending the listener reads back to back instead of pacing on
+    queue room, so subscribe() is not `messages_ahead x 20ms`."""
+    obs, pub = _pair(redis_url, prefix, dispatch_queue_maxsize=10, subscribe_timeout=2.0)
+    release = threading.Event()
+    n_slow = [0]
+    other_got: list = []
+    try:
+
+        def slow(k):
+            release.wait(30)
+            n_slow[0] += 1
+
+        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("s",)))).bind(slow)
+        n = 50_000  # 200 messages of 250 keys
+        pub.notify([("s", i) for i in range(n)])
+        pub.flush(20)
+        time.sleep(0.3)  # valkey has buffered the backlog for this client
+
+        t0 = time.monotonic()
+        sub = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("other",))))
+        assert time.monotonic() - t0 < 1.0, "subscribe paced by the backlog"
+        sub.bind(other_got.append)
+        pub.notify(("other", 1))
+        pub.flush(2)
+    finally:
+        release.set()
+        try:
+            assert _wait_until(lambda: n_slow[0] == n and other_got == [("other", 1)], 30)
+        finally:
+            pub.disconnect()
+            obs.disconnect()
+
+
+# =============================================================================
+# review m1: a listener stuck past the join keeps its reference, connect refuses
+# =============================================================================
+
+
+def test_listener_outliving_disconnect_blocks_the_next_connect(redis_url, prefix, caplog):
+    import logging
+
+    from virtuals._backends.observers.redis_pubsub import RedisObserver
+
+    obs = RedisObserver(redis_url=redis_url, channel_prefix=prefix)
+    obs.connect()
+    block = threading.Event()
+    entered = threading.Event()
+
+    def stuck(stop):
+        entered.set()
+        block.wait(10)
+        return False
+
+    obs._listener_step = stuck
+    assert entered.wait(3)
+    old = obs._listener_thread
+    caplog.set_level(logging.WARNING, logger="virtuals._backends.observers.redis_pubsub")
+    try:
+        obs.disconnect()
+        assert old.is_alive()
+        assert obs._listener_thread is old
+        assert any(old.name in r.message for r in caplog.records)
+        with pytest.raises(ObserverConnectionError, match="still running"):
+            obs.connect()
+    finally:
+        block.set()
+        old.join(3)
+    assert not old.is_alive()
+    obs.connect()
+    obs.disconnect()
