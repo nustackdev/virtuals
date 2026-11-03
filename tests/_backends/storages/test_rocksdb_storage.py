@@ -827,3 +827,11 @@ def test_secondary_catches_up_past_the_staleness_bound_under_overlapping_readers
     finally:
         secondary.close()
         primary.close()
+
+
+def test_grant_to_a_loop_closed_after_the_handoff_is_reclaimed(storage) -> None:
+    cases.grant_to_a_loop_closed_after_the_handoff_is_reclaimed(storage)
+
+
+def test_areserve_timeout_meeting_a_release_is_a_lock_timeout(storage) -> None:
+    cases.areserve_timeout_meeting_a_release_is_a_lock_timeout(storage)

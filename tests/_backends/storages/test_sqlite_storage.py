@@ -1692,3 +1692,11 @@ def test_areserve_task_destroyed_with_its_loop_leaves_no_ghost(storage) -> None:
 
 def test_areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage) -> None:
     cases.areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage)
+
+
+def test_grant_to_a_loop_closed_after_the_handoff_is_reclaimed(storage) -> None:
+    cases.grant_to_a_loop_closed_after_the_handoff_is_reclaimed(storage)
+
+
+def test_areserve_timeout_meeting_a_release_is_a_lock_timeout(storage) -> None:
+    cases.areserve_timeout_meeting_a_release_is_a_lock_timeout(storage)

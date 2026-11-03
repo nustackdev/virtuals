@@ -20,7 +20,7 @@ Backends: sqlite, lmdb, rocksdb, mem. A backend ships only if it passes the conf
 
 ## 3. Errors and retry
 
-- Two classes are retryable: `StorageTransactionConflictError` (the backend found a conflict at commit) and `StorageLockTimeoutError` (a wait for the writer slot or a lock ran out). Contention surfaces as one of these two, never as a backend-specific error.
+- Two classes are retryable: `StorageTransactionConflictError` (the backend found a conflict at commit, or a snapshot lost its view, as when a rocksdb secondary caught up with the primary; retry by opening a new snapshot) and `StorageLockTimeoutError` (a wait for the writer slot or a lock ran out). Contention surfaces as one of these two, never as a backend-specific error.
 - Everything else is not retryable: `StorageNestedTransactionError`, `StorageClosedError`, `StorageOperationError`.
 - A scan resumed after its snapshot, transaction or storage closed raises `StorageClosedError`, never a buffered row.
 - The sync wait for the writer slot is `busy_timeout` (default 60s). On an event loop thread a sync begin waits at most `LOOP_THREAD_WAIT_CAP` (50ms) for a holder on another thread or in another process, then raises `StorageLockTimeoutError`. The loop is never stalled for long; the caller retries. A sync begin whose own loop has another task holding the slot raises at once, since that holder could never run to release it. Coroutines use `areserve_write_slot()` and pass the slot to `begin_transaction(write_slot=...)`; that path waits without blocking the loop, including for a lock held by another process on sqlite and lmdb.

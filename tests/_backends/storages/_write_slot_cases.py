@@ -633,3 +633,87 @@ def areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage) -> Non
     finally:
         del task
         gc.collect()
+
+
+# =============================================================================
+# Re-review (29-rereview-rb F1, F2): a grant to a loop that closes later, a timeout
+# landing with a release
+# =============================================================================
+
+
+def grant_to_a_loop_closed_after_the_handoff_is_reclaimed(storage) -> None:
+    """A coroutine queued on a loop that is stopped at the handoff holds the grant until the loop closes, not for good.
+
+    The loop ran once, left the task queued and stopped. The holder's
+    release hands the slot to that task, whose loop never runs again.
+    Once the loop is closed, the next acquire takes the slot back.
+    """
+    held, release = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with storage.transaction() as t:
+            t.put(KEY, b"holder")
+            held.set()
+            release.wait(5)
+
+    th = threading.Thread(target=holder)
+    th.start()
+    assert held.wait(5)
+    loop = asyncio.new_event_loop()
+    task = loop.create_task(storage.areserve_write_slot())
+    loop.run_until_complete(asyncio.sleep(0.01))  # queued; the loop is stopped, not closed
+    release.set()
+    th.join(5)  # the slot was handed to the task
+    busy, storage._busy_timeout = storage._busy_timeout, 0.2
+    try:
+        with pytest.raises(StorageLockTimeoutError):
+            storage.begin_transaction()  # held by a loop that may still run
+    finally:
+        storage._busy_timeout = busy
+    loop.close()
+    _write_fast(storage)  # reclaimed at this acquire
+    del task
+    gc.collect()
+    _write_fast(storage)
+
+
+def areserve_timeout_meeting_a_release_is_a_lock_timeout(storage) -> None:
+    """An areserve that times out as a release lands raises the retryable lock timeout, not closed.
+
+    On timeout the future is cancelled and the task resumes one turn
+    later; a release in that window skips the waiter as dead and unlocks.
+    The release here runs as a done callback on the future, standing in
+    for a release from another thread in that window.
+    """
+    held, release = threading.Event(), threading.Event()
+    box: dict = {}
+
+    def holder() -> None:
+        box["txn"] = storage.begin_transaction()
+        held.set()
+        release.wait(5)
+
+    th = threading.Thread(target=holder)
+    th.start()
+    assert held.wait(5)
+    writer = storage._writer
+
+    async def main() -> None:
+        busy, storage._busy_timeout = storage._busy_timeout, 0.05
+        try:
+            task = asyncio.create_task(storage.areserve_write_slot())
+            await asyncio.sleep(0.01)
+            waiter = writer._waiters[0]
+            # The holder's transaction is ended from the callback itself, so
+            # the release lands inside the window, on this very turn.
+            waiter.future.add_done_callback(lambda _: box["txn"].abort())
+            with pytest.raises(StorageLockTimeoutError):
+                await task
+        finally:
+            storage._busy_timeout = busy
+            release.set()
+        th.join(5)
+        assert waiter.state == "abandoned"
+
+    asyncio.run(main())
+    _write_fast(storage)
