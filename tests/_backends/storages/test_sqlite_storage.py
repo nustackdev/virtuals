@@ -136,6 +136,17 @@ def _option_grid(keys: list[tuple], codec: BinaryCodec) -> list[StorageScanOptio
             StorageScanOptions(start=site, limit=100),
             StorageScanOptions(break_filter=prefix),
             StorageScanOptions(reverse=True, break_filter=prefix),
+            StorageScanOptions(
+                start=site, break_filter=prefix, filter=child, max_depth=len(site) + 1
+            ),
+            StorageScanOptions(
+                start_encoded=codec.upper_bound_of_prefix(site),
+                reverse=True,
+                break_filter=prefix,
+                filter=child,
+                max_depth=len(site) + 1,
+            ),
+            StorageScanOptions(start=site, break_filter=prefix, max_depth=2, limit=5),
         ]
     return grid
 
@@ -176,6 +187,75 @@ def test_delete_while_iterating(storage: SQLiteStorage) -> None:
     with storage.snapshot() as snap:
         assert snap.get(("y", 0)) == b"v3000"
         assert snap.get(("x", 5)) is EMPTY
+
+
+def _count_pages(storage: SQLiteStorage, options: StorageScanOptions) -> tuple[int, int]:
+    """Run a scan, return (keys yielded, pages queried)."""
+    from virtuals._backends.storages.sqlite.scan import SQLiteScan
+
+    fetch = SQLiteScan._fetch_page
+    pages = 0
+
+    def counted(self, *args, **kwargs):
+        nonlocal pages
+        pages += 1
+        return fetch(self, *args, **kwargs)
+
+    SQLiteScan._fetch_page = counted  # type: ignore[method-assign]
+    try:
+        with storage.snapshot() as snap:
+            n = sum(1 for _ in snap.scan(options).keys())
+    finally:
+        SQLiteScan._fetch_page = fetch  # type: ignore[method-assign]
+    return n, pages
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_max_depth_skip_stays_in_page(storage: SQLiteStorage, reverse: bool) -> None:
+    """A skip over a small subtree moves on within the fetched page, no re-query."""
+    children = 1000
+    keys = [("d",)]
+    for i in range(children):
+        keys += [("d", i), ("d", i, "x"), ("d", i, "y")]
+    _fill(storage, keys)
+    prefix = PrefixFilter(prefix=("d",))
+    if reverse:
+        options = StorageScanOptions(
+            start_encoded=storage.codec.upper_bound_of_prefix(("d",)),
+            reverse=True,
+            break_filter=prefix,
+            filter=prefix & LengthFilter(length=2),
+            max_depth=2,
+        )
+    else:
+        options = StorageScanOptions(
+            start=("d",),
+            break_filter=prefix,
+            filter=prefix & LengthFilter(length=2),
+            max_depth=2,
+        )
+
+    n, pages = _count_pages(storage, options)
+    assert n == children
+    # 3001 rows in pages that double up to 1024: a handful of queries, not one per child
+    assert pages <= 12, pages
+
+
+def test_max_depth_wide_subtree_reseeks_small(storage: SQLiteStorage) -> None:
+    """A subtree wider than a page is left with one small query per child."""
+    children, width = 20, 2000
+    keys = [("d",)]
+    for i in range(children):
+        keys += [("d", i)] + [("d", i, j) for j in range(width)]
+    _fill(storage, keys)
+    prefix = PrefixFilter(prefix=("d",))
+    options = StorageScanOptions(
+        start=("d",), break_filter=prefix, filter=prefix & LengthFilter(length=2), max_depth=2
+    )
+
+    n, pages = _count_pages(storage, options)
+    assert n == children
+    assert pages <= children + 2, pages
 
 
 # =========================================================================
