@@ -38,6 +38,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from logging import getLogger
@@ -89,7 +90,7 @@ class WriterThread:
     transaction per environment).
     """
 
-    __slots__ = ("_lock", "_name", "_queue", "_stopped", "_thread")
+    __slots__ = ("_gate_since", "_lock", "_name", "_queue", "_stopped", "_thread", "_wait_since")
 
     def __init__(self, name: str) -> None:
         """Initialize an idle writer thread.
@@ -104,6 +105,36 @@ class WriterThread:
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
         self._stopped = False
+        # When the oldest waiting requester handed its job over, 0.0 when
+        # none waits. Read by the storage's readers, see ``_yield_to_writer``:
+        # a job in flight for longer than it should take means the thread,
+        # or the requester it answers, cannot get the GIL back from threads
+        # spinning on short py-lmdb calls (CPython's convoy effect). Written
+        # by requesters only; a late clear by one of two overlapping
+        # requesters is harmless, the other clears its own stamp.
+        self._wait_since = 0.0
+        # The same for the storage's gate calls (``flock`` releases the GIL
+        # too), which readers answer with the nudge tier only: a gate wait
+        # lasts as long as a peer process's transaction, legitimately.
+        self._gate_since = 0.0
+
+    def _stamp(self) -> float:
+        stamp = time.monotonic()
+        self._wait_since = stamp
+        return stamp
+
+    def _unstamp(self, stamp: float) -> None:
+        if self._wait_since == stamp:
+            self._wait_since = 0.0
+
+    def _stamp_gate(self) -> float:
+        stamp = time.monotonic()
+        self._gate_since = stamp
+        return stamp
+
+    def _unstamp_gate(self, stamp: float) -> None:
+        if self._gate_since == stamp:
+            self._gate_since = 0.0
 
     def start(self) -> None:
         """Accept jobs (again): the storage is open. The thread itself starts lazily."""
@@ -202,15 +233,19 @@ class WriterThread:
         if self._on_thread():
             return fn()  # a job calling back in (e.g. a finalizer); never wait on ourselves
         future: Future = Future()
-        self._submit(fn, future, undo)
+        stamp = self._stamp()
         try:
-            return future.result(timeout)
-        except FutureTimeoutError:
-            if future.cancel():
-                raise StorageLockTimeoutError(
-                    f"Timed out after {timeout}s waiting for LMDB's writer lock"
-                ) from None
-            return future.result()
+            self._submit(fn, future, undo)
+            try:
+                return future.result(timeout)
+            except FutureTimeoutError:
+                if future.cancel():
+                    raise StorageLockTimeoutError(
+                        f"Timed out after {timeout}s waiting for LMDB's writer lock"
+                    ) from None
+                return future.result()
+        finally:
+            self._unstamp(stamp)
 
     def run_staged(
         self,
@@ -234,15 +269,19 @@ class WriterThread:
             return then(fn())
         begun: Future = Future()
         done: Future = Future()
-        self._submit(fn, begun, undo, then, done)
+        stamp = self._stamp()
         try:
-            return done.result(timeout)
-        except FutureTimeoutError:
-            if begun.cancel():
-                raise StorageLockTimeoutError(
-                    f"Timed out after {timeout}s waiting for LMDB's writer lock"
-                ) from None
-            return done.result()
+            self._submit(fn, begun, undo, then, done)
+            try:
+                return done.result(timeout)
+            except FutureTimeoutError:
+                if begun.cancel():
+                    raise StorageLockTimeoutError(
+                        f"Timed out after {timeout}s waiting for LMDB's writer lock"
+                    ) from None
+                return done.result()
+        finally:
+            self._unstamp(stamp)
 
     def try_fire(self, fn: Callable[[], Any]) -> bool:
         """``fire`` for finalizers: queued, never waited for, never at exit.
@@ -282,18 +321,22 @@ class WriterThread:
         cancel of the wait ever loses a result.
         """
         future: Future = Future()
-        self._submit(fn, future, undo)
+        stamp = self._stamp()
         try:
-            await _await_done(future, timeout)
-        except BaseException:
-            if not future.cancel() and undo is not None:
-                future.add_done_callback(lambda f: self._undo_later(f, undo))
-            raise
-        if not future.done() and future.cancel():
-            raise StorageLockTimeoutError(
-                f"Timed out after {timeout}s waiting for LMDB's writer lock"
-            )
-        return future.result()
+            self._submit(fn, future, undo)
+            try:
+                await _await_done(future, timeout)
+            except BaseException:
+                if not future.cancel() and undo is not None:
+                    future.add_done_callback(lambda f: self._undo_later(f, undo))
+                raise
+            if not future.done() and future.cancel():
+                raise StorageLockTimeoutError(
+                    f"Timed out after {timeout}s waiting for LMDB's writer lock"
+                )
+            return future.result()
+        finally:
+            self._unstamp(stamp)
 
     def _undo_later(self, future: Future, undo: Callable[[Any], None]) -> None:
         """Queue ``undo`` of a landed result on the writer thread, never here.

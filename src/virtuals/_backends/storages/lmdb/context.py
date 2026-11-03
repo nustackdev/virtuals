@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +48,58 @@ if TYPE_CHECKING:
 # Guards the check-and-clear of ``_holds_write_slot``: close() may abort a
 # context from another thread while its owner commits it.
 _SLOT_FLAG_LOCK = threading.Lock()
+
+# Readers in a tight loop of short py-lmdb calls release and retake the GIL
+# so often that a thread woken to take it (the writer thread after a job
+# lands on its queue or after each of its C calls, or the requester after
+# its result) loses the race every time and never times out into a drop
+# request (CPython's convoy effect, bpo-7946). Two tiers, both only while
+# a writer job is in flight: past ``WRITER_STARVED_AFTER`` each reader
+# sleeps ``WRITER_YIELD`` once per ``WRITER_YIELD_EVERY`` of its own time
+# (a nudge: at most a fifth of its throughput, and nothing during a commit
+# that is merely fsyncing); past ``WRITER_BLOCKED_AFTER`` it stays off the
+# GIL in ``WRITER_YIELD`` steps until the job is through, at most
+# ``WRITER_BACKOFF_STEPS`` per call, so a writer stuck for another reason
+# (behind a writer outside virtuals) slows readers down but never holds
+# them.
+WRITER_STARVED_AFTER = 0.001
+WRITER_YIELD_EVERY = 0.001
+WRITER_BLOCKED_AFTER = 0.01
+WRITER_BACKOFF_STEPS = 10
+WRITER_YIELD = 0.0002
+
+
+def yield_to_writer(writer_thread: Any, yielded_at: float) -> float:  # noqa: ANN401
+    """Give a starved writer job the GIL; see the tiers above.
+
+    Args:
+        writer_thread: The storage's ``WriterThread``.
+        yielded_at: When this caller last yielded.
+
+    Returns:
+        The new ``yielded_at``.
+    """
+    now = time.monotonic()
+    wait_since = writer_thread._wait_since
+    if wait_since:
+        age = now - wait_since
+        if age > WRITER_BLOCKED_AFTER:
+            for _ in range(WRITER_BACKOFF_STEPS):
+                time.sleep(WRITER_YIELD)
+                wait_since = writer_thread._wait_since
+                now = time.monotonic()
+                if not wait_since or now - wait_since <= WRITER_BLOCKED_AFTER:
+                    break
+            return now
+    else:
+        gate_since = writer_thread._gate_since
+        if not gate_since:
+            return yielded_at
+        age = now - gate_since
+    if age > WRITER_STARVED_AFTER and now - yielded_at > WRITER_YIELD_EVERY:
+        time.sleep(WRITER_YIELD)
+        return now
+    return yielded_at
 
 
 def _after_fork_in_child() -> None:
@@ -115,6 +168,7 @@ class ContextBase:
         "_pid",
         "_storage",
         "_write_lock",
+        "_yielded_at",
     )
 
     def __init__(
@@ -142,6 +196,7 @@ class ContextBase:
         self._closed = False
         self._call_lock = threading.Lock()
         self._pid = os.getpid()
+        self._yielded_at = 0.0  # see yield_to_writer
 
     @property
     def storage(self) -> LMDBStorage:
@@ -227,6 +282,7 @@ class ReadOperationsMixin:
     _storage: LMDBStorage
     _call_lock: threading.Lock
     _require_active: Any  # Method from ContextBase
+    _yielded_at: float
 
     def get(self, key: Key) -> Value | Empty:
         """Get value by key.
@@ -244,6 +300,9 @@ class ReadOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
+        writer_thread = self._storage._writer_thread
+        if writer_thread._wait_since or writer_thread._gate_since:
+            self._yielded_at = yield_to_writer(writer_thread, self._yielded_at)
         with self._call_lock:
             txn = self._require_active()
             try:
@@ -268,6 +327,9 @@ class ReadOperationsMixin:
         except Exception as e:
             raise StorageOperationError(f"Failed to encode key {key}: {e}") from e
 
+        writer_thread = self._storage._writer_thread
+        if writer_thread._wait_since or writer_thread._gate_since:
+            self._yielded_at = yield_to_writer(writer_thread, self._yielded_at)
         with self._call_lock:
             txn = self._require_active()
             try:

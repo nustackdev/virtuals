@@ -1802,3 +1802,49 @@ def test_inherited_reserved_slot_released_in_child_keeps_parents_gate(ctx, tmp_p
         if peer.is_alive():
             peer.kill()
         st.close()
+
+
+# =========================================================================
+# Round 2: readers spinning on short py-lmdb calls starve writers of the GIL (X2)
+# =========================================================================
+
+
+@pytest.mark.timeout(60)
+def test_writes_keep_flowing_under_spinning_reader_threads(tmp_path: Path) -> None:
+    """Two threads looping snapshot, get, close: writes still land within milliseconds.
+
+    Before, CPython's GIL convoy let such readers starve the writer thread
+    and the writer's own gate calls for seconds at a time (single-digit
+    writes per second, worst cases around a second).
+    """
+    st = _open(str(tmp_path), busy_timeout=5.0, sync=False, metasync=False)
+    with st.transaction() as tx:
+        tx.put(("k",), b"1")
+    stop = threading.Event()
+
+    def reader() -> None:
+        while not stop.is_set():
+            with st.snapshot() as snap:
+                snap.get(("k",))
+
+    threads = [threading.Thread(target=reader, daemon=True) for _ in range(2)]
+    for t in threads:
+        t.start()
+    time.sleep(0.05)
+    try:
+        n = 0
+        worst = 0.0
+        end = time.monotonic() + 1.5
+        while time.monotonic() < end:
+            t0 = time.monotonic()
+            with st.transaction() as tx:
+                tx.put(("x",), str(n).encode())
+            worst = max(worst, time.monotonic() - t0)
+            n += 1
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(5)
+        st.close()
+    assert n >= 100, n  # timing: thousands when the convoy is broken, single digits when not
+    assert worst < 0.25, worst  # timing: a few ms when broken, around a second when not
