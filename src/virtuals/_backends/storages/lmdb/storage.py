@@ -21,6 +21,7 @@ from virtuals.tkv.storage import (
     WriteBatchProtocol,
 )
 
+from .._write_slot import WriterLock, WriteSlot
 from .snapshot import LMDBSnapshot
 from .transaction import LMDBTransaction
 from .write_batch import LMDBWriteBatch
@@ -44,7 +45,7 @@ except ImportError as e:
     ) from e
 
 
-__all__ = ["LMDBStorage"]
+__all__ = ["LMDBStorage", "LMDBWriteSlot"]
 
 
 logger = getLogger(__name__)
@@ -52,6 +53,10 @@ logger = getLogger(__name__)
 
 DEFAULT_MAP_SIZE = 10 * 1024 * 1024 * 1024  # 10 GiB
 DEFAULT_MAX_READERS = 126
+DEFAULT_BUSY_TIMEOUT = 60.0  # seconds
+
+LMDBWriteSlot = WriteSlot
+"""Returned by ``LMDBStorage.areserve_write_slot``; see ``WriteSlot``."""
 
 
 class LMDBStorage:
@@ -62,11 +67,25 @@ class LMDBStorage:
 
     LMDB semantics worth knowing:
       - Only one write transaction may be active per environment at a
-        time; concurrent writers block inside LMDB. This adapter does
-        not add its own locking on top.
+        time. Writers in other processes block inside LMDB.
       - Read transactions are MVCC snapshots and never block writers.
       - `map_size` sets the maximum on-disk size; the mmap is grown to
         `map_size` even on empty databases.
+
+    Writers in this process (transactions and write batches) first take an
+    in-process writer slot, the same one SQLite uses, so threads queue on
+    it for up to ``busy_timeout`` and then raise ``StorageLockTimeoutError``
+    instead of LMDB refusing a second writer. Snapshots never touch the
+    slot, so a waiting writer never delays a reader.
+
+    Coroutines: the slot belongs to a thread and, on an event loop, to the
+    task that took it. Coroutines sharing one loop wait for it with
+    ``areserve_write_slot``, which polls without blocking the loop, and
+    hand it to ``begin_transaction(write_slot=...)``. A second writer from
+    the task or thread that already holds the slot raises
+    ``StorageNestedTransactionError``; a sync begin while another task on
+    the same loop holds it raises ``StorageLockTimeoutError`` at once.
+    An LMDB write transaction must finish on the thread that began it.
     """
 
     def __init__(
@@ -85,6 +104,7 @@ class LMDBStorage:
         lock: bool = True,
         create_if_missing: bool = True,
         env_options: dict[str, Any] | None = None,
+        busy_timeout: float = DEFAULT_BUSY_TIMEOUT,
     ) -> None:
         """Initialize LMDB storage.
 
@@ -105,6 +125,8 @@ class LMDBStorage:
             lock: If True, use LMDB's file locking.
             create_if_missing: Create database if it doesn't exist.
             env_options: Extra kwargs passed through to `lmdb.open()`.
+            busy_timeout: Seconds an in-process writer waits for the
+                writer slot before ``StorageLockTimeoutError``.
         """
         self._codec = codec
         self._publisher = publisher
@@ -120,6 +142,8 @@ class LMDBStorage:
         self._lock = lock
         self._create_if_missing = create_if_missing
         self._env_options = dict(env_options or {})
+        self._busy_timeout = busy_timeout
+        self._writer = WriterLock("LMDB")
 
         self._env: lmdb.Environment | None = None
         self._env_lock = threading.RLock()
@@ -270,39 +294,87 @@ class LMDBStorage:
             self._active_snapshots.add(snapshot)
             return snapshot
 
-    def begin_transaction(self) -> LMDBTransaction:
-        """Begin read-write transaction."""
+    def begin_transaction(self, *, write_slot: WriteSlot | None = None) -> LMDBTransaction:
+        """Begin read-write transaction, taking the writer slot now.
+
+        Args:
+            write_slot: A slot from ``areserve_write_slot``. The transaction
+                takes it over instead of acquiring the slot itself, then
+                releases it on commit or abort. None acquires as usual.
+        """
         if self._read_only:
             raise StorageError("Cannot start transaction in read only mode.")
 
         self._require_open()
 
+        lmdb_txn = self._begin_write(write_slot, StorageError, "transaction")
+        transaction = LMDBTransaction(self, lmdb_txn)
         with self._env_lock:
-            try:
-                lmdb_txn = self._env.begin(write=True)
-            except Exception as e:
-                raise StorageError(f"Failed to begin transaction: {e}") from e
-
-            transaction = LMDBTransaction(self, lmdb_txn)
             self._active_transactions.add(transaction)
-            return transaction
+        return transaction
+
+    async def areserve_write_slot(self) -> WriteSlot:
+        """Wait for the writer slot without blocking the event loop.
+
+        Polls the slot with a short, growing sleep between tries, so other
+        coroutines on the loop keep running, including the one that holds
+        it. Waits behind other threads too.
+
+        Returns:
+            The held slot, for ``begin_transaction(write_slot=...)``. Call
+            its ``release`` if no transaction takes it.
+
+        Raises:
+            StorageNestedTransactionError: If this task already holds the
+                slot.
+            StorageLockTimeoutError: If it is not free within
+                ``busy_timeout``.
+        """
+        if self._read_only:
+            raise StorageError("Cannot reserve the write slot in read only mode.")
+        self._require_open()
+        lock = await self._writer.areserve(self._busy_timeout)
+        return LMDBWriteSlot(self, lock)
 
     def begin_write_batch(self) -> LMDBWriteBatch:
-        """Begin write-only batch."""
+        """Begin write-only batch, taking the writer slot now."""
         if self._read_only:
             raise StorageError("Cannot start write batch in read only mode.")
 
         self._require_open()
 
+        lmdb_txn = self._begin_write(None, StorageOperationError, "write batch")
+        write_batch = LMDBWriteBatch(self, lmdb_txn)
         with self._env_lock:
-            try:
-                lmdb_txn = self._env.begin(write=True)
-            except Exception as e:
-                raise StorageOperationError(f"Failed to begin write batch: {e}") from e
-
-            write_batch = LMDBWriteBatch(self, lmdb_txn)
             self._active_write_batches.add(write_batch)
-            return write_batch
+        return write_batch
+
+    def _begin_write(
+        self, write_slot: WriteSlot | None, error: type[StorageError], what: str
+    ) -> Any:  # noqa: ANN401
+        """Take the writer slot, then begin an LMDB write transaction.
+
+        ``env.begin(write=True)`` runs outside ``_env_lock``: it can still
+        block on a writer in another process, and snapshots must not wait
+        behind it. On failure the slot is released, or returned to
+        ``write_slot``'s holder.
+        """
+        give_back_slot = self._writer.take(self, write_slot, self._busy_timeout)
+        try:
+            env = self._env
+            if env is None:
+                raise StorageClosedError("Storage is not open")
+            return env.begin(write=True)
+        except StorageClosedError:
+            give_back_slot()
+            raise
+        except Exception as e:
+            give_back_slot()
+            raise error(f"Failed to begin {what}: {e}") from e
+
+    def _release_write_slot(self, lock: Any = None) -> None:  # noqa: ANN401
+        """Release the in-process writer slot."""
+        self._writer.release(lock)
 
     @contextmanager
     def transaction(self) -> Iterator[LMDBTransaction]:

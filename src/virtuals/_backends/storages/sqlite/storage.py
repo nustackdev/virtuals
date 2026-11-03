@@ -8,11 +8,9 @@ standard library.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sqlite3
 import threading
-import time
 from contextlib import contextmanager
 from logging import getLogger
 from pathlib import Path
@@ -23,11 +21,11 @@ from virtuals.tkv.storage import (
     StorageClosedError,
     StorageError,
     StorageLockTimeoutError,
-    StorageNestedTransactionError,
     TransactionProtocol,
     WriteBatchProtocol,
 )
 
+from .._write_slot import WriterLock
 from .context import is_busy_error
 from .snapshot import SQLiteSnapshot
 from .transaction import SQLiteTransaction
@@ -53,30 +51,9 @@ logger = getLogger(__name__)
 DEFAULT_BUSY_TIMEOUT = 60.0  # seconds
 DEFAULT_MAX_IDLE_CONNECTIONS = 8
 
-# Poll interval bounds for a coroutine waiting on the writer slot (seconds).
-_SLOT_POLL_MIN = 0.0005
-_SLOT_POLL_MAX = 0.005
-
 Synchronous = Literal["OFF", "NORMAL", "FULL", "EXTRA"]
 
 _SCHEMA = "CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID"
-
-_Owner = tuple[int, "asyncio.Task | None"]
-
-
-_REENTRY_MESSAGE = (
-    "This task or thread already holds the write lock on this SQLite storage; "
-    "a second write transaction here would wait on itself"
-)
-
-
-def _caller() -> _Owner:
-    """Who is asking for the writer slot: this thread, and its running task if any."""
-    try:
-        task = asyncio.current_task()
-    except RuntimeError:  # no running event loop on this thread
-        task = None
-    return threading.get_ident(), task
 
 
 class SQLiteStorage:
@@ -181,10 +158,7 @@ class SQLiteStorage:
 
         self._state_lock = threading.Lock()
         self._idle: list[sqlite3.Connection] = []
-        # In-process writer slot. A plain Lock (not RLock): it may be
-        # released from a different thread than the one that took it.
-        self._write_lock = threading.Lock()
-        self._write_owner: _Owner | None = None
+        self._writer = WriterLock("SQLite")
 
         self._active_transactions: set[SQLiteTransaction] = set()
         self._active_write_batches: set[SQLiteWriteBatch] = set()
@@ -410,22 +384,7 @@ class SQLiteStorage:
             raise StorageError("Cannot reserve the write slot in read only mode.")
         self._require_open()
         self._check_fork()
-
-        me = _caller()
-        if self._write_owner == me:
-            raise StorageNestedTransactionError(_REENTRY_MESSAGE)
-        lock = self._write_lock
-        deadline = time.monotonic() + max(self._busy_timeout, 0)
-        delay = _SLOT_POLL_MIN
-        while not lock.acquire(blocking=False):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise StorageLockTimeoutError(
-                    f"Timed out after {self._busy_timeout}s waiting for the write lock"
-                )
-            await asyncio.sleep(min(delay, remaining))
-            delay = min(delay * 2, _SLOT_POLL_MAX)
-        self._write_owner = me
+        lock = await self._writer.areserve(self._busy_timeout)
         return SQLiteWriteSlot(self, lock)
 
     def begin_write_batch(self) -> SQLiteWriteBatch:
@@ -554,16 +513,7 @@ class SQLiteStorage:
         and the slot is released, or returned to ``write_slot``'s holder.
         """
         self._check_fork()
-        if write_slot is not None:
-            write_slot._take(self)
-        else:
-            self._acquire_write_slot()
-
-        def give_back_slot() -> None:
-            if write_slot is not None:
-                write_slot._give_back()
-            else:
-                self._release_write_slot()
+        give_back_slot = self._writer.take(self, write_slot, self._busy_timeout)
 
         try:
             conn = self._acquire_connection()
@@ -583,31 +533,6 @@ class SQLiteStorage:
             raise StorageError(f"Failed to begin write transaction: {e}") from e
         return conn
 
-    def _acquire_write_slot(self) -> None:
-        """Block for the writer slot, up to ``busy_timeout``.
-
-        Fails at once when the slot is held from this same thread: by this
-        task or thread with ``StorageNestedTransactionError`` (a second
-        write transaction would wait on itself), or by another coroutine on
-        this thread's loop with ``StorageLockTimeoutError``, since that
-        holder cannot run to release it while this thread blocks.
-        """
-        me = _caller()
-        owner = self._write_owner
-        if owner is not None and owner[0] == me[0]:
-            if owner == me:
-                raise StorageNestedTransactionError(_REENTRY_MESSAGE)
-            raise StorageLockTimeoutError(
-                "Another task on this thread's event loop holds the write lock on this "
-                "SQLite storage; blocking for it here would stall the loop it needs to "
-                "finish. Wait for the slot with areserve_write_slot instead"
-            )
-        if not self._write_lock.acquire(timeout=max(self._busy_timeout, 0)):
-            raise StorageLockTimeoutError(
-                f"Timed out after {self._busy_timeout}s waiting for the write lock"
-            )
-        self._write_owner = me
-
     def _check_fork(self) -> None:
         """Drop state inherited across a fork.
 
@@ -622,8 +547,7 @@ class SQLiteStorage:
         with self._state_lock:
             if self._pid != os.getpid():
                 self._idle = []
-                self._write_lock = threading.Lock()
-                self._write_owner = None
+                self._writer.reset()
                 self._pid = os.getpid()
 
     def _release_write_slot(self, lock: threading.Lock | None = None) -> None:
@@ -634,10 +558,7 @@ class SQLiteStorage:
                 released when it is no longer the storage's lock (a fork
                 reset the slot since).
         """
-        if lock is not None and lock is not self._write_lock:
-            return
-        self._write_owner = None
-        self._write_lock.release()
+        self._writer.release(lock)
 
     # =========================================================================
     # Internal Methods
