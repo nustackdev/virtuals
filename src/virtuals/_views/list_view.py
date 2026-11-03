@@ -180,6 +180,7 @@ class ListViewBase(
 
     def insert(self, address: int, value: object) -> None:
         """Insert value at index, shifting later items."""
+        self._reject_empty(address, value)
         self.ensure_created()
         length = len(self)
 
@@ -207,6 +208,7 @@ class ListViewBase(
 
     def extend(self, values: Iterable[object]) -> None:
         """Extend list with items from iterable."""
+        values = self._reject_empty_in(values)  # type: ignore[assignment]
         for value in values:
             self.append(value)
 
@@ -225,6 +227,7 @@ class ListViewBase(
             value: Iterable to store
             replace: If True, clear existing content first; if False, append
         """
+        value = self._reject_empty_in(value)  # type: ignore[assignment]
         self.ensure_created()
         if replace:
             self.clear()

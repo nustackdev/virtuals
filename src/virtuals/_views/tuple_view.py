@@ -196,6 +196,7 @@ class TupleView(
             value: Sequence to store
             replace: If True, clear existing content first; if False, append
         """
+        value = self._reject_empty_in(value)  # type: ignore[assignment]
         self.ensure_created()
         if replace:
             self.container.clear_children()

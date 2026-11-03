@@ -611,6 +611,7 @@ class FractionalIndexedDictViewBase(
             # original error if storage itself is failing.
             with contextlib.suppress(Exception):
                 pc.delete_child_primitive_unsafe(address)
+            with contextlib.suppress(Exception):
                 self._data_container().delete_child(address)
             raise
         self._order_container().put_child_primitive(
@@ -714,6 +715,8 @@ class FractionalIndexedDictViewBase(
         self._pos_container().clear_children(validate=False)
 
     def update(self, other: PyMapping[Address, object] | None = None, **kwargs: object) -> None:
+        self._reject_empty_in(other or {})
+        self._reject_empty_in(kwargs)
         if other:
             for key, value in other.items():
                 self[key] = value
@@ -724,6 +727,7 @@ class FractionalIndexedDictViewBase(
         self, value: PyMapping[Address, object] | Iterable[Address], *, replace: bool = True
     ) -> None:
         """Fill from a mapping (id -> value) or an iterable of ids (value True), in order."""
+        value = self._reject_empty_in(value)  # type: ignore[assignment]
         self.ensure_created()
         if replace and self._edge(last=False) is not None:
             self.clear()

@@ -151,6 +151,8 @@ class FlatDictView(
 
     def update(self, other: PyMapping[str | int, Value] | None = None, **kwargs: Value) -> None:
         """Update from dict or kwargs."""
+        self._reject_empty_in(other or {})
+        self._reject_empty_in(kwargs)
         if other:
             for key, value in other.items():
                 self[key] = value
@@ -168,6 +170,7 @@ class FlatDictView(
             value: Mapping to store
             replace: If True, clear existing content first
         """
+        value = self._reject_empty_in(value)  # type: ignore[assignment]
         self.ensure_created()
         if replace:
             self.clear()

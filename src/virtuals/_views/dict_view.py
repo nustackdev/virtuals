@@ -160,6 +160,8 @@ class DictViewBase(
 
     def update(self, other: PyMapping[str | int, object] | None = None, **kwargs: object) -> None:
         """Update from dict or kwargs."""
+        self._reject_empty_in(other or {})
+        self._reject_empty_in(kwargs)
         if other:
             for key, value in other.items():
                 self[key] = value
@@ -168,6 +170,7 @@ class DictViewBase(
 
     def store(self, value: PyMapping[str | int, object], *, replace: bool = True) -> None:
         """Store dict contents."""
+        value = self._reject_empty_in(value)  # type: ignore[assignment]
         self.ensure_created()
         if replace:
             self.clear()

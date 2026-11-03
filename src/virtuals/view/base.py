@@ -7,6 +7,7 @@ Views are created through Navigator, not directly.
 from __future__ import annotations
 
 from abc import ABC
+from collections.abc import Iterable, Mapping
 from logging import getLogger
 from typing import TYPE_CHECKING, ClassVar
 
@@ -204,6 +205,22 @@ class ViewBase(ABC):
         absent view absent.
         """
         reject_empty_value((*self._children_container().site, address), value)
+
+    def _reject_empty_in(self, value: object) -> object:
+        """Raise ValueError if ``value`` is or contains EMPTY; return it, walkable.
+
+        For bulk doors (``store``, ``update``, ``extend``, ``append``) that
+        write several children: the whole value is checked before the first
+        write, so a rejected bulk write leaves the view as it was. A lazy
+        iterable is materialized as a list so it can be checked and then
+        stored; mappings and sequences come back as they are.
+        """
+        if isinstance(value, Iterable) and not isinstance(
+            value, Mapping | list | tuple | set | frozenset | str | bytes | bytearray
+        ):
+            value = list(value)
+        reject_empty_value(self._children_container().site, value)
+        return value
 
     def _put_child_primitive(self, address: site_.SiteSegment, value: object) -> None:
         """Write a primitive child, firing ``_on_child_created`` if the key is new.

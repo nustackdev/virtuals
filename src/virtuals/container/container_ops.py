@@ -26,6 +26,7 @@ Three-layer architecture for child operations:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from logging import getLogger
 from typing import TYPE_CHECKING, cast
@@ -616,13 +617,36 @@ def reject_empty_value(site: site_.Site, value: object) -> None:
     see it, so the container disagrees with itself. Callers that mean
     "absent" delete the key instead.
 
+    Compound values (mappings, lists, tuples, sets) are walked in Python, so
+    a nested EMPTY is refused before any part of the value is written.
+    O(value size), no storage touch.
+
     Raises:
-        ValueError: If ``value`` is EMPTY
+        ValueError: If ``value`` is or contains EMPTY
     """
-    if is_empty(value):
+    path = _find_empty(value, ())
+    if path is not None:
+        where = f"{site}" if not path else f"{site} (nested at {path})"
         raise ValueError(
-            f"Cannot store EMPTY at {site}: EMPTY means absent, delete the key instead"
+            f"Cannot store EMPTY at {where}: EMPTY means absent, delete the key instead"
         )
+
+
+def _find_empty(value: object, path: tuple[object, ...]) -> tuple[object, ...] | None:
+    """Path to the first EMPTY inside ``value``, None if there is none."""
+    if is_empty(value):
+        return path
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            found = _find_empty(item, (*path, key))
+            if found is not None:
+                return found
+    elif isinstance(value, list | tuple | set | frozenset):
+        for index, item in enumerate(value):
+            found = _find_empty(item, (*path, index))
+            if found is not None:
+                return found
+    return None
 
 
 def put_child_primitive(
