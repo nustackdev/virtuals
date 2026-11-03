@@ -38,7 +38,7 @@ class ContextBase:
     Wraps an lmdb.Transaction handle and tracks open/closed state.
     """
 
-    __slots__ = ("_closed", "_holds_write_slot", "_lmdb_txn", "_storage")
+    __slots__ = ("_closed", "_ending", "_holds_write_slot", "_lmdb_txn", "_storage")
 
     def __init__(
         self,
@@ -59,6 +59,7 @@ class ContextBase:
         self._lmdb_txn: Any | None = lmdb_txn
         self._holds_write_slot = holds_write_slot
         self._closed = False
+        self._ending = False
 
     @property
     def storage(self) -> LMDBStorage:
@@ -76,6 +77,20 @@ class ContextBase:
         if self._lmdb_txn is None:
             raise StorageClosedError("Context handle is invalid")
         return self._lmdb_txn
+
+    def _claim_end(self) -> bool:
+        """Claim the right to commit or abort; False if a racing call has it.
+
+        close() may abort a context from another thread while its owner
+        commits it. Only the first claim ends the LMDB transaction, so the
+        context never reports both outcomes, and LMDB never sees one write
+        transaction committed and aborted at once.
+        """
+        with _SLOT_FLAG_LOCK:
+            if self._ending:
+                return False
+            self._ending = True
+            return True
 
     def _mark_closed(self) -> None:
         """Mark context as closed, clear handle, and give back the writer slot."""

@@ -63,6 +63,8 @@ class LMDBWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
             raise StorageTransactionError("Write batch already aborted")
 
         txn = self._require_active()
+        if not self._claim_end():
+            raise StorageClosedError("Write batch was closed while committing")
 
         try:
             txn.commit()
@@ -87,6 +89,9 @@ class LMDBWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
         """Abort write batch and discard changes."""
         if self._closed:
             logger.debug("Abort called on closed write batch")
+            return
+        if not self._claim_end():
+            logger.debug("Abort skipped, write batch is already ending")
             return
 
         txn = self._require_active()

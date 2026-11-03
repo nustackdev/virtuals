@@ -65,6 +65,8 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
             raise StorageTransactionError("Transaction already aborted")
 
         txn = self._require_active()
+        if not self._claim_end():
+            raise StorageClosedError("Transaction was closed while committing")
 
         try:
             txn.commit()
@@ -89,6 +91,9 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         """Abort transaction and discard all changes."""
         if self._closed:
             logger.debug("Abort called on closed transaction")
+            return
+        if not self._claim_end():
+            logger.debug("Abort skipped, transaction is already ending")
             return
 
         txn = self._require_active()

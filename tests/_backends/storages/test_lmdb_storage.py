@@ -386,3 +386,33 @@ def test_handoff_then_writers_on_same_worker(storage: LMDBStorage) -> None:
 def test_spawned_task_waits(storage: LMDBStorage) -> None:
     cases.spawned_task_waits(storage)
 
+
+class _AbortDuringCommit:
+    """Wraps an LMDB write txn so ``fn`` runs inside commit, before LMDB's own."""
+
+    def __init__(self, txn, fn) -> None:
+        self._txn, self._fn = txn, fn
+
+    def commit(self) -> None:
+        self._fn()
+        self._txn.commit()
+
+    def __getattr__(self, name: str):
+        return getattr(self._txn, name)
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("ctx", ["transaction", "write_batch"])
+def test_close_during_commit_keeps_one_outcome(storage: LMDBStorage, ctx: str) -> None:
+    tx = storage.begin_transaction() if ctx == "transaction" else storage.begin_write_batch()
+
+    def during_commit(fn) -> None:
+        tx._lmdb_txn = _AbortDuringCommit(tx._lmdb_txn, fn)
+
+    if ctx == "transaction":
+        cases.close_during_commit_keeps_one_outcome(storage, tx, during_commit)
+        return
+    tx.put(("k",), b"1")
+    during_commit(tx.abort)
+    tx.write()
+    assert (tx._written, tx._aborted) == (True, False)
