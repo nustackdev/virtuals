@@ -63,6 +63,7 @@ def _rocksdb(root: Path, lock_timeout: float | None, codec: Any):
     if lock_timeout is not None:
         ms = max(1, int(lock_timeout * 1000))
         kwargs["txn_db_options"] = {"transaction_lock_timeout": ms, "default_lock_timeout": ms}
+        kwargs["busy_timeout"] = lock_timeout  # in-process slot, see contract section 4
     return RocksDBStorage(path=root / "rocks", codec=codec, **kwargs)
 
 

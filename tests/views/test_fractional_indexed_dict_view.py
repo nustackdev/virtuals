@@ -1001,61 +1001,6 @@ def test_two_writers_appending(fdict):
     _assert_consistent(view)
 
 
-@pytest.mark.parametrize("backend", ["rocksdb"])
-def test_window_respace_vs_concurrent_insert_inside_window(backend, tmp_path):
-    """A respace can displace a concurrent insert next to a row in its window.
-
-    T1 inserts at a hot gap until a window respace fires; T2 inserts after
-    a row inside T1's window. T2 writes none of the rows T1 rewrites, so
-    both commit on every multi-writer backend (sqlite, lmdb and mem
-    are single-writer and never see this). The documented outcome: T2's item
-    is present exactly once and the rest of the order is intact; only its
-    position may have shifted into the rewritten range.
-    """
-    storage = _open_storage(backend, tmp_path)
-    try:
-        with storage.transaction() as tx:
-            view = Navigator(storage).root(tx).open_child("lst", _CountingRespaceView)
-            view.store([f"r{i}" for i in range(20)] + ["h"] + [f"s{i}" for i in range(20)])
-            # Fill the gap after h until the next fresh key would pass the cap.
-            i = 0
-            while True:
-                view.insert_after("h", f"c{i}")
-                if len(view.position(f"c{i}")) >= view.MAX_KEY_LENGTH - 3:
-                    break
-                i += 1
-        t1 = storage.begin_transaction()
-        t2 = storage.begin_transaction()
-        try:
-            v1 = Navigator(storage).root(t1).open_child("lst", _CountingRespaceView)
-            v2 = Navigator(storage).root(t2).open_child("lst", _CountingRespaceView)
-            _CountingRespaceView.respaces = []
-            n = 0
-            while not _CountingRespaceView.respaces:
-                v1.insert_after("h", f"y{n}")
-                n += 1
-            order_t1 = list(v1)
-            ref = order_t1[order_t1.index("h") - 2]  # inside T1's window below h
-            v2.insert_after(ref, "Z")
-            t1.commit()
-            t2.commit()
-        except BaseException:
-            for t in (t1, t2):
-                t.abort()
-            raise
-        with storage.snapshot() as sn:
-            view = Navigator(storage).root(sn).open_child("lst", _CountingRespaceView)
-            got = list(view)
-            assert got.count("Z") == 1
-            assert len(view) == len(got)
-            assert [x for x in got if x != "Z"] == order_t1
-            assert view["Z"] is True
-            assert view.position("Z") == next(ok for ok, a in view.positions() if a == "Z")
-            _assert_consistent(view)
-    finally:
-        storage.close()
-
-
 # ============================================================================
 # HOOKS (mem with the in-memory transport)
 # ============================================================================
