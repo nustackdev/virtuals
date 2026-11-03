@@ -100,14 +100,25 @@ class SQLiteWriteBatch(ContextBase, WriteBatchProtocol):
         deletes = [(k,) for k, v in self._ops.items() if v is None]
 
         try:
-            if puts or deletes:
-                self._conn = self._storage._begin_write_connection()
-                self._holds_write_lock = True
-                if deletes:
-                    self._conn.executemany("DELETE FROM kv WHERE k = ?", deletes)
-                if puts:
-                    self._conn.executemany("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", puts)
-            self._end("COMMIT")
+            if not puts and not deletes:
+                self._end("COMMIT")  # nothing to apply: just ends the batch
+            else:
+                # The lock wait at begin happens outside the context lock, so
+                # close() aborting this batch meanwhile is not held up by it.
+                conn, writer_lock = self._storage._begin_write_connection()
+                with self._lock:
+                    if self._closed:
+                        self._storage._release_connection(conn)
+                        self._storage._release_write_slot(writer_lock)
+                        raise StorageClosedError("Write batch was closed while writing")
+                    self._conn = conn
+                    self._writer_lock = writer_lock
+                    self._holds_write_lock = True
+                    if deletes:
+                        conn.executemany("DELETE FROM kv WHERE k = ?", deletes)
+                    if puts:
+                        conn.executemany("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", puts)
+                    self._end_locked("COMMIT")
         except Exception as e:
             self._aborted = True
             if not self._closed:
@@ -115,7 +126,9 @@ class SQLiteWriteBatch(ContextBase, WriteBatchProtocol):
             self._ops.clear()
             self._storage._untrack_write_batch(self)
             logger.error("Write batch write failed")
-            if isinstance(e, (StorageLockTimeoutError, StorageNestedTransactionError)):
+            if isinstance(
+                e, (StorageLockTimeoutError, StorageNestedTransactionError, StorageClosedError)
+            ):
                 raise
             if is_busy_error(e):
                 raise StorageLockTimeoutError(f"Timed out writing batch: {e}") from e
@@ -134,7 +147,12 @@ class SQLiteWriteBatch(ContextBase, WriteBatchProtocol):
             logger.debug("Abort called on closed write batch")
             return
         self._aborted = True
-        self._closed = True
+        # Goes through the context lock: a write in flight on another thread
+        # finishes first, and an apply begun but not committed is rolled back.
+        try:
+            self._end("ROLLBACK")
+        except Exception as e:
+            logger.error(f"Write batch abort failed: {e}")
         self._ops.clear()
         self._storage._untrack_write_batch(self)
         logger.debug("Write batch aborted")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import weakref
 from contextlib import contextmanager
 from logging import getLogger
 from pathlib import Path
@@ -160,9 +161,11 @@ class SQLiteStorage:
         self._idle: list[sqlite3.Connection] = []
         self._writer = WriterLock("SQLite")
 
-        self._active_transactions: set[SQLiteTransaction] = set()
-        self._active_write_batches: set[SQLiteWriteBatch] = set()
-        self._active_snapshots: set[SQLiteSnapshot] = set()
+        # Weak: a context dropped without being ended must be collectable,
+        # so its finalizer can give back its connection and the writer slot.
+        self._active_transactions: weakref.WeakSet[SQLiteTransaction] = weakref.WeakSet()
+        self._active_write_batches: weakref.WeakSet[SQLiteWriteBatch] = weakref.WeakSet()
+        self._active_snapshots: weakref.WeakSet[SQLiteSnapshot] = weakref.WeakSet()
         self._opened = False
         self._pid = os.getpid()
 
@@ -244,34 +247,43 @@ class SQLiteStorage:
         closes every pooled connection. The last connection to close (in
         any process) checkpoints the WAL back into the file. The storage
         can be opened again afterwards.
-        """
-        if not self._opened:
-            return
 
-        for transaction in list(self._active_transactions):
+        A context in use on another thread is ended once its current
+        statement finishes (see ``ContextBase``), so close never pulls a
+        connection away mid-statement.
+        """
+        with self._state_lock:
+            if not self._opened:
+                return
+            # Closed from here on: begins fail at once, and connections
+            # given back by the contexts ended below are closed, not pooled.
+            self._opened = False
+            transactions = list(self._active_transactions)
+            snapshots = list(self._active_snapshots)
+            write_batches = list(self._active_write_batches)
+            self._active_transactions.clear()
+            self._active_write_batches.clear()
+            self._active_snapshots.clear()
+            idle, self._idle = self._idle, []
+
+        for transaction in transactions:
             try:
                 transaction.abort()
             except Exception as e:
                 logger.error(f"Transaction abort failed during close: {e}")
 
-        for snapshot in list(self._active_snapshots):
+        for snapshot in snapshots:
             try:
                 snapshot.close()
             except Exception as e:
                 logger.error(f"Snapshot close failed during close: {e}")
 
-        for write_batch in list(self._active_write_batches):
+        for write_batch in write_batches:
             try:
                 write_batch.abort()
             except Exception as e:
                 logger.error(f"Write batch abort failed during close: {e}")
 
-        with self._state_lock:
-            self._active_transactions.clear()
-            self._active_write_batches.clear()
-            self._active_snapshots.clear()
-            idle, self._idle = self._idle, []
-            self._opened = False
         self._writer.close()  # a reserved slot nobody took does not survive the reopen
 
         errors: list[Exception] = []
@@ -358,8 +370,8 @@ class SQLiteStorage:
             raise StorageError("Cannot start transaction in read only mode.")
         self._require_open()
 
-        conn = self._begin_write_connection(write_slot)
-        transaction = SQLiteTransaction(self, conn)
+        conn, writer_lock = self._begin_write_connection(write_slot)
+        transaction = SQLiteTransaction(self, conn, writer_lock)
         with self._state_lock:
             self._active_transactions.add(transaction)
         return transaction
@@ -514,15 +526,20 @@ class SQLiteStorage:
 
     def _begin_write_connection(
         self, write_slot: SQLiteWriteSlot | None = None
-    ) -> sqlite3.Connection:
+    ) -> tuple[sqlite3.Connection, threading.Lock]:
         """Take the writer slot and a connection with ``BEGIN IMMEDIATE`` run.
 
         With ``write_slot`` the slot is already held and is taken over, not
         acquired. On failure nothing is held: the connection is given back,
         and the slot is released, or returned to ``write_slot``'s holder.
+
+        Returns:
+            The connection, and the writer lock held for it (to release by
+            identity when the transaction ends).
         """
         self._check_fork()
         give_back_slot = self._writer.take(self, write_slot, self._busy_timeout)
+        writer_lock = self._writer.lock
 
         try:
             conn = self._acquire_connection()
@@ -540,7 +557,7 @@ class SQLiteStorage:
                     f"Timed out after {self._busy_timeout}s waiting for the write lock: {e}"
                 ) from e
             raise StorageError(f"Failed to begin write transaction: {e}") from e
-        return conn
+        return conn, writer_lock
 
     def _check_fork(self) -> None:
         """Drop state inherited across a fork.

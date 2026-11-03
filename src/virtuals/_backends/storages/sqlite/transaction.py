@@ -18,6 +18,7 @@ from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin, is_
 
 if TYPE_CHECKING:
     import sqlite3
+    import threading
     from types import TracebackType
 
     from virtuals.tkv.types import Key
@@ -45,9 +46,17 @@ class SQLiteTransaction(
 
     __slots__ = ("_aborted", "_committed", "_modified_keys")
 
-    def __init__(self, storage: SQLiteStorage, conn: sqlite3.Connection) -> None:
-        """Initialize transaction."""
-        super().__init__(storage, conn, holds_write_lock=True)
+    def __init__(
+        self, storage: SQLiteStorage, conn: sqlite3.Connection, writer_lock: threading.Lock
+    ) -> None:
+        """Initialize transaction.
+
+        Args:
+            storage: Parent storage.
+            conn: Pooled connection with ``BEGIN IMMEDIATE`` already run.
+            writer_lock: The storage's writer lock held for this transaction.
+        """
+        super().__init__(storage, conn, writer_lock=writer_lock)
         self._modified_keys: set[Key] = set()
         self._committed = False
         self._aborted = False
@@ -111,6 +120,20 @@ class SQLiteTransaction(
             if rolled_back:
                 self._aborted = True
             self._storage._untrack_transaction(self)
+
+    def __del__(self) -> None:
+        """Last resort: end a transaction dropped without commit or abort.
+
+        Without this a forgotten transaction would hold the write lock,
+        in this process and across processes, until the storage closed.
+        """
+        if getattr(self, "_closed", True):
+            return
+        self._aborted = True
+        try:
+            self._finalize()
+        except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
+            pass
 
     def __enter__(self) -> SQLiteTransaction:
         """Enter context manager."""

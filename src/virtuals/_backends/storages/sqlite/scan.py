@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, cast
 from virtuals.tkv.filter import PrefixFilter
 from virtuals.tkv.storage import (
     ScanProtocol,
+    StorageClosedError,
     StorageOperationError,
     StorageScanOptions,
 )
@@ -136,7 +137,6 @@ class SQLiteScan(ScanProtocol):
         page: int,
     ) -> list[tuple]:
         """Fetch one page of raw ``(k,)`` or ``(k, v)`` rows in scan order."""
-        conn = self._context._require_active()
         where: list[str] = []
         params: list[object] = []
         if bound is not None:
@@ -151,10 +151,15 @@ class SQLiteScan(ScanProtocol):
         sql += f" ORDER BY k {order} LIMIT ?"
         params.append(page)
 
-        try:
-            return conn.execute(sql, params).fetchall()
-        except Exception as e:
-            raise StorageOperationError(f"Failed to scan: {e}") from e
+        # Under the context lock: close() ending the context from another
+        # thread waits for this page rather than pulling the connection away
+        # mid-statement.
+        with self._context._lock:
+            conn = self._context._require_active()
+            try:
+                return conn.execute(sql, params).fetchall()
+            except Exception as e:
+                raise StorageOperationError(f"Failed to scan: {e}") from e
 
     def _iterate_impl(self, iterator_type: _IteratorType) -> Generator[object, None, None]:
         """Core iteration implementation.
@@ -166,8 +171,13 @@ class SQLiteScan(ScanProtocol):
         at the bound. The page then shrinks to ``_SEEK_PAGE`` if the page
         held a single walked row (one wide subtree swallowed it, so the
         next useful row is right at the bound) and keeps growing otherwise.
+
+        A page is fetched whole, so the context may close while rows of it
+        are still buffered. Each row checks for that before it is yielded:
+        a scan never hands out data past the close of its context.
         """
-        self._context._require_active()
+        context = self._context
+        context._require_active()
         codec = self._storage.codec
         options = self._options
         need_values = iterator_type != _IteratorType.KEYS
@@ -231,6 +241,8 @@ class SQLiteScan(ScanProtocol):
                     except Exception as e:
                         raise StorageOperationError(f"Failed to decode value: {e}") from e
 
+                if context._closed:
+                    raise StorageClosedError("Context is closed")
                 if iterator_type == _IteratorType.KEYS:
                     yield key
                 elif iterator_type == _IteratorType.VALUES:
