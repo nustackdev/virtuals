@@ -23,40 +23,53 @@ class BackendSpec:
     process_model: str  # "multi" | "single"
     factory: Callable[..., Any]
 
-    def make(self, root: Path, *, lock_timeout: float | None = None, codec: Any = None) -> Any:
+    def make(
+        self,
+        root: Path,
+        *,
+        lock_timeout: float | None = None,
+        codec: Any = None,
+        publisher: Any = None,
+    ) -> Any:
         """Build an unopened storage rooted at ``root``.
 
         ``lock_timeout`` (seconds) shortens the backend's wait for a held
         write lock where it has such a knob, so contention surfaces as an
         error instead of a wait. ``codec`` replaces the default
-        ``BinaryCodec`` (section 7 passes a counting one).
+        ``BinaryCodec`` (section 7 passes a counting one). ``publisher``
+        receives the change notifications (section 5).
         """
-        return self.factory(Path(root), lock_timeout, BinaryCodec() if codec is None else codec)
+        return self.factory(
+            Path(root), lock_timeout, BinaryCodec() if codec is None else codec, publisher
+        )
 
     def has_write_slot(self, storage: Any) -> bool:
         return callable(getattr(storage, "areserve_write_slot", None))
 
 
-def _sqlite(root: Path, lock_timeout: float | None, codec: Any):
+def _sqlite(root: Path, lock_timeout: float | None, codec: Any, publisher: Any = None):
     from virtuals.storages.sqlite import SQLiteStorage
 
     return SQLiteStorage(
         path=root / "db.sqlite",
         codec=codec,
+        publisher=publisher,
         busy_timeout=5.0 if lock_timeout is None else lock_timeout,
     )
 
 
-def _lmdb(root: Path, lock_timeout: float | None, codec: Any):
+def _lmdb(root: Path, lock_timeout: float | None, codec: Any, publisher: Any = None):
     from virtuals.storages.lmdb import LMDBStorage
 
     kwargs: dict[str, Any] = {}
     if lock_timeout is not None:
         kwargs["busy_timeout"] = lock_timeout  # in-process slot only, see contract section 4
-    return LMDBStorage(path=root / "lmdb", codec=codec, map_size=1 << 26, **kwargs)
+    return LMDBStorage(
+        path=root / "lmdb", codec=codec, publisher=publisher, map_size=1 << 26, **kwargs
+    )
 
 
-def _rocksdb(root: Path, lock_timeout: float | None, codec: Any):
+def _rocksdb(root: Path, lock_timeout: float | None, codec: Any, publisher: Any = None):
     from virtuals.storages.rocksdb import RocksDBStorage
 
     kwargs: dict[str, Any] = {}
@@ -64,16 +77,16 @@ def _rocksdb(root: Path, lock_timeout: float | None, codec: Any):
         ms = max(1, int(lock_timeout * 1000))
         kwargs["txn_db_options"] = {"transaction_lock_timeout": ms, "default_lock_timeout": ms}
         kwargs["busy_timeout"] = lock_timeout  # in-process slot, see contract section 4
-    return RocksDBStorage(path=root / "rocks", codec=codec, **kwargs)
+    return RocksDBStorage(path=root / "rocks", codec=codec, publisher=publisher, **kwargs)
 
 
-def _mem(root: Path, lock_timeout: float | None, codec: Any):
+def _mem(root: Path, lock_timeout: float | None, codec: Any, publisher: Any = None):
     from virtuals.storages.mem import InMemoryStorage
 
     kwargs: dict[str, Any] = {}
     if lock_timeout is not None:
         kwargs["busy_timeout"] = lock_timeout  # in-process slot only, see contract section 4
-    return InMemoryStorage(codec=codec, **kwargs)
+    return InMemoryStorage(codec=codec, publisher=publisher, **kwargs)
 
 
 BACKENDS: dict[str, BackendSpec] = {
