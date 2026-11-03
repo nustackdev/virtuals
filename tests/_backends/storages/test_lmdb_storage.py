@@ -7,10 +7,13 @@ queueing on it, bounded waits, and snapshots never waiting behind a writer.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
 import gc
 import json
 import multiprocessing as mp
 import os
+import signal
 import threading
 import time
 from pathlib import Path
@@ -2071,3 +2074,372 @@ def test_grant_to_a_loop_closed_after_the_handoff_is_reclaimed(storage: LMDBStor
 
 def test_areserve_timeout_meeting_a_release_is_a_lock_timeout(storage: LMDBStorage) -> None:
     cases.areserve_timeout_meeting_a_release_is_a_lock_timeout(storage)
+
+
+# =========================================================================
+# Round 3 audit: interrupts in writer waits (D1, D2), owned stamps (D3), fork locks and fds (D4, D5)
+# =========================================================================
+
+
+class _Interrupt(BaseException):
+    """Raised by a signal handler on the main thread: what Ctrl-C does, minus pytest's handling."""
+
+
+@contextlib.contextmanager
+def _interrupt_after(delay: float):
+    """Deliver SIGUSR1 to this process after ``delay``; its handler raises ``_Interrupt``.
+
+    The handler runs on the main thread, inside whatever wait it is in
+    (a future's lock acquire is interruptible). SIGUSR1, so pytest-timeout's
+    SIGALRM is left alone.
+    """
+
+    def handler(*_args) -> None:
+        raise _Interrupt
+
+    previous = signal.signal(signal.SIGUSR1, handler)
+    timer = threading.Timer(delay, os.kill, (os.getpid(), signal.SIGUSR1))
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        signal.signal(signal.SIGUSR1, previous)
+
+
+def _gate_is_free(root: str) -> bool:
+    """Whether a fresh descriptor can take the gate (it sees this process's own lock too)."""
+    fd = os.open(Path(root) / "db" / "writer.lock", os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(fd)
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.seen: list[set] = []
+
+    def notify(self, keys) -> None:
+        self.seen.append(set(keys))
+
+
+@pytest.mark.timeout(30)
+def test_interrupted_begin_hop_leaves_no_live_write(ctx, tmp_path: Path) -> None:
+    """A signal in the first read's begin hop: the begin that lands later is aborted, not orphaned.
+
+    Before, the begun txn sat in ``_live_writes`` with LMDB's mutex held by
+    the writer thread until close(): every writer in this process failed at
+    once and every peer blocked until its timeout.
+    """
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    try:
+        with st.transaction() as tx:
+            tx.put(("k",), b"0")
+        st._writer_thread.fire(lambda: time.sleep(0.3))  # the hop queues behind this
+        tx = st.begin_transaction()  # slot and gate held, pending
+        with _interrupt_after(0.05), pytest.raises(_Interrupt):
+            tx.get(("k",))
+        tx.abort()  # pending: touches nothing
+        assert not st._writer.lock.locked()
+        st._drain_writer()  # the begin lands and is aborted ahead of this
+        assert not st._live_writes
+        with (
+            st.transaction() as tx
+        ):  # before: failed at once, "another write transaction is active"
+            tx.put(("k",), b"1")
+        ready, go, out = ctx.Event(), ctx.Event(), tmp_path / "peer.json"
+        p = ctx.Process(target=_peer_write, args=(str(tmp_path), 1.0, ready, go, str(out)))
+        p.start()
+        assert ready.wait(20)
+        go.set()
+        p.join(20)
+        assert json.loads(out.read_text())["result"] == "ok"  # before: StorageLockTimeoutError
+        with st.snapshot() as snap:
+            assert snap.get(("peer",)) == b"1"
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(30)
+def test_interrupted_replay_aborts_the_begun_txn(storage: LMDBStorage, monkeypatch) -> None:
+    """A signal in the replay of pending writes (on the caller's thread) aborts the begun txn.
+
+    Before, only ``Exception`` was handled there: the begun txn stayed live
+    and nobody owned it.
+    """
+    from virtuals._backends.storages.lmdb import storage as storage_module
+
+    def interrupted(*_args, **_kwargs):
+        raise _Interrupt
+
+    tx = storage.begin_transaction()
+    tx.put(("a",), b"1")
+    monkeypatch.setattr(storage_module, "replay_pending", interrupted)
+    with pytest.raises(_Interrupt):
+        tx.get(("a",))  # begin lands, the replay is interrupted
+    monkeypatch.undo()
+    assert not storage._live_writes
+    assert tx._pending  # still pending, still usable
+    assert tx.get(("a",)) == b"1"
+    tx.commit()
+    with storage.snapshot() as snap:
+        assert snap.get(("a",)) == b"1"
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("what", ["begun", "pending", "batch"])
+def test_interrupted_commit_settles_once_it_lands(tmp_path: Path, what: str) -> None:
+    """A signal while the commit is in flight: it runs to its end, then is marked and notified.
+
+    The caller gets the interrupt; the context manager's abort waits for
+    the outcome and is a no-op. Before, the context was "aborted" with its
+    writes durable and subscribers never heard of the commit.
+    """
+    st = _open(str(tmp_path), busy_timeout=5.0, map_size=1 << 30, sync=True)
+    recorder = _Recorder()
+    st._publisher = recorder
+    keys = {("k", i) for i in range(30000)}
+    try:
+        if what == "batch":
+            with pytest.raises(_Interrupt), st.batch_write() as ctx:
+                for key in keys:
+                    ctx.put(key, os.urandom(2000))
+                with _interrupt_after(0.03):
+                    ctx.write()  # the begin lands at once, the replay and the fsync take longer
+        else:
+            with pytest.raises(_Interrupt), st.transaction() as ctx:
+                if what == "begun":
+                    ctx.get(("k", 0))
+                for key in keys:
+                    ctx.put(key, os.urandom(2000))
+                with _interrupt_after(0.03):
+                    ctx.commit()
+        landed = ctx._written if what == "batch" else ctx._committed
+        assert landed and not ctx._aborted and ctx.is_closed
+        assert not st._live_writes
+        assert not st._writer.lock.locked()
+        assert recorder.seen == [keys]
+        with st.snapshot() as snap:
+            assert snap.get(("k", 7)) is not EMPTY
+        with st.transaction() as tx:  # the slot and the gate are free
+            tx.put(("after",), b"1")
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(30)
+def test_interrupted_staged_commit_before_its_begin_commits_nothing(tmp_path: Path) -> None:
+    """A signal while a write-only commit waits for its begin: the begin is undone, nothing lands."""
+    st = _open(str(tmp_path), busy_timeout=5.0)
+    recorder = _Recorder()
+    st._publisher = recorder
+    try:
+        st._writer_thread.fire(lambda: time.sleep(0.3))  # the begin queues behind this
+        with pytest.raises(_Interrupt), st.transaction() as tx:
+            tx.put(("k",), b"1")
+            with _interrupt_after(0.05):
+                tx.commit()
+        assert tx._aborted and not tx._committed
+        st._drain_writer()
+        assert not st._live_writes
+        assert recorder.seen == []
+        with st.snapshot() as snap:
+            assert snap.get(("k",)) is EMPTY
+        with st.transaction() as tx:
+            tx.put(("k",), b"2")
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(30)
+def test_interrupted_gate_wait_leaves_the_gate_free(holder, tmp_path: Path) -> None:
+    """A signal in the sync gate wait: the lock the helper lands afterwards is released.
+
+    Before, it landed on a consumer nobody read, so this process held the
+    gate with no owner until its next write; peers blocked meanwhile.
+    """
+    st = _open(str(tmp_path), busy_timeout=5.0)
+    try:
+        with _interrupt_after(0.1), pytest.raises(_Interrupt):
+            st.begin_transaction()  # waits for the gate behind the holder
+        assert not st._writer.lock.locked()
+        holder.join(10)
+        deadline = time.monotonic() + 5
+        while st._gate._waiting and time.monotonic() < deadline:
+            time.sleep(0.005)  # the helper's flock lands once the holder is gone
+        assert not st._gate._waiting
+        assert _gate_is_free(str(tmp_path))  # before: held by this process, no owner
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(10)
+def test_unwaited_job_keeps_the_next_requesters_stamp(storage: LMDBStorage) -> None:
+    """A job nobody waits for, ahead of a waited one, never clears the waiter's stamp.
+
+    Before, the unwaited job stamped at pickup and cleared at its end,
+    which took the requester's stamp with it while its job was still
+    queued: no convoy protection for the rest of that job.
+    """
+    wt = storage._writer_thread
+    picked, finished = threading.Event(), threading.Event()
+
+    def unwaited() -> None:
+        picked.set()
+        time.sleep(0.05)
+
+    def waited() -> None:
+        time.sleep(0.1)
+        finished.set()  # the requester clears its stamp once it has the result
+
+    wt.fire(unwaited)
+    assert picked.wait(5)
+    t = threading.Thread(target=lambda: wt.run(waited))
+    t.start()
+    time.sleep(0.02)  # the requester has stamped and queued; the unwaited job still runs
+    samples: list[float] = []
+    while not finished.is_set():
+        samples.append(wt._wait_since)
+        time.sleep(0.001)
+    t.join(5)
+    assert len(samples) > 50, samples  # timing: about 130 samples
+    assert all(samples), samples  # before: cleared at 50ms, when the unwaited job ended
+    assert wt._wait_since == 0.0 and not wt._waiting
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_forked_child_never_blocks_on_a_parents_call_lock(storage: LMDBStorage) -> None:
+    """A fork while a parent thread is inside a call: the child's calls raise, never block.
+
+    Before, ``_forget`` kept the call lock, held for good in the child, and
+    ``commit``, ``get`` and a scan step took it before looking at the closed
+    flag.
+    """
+    with storage.transaction() as tx:
+        for i in range(100):
+            tx.put(("k", i), b"v")
+    tx = storage.begin_transaction()
+    tx.get(("k", 0))  # begun
+    snap = storage.begin_snapshot()
+    rows = iter(tx.scan(StorageScanOptions()).keys())
+    next(rows)
+    go = threading.Event()
+
+    def inside_calls() -> None:  # a reader thread inside a call on each context at the fork
+        with tx._call_lock, snap._call_lock:
+            go.wait()
+
+    t = threading.Thread(target=inside_calls, daemon=True)
+    t.start()
+    time.sleep(0.05)
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+
+            def refused(call) -> bool:
+                t0 = time.monotonic()
+                try:
+                    call()
+                except StorageClosedError:
+                    return time.monotonic() - t0 < 1.0
+                return False
+
+            if (
+                refused(tx.commit)
+                and refused(lambda: tx.get(("k", 1)))
+                and refused(lambda: snap.get(("k", 1)))
+                and refused(lambda: next(rows))
+                and refused(lambda: list(tx.scan(StorageScanOptions()).keys()))
+            ):
+                tx.abort()
+                snap.close()
+                storage.close()
+                code = 0
+        finally:
+            os._exit(code)
+    try:
+        assert _wait_child(pid, 15.0) == 0  # None: the child hung
+    finally:
+        go.set()
+        t.join(5)
+    assert next(rows) == ("k", 1)  # the parent's contexts are untouched
+    tx.abort()
+    snap.close()
+
+
+def _hold_write_until(root: str, started, release) -> None:
+    st = _open(root, busy_timeout=10.0)
+    tx = st.begin_transaction()
+    tx.put(("held",), b"1")
+    started.set()
+    release.wait(30)
+    tx.commit()
+    st.close()
+
+
+def _fork_during_gate_wait(root: str, child_pid, forked, holding) -> None:
+    """Queue a gate wait on a thread, fork a child that only sleeps, land the gate, idle until killed."""
+    st = _open(root, busy_timeout=10.0)
+    keep: list = []
+    t = threading.Thread(target=lambda: keep.append(st.begin_transaction()), daemon=True)
+    t.start()
+    while not st._gate._waiting:
+        time.sleep(0.002)  # the helper is blocked in flock on its duplicate
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(60)
+        os._exit(0)
+    child_pid.value = pid
+    forked.set()
+    t.join()
+    holding.set()  # the gate landed: this process holds it until killed
+    time.sleep(60)
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_gate_does_not_outlive_a_dead_parent_through_a_forked_child(ctx, tmp_path: Path) -> None:
+    """A fork during a gate wait: the child closes the helper's duplicate, so the lock dies with the parent.
+
+    Before, the inherited duplicate kept the open file description, and
+    its lock, alive for the child's lifetime after the parent was killed.
+    """
+    _open(str(tmp_path)).close()
+    started, release = ctx.Event(), ctx.Event()
+    peer = ctx.Process(target=_hold_write_until, args=(str(tmp_path), started, release))
+    peer.start()
+    child_pid, forked, holding = ctx.Value("i", 0), ctx.Event(), ctx.Event()
+    parent = ctx.Process(
+        target=_fork_during_gate_wait, args=(str(tmp_path), child_pid, forked, holding)
+    )
+    try:
+        assert started.wait(20)
+        parent.start()
+        assert forked.wait(20)
+        release.set()
+        peer.join(20)
+        assert holding.wait(20)
+        parent.kill()
+        parent.join(10)
+        deadline = time.monotonic() + 2
+        while not _gate_is_free(str(tmp_path)) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert _gate_is_free(str(tmp_path))  # before: held by the child's inherited duplicate
+    finally:
+        release.set()
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(child_pid.value, signal.SIGKILL)
+        if parent.is_alive():
+            parent.kill()
+        parent.join(10)
+        peer.join(10)
+        if peer.is_alive():
+            peer.kill()

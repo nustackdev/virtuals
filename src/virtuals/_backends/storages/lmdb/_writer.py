@@ -20,7 +20,8 @@ no timed variant. Two helpers keep virtuals clear of both edges:
   helper thread, so the kernel wakes the waiter the moment the holder lets
   go (no polling); the requester waits on a future bounded by its timeout,
   and a lock that lands after the requester gave up is released at once.
-  The kernel drops the lock when its holder dies.
+  The kernel drops the lock when its holder dies, since no forked child
+  keeps a descriptor on it (the helper's duplicate is closed at fork).
 
 Filesystem notes: LMDB itself requires a local filesystem (its lock file is
 shared memory between processes and its data file is mmapped), so the gate
@@ -93,6 +94,7 @@ class WriterThread:
     __slots__ = (
         "_lock",
         "_name",
+        "_owner",
         "_queue",
         "_soft_since",
         "_stopped",
@@ -124,11 +126,16 @@ class WriterThread:
         # has its result; the thread refreshes it at every boundary where
         # it will need the GIL back (job pickup, after the begin, every
         # ``PROGRESS_EVERY`` replayed ops, before handing the result over).
-        # One slot per storage: an overlapping requester (close() ending
-        # leftovers beside a finalizer) may clear the other's stamp, which
-        # costs that one job its protection, and readers of one storage
-        # never yield to another storage's writer. Both accepted.
+        # One slot per storage, owned: ``_stamp`` hands out a token and only
+        # its holder clears the stamp, so a job nobody waits for (an
+        # abort queued by a finalizer, an undo) never clears the stamp of
+        # the requester queued behind it. An overlapping requester
+        # (close() ending leftovers beside a finalizer) still replaces the
+        # other's stamp, which costs that one job its protection, and
+        # readers of one storage never yield to another storage's writer.
+        # Both accepted.
         self._wait_since = 0.0
+        self._owner = 0
         # True between a requester's stamp and its clear: the thread only
         # refreshes or restores a stamp somebody still owns, so a requester
         # that left by an exception mid-job never leaves one behind.
@@ -139,13 +146,18 @@ class WriterThread:
         # back once, at the end, not throughout.
         self._soft_since = 0.0
 
-    def _stamp(self) -> None:
+    def _stamp(self) -> int:
+        """Set the stamp; returns the token that clears it."""
+        self._owner += 1
         self._waiting = True
         self._wait_since = time.monotonic()
+        return self._owner
 
-    def _unstamp(self) -> None:
-        self._waiting = False
-        self._wait_since = 0.0
+    def _unstamp(self, token: int) -> None:
+        """Clear the stamp, unless somebody else has stamped since."""
+        if self._owner == token:
+            self._waiting = False
+            self._wait_since = 0.0
 
     def _progress(self) -> None:
         """Refresh the owner's stamp from the thread (a long replay is progress)."""
@@ -170,9 +182,10 @@ class WriterThread:
         self,
         fn: Callable[[], Any],
         future: Future,
-        undo: Callable[[Any], None] | None,
+        abandoned: Callable[[Any], None] | None,
         then: Callable[[Any], Any] | None = None,
         done: Future | None = None,
+        then_abandoned: Callable[[Any], None] | None = None,
         waited: bool = True,
     ) -> None:
         """Queue a job, starting the thread if needed.
@@ -182,7 +195,9 @@ class WriterThread:
         After ``stop`` nothing is accepted until ``start``: a job that
         started a fresh thread then would run against an environment
         being closed. ``waited`` says a requester waits for the result and
-        will clear the progress stamp itself.
+        will clear the progress stamp itself. ``abandoned`` and
+        ``then_abandoned`` take a result its requester no longer waits for
+        (see ``run`` and ``run_staged``).
         """
         with self._lock:
             if self._stopped:
@@ -194,7 +209,7 @@ class WriterThread:
                 )
                 self._thread = thread
                 thread.start()
-            self._queue.put((fn, future, undo, then, done, waited))
+            self._queue.put((fn, future, abandoned, then, done, then_abandoned, waited))
 
     def _on_thread(self) -> bool:
         return threading.current_thread() is self._thread
@@ -204,47 +219,77 @@ class WriterThread:
             job = jobs.get()
             if job is None:
                 return
-            fn, future, undo, then, done, waited = job
+            fn, future, abandoned, then, done, then_abandoned, waited = job
             # A waited job keeps the requester's stamp through its short
             # steps (pickup, begin, hand-off): each is a point where the
             # GIL is needed back, and one continuous age covers them all.
             # Long work (a replay, the commit) refreshes or softens it
-            # itself. A job nobody waits for stamps and clears its own.
+            # itself. A job nobody waits for stamps and clears its own,
+            # unless a requester queued behind it has stamped already: then
+            # its stamp is refreshed, never replaced, and stays the
+            # requester's to clear.
+            token: int | None = None
             if not waited:
-                self._stamp()
+                if self._waiting:
+                    self._progress()
+                else:
+                    token = self._stamp()
             try:
-                result = fn()
+                self._run_job(fn, future, abandoned, then, done, then_abandoned)
+            finally:
+                if token is not None:
+                    self._unstamp(token)
+
+    def _run_job(
+        self,
+        fn: Callable[[], Any],
+        future: Future,
+        abandoned: Callable[[Any], None] | None,
+        then: Callable[[Any], Any] | None,
+        done: Future | None,
+        then_abandoned: Callable[[Any], None] | None,
+    ) -> None:
+        try:
+            result = fn()
+        except BaseException as e:
+            if future.set_running_or_notify_cancel():
+                future.set_exception(e)
+            if done is not None and done.set_running_or_notify_cancel():
+                done.set_exception(e)
+            return
+        # The requester may have given up while ``fn`` ran. Marking the
+        # future running after the call makes that race explicit: either
+        # the requester's cancel wins and ``abandoned`` takes the result
+        # (an abandoned begin is aborted at once), or the result lands.
+        if not future.set_running_or_notify_cancel():
+            self._hand_over(abandoned, result)
+            return
+        future.set_result(result)
+        if then is not None:
+            # The second stage runs right here, on the result the
+            # requester now owns: no second hop, and no cancel can cut it
+            # short (a commit is never abandoned half way). Its result is
+            # handed over the same way if the requester gave up meanwhile.
+            try:
+                second = then(result)
             except BaseException as e:
-                if future.set_running_or_notify_cancel():
-                    future.set_exception(e)
-                if done is not None:
-                    done.set_exception(e)
-                if not waited:
-                    self._unstamp()
-                continue
-            # The requester may have given up while ``fn`` ran. Marking the
-            # future running after the call makes that race explicit: either
-            # the requester's cancel wins and ``undo`` takes the result back
-            # (an abandoned begin is aborted at once), or the result lands.
-            if not future.set_running_or_notify_cancel():
-                if undo is not None:
-                    try:
-                        undo(result)
-                    except Exception as e:
-                        logger.error(f"Undo of an abandoned LMDB writer call failed: {e}")
-                self._unstamp()
-                continue
-            future.set_result(result)
-            if then is not None:
-                # The second stage runs right here, on the result the
-                # requester now owns: no second hop, and no cancel can
-                # reach it (a commit is never abandoned half way).
-                try:
-                    done.set_result(then(result))  # type: ignore[union-attr]
-                except BaseException as e:
+                if done.set_running_or_notify_cancel():  # type: ignore[union-attr]
                     done.set_exception(e)  # type: ignore[union-attr]
-            if not waited:
-                self._unstamp()
+                return
+            if done.set_running_or_notify_cancel():  # type: ignore[union-attr]
+                done.set_result(second)  # type: ignore[union-attr]
+            else:
+                self._hand_over(then_abandoned, second)
+
+    @staticmethod
+    def _hand_over(abandoned: Callable[[Any], None] | None, result: Any) -> None:  # noqa: ANN401
+        """Give a result nobody waits for to ``abandoned``, right here on the writer thread."""
+        if abandoned is None:
+            return
+        try:
+            abandoned(result)
+        except Exception as e:
+            logger.error(f"Handling an abandoned LMDB writer call failed: {e}")
 
     def fire(self, fn: Callable[[], Any]) -> None:
         """Run ``fn`` on the writer thread; nobody waits for it. Dropped after ``stop``."""
@@ -258,32 +303,45 @@ class WriterThread:
         fn: Callable[[], Any],
         *,
         timeout: float | None = None,
-        undo: Callable[[Any], None] | None = None,
+        abandoned: Callable[[Any], None] | None = None,
     ) -> Any:  # noqa: ANN401
         """Run ``fn`` on the writer thread and return its result.
 
         Blocks the caller. With ``timeout`` the wait is bounded: a call
-        still in flight then is abandoned (``undo`` runs on its result when
-        it lands, on the writer thread) and ``StorageLockTimeoutError`` is
-        raised. A result that lands just as the wait ends is taken, not
-        dropped.
+        still in flight then is abandoned and ``StorageLockTimeoutError``
+        is raised. A result that lands just as the wait ends is taken, not
+        dropped. The wait left by any other exception (a signal handler
+        raising, ``KeyboardInterrupt``) abandons the call the same way.
+
+        ``abandoned`` takes the result of an abandoned call once it lands,
+        on the writer thread: a begin nobody waits for is aborted, a commit
+        nobody waits for has its bookkeeping finished. Without it the
+        result is dropped (an abort needs nothing).
         """
         if self._on_thread():
             return fn()  # a job calling back in (e.g. a finalizer); never wait on ourselves
         future: Future = Future()
-        self._stamp()  # queued: the thread needs the GIL to pick it up
+        token = self._stamp()  # queued: the thread needs the GIL to pick it up
         try:
-            self._submit(fn, future, undo)
+            self._submit(fn, future, abandoned)
             try:
                 return future.result(timeout)
             except FutureTimeoutError:
-                if future.cancel():
-                    raise StorageLockTimeoutError(
-                        f"Timed out after {timeout}s waiting for LMDB's writer lock"
-                    ) from None
+                pass
+            except BaseException as e:
+                self._left(future, future, e, abandoned)
+                raise
+            if future.cancel():
+                raise StorageLockTimeoutError(
+                    f"Timed out after {timeout}s waiting for LMDB's writer lock"
+                )
+            try:
                 return future.result()
+            except BaseException as e:
+                self._left(future, future, e, abandoned)
+                raise
         finally:
-            self._unstamp()
+            self._unstamp(token)
 
     def run_staged(
         self,
@@ -291,35 +349,71 @@ class WriterThread:
         then: Callable[[Any], Any],
         *,
         timeout: float,
-        undo: Callable[[Any], None],
+        abandoned: Callable[[Any], None],
+        then_abandoned: Callable[[Any], None] | None = None,
     ) -> Any:  # noqa: ANN401
         """Run ``fn`` and then ``then(result)`` on the writer thread, one hop.
 
         The wait is bounded only while ``fn`` is in flight: a timeout then
-        abandons it (``undo`` runs on its result when it lands) and raises
-        ``StorageLockTimeoutError``. Once ``fn`` has landed, ``then`` runs
-        to the end and the caller waits for it. For a write-only
+        abandons it (``abandoned`` runs on its result when it lands) and
+        raises ``StorageLockTimeoutError``. Once ``fn`` has landed, ``then``
+        runs to the end and the caller waits for it. For a write-only
         transaction ``fn`` is the begin and ``then`` replays and commits,
         so a begin behind a writer outside virtuals stays bounded while a
-        commit is never cut short.
+        commit is never cut short. A wait left by any other exception
+        abandons ``fn`` the same way if it has not landed; if it has,
+        ``then`` runs to the end and ``then_abandoned`` takes its result.
         """
         if self._on_thread():
             return then(fn())
         begun: Future = Future()
         done: Future = Future()
-        self._stamp()
+        token = self._stamp()
         try:
-            self._submit(fn, begun, undo, then, done)
+            self._submit(fn, begun, abandoned, then, done, then_abandoned)
             try:
                 return done.result(timeout)
             except FutureTimeoutError:
-                if begun.cancel():
-                    raise StorageLockTimeoutError(
-                        f"Timed out after {timeout}s waiting for LMDB's writer lock"
-                    ) from None
+                pass
+            except BaseException as e:
+                self._left(begun, done, e, then_abandoned)
+                raise
+            if begun.cancel():
+                raise StorageLockTimeoutError(
+                    f"Timed out after {timeout}s waiting for LMDB's writer lock"
+                )
+            try:
                 return done.result()
+            except BaseException as e:
+                self._left(begun, done, e, then_abandoned)
+                raise
         finally:
-            self._unstamp()
+            self._unstamp(token)
+
+    def _left(
+        self,
+        job: Future,
+        result: Future,
+        error: BaseException,
+        abandoned: Callable[[Any], None] | None,
+    ) -> None:
+        """A wait on ``result`` ended with ``error``: abandon the job if that was not its own failure.
+
+        A stage still in flight is cancelled: the thread hands its result
+        to its abandoned handler right after the call, before any later
+        job. A result already in is handed over now, by a job queued
+        here, before the caller sees the error. Either way nothing the
+        thread begins or commits is left unobserved, and the handler runs
+        before any job the caller queues afterwards (an abort).
+        """
+        if result.done() and not result.cancelled() and result.exception() is error:
+            return  # the call itself failed: nothing landed
+        if job.cancel():
+            return  # the first stage is in flight: the thread hands over its result
+        if result is not job and result.cancel():
+            return  # the second stage is in flight: the thread hands over its result
+        if abandoned is not None:
+            result.add_done_callback(lambda f: self._abandoned_later(f, abandoned))
 
     def try_fire(self, fn: Callable[[], Any]) -> bool:
         """``fire`` for finalizers: queued, never waited for, never at exit.
@@ -350,23 +444,23 @@ class WriterThread:
         fn: Callable[[], Any],
         *,
         timeout: float,
-        undo: Callable[[Any], None] | None = None,
+        abandoned: Callable[[Any], None] | None = None,
     ) -> Any:  # noqa: ANN401
         """Like ``run`` but waits without blocking the event loop.
 
-        Cancelled while waiting, it abandons the call: ``undo`` takes back
+        Cancelled while waiting, it abandons the call: ``abandoned`` takes
         a result that has landed or lands later, on the writer thread. No
         cancel of the wait ever loses a result.
         """
         future: Future = Future()
-        self._stamp()
+        token = self._stamp()
         try:
-            self._submit(fn, future, undo)
+            self._submit(fn, future, abandoned)
             try:
                 await _await_done(future, timeout)
             except BaseException:
-                if not future.cancel() and undo is not None:
-                    future.add_done_callback(lambda f: self._undo_later(f, undo))
+                if not future.cancel() and abandoned is not None:
+                    future.add_done_callback(lambda f: self._abandoned_later(f, abandoned))
                 raise
             if not future.done() and future.cancel():
                 raise StorageLockTimeoutError(
@@ -374,20 +468,21 @@ class WriterThread:
                 )
             return future.result()
         finally:
-            self._unstamp()
+            self._unstamp(token)
 
-    def _undo_later(self, future: Future, undo: Callable[[Any], None]) -> None:
-        """Queue ``undo`` of a landed result on the writer thread, never here.
+    def _abandoned_later(self, future: Future, abandoned: Callable[[Any], None]) -> None:
+        """Queue ``abandoned`` on a landed result on the writer thread, never here.
 
         Runs on the thread that completed the future (the writer thread,
         or the requester's if it was already done): either way it only
-        queues the job, so an abort never runs off the writer thread.
+        queues the job, so an abort never runs off the writer thread. The
+        result is in by then, so ``result()`` never waits.
         """
         try:
             result = future.result()
-        except BaseException:  # the call failed: nothing to undo
+        except BaseException:  # the call failed: nothing landed
             return
-        self.fire(lambda: undo(result))
+        self.fire(lambda: abandoned(result))
 
     def stop(self, timeout: float) -> bool:
         """Ask the thread to exit after its queued jobs and wait for it.
@@ -415,6 +510,9 @@ class WriterThread:
         self._queue = queue.SimpleQueue()
         self._thread = None
         self._stopped = False
+        self._waiting = False  # the parent's requester, not the child's
+        self._wait_since = 0.0
+        self._soft_since = 0.0
 
 
 class WriterGate:
@@ -443,6 +541,7 @@ class WriterGate:
         "_path",
         "_requests",
         "_thread",
+        "_wait_fd",
         "_waiting",
     )
 
@@ -458,6 +557,7 @@ class WriterGate:
         self._generation = 0  # bumped per open: a wait from an older one touches nothing
         self._waiting = False  # a blocking wait is in flight for this generation
         self._consumer: Future | None = None  # the requester attached to that wait
+        self._wait_fd: int | None = None  # the helper's duplicate for that wait
         self._requests: queue.SimpleQueue = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
 
@@ -498,12 +598,22 @@ class WriterGate:
 
         Takes no lock: a parent thread may hold the inherited one forever.
         The descriptor is replaced by ``reopen_after_fork`` on first use.
+        A wait in flight at the fork left its duplicate descriptor in the
+        child; it is closed here, or the lock it lands in the parent would
+        live on in the child after the parent's death (an ``flock`` lock
+        lasts as long as any descriptor on its open file description).
         """
         self._mu = threading.Lock()
         self._thread = None
         self._requests = queue.SimpleQueue()
         self._waiting = False
         self._consumer = None
+        fd, self._wait_fd = self._wait_fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:  # closed by the helper between its clear and the fork
+                pass
 
     def reopen_after_fork(self) -> None:
         """Replace the inherited descriptor: it shares the parent's lock state."""
@@ -554,7 +664,9 @@ class WriterGate:
             )
             self._thread = thread
             thread.start()
-        self._requests.put((os.dup(self._fd), self._generation))
+        fd = os.dup(self._fd)
+        self._wait_fd = fd  # for a forked child to close (``reset_after_fork``)
+        self._requests.put((fd, self._generation))
 
     def _serve(self, requests: queue.SimpleQueue) -> None:
         while True:
@@ -567,24 +679,24 @@ class WriterGate:
                 error: Exception | None = None
             except OSError as e:
                 error = StorageError(f"Failed to take the LMDB writer gate: {e}")
-            try:
-                with self._mu:
-                    if generation != self._generation:
-                        # The gate was closed meanwhile: closing this last
-                        # duplicate below drops the lock with the file.
-                        continue
+            consumer: Future | None = None
+            with self._mu:
+                if generation == self._generation:
                     self._waiting = False
                     consumer, self._consumer = self._consumer, None
-                    if consumer is None:
-                        if error is None:
-                            fcntl.flock(fd, fcntl.LOCK_UN)  # nobody wants it any more
-                        continue
-                if error is not None:
-                    consumer.set_exception(error)
-                else:
-                    consumer.set_result(True)
-            finally:
+                    if consumer is None and error is None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)  # nobody wants it any more
+                # else: the gate was closed meanwhile, and closing this last
+                # duplicate drops the lock with the file.
+                if self._wait_fd == fd:
+                    self._wait_fd = None  # cleared first: a child never closes a reused number
                 os.close(fd)  # the storage's own descriptor keeps a landed lock
+            if consumer is None:
+                continue
+            if error is not None:
+                consumer.set_exception(error)
+            else:
+                consumer.set_result(True)
 
     def _detach(self, consumer: Future) -> bool:
         """Give up waiting. False if the gate landed on ``consumer`` first (it is ours)."""
@@ -621,6 +733,18 @@ class WriterGate:
             if self._detach(consumer):
                 raise self._timed_out(timeout) from None
             consumer.result()  # landed as the wait ended: ours
+        except BaseException:
+            # Left by a signal or an interrupt: the lock must not land on a
+            # consumer nobody reads (the gate would then be held by no one
+            # until this process's next write), same as ``aacquire``.
+            if not self._detach(consumer):
+                try:
+                    consumer.result()
+                except Exception:  # noqa: S110 (failed, nothing held)
+                    pass
+                else:
+                    self.release()  # landed, but the requester is gone
+            raise
 
     async def aacquire(self, timeout: float) -> None:
         """Like ``acquire`` but waits on the event loop instead of blocking it."""

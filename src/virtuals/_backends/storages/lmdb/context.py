@@ -267,11 +267,15 @@ class ContextBase:
         """Mark the context closed without touching LMDB; returns its handle.
 
         For a forked child: the handle is the parent's. The caller parks
-        it so it is never aborted or collected here.
+        it so it is never aborted or collected here. The call lock is
+        replaced too: a parent thread inside a call at the fork holds the
+        inherited one for good, and every call here takes the lock before
+        it sees the context is closed.
         """
         handle, self._lmdb_txn = self._lmdb_txn, None
         self._closed = True
         self._holds_write_slot = False
+        self._call_lock = threading.Lock()
         return handle
 
     def _finalize_unended_write(self, what: str) -> None:
