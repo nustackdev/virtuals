@@ -72,7 +72,8 @@ class SQLiteTransaction(
         self._require_active()
 
         try:
-            self._end("COMMIT")
+            if not self._end("COMMIT"):
+                raise StorageClosedError("Transaction was closed while committing")
         except Exception as e:
             # The connection went back to the pool rolled back: treat as aborted.
             self._aborted = True

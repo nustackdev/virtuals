@@ -7,6 +7,7 @@ queueing on it, bounded waits, and snapshots never waiting behind a writer.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -259,3 +260,43 @@ def test_to_thread_nested_raises_fast(storage: LMDBStorage) -> None:
 @pytest.mark.timeout(10)
 def test_asyncio_run_inside_sync_txn_is_nested(storage: LMDBStorage) -> None:
     cases.asyncio_run_inside_sync_txn_is_nested(storage)
+
+
+@pytest.mark.timeout(10)
+def test_racing_ends_release_slot_once(storage: LMDBStorage) -> None:
+    tx = storage.begin_transaction()
+    tx._lmdb_txn.abort()  # end LMDB's side once; the race is in giving back the slot
+    cases.racing_ends_release_once(storage, tx, lambda t: t._mark_closed(), "_holds_write_slot")
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_fork_child_can_write(storage: LMDBStorage) -> None:
+    held, go = threading.Event(), threading.Event()
+
+    def holder() -> None:  # another parent thread holds the slot at fork
+        with storage.transaction() as tx:
+            tx.put(("parent",), b"1")
+            held.set()
+            go.wait()
+
+    t = threading.Thread(target=holder)
+    t.start()
+    held.wait()
+    pid = os.fork()
+    if pid == 0:  # child
+        code = 1
+        try:
+            with storage.transaction() as ctx:
+                ctx.put(("child",), b"1")
+            code = 0
+        finally:
+            os._exit(code)
+    time.sleep(0.05)
+    go.set()  # the parent commit frees LMDB's own writer lock for the child
+    t.join()
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    with storage.snapshot() as snap:
+        assert snap.get(("child",)) == b"1"
+    storage.begin_transaction().commit()
