@@ -1,8 +1,9 @@
 """The writer slot of an in-memory storage, taken ahead of a transaction.
 
-Same shape as the SQLite slot, so code that waits for a slot by name
-(``areserve_write_slot`` then ``begin_transaction(write_slot=...)``) works
-on either storage unchanged.
+Mirrors the SQLite slot (kept in step by hand until a shared one is
+lifted), so code that waits for a slot by name (``areserve_write_slot``
+then ``begin_transaction(write_slot=...)``) works on either storage
+unchanged.
 """
 
 from __future__ import annotations
@@ -60,6 +61,10 @@ class InMemoryWriteSlot:
             raise StorageError("Write slot belongs to a different in-memory storage")
         if self._state != "held":
             raise StorageError(f"Write slot is already {self._state}")
+        if self._lock is not storage._write_lock:
+            # close() replaced the slot since this one was reserved.
+            self._state = "released"
+            raise StorageError("Write slot is stale: the storage was closed after it was reserved")
         self._state = "taken"
         return self._lock
 

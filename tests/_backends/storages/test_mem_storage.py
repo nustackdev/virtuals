@@ -9,6 +9,8 @@ SQLite adapter over the same option grid the views use.
 from __future__ import annotations
 
 import asyncio
+import gc
+import os
 import random
 import threading
 import time
@@ -27,6 +29,7 @@ from virtuals.tkv.storage import (
     StorageError,
     StorageLockTimeoutError,
     StorageNestedTransactionError,
+    StorageOperationError,
     StorageTransactionConflictError,
     StorageTransactionError,
 )
@@ -645,6 +648,230 @@ def test_notifies_after_commit_only_for_real_changes() -> None:
         with s.snapshot() as snap:
             list(snap.scan(StorageScanOptions()).keys())
         assert len(pub.batches) == 2
+
+
+# =========================================================================
+# Lifecycle edges (review findings)
+# =========================================================================
+
+
+def test_close_racing_commit_releases_slot_once() -> None:
+    """close() on another thread while a commit is applying must not free the slot twice."""
+    s = InMemoryStorage(codec=NoOpCodec(), busy_timeout=0.05)
+    s.open()
+    in_apply, go = threading.Event(), threading.Event()
+    real_apply = s._store.apply
+
+    def slow_apply(ops, modified):
+        in_apply.set()
+        go.wait(2)
+        return real_apply(ops, modified)
+
+    s._store.apply = slow_apply
+    tx = s.begin_transaction()
+    tx.put(X, 1)
+    committer = threading.Thread(target=tx.commit)
+    committer.start()
+    assert in_apply.wait(2)
+    closer = threading.Thread(target=s.close)
+    closer.start()
+    time.sleep(0.02)
+    go.set()
+    committer.join(2)
+    closer.join(2)
+    s._store.apply = real_apply
+    assert tx.is_closed and tx._committed and not tx._aborted
+
+    s.open()
+    assert not s._write_lock.locked()
+    holder = s.begin_transaction()
+    with pytest.raises(StorageLockTimeoutError):
+        _in_thread(s.begin_transaction)  # the slot is really held by exactly one writer
+    holder.abort()
+    s.close()
+
+
+def test_commit_and_abort_race_end_once(storage: InMemoryStorage) -> None:
+    for _ in range(20):
+        tx = storage.begin_transaction()
+        tx.put(X, 1)
+        errors: list[BaseException] = []
+
+        def run(fn, errors=errors) -> None:
+            try:
+                fn()
+            except StorageClosedError:
+                pass
+            except BaseException as e:
+                errors.append(e)
+
+        a = threading.Thread(target=run, args=(tx.commit,))
+        b = threading.Thread(target=run, args=(tx.abort,))
+        a.start()
+        b.start()
+        a.join()
+        b.join()
+        assert not errors
+        assert tx.is_closed and tx._committed != tx._aborted
+        assert not storage._write_lock.locked()
+
+
+def test_leaked_snapshot_releases_its_pin(storage: InMemoryStorage) -> None:
+    def leak() -> None:
+        snap = storage.begin_snapshot()
+        snap.get(X)  # dropped without close()
+
+    leak()
+    gc.collect()
+    for i in range(10):
+        _put(storage, X, i)  # the first commit applies the queued release
+    assert storage._store._pins == {}
+    assert storage._store._history == {}
+    assert not storage._store._undo_log
+
+
+def test_reserved_slot_does_not_survive_close() -> None:
+    async def main() -> None:
+        s = InMemoryStorage(codec=NoOpCodec(), busy_timeout=0.1)
+        s.open()
+        slot = await s.areserve_write_slot()
+        s.close()
+        s.open()
+        assert not s._write_lock.locked() and s._write_owner is None
+        with pytest.raises(StorageError, match="stale"):
+            s.begin_transaction(write_slot=slot)
+        assert not slot.held
+        slot.release()  # no-op, never touches the fresh slot
+        assert not s._write_lock.locked()
+        s.begin_transaction().abort()
+        (await s.areserve_write_slot()).release()
+        s.close()
+
+    asyncio.run(main())
+
+
+def test_base_exception_in_commit_ends_transaction(storage: InMemoryStorage) -> None:
+    tx = storage.begin_transaction()
+    tx.put(X, 1)
+    real_apply = storage._store.apply
+
+    def boom(ops, modified):
+        raise KeyboardInterrupt
+
+    storage._store.apply = boom
+    with pytest.raises(KeyboardInterrupt):
+        tx.commit()
+    storage._store.apply = real_apply
+    assert tx.is_closed and not storage._write_lock.locked()
+    assert _get(storage, X) is EMPTY
+    storage.begin_transaction().abort()
+
+
+class _RawCodec:
+    """Keys encode to their first component as is, so str and int keys cannot be ordered."""
+
+    def encode_key(self, key):
+        return key[0]
+
+    def decode_key(self, encoded):
+        return (encoded,)
+
+    def encode_value(self, value):
+        return value
+
+    def decode_value(self, encoded):
+        return encoded
+
+
+def test_failed_apply_leaves_state_untouched() -> None:
+    pub = _Publisher()
+    with InMemoryStorage(codec=_RawCodec(), publisher=pub) as s:
+        with s.transaction() as t:
+            t.put(("a",), 1)
+            t.put(("b",), 2)
+        seq = s._store._seq
+        snap = s.begin_snapshot()  # version recording is live during the failing commit
+        tx = s.begin_transaction()
+        tx.delete(("a",))
+        tx.put(("b",), 20)
+        tx.put(("z",), 26)
+        tx.put((1,), 0)  # int against str keys: the index raises part way through
+        with pytest.raises(StorageTransactionError):
+            tx.commit()
+        assert tx.is_closed and not s._write_lock.locked()
+        assert s._store._seq == seq
+        assert dict(s._store._live) == {"a": (("a",), 1), "b": (("b",), 2)}
+        assert list(s._store._index) == ["a", "b"]
+        assert s._store._history == {} and not s._store._undo_log
+        assert len(pub.batches) == 1
+        assert snap.get(("a",)) == 1 and snap.get(("z",)) is EMPTY
+        snap.close()
+        with s.snapshot() as fresh:
+            assert list(fresh.scan(StorageScanOptions()).items()) == [(("a",), 1), (("b",), 2)]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_fork_child_gets_fresh_locks(storage: InMemoryStorage) -> None:
+    """A child forked while a parent thread holds the store lock can still read and write."""
+    _put(storage, X, 1)
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with storage._store.lock:
+            held.set()
+            release.wait(3)
+
+    threading.Thread(target=hold, daemon=True).start()
+    assert held.wait(2)
+    pid = os.fork()
+    if pid == 0:  # child
+        code = 4
+        try:
+            with storage.snapshot() as s:
+                code = 0 if s.get(X) == 1 else 3
+            with storage.transaction() as tx:
+                tx.put(Y, 2)
+        except BaseException:
+            code = 5
+        os._exit(code)
+    killer = threading.Timer(3.0, lambda: os.kill(pid, 9))
+    killer.start()
+    try:
+        _, status = os.waitpid(pid, 0)
+    finally:
+        killer.cancel()
+        release.set()
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+
+
+def test_snapshot_double_close_from_threads_is_idempotent(storage: InMemoryStorage) -> None:
+    _put(storage, X, 1)
+    keeper = storage.begin_snapshot()
+    seq = keeper._seq
+    for _ in range(20):
+        snap = storage.begin_snapshot()
+        assert snap._seq == seq
+        threads = [threading.Thread(target=snap.close) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert storage._store._pins == {seq: 1}
+    _in_thread(lambda: _put(storage, X, 2))
+    assert keeper.get(X) == 1  # its versions were not trimmed by the extra closes
+    keeper.close()
+    assert storage._store._pins == {}
+
+
+def test_mistyped_start_encoded_raises_storage_error() -> None:
+    with InMemoryStorage(codec=TextCodec()) as s:
+        _put(s, ("a",), "v")
+        with s.snapshot() as snap:
+            with pytest.raises(StorageOperationError, match="Failed to scan"):
+                list(snap.scan(StorageScanOptions(start_encoded=b"a")).items())
+        with s.transaction() as tx:
+            with pytest.raises(StorageOperationError, match="Failed to scan"):
+                list(tx.scan(StorageScanOptions(start_encoded=b"a", reverse=True)).keys())
 
 
 # =========================================================================

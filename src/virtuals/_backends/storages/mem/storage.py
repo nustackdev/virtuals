@@ -25,6 +25,7 @@ import asyncio
 import os
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from logging import getLogger
 from typing import TYPE_CHECKING, Literal, overload
@@ -73,6 +74,20 @@ _NESTED_MESSAGE = (
     "This task or thread already holds the write lock on this in-memory storage; "
     "a second write transaction here would wait on itself"
 )
+
+
+_storages: weakref.WeakSet[InMemoryStorage] = weakref.WeakSet()
+"""Every storage made in this process, so a forked child can reset their locks."""
+
+
+def _reset_locks_in_child() -> None:
+    """After a fork: fresh locks in the child, since a parent thread may hold the old ones."""
+    for storage in list(_storages):
+        storage._reset_locks()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_locks_in_child)
 
 
 def _caller() -> _Owner:
@@ -127,17 +142,20 @@ class InMemoryStorage:
 
         self._store = VersionedStore()
         self._opened = False
-        self._pid = os.getpid()
 
         self._state_lock = threading.Lock()
         # In-process writer slot. A plain Lock (not RLock): it may be
         # released from a different thread than the one that took it.
+        # Mirrors the SQLite slot; keep the two in step until a shared one is lifted.
         self._write_lock = threading.Lock()
         self._write_owner: _Owner | None = None
 
         self._active_transactions: set[InMemoryTransaction] = set()
-        self._active_snapshots: set[InMemorySnapshot] = set()
+        # Weak: a snapshot dropped without close() must be collectable, its
+        # finalizer then releases the pin.
+        self._active_snapshots: weakref.WeakSet[InMemorySnapshot] = weakref.WeakSet()
         self._active_write_batches: set[InMemoryWriteBatch] = set()
+        _storages.add(self)
 
     @property
     def read_only(self) -> bool:
@@ -156,7 +174,12 @@ class InMemoryStorage:
         self._opened = True
 
     def close(self) -> None:
-        """Close storage. Active contexts are aborted or closed, all data is dropped."""
+        """Close storage. Active contexts are aborted or closed, all data is dropped.
+
+        The writer slot is replaced too, so a slot reserved but not yet
+        taken, or a transaction still finishing on another thread, cannot
+        hold or free the slot of the reopened storage.
+        """
         if not self._opened:
             return
 
@@ -184,6 +207,8 @@ class InMemoryStorage:
             self._active_transactions.clear()
             self._active_snapshots.clear()
             self._active_write_batches.clear()
+            self._write_lock = threading.Lock()
+            self._write_owner = None
         self._store.reset()
         self._opened = False
 
@@ -251,7 +276,6 @@ class InMemoryStorage:
         if self._read_only:
             raise StorageError("Cannot start transaction in read only mode.")
         self._require_open()
-        self._check_fork()
 
         if write_slot is not None:
             lock = write_slot._take(self)
@@ -287,7 +311,6 @@ class InMemoryStorage:
         if self._read_only:
             raise StorageError("Cannot reserve the write slot in read only mode.")
         self._require_open()
-        self._check_fork()
 
         me = _caller()
         if self._write_owner == me:
@@ -387,28 +410,24 @@ class InMemoryStorage:
         Args:
             lock: The lock the caller acquired, if known. Nothing is
                 released when it is no longer the storage's lock (a fork
-                reset the slot since).
+                or ``close`` replaced the slot since).
         """
         if lock is not None and lock is not self._write_lock:
             return
         self._write_owner = None
         self._write_lock.release()
 
-    def _check_fork(self) -> None:
-        """Reset locks inherited across a fork.
+    def _reset_locks(self) -> None:
+        """Fresh locks and no slot owner, for a forked child.
 
-        A slot held by a parent thread would never be released in the
-        child, so the child starts with fresh locks and no owner. The data
-        itself is the child's copy.
+        A lock held by a parent thread at the fork would never be released
+        in the child. The data itself is the child's copy. Called from the
+        process-wide fork hook, not under any lock.
         """
-        if self._pid == os.getpid():
-            return
-        with self._state_lock:
-            if self._pid != os.getpid():
-                self._write_lock = threading.Lock()
-                self._write_owner = None
-                self._store.lock = threading.Lock()
-                self._pid = os.getpid()
+        self._state_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._write_owner = None
+        self._store.lock = threading.Lock()
 
     # =========================================================================
     # Internal
