@@ -17,6 +17,8 @@ from virtuals.container import (
     ContainerStructure,
     NodeType,
 )
+from virtuals.tkv.filter import PrefixFilter
+from virtuals.tkv.observer import SubscriptionOptions
 from virtuals.view import (
     ChildNavigationBase,
     ChildNestedGetBase,
@@ -110,6 +112,19 @@ class ListViewBase(
             raise IndexError("list index out of range")
 
         return address
+
+    def on_child_change(self, address: int) -> SubscriptionOptions:
+        """Build subscription options for the item at ``address`` and its subtree.
+
+        A watch is a filter, not a read: a non-negative index names a slot
+        whether or not the list, or that slot, exists yet, so it is used as
+        is and the watch works on an absent list (contract: subscriptions
+        on absent containers work). A negative index is resolved against
+        the current length and raises ``IndexError`` when out of range.
+        """
+        if address < 0:
+            address = self.normalize_address(address)
+        return SubscriptionOptions(filter=PrefixFilter(prefix=(*self.container.site, address)))
 
     # =========================================================================
     # MEMBERSHIP (same for both facets)
