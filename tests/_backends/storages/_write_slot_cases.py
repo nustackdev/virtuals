@@ -534,3 +534,102 @@ def _in_thread(fn, timeout: float = 5.0):
     if "error" in box:
         raise box["error"]
     return box.get("result")
+
+
+# =============================================================================
+# Review round 2 (28-review-rb R1): waiters that leave the queue by other routes
+# =============================================================================
+
+
+def sync_waiter_interrupted_by_signal_leaves_no_ghost(storage) -> None:
+    """A sync writer whose wait is cut short by a signal handler raising frees nothing and leaks nothing.
+
+    The next writer must get the slot at once after the holder releases.
+    """
+    import signal
+
+    class BoomError(Exception):
+        pass
+
+    def handler(*_: object) -> None:
+        raise BoomError
+
+    held, release = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with storage.transaction() as t:
+            t.put(KEY, b"holder")
+            held.set()
+            release.wait(5)
+
+    th = threading.Thread(target=holder)
+    th.start()
+    assert held.wait(5)
+    previous = signal.signal(signal.SIGALRM, handler)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0.05)
+        with pytest.raises(BoomError):
+            storage.begin_transaction()  # the main thread waits in the slot
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        release.set()
+        th.join(5)
+    _write_fast(storage)
+
+
+def areserve_task_destroyed_with_its_loop_leaves_no_ghost(storage) -> None:
+    """A coroutine queued in areserve whose loop closes without cancelling it does not hold up the slot.
+
+    The task is torn down with its loop (``GeneratorExit`` at the await,
+    or never resumed at all); at the next release the slot must go to a
+    live waiter or be unlocked, not sit granted to a dead one.
+    """
+    held, release = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with storage.transaction() as t:
+            t.put(KEY, b"holder")
+            held.set()
+            release.wait(5)
+
+    th = threading.Thread(target=holder)
+    th.start()
+    assert held.wait(5)
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(storage.areserve_write_slot())
+        loop.run_until_complete(asyncio.sleep(0.01))  # queued now
+    finally:
+        loop.close()  # without cancelling the task
+    del task
+    gc.collect()
+    release.set()
+    th.join(5)
+    _write_fast(storage)
+
+
+def areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage) -> None:
+    """A queued waiter whose loop closed but whose task object still lives is skipped at handoff."""
+    held, release = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with storage.transaction() as t:
+            t.put(KEY, b"holder")
+            held.set()
+            release.wait(5)
+
+    th = threading.Thread(target=holder)
+    th.start()
+    assert held.wait(5)
+    loop = asyncio.new_event_loop()
+    task = loop.create_task(storage.areserve_write_slot())
+    loop.run_until_complete(asyncio.sleep(0.01))
+    loop.close()
+    try:
+        release.set()
+        th.join(5)
+        _write_fast(storage)
+    finally:
+        del task
+        gc.collect()

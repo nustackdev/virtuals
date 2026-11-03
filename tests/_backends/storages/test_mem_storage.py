@@ -1557,3 +1557,15 @@ def test_history_under_one_snapshot_is_bounded_by_keys_not_commits(storage) -> N
             assert all(snap.get(("k", i)) == 0 for i in range(10))
     assert not storage._store._undo_log
     assert _get(storage, ("k", 3)) == -1
+
+
+def test_sync_waiter_interrupted_by_signal_leaves_no_ghost(storage) -> None:
+    cases.sync_waiter_interrupted_by_signal_leaves_no_ghost(storage)
+
+
+def test_areserve_task_destroyed_with_its_loop_leaves_no_ghost(storage) -> None:
+    cases.areserve_task_destroyed_with_its_loop_leaves_no_ghost(storage)
+
+
+def test_areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage) -> None:
+    cases.areserve_task_pending_on_a_closed_loop_is_skipped_at_handoff(storage)
