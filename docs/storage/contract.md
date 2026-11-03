@@ -34,7 +34,7 @@ Backends: sqlite, lmdb, rocksdb, mem. A backend ships only if it passes the conf
 | rocksdb | single-process | RocksDB locks its directory. Others open it read-only as a secondary or go through the owning process |
 | mem | single-process | one process by nature |
 
-- Open the storage in each process (the `spawn` start method is the supported path). Reusing an open storage across `os.fork` is best effort and documented per backend.
+- Open the storage in each process (the `spawn` start method is the supported path). Reusing an open storage across `os.fork` is best effort and documented per backend: sqlite parks inherited connections and lets the child open fresh ones, lmdb refuses every use in the child with a clear error.
 - LMDB thread affinity: LMDB's writer lock belongs to the thread that took it. The storage runs every begin, commit and abort on one writer thread per storage, so a transaction may be begun on one thread and ended on another. Snapshots never touch the writer thread.
 - A transaction, snapshot or scan on rocksdb belongs to one thread.
 - `close()` ends open contexts. A context whose owner is inside a call is ended after that call returns. The owner's next call raises `StorageClosedError`. A storage closed and reopened does not honor slots reserved before.
