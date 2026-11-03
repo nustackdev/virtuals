@@ -88,6 +88,8 @@ class SQLiteTransaction(
             self._aborted = True
             self._storage._untrack_transaction(self)
             logger.error("Transaction commit failed")
+            if isinstance(e, StorageClosedError):
+                raise  # the storage's close ended it first: say so, as every backend does
             if is_busy_error(e):
                 raise StorageLockTimeoutError(f"Timed out committing transaction: {e}") from e
             raise StorageTransactionError(f"Failed to commit transaction: {e}") from e

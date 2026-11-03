@@ -1526,3 +1526,157 @@ def test_close_during_commit_keeps_one_outcome(storage: SQLiteStorage) -> None:
     finally:
         for conn in storage._idle:
             conn.set_trace_callback(None)
+
+
+# =============================================================================
+# Round 2: loop-thread cap on the file lock, close under a busy-handler
+# writer, stale slot wording, slot finalizer in a forked child
+# =============================================================================
+
+
+@pytest.mark.timeout(20)
+def test_sync_begin_on_loop_behind_peer_process_is_capped(db_path: Path) -> None:
+    """A sync begin or batch write from a coroutine gives up after the loop cap, not busy_timeout.
+
+    The write lock is held by another process, so SQLite's busy handler
+    would sleep for the whole ``busy_timeout`` with the loop stalled behind
+    it. On a loop thread the file lock wait is capped like the slot wait
+    and surfaced as the retryable error that names ``areserve_write_slot``.
+    """
+    st = SQLiteStorage(path=db_path, codec=BinaryCodec(), busy_timeout=5.0)
+    st.open()
+    proc = _hold_in_other_process(db_path, 1.0)
+
+    async def main() -> tuple[float, float, str]:
+        async with _Ticker() as ticker:
+            t0 = time.perf_counter()
+            with pytest.raises(StorageLockTimeoutError) as info:
+                st.begin_transaction()
+            with pytest.raises(StorageLockTimeoutError):
+                b = st.begin_write_batch()
+                b.put(("x",), b"1")
+                b.write()
+            waited = time.perf_counter() - t0
+        return waited, ticker.gap, str(info.value)
+
+    try:
+        waited, gap, message = asyncio.run(main())
+    finally:
+        proc.wait(10)
+        st.close()
+    assert waited < 0.4, f"two sync begins on the loop took {waited:.3f}s"
+    assert gap < 0.2, f"loop blocked {gap * 1000:.0f}ms behind a peer process"
+    assert "areserve_write_slot" in message and "event loop" in message
+
+
+@pytest.mark.timeout(20)
+def test_close_and_reopen_under_busy_handler_writer_refuses_slotless_transaction(
+    db_path: Path,
+) -> None:
+    """A writer waiting in SQLite's busy handler across close() and open() does not get a transaction.
+
+    close() released its slot on its behalf; a transaction returned after
+    the reopen would be tracked by the reopened storage without holding
+    its slot, and the next in-process writer would wait out busy_timeout
+    in SQLite instead of the in-process handoff. The writer gets
+    ``StorageClosedError`` instead, and the reopened storage writes at once.
+    """
+    st = SQLiteStorage(path=db_path, codec=BinaryCodec(), busy_timeout=3.0)
+    st.open()
+    proc = _hold_in_other_process(db_path, 0.8)
+    box: dict = {}
+
+    def writer() -> None:
+        try:
+            box["txn"] = st.begin_transaction()
+        except BaseException as e:
+            box["err"] = e
+
+    th = threading.Thread(target=writer)
+    th.start()
+    time.sleep(0.2)  # the writer holds the slot and waits in BEGIN IMMEDIATE
+    st.close()
+    st.open()
+    th.join(10)
+    assert not th.is_alive()
+    proc.wait(10)
+    try:
+        if "txn" in box:
+            box["txn"].abort()
+        assert isinstance(box.get("err"), StorageClosedError), box
+        assert not st._writer.lock.locked()
+        t0 = time.perf_counter()
+        with st.transaction() as t:
+            t.put(("after",), b"1")
+        assert time.perf_counter() - t0 < 0.5
+    finally:
+        st.close()
+
+
+def test_stale_slot_after_close_names_the_close(storage: SQLiteStorage) -> None:
+    """The stale slot error says the storage was closed, as every other backend does."""
+
+    async def main() -> None:
+        slot = await storage.areserve_write_slot()
+        storage.close()
+        storage.open()
+        with pytest.raises(StorageError, match="closed") as info:
+            storage.begin_transaction(write_slot=slot)
+        assert "stale" in str(info.value)
+        slot.release()
+
+    asyncio.run(main())
+    with storage.transaction() as t:
+        t.put(("k",), b"1")
+
+
+def test_slot_finalizer_in_forked_child_leaves_the_inherited_lock_held(db_path: Path) -> None:
+    """A held slot collected in a child before any storage call does not free the parent's lock.
+
+    The lock is the inherited one until ``_check_fork`` replaces it; a
+    release here would make the child read the parent's write lock as
+    free and go on to wait out busy_timeout in SQLite instead of learning
+    at once that writes are refused. The finalizer parks the begun
+    connection and leaves the lock alone. Simulated without a fork: the
+    slot is told it belongs to another process.
+    """
+    from virtuals._backends.storages.sqlite import storage as module
+
+    st = SQLiteStorage(path=db_path, codec=BinaryCodec(), busy_timeout=0.5)
+    st.open()
+    parked = len(module._INHERITED_CONNECTIONS)
+
+    async def main() -> None:
+        slot = await st.areserve_write_slot()
+        slot._pid = os.getpid() + 1  # as seen by a forked child
+        lock = st._writer.lock
+        del slot
+        gc.collect()
+        assert lock.locked(), "the finalizer released the inherited writer lock"
+        assert len(module._INHERITED_CONNECTIONS) == parked + 1
+
+    try:
+        asyncio.run(main())
+    finally:
+        st.close()  # releases the lock on the holder's behalf
+
+
+def test_commit_ended_by_a_racing_close_raises_closed_error(storage: SQLiteStorage) -> None:
+    """A commit whose transaction close() ended first raises StorageClosedError, not a wrapped one."""
+    from virtuals._backends.storages.sqlite.transaction import SQLiteTransaction
+
+    tx = storage.begin_transaction()
+    tx.put(("k",), b"1")
+    real_end = SQLiteTransaction._end
+
+    def ended_by_close(self, sql):
+        real_end(self, "ROLLBACK")  # close() on another thread took the connection
+        return False
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(SQLiteTransaction, "_end", ended_by_close)
+        with pytest.raises(StorageClosedError, match="closed while committing"):
+            tx.commit()
+    assert tx.is_closed
+    with storage.transaction() as t:
+        t.put(("k",), b"2")
