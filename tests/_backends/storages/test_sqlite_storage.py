@@ -666,3 +666,13 @@ def test_cancel_while_reserving_holds_nothing(storage: SQLiteStorage) -> None:
 @pytest.mark.timeout(10)
 def test_cancel_between_reserve_and_begin_releases_slot(storage: SQLiteStorage) -> None:
     cases.cancel_between_reserve_and_begin(storage)
+
+
+@pytest.mark.timeout(10)
+def test_to_thread_nested_raises_fast(storage: SQLiteStorage) -> None:
+    cases.to_thread_nested_raises_fast(storage)
+
+
+@pytest.mark.timeout(10)
+def test_asyncio_run_inside_sync_txn_is_nested(storage: SQLiteStorage) -> None:
+    cases.asyncio_run_inside_sync_txn_is_nested(storage)

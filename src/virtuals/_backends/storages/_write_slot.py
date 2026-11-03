@@ -56,8 +56,10 @@ class WriterLock:
     """A storage's writer slot: one in-process writer at a time.
 
     The slot belongs to a thread and, on an event loop, to the task that
-    took it. It is a plain Lock (not an RLock), so it may be released from
-    a different thread than the one that took it.
+    took it. A slot reserved with ``areserve`` passes to whoever begins the
+    transaction with it, so a transaction begun in a worker thread is owned
+    by that thread. It is a plain Lock (not an RLock), so it may be released
+    from a different thread than the one that took it.
     """
 
     __slots__ = ("_label", "_lock", "_owner")
@@ -82,6 +84,17 @@ class WriterLock:
         self._lock = threading.Lock()
         self._owner = None
 
+    def _is_nested(self, me: _Owner) -> bool:
+        """True if ``me`` can never get the slot because it already holds it.
+
+        That is the owner itself, or any caller on a thread whose owner is
+        that thread outside any task: a thread holding a sync write
+        transaction cannot release it while it is blocked in a nested call,
+        such as an ``asyncio.run`` begun inside it.
+        """
+        owner = self._owner
+        return owner is not None and owner[0] == me[0] and (owner == me or owner[1] is None)
+
     def _nested(self) -> StorageNestedTransactionError:
         return StorageNestedTransactionError(
             f"This task or thread already holds the write lock on this {self._label} "
@@ -95,15 +108,16 @@ class WriterLock:
         """Block for the slot, up to ``timeout`` seconds.
 
         Fails at once when the slot is held from this same thread: by this
-        task or thread with ``StorageNestedTransactionError``, or by another
-        coroutine on this thread's loop with ``StorageLockTimeoutError``,
-        since that holder cannot run to release it while this thread blocks.
+        task, or by this thread outside any task, with
+        ``StorageNestedTransactionError``; by another coroutine on this
+        thread's loop with ``StorageLockTimeoutError``, since that holder
+        cannot run to release it while this thread blocks.
         """
         me = _caller()
+        if self._is_nested(me):
+            raise self._nested()
         owner = self._owner
         if owner is not None and owner[0] == me[0]:
-            if owner == me:
-                raise self._nested()
             raise StorageLockTimeoutError(
                 f"Another task on this thread's event loop holds the write lock on this "
                 f"{self._label} storage; blocking for it here would stall the loop it "
@@ -126,7 +140,7 @@ class WriterLock:
             The lock acquired, to hand to a ``WriteSlot``.
         """
         me = _caller()
-        if self._owner == me:
+        if self._is_nested(me):
             raise self._nested()
         lock = self._lock
         deadline = time.monotonic() + max(timeout, 0)
@@ -158,16 +172,27 @@ class WriterLock:
     ) -> Callable[[], None]:
         """Take the slot for a write transaction being begun on ``storage``.
 
-        With ``write_slot`` the slot is already held and is taken over;
-        otherwise it is acquired, waiting up to ``timeout``.
+        With ``write_slot`` the slot is already held and is taken over, and
+        its owner becomes the caller: the thread (and task) running the
+        transaction, which may differ from the one that reserved it, e.g. a
+        slot reserved on the loop and handed to ``asyncio.to_thread``.
+        Otherwise it is acquired, waiting up to ``timeout``.
 
         Returns:
             A callable that undoes the take after a failed begin: it
-            releases the slot, or returns it to ``write_slot``'s holder.
+            releases the slot, or returns it (and its owner) to
+            ``write_slot``'s holder.
         """
         if write_slot is not None:
             write_slot._take(storage)
-            return write_slot._give_back
+            previous = self._owner
+            self._owner = _caller()
+
+            def give_back() -> None:
+                self._owner = previous
+                write_slot._give_back()
+
+            return give_back
         self.acquire(timeout)
         lock = self._lock
         return lambda: self.release(lock)
