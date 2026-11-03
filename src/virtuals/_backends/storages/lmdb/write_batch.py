@@ -83,7 +83,8 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
         with self._call_lock:
             if self._closed:
                 raise StorageClosedError("Context is closed")
-            self._storage._check_key(encoded_key, key)
+            if not self._storage._key_fits(encoded_key):
+                return  # a key LMDB cannot store cannot exist: a no-op
             self._ops[encoded_key] = (key, None)
         self._modified_keys.add(key)
 
