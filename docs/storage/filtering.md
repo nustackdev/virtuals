@@ -1,4 +1,4 @@
-# Storage Layer — Filtering System
+# Storage Layer: Filtering System
 
 Filters are **composable, hashable predicates** for key matching.
 
@@ -8,8 +8,8 @@ They are used by both scan operations (storage layer) and observer subscriptions
 
 - Filters are **immutable** and **hashable** (usable in sets/dicts)
 - Filters are **composable** via `&` (and) and `|` (or) operators
-- Filters are **short-circuit evaluated** for efficiency
-- Filters are **declarative** — they describe what to match, not how
+- Filters are **short-circuit evaluated**
+- Filters are **declarative**: they describe what to match, not how
 
 ## Built-in Filter Types
 
@@ -83,7 +83,7 @@ f.matches(("posts", "123"))    # True
 f.matches(("comments",))       # False
 ```
 
-Nested compositions are automatically flattened:
+Nested compositions are flattened:
 
 ```python
 (a & b) & c  # becomes And(a, b, c)
@@ -150,7 +150,7 @@ class RegexFilter(Filter):
         return self.pattern == other.pattern
 ```
 
-Custom filters work with both scan and subscription systems.
+Custom filters work with scans as they are. A subscription also needs the filter's hash (`filter_hash`), which is built from `to_dict()`: the redis observer sends it at subscribe, and every observer keys resync wakes by it. A custom filter must override `to_dict()` with a literal dict of its fields to be subscribed on redis or to receive resync wakes; the `RegexFilter` above would need one. Without it `subscribe()` raises `NotImplementedError` on redis, and in-memory delivery works but misses resync wakes.
 
 **Performance note:** Custom filters cannot be indexed by the subscription registry. They are checked against every key change. For high-frequency notifications with many subscriptions, prefer built-in filter types.
 
@@ -179,7 +179,7 @@ When a key changes, the registry performs targeted hash lookups instead of check
 
 ### Custom Filter Indexing
 
-Custom filters cannot be indexed — the registry doesn't know their structure. They are stored in an unindexed set and checked on every key change.
+Custom filters cannot be indexed: the registry doesn't know their structure. They are stored in an unindexed set and checked on every key change.
 
 For subscriptions with many custom filters, matching degrades to O(custom_count).
 
@@ -196,6 +196,6 @@ For subscriptions with many custom filters, matching degrades to O(custom_count)
 
 ---
 
-Filters exist to be **declarative, composable, and efficient**.
+Filters exist to be **declarative and composable**.
 
 Complex matching logic should compose simple filters, not create monolithic custom implementations.

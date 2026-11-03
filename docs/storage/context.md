@@ -1,4 +1,4 @@
-# Storage Layer — Context Model
+# Storage Layer: Context Model
 
 All storage operations execute inside an explicit **context**.
 
@@ -14,9 +14,9 @@ Contexts are **foundational**, not optional.
 
 There are three kinds of contexts:
 
-- **Snapshot** — read-only
-- **WriteBatch** — write-only
-- **Transaction** — read + write
+- **Snapshot**: read-only
+- **WriteBatch**: write-only
+- **Transaction**: read + write
 
 Each context exposes a constrained command set.
 
@@ -30,7 +30,7 @@ Allowed operations:
 
 - `get(key) -> Value | EMPTY`
 - `exists(key) -> bool`
-- `multiget(keys: list[key.Key]) -> dict[key.Key, Value | EMPTY]`
+- `multiget(keys: list[key.Key]) -> dict[key.Key, Value]` (missing keys are omitted)
 - `scan(...) -> iterator`
 
 Disallowed:
@@ -70,7 +70,7 @@ Purpose: isolated read-modify-write sequences.
 Allowed operations:
 
 - `get(key) -> Value | EMPTY`
-- `multiget(keys: list[key.Key]) -> dict[key.Key, Value | EMPTY]`
+- `multiget(keys: list[key.Key]) -> dict[key.Key, Value]` (missing keys are omitted)
 - `exists(key) -> bool`
 - `put(key, value) -> None`
 - `delete(key) -> None`

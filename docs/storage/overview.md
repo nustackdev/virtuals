@@ -29,13 +29,13 @@ Keys are ordered like words in a dictionary:
 ("a",) < ("a", "b") < ("a", "b", "c") < ("a", "c") < ("b",)
 ```
 
-This ordering enables efficient range queries.
+This ordering makes a prefix range query one seek.
 
 ### Flat Storage
 
 All keys are equal. No concept of hierarchy:
 
-- `("users",)` and `("users", "alice")` are just two keys
+- `("users",)` and `("users", "alice")` are two keys
 - No relationship between them at this layer
 - No concept of "parent", "child", "container", "value"
 
@@ -63,7 +63,7 @@ Every operation runs inside a context: a `Snapshot` (read only), a `Transaction`
 with storage.snapshot() as snap:        # read only, binds at open
     value = snap.get(key)               # Value or EMPTY
     found = snap.exists(key)
-    many = snap.multiget([k1, k2])      # dict, missing keys hold EMPTY
+    many = snap.multiget([k1, k2])      # dict, missing keys are omitted
 
 with storage.transaction() as tx:       # read and write, commit on exit
     tx.put(key, value)
@@ -75,7 +75,7 @@ with storage.batch_write() as batch:    # write only, applied on exit
     batch.delete(other)
 ```
 
-The plain forms are `begin_snapshot()`, `begin_transaction()` and `begin_write_batch()`; each returns a context with `commit()` or `write()` and `abort()`. A transaction aborted by an exception inside the block leaves no key.
+The plain forms are `begin_snapshot()`, `begin_transaction()` and `begin_write_batch()`; a snapshot has `close()`, a transaction `commit()` and `abort()`, a write batch `write()` and `abort()`. A transaction aborted by an exception inside the block leaves no key.
 
 ### Scan
 
@@ -103,7 +103,7 @@ Transactions are serializable, snapshots bind at open and are never torn. One wr
 
 ## Why Tuples?
 
-### Efficient Prefix Queries
+### Prefix Queries
 
 Want all keys starting with `("users",)`?
 
@@ -113,7 +113,7 @@ for key in db.all_keys():
     if key.startswith("users:"):
         yield key
 
-# KV: efficient range scan
+# KV: one range scan
 prefix = PrefixFilter(prefix=("users",))
 scan = tx.scan(StorageScanOptions(start=("users",), break_filter=prefix, filter=prefix))
 for key in scan.keys():
@@ -124,7 +124,7 @@ Backend seeks directly to `("users",)` and stops at the first key past the prefi
 
 ### Natural Hierarchical Encoding
 
-Tuples naturally represent paths:
+Tuples represent paths:
 
 ```python
 ("users", "alice", "profile")

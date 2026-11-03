@@ -55,9 +55,12 @@ Races are forced, not hoped for. In lost update a pause sits between each read a
 | `test_s3_scan_after_storage_close_raises_closed` | 3 | same after the storage closed |
 | `test_s4_coroutine_writers_serialize` | 4 | N coroutines doing read, await, write all land, in bounded time |
 | `test_s4_coroutine_writers_do_not_block_loop` | 4 | writers holding a write across an await never block the loop for 200ms |
+| `test_s4_cross_process_sync_begin_on_loop_is_bounded` | 4 | with another process holding the write lock, a sync begin or batch write from a coroutine gives up within the in-process cap, not the whole `busy_timeout` (multi-process backends only) |
+| `test_s4_backend_declares_process_model` | 4 | every backend class declares the process model its spec claims |
 | `test_s1_dropped_transaction_frees_slot` | 1 | a txn dropped without commit or abort (other thread, then same thread) does not hold the slot once collected: the next writer lands within 200ms |
 | `test_s1_nested_through_worker_or_nested_loop_raises_distinct_error` | 1, 3 | a write begun in a `to_thread` worker below the slot holder, or inside an `asyncio.run` within a sync txn, raises `StorageNestedTransactionError` at once |
 | `test_s4_sync_begin_on_loop_thread_is_bounded` | 4 | a sync `begin_transaction` or `batch.write` from a coroutine while a thread holds the slot gives up within 300ms with the retryable lock timeout, loop gap under 200ms |
+| `test_s4_async_writer_lands_next_to_sync_writer_threads` | 4 | an `areserve_write_slot` writer on the loop gets the slot in FIFO order while two sync threads write back to back |
 | `test_s4_late_release_after_close_and_reopen_frees_nothing` | 4 | close and reopen while a commit is about to give the slot back, a new writer takes the fresh slot: the old release neither frees it nor raises |
 | `test_s4_reserved_slot_does_not_survive_close` | 4 | a slot reserved and never taken is gone after close and reopen: the next writer lands within 200ms, the stale slot is refused with a non-retryable error |
 | `test_s4_cross_process_lock_wait_does_not_block_loop` | 4 | a slot writer waiting for a write lock held by another process never blocks the loop for 200ms (multi-process backends only) |
@@ -71,12 +74,13 @@ Races are forced, not hoped for. In lost update a pause sits between each read a
 | `test_s5_one_wake_per_subscription_per_commit` | 5 | a key matching two subscriptions with different filters wakes each once |
 | `test_s5_subscribe_ready_on_return` | 5 | the very next commit after subscribe() returns is delivered, no window |
 | `test_s5_watch_covers_the_subtree` | 5 | a prefix watch gets the row and everything under it, not a sibling whose name only starts the same |
+| `test_s5_untyped_child_watch_covers_the_child_subtree` | 5 | the watch a dict view builds for an untyped child fires on a write deep inside the compound value stored there, not on a sibling (once per dict view kind) |
 | `test_s5_resync_on_reconnect` | 5 | writes made while the observer is cut off are recovered by one keyless wake (redis transport only) |
 | `test_s7_storage_delete_is_point_delete` | 7 | `txn.delete` of one key handles one key inside the backend at 10 and 1000 siblings |
 | `test_s7_storage_delete_time_flat` | 7 | median `txn.delete` time grows under 10x from 100 to 10k siblings |
 | `test_s7_view_dict_delete_is_point_delete` | 7 | deleting one dict view key handles as many keys at 10 as at 1000 siblings |
 
-Concurrency cases retry only `RETRYABLE` errors; any other class fails the case. Every case carries a `pytest.mark.timeout`, so a stall fails instead of hanging. Both section 4 cases run twice: `slot` waits in the backend's `areserve_write_slot()` where it has one, `plain` calls `begin_transaction()` directly and retries.
+Concurrency cases retry only `RETRYABLE` errors; any other class fails the case. Every case in sections 1 to 4 and 7 carries a `pytest.mark.timeout`, so a stall fails instead of hanging; the section 5 cases wait on `flush()` barriers with their own timeouts, and the process model case is a plain assertion. There is no suite-wide timeout. The two coroutine writer cases of section 4 run twice: `slot` waits in the backend's `areserve_write_slot()` where it has one, `plain` calls `begin_transaction()` directly and retries.
 
 Section 7 counts keys below the transaction API: storages are built with `CountingCodec`, which counts every key the backend encodes or decodes, so a delete that walks the store shows up however it is wrapped. A walk over raw bytes that never decodes is caught by the timing case.
 
@@ -84,11 +88,7 @@ Out of scope: multi-store transactions (one Transaction over several storages, c
 
 ## known failures
 
-Strict xfails: an unexpected pass fails the run, so delete the row in the commit that fixes it. The table below is `known_failures.py` as of this commit; the file is the source of truth.
-
-| case | backend | owner |
-|---|---|---|
-| scan after context close, scan after storage close | mem | the mem scan keeps yielding a page it buffered before close; lane V round 2 (mem) |
+Strict xfails: an unexpected pass fails the run, so delete the row in the commit that fixes it. `known_failures.py` is the source of truth and is empty as of this commit: every case passes on every backend. A row names the case, the backend (or one parametrization of it), and an owner.
 
 Section 5 runs every case on both transports (in-memory, redis). The resync case is skipped on the in-memory transport, which has no connection to lose. The multi-process cases skip on rocksdb and mem, which declare a single-process model.
 

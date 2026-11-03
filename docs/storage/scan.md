@@ -1,4 +1,4 @@
-# Storage Layer — Scan Operation
+# Storage Layer: Scan Operation
 
 `scan` provides ordered, streaming access to key ranges.
 
@@ -42,11 +42,18 @@ Any stronger guarantees belong in higher layers.
 
 scan(self, options: StorageScanOptions) -> ScanProtocol:
 
-StorageScanOptions:
-    start: Starting key (inclusive by default). None means from beginning.
-    direction: Direction to scan (forward or reverse).
-    filter: filter keys
-    break_filter: break the scan loop
+StorageScanOptions (a frozen dataclass, every field optional):
+    start: first key visited, always inclusive. None means the first key
+        of the store (forward) or the last (reverse).
+    reverse: False walks forward in key order, True walks backward.
+    limit: stop after this many yielded rows. None means no cap.
+    filter: a key is yielded only when it matches.
+    break_filter: the scan stops at the first key that does not match
+        (a PrefixFilter here bounds the walk to a subtree).
+    start_encoded: a pre-encoded start bound; wins over start when set.
+    max_depth: deepest key length walked row by row; longer keys are
+        skipped with one seek per subtree, so a child scan costs
+        O(children). Must be at least 1.
 
 ScanProtocol:
     def items(self) -> Generator[tuple[key.Key, Value], None, None]:
