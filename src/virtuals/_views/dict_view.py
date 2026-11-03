@@ -191,7 +191,13 @@ class DictViewBase(
         already knows; this is the door for it to say so on the write path,
         so non-default layouts (``Kh57View``, ``IndexedDictView``, …) round-
         trip correctly.
+
+        Raises:
+            ValueError: If ``value`` holds EMPTY anywhere. Checked before
+                the view is materialized, so a rejected write leaves nothing
+                behind.
         """
+        self._reject_empty(address, value)
         self.ensure_created()
         self._populate_child_container(address, value, view_class=view_class)
 

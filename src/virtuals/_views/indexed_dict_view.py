@@ -14,6 +14,13 @@ Layout under the view's container::
 No /m tree.  Length = len(__keys__).  Data ops route to ``__data__/``,
 key ops route to ``__keys__/``.
 
+Known cost: ``__delitem__`` rewrites the whole ``__keys__`` list, so a
+delete is O(n) in the number of keys, and ``__len__`` reads the stored
+length of that list. Both go against the cost rules in
+``docs/storage/contract.md`` (point deletes, no stored length). New
+ordered collections should use ``FractionalIndexedDictView``, whose every
+op is O(1) in the number of keys. This view stays for existing data.
+
 Provides three classes following the eager/lazy facet pattern:
 - IndexedDictViewBase: shared mutations, keys, lifecycle
 - EagerIndexedDictView: reads return extracted Python values
@@ -216,7 +223,11 @@ class IndexedDictViewBase(
         and record the key -- but takes ``view_class`` explicitly instead of
         dispatching by Python value type. Used by Refs that carry
         ``view_type=view_class`` in their slot payload.
+
+        A value holding EMPTY anywhere raises ``ValueError`` before the view,
+        the key list or the child are written.
         """
+        self._reject_empty(address, value)
         self.ensure_created()
         self._populate_child_container(address, value, view_class=view_class)
 

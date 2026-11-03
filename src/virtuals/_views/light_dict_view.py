@@ -110,6 +110,10 @@ class LightDictView(
         """Count number of keys."""
         return sum(1 for _ in self.keys())
 
+    def __bool__(self) -> bool:
+        """True if any key exists. One row, so ``if view:`` never counts."""
+        return self.container.has_children()
+
     def __iter__(self) -> Generator[str | int, None, None]:
         """Iterate over keys."""
         yield from self.container.iter_child_keys(validate=False)
