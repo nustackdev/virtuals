@@ -273,3 +273,67 @@ def test_s4_late_release_after_close_and_reopen_frees_nothing(quick):
         holder.join(5)
     assert not holder_errors, holder_errors
     assert _write(quick, 2) < FREE_BUDGET
+
+
+SYNC_LOOP = 1.5  # seconds the sync writer threads loop
+ASYNC_WINDOW = 1.0  # seconds the async writer tries inside that
+MIN_ASYNC = 10  # transactions the async writer must land in the window
+
+
+@pytest.mark.timeout(20)
+def test_s4_async_writer_lands_next_to_sync_writer_threads(backend, tmp_path):
+    """An areserve writer on the loop gets the slot while sync threads write in a loop.
+
+    The slot is free for microseconds between two sync transactions, so a
+    coroutine that polled for it would never see it free; the slot hands
+    off in FIFO order instead. Two sync threads, since one leaves gaps on
+    the fastest backend.
+    """
+    st = backend.make(tmp_path, lock_timeout=0.5)
+    st.open()
+    stop = threading.Event()
+    sync_n = [0]
+    errors: list[BaseException] = []
+
+    def writer(i: int) -> None:
+        try:
+            while not stop.is_set():
+                with st.transaction() as t:
+                    t.put(("s", i), 1)
+                sync_n[0] += 1
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=writer, args=(i,), daemon=True) for i in range(2)]
+    for th in threads:
+        th.start()
+
+    async def main() -> tuple[int, int, float]:
+        ok, failed, worst = 0, 0, 0.0
+        await asyncio.sleep(0.05)  # the sync loop is running
+        end = time.perf_counter() + ASYNC_WINDOW
+        while time.perf_counter() < end:
+            t0 = time.perf_counter()
+            try:
+                slot = await st.areserve_write_slot()
+                tx = st.begin_transaction(write_slot=slot)
+                tx.put(("a",), 1)
+                tx.commit()
+                ok += 1
+            except StorageLockTimeoutError:
+                failed += 1
+            worst = max(worst, time.perf_counter() - t0)
+        return ok, failed, worst
+
+    try:
+        ok, failed, worst = asyncio.run(main())
+    finally:
+        stop.set()
+        for th in threads:
+            th.join(5)
+        st.close()
+    assert not errors, errors[0]
+    assert sync_n[0] > 0
+    assert failed == 0, f"async writer timed out {failed} times next to {sync_n[0]} sync txns"
+    assert ok >= MIN_ASYNC, f"async writer landed {ok} txns next to {sync_n[0]} sync txns"
+    assert worst < 0.5, f"worst async wait {worst:.3f}s"
