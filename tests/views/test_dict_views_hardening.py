@@ -550,3 +550,229 @@ def test_len_scans_children_not_descendants(costed, view_cls):
         costs[width] = measure(storage, counts, lambda root: len(root.open_child("d", view_cls)))
     assert costs[5] == costs[200], costs
     assert costs[5]["scan_rows"] <= 2 * n + 2, costs
+
+
+# ============================================================================
+# LOGINDEXED REVERSE INDEX: stale, wrong or missing rows (mixed-version stores)
+# ============================================================================
+
+
+def _log_key_of(view, key):
+    return next(lk for lk, ak in view.keys_with_log_keys() if ak == key)
+
+
+def _bypass_delete_and_reset(view, key, value):
+    """What a writer that does not know ``__log__/`` does: drop data and log row, re-set both."""
+    from virtuals._views.log_indexed_dict_view import _generate_log_key
+
+    view._keys_container().delete_child_primitive_unsafe(_log_key_of(view, key))
+    view._data_container().delete_child(key)
+    view._data_container().put_child_primitive(key, value)
+    view._keys_container().put_child_primitive(_generate_log_key(), key)
+
+
+def test_log_indexed_delete_with_stale_reverse_row_falls_back_to_scan(root):
+    """A reverse row pointing at a dead log key must not leave a ghost key."""
+    view = root.open_child("d", EagerLogIndexedDictView)
+    view.store({"a": 1, "c": 3, "e": 5})
+    stale = view._log_container().get_child_primitive_unsafe("a")
+    _bypass_delete_and_reset(view, "a", 10)
+    assert view._log_container().get_child_primitive_unsafe("a") == stale
+    assert view["a"] == 10
+    del view["a"]
+    assert "a" not in view
+    assert list(view) == ["c", "e"]
+    assert len(view) == 2
+    assert list(view.items()) == [("c", 3), ("e", 5)]
+    assert sorted(view._log_container().iter_child_keys(validate=False)) == ["c", "e"]
+
+
+def test_log_indexed_delete_with_wrong_reverse_row_keeps_the_other_key(root):
+    """A reverse row naming another key's log key must not delete that key's log row."""
+    view = root.open_child("d", EagerLogIndexedDictView)
+    view.store({"a": 1, "b": 2, "c": 3})
+    view._log_container().put_child_primitive(
+        "a", _log_key_of(view, "b"), validate=False, validate_parent=False
+    )
+    del view["a"]
+    assert list(view) == ["b", "c"]
+    assert len(view) == 2
+    assert view["b"] == 2
+    assert view._log_container().get_child_primitive_unsafe("b") == _log_key_of(view, "b")
+    view["a"] = 11
+    assert list(view) == ["b", "c", "a"]
+    del view["b"]
+    assert list(view) == ["c", "a"]
+
+
+def test_log_indexed_old_data_without_log_container(root, storage):
+    """Data written before ``__log__/`` existed: no marker, no rows, everything still works."""
+    view = root.open_child("d", EagerLogIndexedDictView)
+    view.store({"a": 1, "b": {"n": 2}, "c": 3})
+    view.container.delete_child("__log__")
+    assert not view._log_container().exists()
+    assert list(view) == ["a", "b", "c"]
+    assert view["b"] == {"n": 2}
+    assert len(view) == 3
+    # delete falls back to the scan and writes no index
+    del view["b"]
+    assert list(view) == ["a", "c"]
+    assert len(view) == 2
+    assert not view._log_container().exists()
+    # the first write stamps the marker and indexes the new key only
+    view["d"] = 4
+    assert view._log_container().exists()
+    assert list(view._log_container().iter_child_keys(validate=False)) == ["d"]
+    del view["d"]
+    assert list(view) == ["a", "c"]
+    # rebuild fills the rest
+    view.rebuild_bookkeeping()
+    assert {
+        k: v.primitive_value for k, v in view._log_container().iter_children(validate=False)
+    } == {
+        "a": _log_key_of(view, "a"),
+        "c": _log_key_of(view, "c"),
+    }
+    del view["a"]
+    assert list(view) == ["c"]
+
+
+def test_log_indexed_old_data_survives_a_fresh_transaction(storage):
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", EagerLogIndexedDictView)
+        view.store({"a": 1, "b": 2})
+        view.container.delete_child("__log__")
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", EagerLogIndexedDictView)
+        del view["a"]
+        assert list(view) == ["b"]
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", EagerLogIndexedDictView)
+        assert list(view) == ["b"]
+        assert len(view) == 1
+        assert "a" not in view
+
+
+# ============================================================================
+# EMPTY INSIDE COMPOUND AND BULK WRITES: nothing is written before the check
+# ============================================================================
+
+
+@pytest.mark.parametrize("view_cls", NESTED_VIEWS)
+def test_nested_empty_leaves_no_partial_child(root, view_cls):
+    view = root.open_child("d", view_cls)
+    view["keep"] = 1
+    for bad in (
+        {"ok": 1, "bad": EMPTY},
+        {"ok": 1, "deep": {"x": [1, {"y": EMPTY}]}},
+        [1, (2, EMPTY)],
+    ):
+        with pytest.raises(ValueError, match="EMPTY"):
+            view["y"] = bad
+        assert "y" not in view
+        assert len(view) == 1
+        assert list(view) == ["keep"]
+        assert not view.open_child("y", EagerDictView).container.exists()
+        assert view.get("y", "dflt") == "dflt"
+
+
+@pytest.mark.parametrize("view_cls", DICT_VIEWS)
+def test_store_with_empty_leaves_the_view_as_it_was(root, view_cls):
+    view = root.open_child("d", view_cls)
+    keep = _key(view_cls, 0)
+    view[keep] = 1
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.store({_key(view_cls, 1): 2, _key(view_cls, 2): EMPTY}, replace=True)
+    assert list(view) == [keep]
+    assert view[keep] == 1
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.update({_key(view_cls, 1): 2, _key(view_cls, 2): EMPTY})
+    assert list(view) == [keep]
+
+
+def test_store_with_empty_on_absent_view_leaves_it_absent(root):
+    view = root.open_child("absent", EagerDictView)
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.store({"a": 1, "b": {"c": EMPTY}})
+    assert not view.container.exists()
+
+
+def test_fractional_nested_empty_insert_leaves_no_trace(root):
+    """The real failure path through ``_insert``: no subclass, a nested EMPTY."""
+    view = root.open_child("lst", EagerFractionalIndexedDictView)
+    view.store({"a": 1, "b": 2})
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.insert_after("a", "x", {"ok": 1, "bad": {"z": EMPTY}})
+    assert "x" not in view
+    assert len(view) == 2
+    assert list(view) == ["a", "b"]
+    assert view.get("x") is None
+    assert not view._data_container().exists_child("x")
+    assert list(view.items()) == [("a", 1), ("b", 2)]
+    with pytest.raises(ValueError, match="EMPTY"):
+        view.store({"a": 1, "x": {"bad": EMPTY}})
+    assert list(view) == ["a", "b"]
+    assert view["b"] == 2
+
+
+def test_list_views_reject_empty_before_any_shift_or_write(root):
+    from virtuals._views import EagerListView, FlatListView, SetView
+
+    lst = root.open_child("lst", EagerListView)
+    lst.store([1, 2, 3])
+    with pytest.raises(ValueError, match="EMPTY"):
+        lst.insert(1, EMPTY)
+    with pytest.raises(ValueError, match="EMPTY"):
+        lst.insert(1, {"a": EMPTY})
+    with pytest.raises(ValueError, match="EMPTY"):
+        lst.append(EMPTY)
+    with pytest.raises(ValueError, match="EMPTY"):
+        lst.extend([4, EMPTY])
+    with pytest.raises(ValueError, match="EMPTY"):
+        lst.store([4, EMPTY])
+    with pytest.raises(ValueError, match="EMPTY"):
+        lst[0] = [EMPTY]
+    assert lst.extract() == [1, 2, 3]
+    assert len(lst) == 3
+
+    flat = root.open_child("flat", FlatListView)
+    flat.store([1, 2])
+    for op in (
+        lambda: flat.append(EMPTY),
+        lambda: flat.extend([3, EMPTY]),
+        lambda: flat.store([EMPTY]),
+    ):
+        with pytest.raises(ValueError, match="EMPTY"):
+            op()
+    assert flat.extract() == [1, 2]
+    absent = root.open_child("absent_flat", FlatListView)
+    with pytest.raises(ValueError, match="EMPTY"):
+        absent.append(EMPTY)
+    assert not absent.container.exists()
+
+    s = root.open_child("set", SetView)
+    s.store({"a"})
+    with pytest.raises(ValueError, match="EMPTY"):
+        s.add(EMPTY)
+    with pytest.raises(ValueError, match="EMPTY"):
+        s.store(["b", EMPTY])
+    assert s.extract() == {"a"}
+
+
+def test_bulk_doors_still_take_lazy_iterables(root):
+    from virtuals._views import EagerListView, FlatListView, SetView
+
+    lst = root.open_child("lst", EagerListView)
+    lst.store(i for i in range(3))
+    lst.extend(i for i in range(3, 5))
+    assert lst.extract() == [0, 1, 2, 3, 4]
+    flat = root.open_child("flat", FlatListView)
+    flat.store(i for i in range(2))
+    flat.extend(i for i in range(2, 4))
+    assert flat.extract() == [0, 1, 2, 3]
+    s = root.open_child("set", SetView)
+    s.store(str(i) for i in range(3))
+    assert s.extract() == {"0", "1", "2"}
+    f = root.open_child("f", EagerFractionalIndexedDictView)
+    f.store(f"k{i}" for i in range(3))
+    assert list(f) == ["k0", "k1", "k2"]

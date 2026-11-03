@@ -224,14 +224,17 @@ class LogIndexedDictViewBase(
                 seen[actual_key] = log_key
             else:
                 kc.delete_child_primitive_unsafe(log_key)
+        indexed: set[str | int] = set()
         for actual_key, info in list(lc.iter_children(validate=False)):
             want = seen.get(actual_key)
             if want is None:
                 lc.delete_child_primitive_unsafe(actual_key)
-            elif info.primitive_value != want:
+                continue
+            indexed.add(actual_key)
+            if info.primitive_value != want:
                 lc.put_child_primitive(actual_key, want, validate=False, validate_parent=False)
         for actual_key, log_key in seen.items():
-            if is_empty(lc.get_child_primitive_unsafe(actual_key)):
+            if actual_key not in indexed:
                 lc.put_child_primitive(actual_key, log_key, validate=False, validate_parent=False)
         for key in data_keys:
             if key not in seen:
@@ -488,10 +491,16 @@ class LogIndexedDictViewBase(
         if not dc.exists_child(address):
             raise KeyError(address)
         dc.delete_child(address)
-        # Drop the log entry: one reverse-index get, then two point deletes.
-        # Keys written before ``__log__/`` existed have no reverse row and
-        # fall back to a log scan.
+        # Drop the log entry: one reverse-index get, one get to confirm the
+        # log row still names this key, then two point deletes. A missing
+        # reverse row (data logged before ``__log__/`` existed) or a stale
+        # one (a writer that does not maintain the index deleted and re-set
+        # the key) falls back to a log scan, as before the index.
         log_key = self._log_key_or_empty(address)
+        if not is_empty(log_key):
+            held = self._keys_container().get_child_primitive_unsafe(cast("str", log_key))
+            if is_empty(held) or held != address:
+                log_key = EMPTY
         if is_empty(log_key):
             for candidate, actual_key in self._scan_log_keys():
                 if actual_key == address:
@@ -538,6 +547,8 @@ class LogIndexedDictViewBase(
         return key
 
     def update(self, other: PyMapping[str | int, object] | None = None, **kwargs: object) -> None:
+        self._reject_empty_in(other or {})
+        self._reject_empty_in(kwargs)
         if other:
             for key, value in other.items():
                 self[key] = value
@@ -545,6 +556,7 @@ class LogIndexedDictViewBase(
             self[key] = value  # type: ignore[assignment]
 
     def store(self, value: PyMapping[str | int, object], *, replace: bool = True) -> None:
+        value = self._reject_empty_in(value)  # type: ignore[assignment]
         self.ensure_created()
         if replace and self.next_key_after(None) is not None:
             self.clear()

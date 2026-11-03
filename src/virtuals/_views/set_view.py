@@ -101,6 +101,7 @@ class SetView(
         Args:
             value: Value to add
         """
+        self._reject_empty_in(value)
         # A new value is counted via _on_child_created
         self._set_child_value(self._make_key(value), value)
 
@@ -238,6 +239,7 @@ class SetView(
             value: Iterable to store
             replace: If True, clear existing content first; if False, union
         """
+        value = self._reject_empty_in(value)  # type: ignore[assignment]
         self.ensure_created()
         if replace:
             self.clear()

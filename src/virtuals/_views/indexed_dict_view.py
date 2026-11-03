@@ -241,6 +241,8 @@ class IndexedDictViewBase(
         self._keys_view().clear()
 
     def update(self, other: PyMapping[str | int, object] | None = None, **kwargs: object) -> None:
+        self._reject_empty_in(other or {})
+        self._reject_empty_in(kwargs)
         if other:
             for key, value in other.items():
                 self[key] = value
@@ -248,6 +250,7 @@ class IndexedDictViewBase(
             self[key] = value  # type: ignore[assignment]
 
     def store(self, value: PyMapping[str | int, object], *, replace: bool = True) -> None:
+        value = self._reject_empty_in(value)  # type: ignore[assignment]
         self.ensure_created()
         if replace and len(self) > 0:
             self.clear()

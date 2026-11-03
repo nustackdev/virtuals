@@ -103,6 +103,7 @@ class FlatListView(
 
     def append(self, value: Value) -> None:
         """Append a primitive value.  O(1): one primitive write + one metadata write."""
+        self._reject_empty_in(value)
         self.ensure_created()
         index = len(self)
         self.container.put_child_primitive(index, value)
@@ -128,6 +129,7 @@ class FlatListView(
             value: Iterable to store
             replace: If True, clear existing content first; if False, append
         """
+        value = self._reject_empty_in(value)  # type: ignore[assignment]
         self.ensure_created()
         if replace:
             self.clear()
@@ -141,6 +143,7 @@ class FlatListView(
 
     def extend(self, values: Iterable[Value]) -> None:
         """Append multiple values."""
+        values = self._reject_empty_in(values)  # type: ignore[assignment]
         self.ensure_created()
         index = len(self)
         for item in values:

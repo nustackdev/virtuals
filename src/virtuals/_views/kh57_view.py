@@ -340,6 +340,8 @@ class Kh57ViewBase(
         **kwargs: object,
     ) -> None:
         """Update from mapping or kwargs — int keys only."""
+        self._reject_empty_in(other or {})
+        self._reject_empty_in(kwargs)
         if other:
             for key, value in other.items():
                 self[key] = value
@@ -348,6 +350,7 @@ class Kh57ViewBase(
 
     def store(self, value: PyMapping[int, object], *, replace: bool = True) -> None:
         """Bulk-load mapping contents under kh57-encoded segments."""
+        value = self._reject_empty_in(value)  # type: ignore[assignment]
         self.ensure_created()
         if replace and len(self) > 0:
             self.clear()
