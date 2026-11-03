@@ -155,6 +155,8 @@ class DictViewBase(
 
     def clear(self) -> None:
         """Remove all items."""
+        if not self.container.exists():
+            return  # clear of nothing is not a write: the view stays absent
         self.ensure_created()
         self.container.clear_children(validate=True)
 

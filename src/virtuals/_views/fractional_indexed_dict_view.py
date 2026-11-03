@@ -712,6 +712,8 @@ class FractionalIndexedDictViewBase(
         return value
 
     def clear(self) -> None:
+        if not self.container.exists():
+            return  # clear of nothing is not a write: the view stays absent
         self.ensure_created()
         self._data_container().clear_children(validate=False)
         self._order_container().clear_children(validate=False)

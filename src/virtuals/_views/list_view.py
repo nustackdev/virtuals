@@ -172,8 +172,8 @@ class ListViewBase(
         large lists of container children where middle-position deletes are
         common, prefer a dict keyed by id.
         """
+        normalized = self.normalize_address(address)  # IndexError before any write
         self.ensure_created()
-        normalized = self.normalize_address(address)
         length = len(self)
 
         self.container.delete_child(normalized)
@@ -219,6 +219,8 @@ class ListViewBase(
 
     def clear(self) -> None:
         """Remove all items."""
+        if not self.container.exists():
+            return  # clear of nothing is not a write: the view stays absent
         self.ensure_created()
         self.container.clear_children()
         self._set_length(0)

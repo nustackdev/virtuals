@@ -19,6 +19,7 @@ from tests.support.counting import (
 )
 
 from virtuals._views import (
+    ByteArrayView,
     EagerDictView,
     EagerFractionalIndexedDictView,
     EagerIndexedDictView,
@@ -26,8 +27,11 @@ from virtuals._views import (
     EagerListView,
     EagerLogIndexedDictView,
     FlatDictView,
+    FlatListView,
     LazyDictView,
+    LazyListView,
     LightDictView,
+    SetView,
 )
 from virtuals.container import ContainerTypeError
 from virtuals.navigator import Navigator
@@ -1026,3 +1030,106 @@ def test_none_is_a_stored_list_item(storage):
         assert lst[0] is None
         assert None in lst
         assert len(lst) == 3
+
+
+# ============================================================================
+# EXISTENCE: a raising or no-op write never creates the view (contract 6, r3 F3 to F7)
+# ============================================================================
+
+ALL_CLEARABLE_VIEWS = (
+    *DICT_VIEWS,
+    EagerListView,
+    LazyListView,
+    FlatListView,
+    SetView,
+    ByteArrayView,
+)
+
+
+def _assert_absent(view):
+    assert not view.container.exists()
+    assert len(view) == 0
+    assert not view
+    assert list(view) == []
+
+
+@pytest.mark.parametrize("view_cls", (EagerListView, LazyListView, ByteArrayView))
+def test_delete_out_of_range_on_absent_sequence_does_not_create_it(root, view_cls):
+    """``del v[0]`` on an absent list raises like ``pop()`` does and writes nothing."""
+    view = root.open_child("absent", view_cls)
+    with pytest.raises(IndexError):
+        del view[0]
+    _assert_absent(view)
+
+
+@pytest.mark.parametrize("view_cls", (EagerListView, LazyListView, FlatListView, ByteArrayView))
+def test_set_out_of_range_on_absent_sequence_does_not_create_it(root, view_cls):
+    view = root.open_child("absent", view_cls)
+    with pytest.raises(IndexError):
+        view[0] = 1
+    _assert_absent(view)
+
+
+@pytest.mark.parametrize("view_cls", (EagerListView, LazyListView, ByteArrayView))
+def test_remove_missing_on_absent_sequence_does_not_create_it(root, view_cls):
+    view = root.open_child("absent", view_cls)
+    with pytest.raises(ValueError):
+        view.remove(1)
+    _assert_absent(view)
+
+
+def test_set_discard_and_remove_on_absent_set_do_not_create_it(root):
+    view = root.open_child("absent", SetView)
+    view.discard("x")
+    _assert_absent(view)
+    with pytest.raises(KeyError):
+        view.remove("x")
+    _assert_absent(view)
+    assert "x" not in view
+
+
+def test_set_discard_of_a_member_still_deletes_it(root):
+    view = root.open_child("s", SetView)
+    view.add("x")
+    view.add("y")
+    view.discard("x")
+    view.remove("y")
+    assert view.container.exists()
+    assert len(view) == 0
+    assert "x" not in view
+
+
+@pytest.mark.parametrize("view_cls", (EagerListView, LazyListView, FlatListView, ByteArrayView))
+def test_extend_with_nothing_on_absent_sequence_leaves_it_absent(root, view_cls):
+    view = root.open_child("absent", view_cls)
+    view.extend([])
+    _assert_absent(view)
+    view.extend([1, 2])
+    assert view.container.exists()
+    assert list(view) == [1, 2]
+
+
+@pytest.mark.parametrize("view_cls", ALL_CLEARABLE_VIEWS)
+def test_clear_on_absent_view_leaves_it_absent(root, view_cls):
+    """clear() of nothing is not a write: no marker, no internal layout rows."""
+    view = root.open_child("absent", view_cls)
+    view.clear()
+    _assert_absent(view)
+    assert "absent" not in root
+
+
+@pytest.mark.parametrize("view_cls", ALL_CLEARABLE_VIEWS)
+def test_clear_on_existing_view_empties_it_and_keeps_it(root, view_cls):
+    view = root.open_child("v", view_cls)
+    if view_cls is SetView:
+        view.add("x")
+    elif view_cls in (EagerListView, LazyListView, FlatListView, ByteArrayView):
+        view.append(1)
+    else:
+        view[_key(view_cls, 1)] = 1
+    assert len(view) == 1
+    view.clear()
+    assert view.container.exists()
+    assert len(view) == 0
+    assert list(view) == []
+    assert "v" in root
