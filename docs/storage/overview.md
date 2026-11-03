@@ -48,6 +48,13 @@ Works with any ordered KV store:
 - In-memory sorted dict
 - SQLite with compound keys
 
+Key size limits are the backend's own. LMDB rejects an encoded key above
+511 bytes (the whole site, every segment included), which surfaces as a
+`StorageOperationError` on put; SQLite, RocksDB and the in-memory store take
+longer keys. Int key segments must fit int64 on every backend that uses the
+binary codec. Deeply nested sites and long key segments hit the LMDB limit
+first.
+
 ## Operations
 
 ### 1. Point Access (single key)
