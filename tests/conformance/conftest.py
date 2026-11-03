@@ -44,7 +44,11 @@ def pytest_collection_modifyitems(config, items):
         callspec = getattr(item, "callspec", None)
         if callspec is None or "backend" not in callspec.params:
             continue
-        row = KNOWN_FAILURES.get(item.originalname, {}).get(callspec.params["backend"])
+        rows = KNOWN_FAILURES.get(item.originalname, {})
+        backend = callspec.params["backend"]
+        # A row names a backend, or one parametrization of it ("mem-txn").
+        keys = [backend, *(f"{backend}-{v}" for k, v in callspec.params.items() if k != "backend")]
+        row = next((rows[k] for k in keys if k in rows), None)
         if row is not None:
             strict, reason = row
             item.add_marker(pytest.mark.xfail(strict=strict, reason=reason))

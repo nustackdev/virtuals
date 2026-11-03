@@ -149,3 +149,72 @@ def test_s4_coroutine_writers_do_not_block_loop(backend, storage, use_slot):
     wall, gap = _run(backend, storage, body, use_slot=use_slot, stop_on_stall=True)
     assert gap < MAX_GAP, f"event loop blocked for {gap * 1000:.0f}ms"
     assert wall < WALL * CORO_N / 10, f"{CORO_N} writers took {wall:.2f}s"
+
+
+XP_HOLD = 0.5  # how long the other process keeps the write lock
+
+
+@pytest.mark.timeout(30)
+def test_s4_cross_process_lock_wait_does_not_block_loop(multi_process, tmp_path):
+    """Another process holds the write lock: a slot writer waits for it off the loop.
+
+    The holder process keeps a write transaction open for XP_HOLD. On the
+    loop, a writer reserves the slot and begins with it; a ticker runs
+    alongside. The writer must land (so it did wait), and the loop must
+    never go MAX_GAP without the ticker running (so it waited off the
+    loop). Multi-process backends only (contract section 4).
+    """
+    import multiprocessing as mp
+
+    from tests.conformance.helpers import proc_hold_write
+
+    storage = multi_process.make(tmp_path)
+    storage.open()
+    try:
+        ctx = mp.get_context("spawn")
+        held = ctx.Event()
+        proc = ctx.Process(
+            target=proc_hold_write, args=(multi_process.name, str(tmp_path), XP_HOLD, held)
+        )
+        proc.start()
+        assert held.wait(30), "holder process never took the lock"
+
+        async def main():
+            watch = LoopWatch(stop_on_stall=False)
+            stop = asyncio.Event()
+
+            async def ticker() -> None:
+                while not stop.is_set():
+                    await asyncio.sleep(TICK)
+                    watch.mark()
+
+            tick = asyncio.create_task(ticker())
+            await asyncio.sleep(TICK)  # the ticker is running before the wait starts
+            watch.mark()
+            t0 = time.perf_counter()
+            try:
+                t = await _begin(multi_process, storage, use_slot=True)
+                waited = time.perf_counter() - t0
+                watch.check()  # a begin that blocked shows here even if the ticker never ran
+                try:
+                    t.put(K, 1)
+                    t.commit()
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        t.abort()
+                    raise
+            finally:
+                stop.set()
+                await tick
+            return waited, watch.gap
+
+        waited, gap = asyncio.run(main())
+        proc.join(10)
+        assert waited >= XP_HOLD * 0.5, f"writer landed after {waited:.3f}s while the lock was held"
+        assert gap < MAX_GAP, (
+            f"loop blocked {gap * 1000:.0f}ms waiting for a lock held by another process"
+        )
+        with storage.snapshot() as s:
+            assert s.get(K) == 1 and s.get(("held",)) == 1
+    finally:
+        storage.close()

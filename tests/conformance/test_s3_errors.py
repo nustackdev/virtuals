@@ -10,7 +10,8 @@ import time
 import pytest
 
 from tests.conformance.helpers import PROCS, RETRYABLE, THREADS, proc_contend, run_threads
-from virtuals.tkv.storage import StorageError
+from virtuals.tkv import StorageScanOptions
+from virtuals.tkv.storage import StorageClosedError, StorageError
 
 
 K = ("counter",)
@@ -125,5 +126,43 @@ def test_s3_cross_process_contention_raises_retryable(multi_process, tmp_path):
     try:
         with st.snapshot() as s:
             assert s.get(K) == sum(r["commits"] for r in results)
+    finally:
+        st.close()
+
+
+def _scan_after_close(storage, begin, close):
+    with storage.transaction() as t:
+        for i in range(200):
+            t.put(("k", i), i)
+    ctx = begin()
+    items = ctx.scan(StorageScanOptions()).items()
+    assert next(items)[0] == ("k", 0)
+    close(ctx)
+    with pytest.raises(StorageClosedError):
+        next(items)  # a page may be buffered, it is not handed out
+    with pytest.raises(StorageClosedError):
+        ctx.get(("k", 1))
+
+
+@pytest.mark.timeout(10)
+def test_s3_scan_after_context_close_raises_closed(backend, storage):
+    """A scan resumed after its snapshot or transaction closed raises the closed error."""
+    _scan_after_close(storage, storage.begin_snapshot, lambda ctx: ctx.close())
+    _scan_after_close(storage, storage.begin_transaction, lambda ctx: ctx.abort())
+
+
+@pytest.mark.timeout(10)
+def test_s3_scan_after_storage_close_raises_closed(backend, tmp_path):
+    """A scan resumed after the storage closed raises the closed error, not stale rows."""
+    st = backend.make(tmp_path)
+    st.open()
+    try:
+        _scan_after_close(st, st.begin_snapshot, lambda ctx: st.close())
+    finally:
+        st.close()
+    st = backend.make(tmp_path)
+    st.open()
+    try:
+        _scan_after_close(st, st.begin_transaction, lambda ctx: st.close())
     finally:
         st.close()
