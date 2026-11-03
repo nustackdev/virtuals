@@ -114,7 +114,7 @@ Pattern: `_private/` for implementations, top-level for public re-exports.
 virtuals/
 ├── tkv/                    # core protocols (storage, codec, observer, filter, types)
 ├── _backends/              # private implementations
-│   ├── storages/           #   mem, rocksdb, textdb
+│   ├── storages/           #   mem, rocksdb
 │   ├── codecs/             #   json, msgpack, pickle, passthrough
 │   ├── observers/          #   mem, redis_pubsub
 │   └── key_codecs/         #   binary, string
@@ -154,7 +154,6 @@ Views that support nested containers have eager/lazy facets (see `docs/collectio
 | ------- | ---- | ------- |
 | In-memory | Testing, ephemeral, caching | built-in |
 | RocksDB | Persistent, high-performance | `virtuals-py[rocksdb]` |
-| TextDB | Human-readable, debugging | built-in |
 
 Adding a backend = implementing ~4 methods.
 
