@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+from logging import getLogger
 from typing import TYPE_CHECKING, Any
 
 from virtuals.tkv.storage import (
@@ -43,6 +44,9 @@ __all__ = [
 ]
 
 
+logger = getLogger(__name__)
+
+
 class ContextBase:
     """Base class for LMDB transaction/snapshot contexts.
 
@@ -62,7 +66,9 @@ class ContextBase:
         "_closed",
         "_holds_write_slot",
         "_lmdb_txn",
+        "_pid",
         "_storage",
+        "_write_lock",
     )
 
     def __init__(
@@ -71,6 +77,7 @@ class ContextBase:
         lmdb_txn: Any,  # noqa: ANN401
         *,
         holds_write_slot: bool = False,
+        write_lock: threading.Lock | None = None,
     ) -> None:
         """Initialize context with storage reference and LMDB transaction.
 
@@ -79,12 +86,16 @@ class ContextBase:
             lmdb_txn: LMDB transaction handle
             holds_write_slot: True if this context holds the storage's
                 in-process writer slot and must release it on close.
+            write_lock: The slot's lock it holds, released by identity so
+                a late end never frees a lock the slot has since replaced.
         """
         self._storage = storage
         self._lmdb_txn: Any | None = lmdb_txn
         self._holds_write_slot = holds_write_slot
+        self._write_lock = write_lock
         self._closed = False
         self._call_lock = threading.Lock()
+        self._pid = os.getpid()
 
     @property
     def storage(self) -> LMDBStorage:
@@ -110,7 +121,30 @@ class ContextBase:
         with _SLOT_FLAG_LOCK:
             holds, self._holds_write_slot = self._holds_write_slot, False
         if holds:
-            self._storage._release_write_slot()
+            self._storage._release_write_slot(self._write_lock)
+
+    def _finalize_unended_write(self, what: str) -> None:
+        """Last resort for a write context dropped without commit or abort.
+
+        Aborts its LMDB transaction on the writer thread (safe from the
+        collecting thread, whichever it is) and gives the slot back, so a
+        forgotten transaction cannot hold the writer lock until close().
+        Takes no lock: nothing else references the context any more, and a
+        collection may run on a thread that holds one of them. Inherited
+        across a fork, the context is left alone (see ``_check_fork``).
+        """
+        if self._closed or self._pid != os.getpid():
+            return
+        txn, self._lmdb_txn = self._lmdb_txn, None
+        self._closed = True
+        holds, self._holds_write_slot = self._holds_write_slot, False
+        logger.warning(f"LMDB {what} dropped without commit or abort; aborting it")
+        try:
+            if txn is not None:
+                self._storage._end_write(txn, commit=False)
+        finally:
+            if holds:
+                self._storage._release_write_slot(self._write_lock)
 
     @property
     def is_closed(self) -> bool:

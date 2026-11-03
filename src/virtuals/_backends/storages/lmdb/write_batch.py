@@ -15,6 +15,7 @@ from .context import ContextBase, WriteOperationsMixin
 
 
 if TYPE_CHECKING:
+    import threading
     from types import TracebackType
 
     from virtuals.tkv.types import Key
@@ -38,12 +39,23 @@ class LMDBWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
 
     __slots__ = ("_aborted", "_modified_keys", "_written")
 
-    def __init__(self, storage: LMDBStorage, lmdb_txn: object) -> None:
+    def __init__(
+        self, storage: LMDBStorage, lmdb_txn: object, write_lock: threading.Lock | None = None
+    ) -> None:
         """Initialize write batch."""
-        super().__init__(storage, lmdb_txn, holds_write_slot=True)
+        super().__init__(storage, lmdb_txn, holds_write_slot=True, write_lock=write_lock)
         self._modified_keys: set[Key] = set()
         self._written = False
         self._aborted = False
+
+    def __del__(self) -> None:
+        """Abort a batch dropped unended, so it cannot hold the writer lock."""
+        try:
+            if not self._closed:
+                self._aborted = True
+                self._finalize_unended_write("write batch")
+        except Exception:  # noqa: S110 (interpreter shutdown, half-built object)
+            pass
 
     @property
     def writable(self) -> bool:
@@ -97,9 +109,12 @@ class LMDBWriteBatch(ContextBase, WriteOperationsMixin, WriteBatchProtocol):
         the abort waits for that call, then ends the batch on the writer
         thread. A second abort, or one racing a write, is a no-op.
         """
+        if self._closed:
+            # Unlocked on purpose, see LMDBTransaction.abort.
+            logger.debug("Abort called on closed write batch")
+            return
         with self._call_lock:
             if self._closed:
-                logger.debug("Abort called on closed write batch")
                 return
             txn = self._require_active()
             failure: Exception | None = None

@@ -868,3 +868,47 @@ def test_fork_while_env_lock_is_held_elsewhere(storage: LMDBStorage) -> None:
         t.join()
     with storage.snapshot() as snap:
         assert snap.get(("child",)) == b"1"
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("what", ["transaction", "write_batch"])
+def test_dropped_write_context_is_aborted_and_frees_writers(ctx, tmp_path: Path, what: str) -> None:
+    """A transaction or batch dropped unended is aborted on collection, in process and for peers."""
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    ready, go = ctx.Event(), ctx.Event()
+    out = tmp_path / "peer.json"
+    peer = ctx.Process(target=_peer_write, args=(str(tmp_path), 2.0, ready, go, str(out)))
+    peer.start()
+    assert ready.wait(20)
+
+    def drop() -> None:
+        t = st.begin_transaction() if what == "transaction" else st.begin_write_batch()
+        t.put(("dropped",), b"1")  # goes out of scope: neither ended nor released
+
+    try:
+        th = threading.Thread(target=drop)
+        th.start()
+        th.join(5)
+        gc.collect()
+        assert not st._writer.lock.locked()
+        assert not st._gate_held
+        t0 = time.monotonic()
+        with st.transaction() as tx:  # another thread's drop freed the slot and the gate
+            tx.put(("after",), b"1")
+        assert time.monotonic() - t0 < 0.2
+        drop()  # same thread: the finished hold must not read as nested either
+        gc.collect()
+        go.set()
+        peer.join(10)
+        assert peer.exitcode == 0
+        report = json.loads(out.read_text())
+        assert report["result"] == "ok", report
+        assert report["took"] < 0.2, report
+        with st.snapshot() as snap:
+            assert snap.get(("dropped",)) is EMPTY
+            assert snap.get(("after",)) == b"1"
+            assert snap.get(("peer",)) == b"1"
+    finally:
+        if peer.is_alive():
+            peer.kill()
+        st.close()

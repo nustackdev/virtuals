@@ -43,6 +43,8 @@ class LMDBSnapshot(ContextBase, ReadOperationsMixin):
         that call, then ends the read transaction. Read transactions have
         no thread affinity in LMDB, so no writer thread is involved.
         """
+        if self._closed:
+            return  # unlocked on purpose, see LMDBTransaction.abort
         with self._call_lock:
             if self._closed:
                 return

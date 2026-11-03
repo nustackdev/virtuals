@@ -225,11 +225,13 @@ class LMDBStorage:
 
         self._env: lmdb.Environment | None = None
         self._env_lock = threading.RLock()
-        self._active_transactions: set[LMDBTransaction] = set()
-        self._active_write_batches: set[LMDBWriteBatch] = set()
-        # Weak: a snapshot nobody closed is collected, and py-lmdb then ends
-        # its read transaction, so it frees its shared reader slot instead
-        # of pinning it (and the pages it saw) until close().
+        # Weak: a context nobody ended is collected. A snapshot's read
+        # transaction then ends under py-lmdb, freeing its shared reader
+        # slot instead of pinning it (and the pages it saw) until close();
+        # a transaction or batch is aborted by its finalizer on the writer
+        # thread and gives the slot back.
+        self._active_transactions: weakref.WeakSet[LMDBTransaction] = weakref.WeakSet()
+        self._active_write_batches: weakref.WeakSet[LMDBWriteBatch] = weakref.WeakSet()
         self._active_snapshots: weakref.WeakSet[LMDBSnapshot] = weakref.WeakSet()
         # Slots reserved and not yet taken: each carries a begun write txn
         # that close() must end on the writer thread.
@@ -346,8 +348,8 @@ class LMDBStorage:
                 or self._active_write_batches
                 or self._reserved_slots
             )
-            self._active_transactions = set()
-            self._active_write_batches = set()
+            self._active_transactions = weakref.WeakSet()
+            self._active_write_batches = weakref.WeakSet()
             self._active_snapshots = weakref.WeakSet()
             self._reserved_slots = weakref.WeakSet()
             self._writer.reset()
@@ -647,7 +649,7 @@ class LMDBStorage:
         write_slot: WriteSlot | None,
         error: type[StorageError],
         what: str,
-        make: Callable[[LMDBStorage, Any], Any],
+        make: Callable[[LMDBStorage, Any, threading.Lock], Any],
     ) -> Any:  # noqa: ANN401
         """Take the slot and the gate, begin on the writer thread, register the context.
 
@@ -657,7 +659,7 @@ class LMDBStorage:
         slot is released, or returned to ``write_slot``'s holder.
         """
         deadline = time.monotonic() + self._busy_timeout
-        _lock, give_back_slot = self._writer.take_slot(self, write_slot, self._busy_timeout)
+        lock, give_back_slot = self._writer.take_slot(self, write_slot, self._busy_timeout)
         lmdb_txn: Any = None
         try:
             if write_slot is None:
@@ -679,7 +681,7 @@ class LMDBStorage:
                         )
                 if not self._opened:
                     raise StorageClosedError("Storage is not open")
-                context = make(self, lmdb_txn)
+                context = make(self, lmdb_txn, lock)
                 if isinstance(context, LMDBTransaction):
                     self._active_transactions.add(context)
                 else:
