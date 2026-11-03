@@ -56,6 +56,7 @@ Races are forced, not hoped for. In lost update a pause sits between each read a
 | `test_s1_dropped_transaction_frees_slot` | 1 | a txn dropped without commit or abort (other thread, then same thread) does not hold the slot once collected: the next writer lands within 200ms |
 | `test_s1_nested_through_worker_or_nested_loop_raises_distinct_error` | 1, 3 | a write begun in a `to_thread` worker below the slot holder, or inside an `asyncio.run` within a sync txn, raises `StorageNestedTransactionError` at once |
 | `test_s4_sync_begin_on_loop_thread_is_bounded` | 4 | a sync `begin_transaction` or `batch.write` from a coroutine while a thread holds the slot gives up within 300ms with the retryable lock timeout, loop gap under 200ms |
+| `test_s4_late_release_after_close_and_reopen_frees_nothing` | 4 | close and reopen while a commit is about to give the slot back, a new writer takes the fresh slot: the old release neither frees it nor raises |
 | `test_s4_reserved_slot_does_not_survive_close` | 4 | a slot reserved and never taken is gone after close and reopen: the next writer lands within 200ms, the stale slot is refused with a non-retryable error |
 | `test_s7_storage_delete_is_point_delete` | 7 | `txn.delete` of one key handles one key inside the backend at 10 and 1000 siblings |
 | `test_s7_storage_delete_time_flat` | 7 | median `txn.delete` time grows under 10x from 100 to 10k siblings |
@@ -77,6 +78,7 @@ Strict xfails: an unexpected pass fails the run, so delete the row in the commit
 | nested transaction, nested batch write | rocksdb, mem | lane K, lane D |
 | repeatable read, never torn, binds at open (get, scan), commit atomic to snapshots | rocksdb, mem | lane K, lane D |
 | cross-process contention | lmdb | lmdb writer slot follow-up: a cross-process writer waits inside lmdb unbounded (contract section 4) |
+| late release after close and reopen frees nothing | sqlite, lmdb | fixed in P3 (sqlite), P1 (lmdb): contexts release the slot without lock identity |
 | dropped transaction frees slot | sqlite, lmdb | P3 (sqlite), P1 (lmdb): strong active set and no transaction finalizer, so a dropped txn holds the slot until close |
 | coroutine writers serialize (slot, plain) | rocksdb, mem | lane K, lane D |
 | coroutine writers do not block loop (slot, plain) | rocksdb | lane K |
