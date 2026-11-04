@@ -5,12 +5,14 @@ from __future__ import annotations
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
 
+from virtuals._backends.storages._empty import empty_error
 from virtuals.tkv.storage import (
     StorageClosedError,
     StorageOperationError,
     StorageTransactionError,
     WriteBatchProtocol,
 )
+from virtuals.tkv.types import EMPTY
 
 from .context import ContextBase
 
@@ -73,6 +75,8 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
             StorageClosedError: If batch is closed
         """
         self._require_active()
+        if value is EMPTY:
+            raise empty_error(key)
         codec = self._storage.codec
 
         try:

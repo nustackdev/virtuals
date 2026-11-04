@@ -7,6 +7,7 @@ import sqlite3
 import threading
 from typing import TYPE_CHECKING, Any
 
+from virtuals._backends.storages._empty import empty_error
 from virtuals.tkv.storage import (
     ScanProtocol,
     StorageClosedError,
@@ -320,6 +321,8 @@ class WriteOperationsMixin:
 
     def put(self, key: Key, value: Value) -> None:
         """Put key-value pair."""
+        if value is EMPTY:
+            raise empty_error(key)
         codec = self._storage.codec
 
         try:

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import lmdb
 
+from virtuals._backends.storages._empty import empty_error
 from virtuals.tkv.storage import (
     StorageClosedError,
     StorageError,
@@ -14,6 +15,7 @@ from virtuals.tkv.storage import (
     StorageTransactionError,
     WriteBatchProtocol,
 )
+from virtuals.tkv.types import EMPTY
 
 from ._writer import NOT_RUN
 from .context import ContextBase
@@ -61,6 +63,8 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
 
     def put(self, key: Key, value: Value) -> None:
         """Queue a put."""
+        if value is EMPTY:
+            raise empty_error(key)
         codec = self._storage.codec
         try:
             encoded_key = codec.encode_key(key)

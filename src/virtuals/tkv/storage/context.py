@@ -181,6 +181,8 @@ class WriteAccessProtocol(Protocol):
             value: Value to store.
 
         Raises:
+            ValueError: If ``value`` is ``EMPTY`` (the absent sentinel is
+                never stored; delete the key instead).
             StorageWriteError: If write fails.
             StorageClosedError: If context is closed.
         """

@@ -77,6 +77,7 @@ Races are forced, not hoped for. In lost update a pause sits between each read a
 | `test_s5_watch_covers_the_subtree` | 5 | a prefix watch gets the row and everything under it, not a sibling whose name only starts the same |
 | `test_s5_untyped_child_watch_covers_the_child_subtree` | 5 | the watch a dict view builds for an untyped child fires on a write deep inside the compound value stored there, not on a sibling (once per dict view kind) |
 | `test_s5_resync_on_reconnect` | 5 | writes made while the observer is cut off are recovered by one keyless wake (redis transport only) |
+| `test_s6_raw_put_rejects_empty` | 6 | `txn.put` and `batch.put` raise `ValueError` on `EMPTY` and store nothing; the transaction stays usable |
 | `test_s7_storage_delete_is_point_delete` | 7 | `txn.delete` of one key handles one key inside the backend at 10 and 1000 siblings |
 | `test_s7_storage_delete_time_flat` | 7 | median `txn.delete` time grows under 10x from 100 to 10k siblings |
 | `test_s7_view_dict_delete_is_point_delete` | 7 | deleting one dict view key handles as many keys at 10 as at 1000 siblings |
