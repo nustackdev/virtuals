@@ -22,7 +22,7 @@ import attrs
 from virtuals.loc import DATA_ROOT
 
 from . import container_ops, meta_ops, node_ops, validation_ops
-from .exceptions import ContainerInvalidSiteError
+from .exceptions import ContainerInvalidSiteError, absent_container
 
 
 if TYPE_CHECKING:
@@ -186,6 +186,18 @@ class Container:
         """
         return node_ops.node_exists(self.site, self.ctx)
 
+    def require_exists(self, owner: site_.Site | None = None) -> None:
+        """Raise ``ContainerNotFoundError`` (a ``KeyError``) if the container is absent.
+
+        One marker read. Views call it only after their own read came back
+        empty, since any data found already proves the container exists.
+
+        Args:
+            owner: Site to name in the error (default this container's)
+        """
+        if not node_ops.node_exists(self.site, self.ctx):
+            raise absent_container(owner or self.site)
+
     def node_type(self) -> NodeType:
         """Get node type (should always be CONTAINER).
 
@@ -212,11 +224,20 @@ class Container:
     # CHILDREN: QUERY (Read operations)
     # ========================================================================
 
-    def exists_child(self, key: site_.SiteSegment) -> bool:
+    def exists_child(
+        self,
+        key: site_.SiteSegment,
+        *,
+        strict: bool = False,
+        owner: site_.Site | None = None,
+    ) -> bool:
         """Check if direct child exists.
 
         Args:
             key: Child key to check
+            strict: If True, raise ``ContainerNotFoundError`` when this
+                container was never written (checked only on an empty result)
+            owner: Site to name in that error (default this container's site)
 
         Returns:
             True if child exists
@@ -225,7 +246,7 @@ class Container:
             ContainerNotFoundError: If this container doesn't exist
             StorageInterfaceError: If context doesn't support reads
         """
-        return container_ops.exists_child(self.site, key, self.ctx)
+        return container_ops.exists_child(self.site, key, self.ctx, strict=strict, owner=owner)
 
     def get_child_type(self, key: site_.SiteSegment) -> NodeType:
         """Get child node type.
@@ -243,13 +264,21 @@ class Container:
         return container_ops.get_child_type(self.site, key, self.ctx)
 
     def iter_child_keys(
-        self, *, validate: bool = False, reverse: bool = False
+        self,
+        *,
+        validate: bool = False,
+        reverse: bool = False,
+        strict: bool = False,
+        owner: site_.Site | None = None,
     ) -> Generator[site_.SiteSegment, None, None]:
         """Iterate over direct child keys.
 
         Args:
             validate: If True, validate this is a container (default False)
             reverse: If True, yield in reverse insertion order (default False)
+            strict: If True, raise ``ContainerNotFoundError`` when this
+                container was never written (checked only on an empty result)
+            owner: Site to name in that error (default this container's site)
 
         Yields:
             Child keys
@@ -260,17 +289,25 @@ class Container:
             StorageInterfaceError: If context doesn't support reads
         """
         yield from container_ops.iter_child_keys(
-            self.site, self.ctx, validate=validate, reverse=reverse
+            self.site, self.ctx, validate=validate, reverse=reverse, strict=strict, owner=owner
         )
 
     def iter_children(
-        self, *, validate: bool = False, reverse: bool = False
+        self,
+        *,
+        validate: bool = False,
+        reverse: bool = False,
+        strict: bool = False,
+        owner: site_.Site | None = None,
     ) -> Generator[tuple[site_.SiteSegment, NodeInfo], None, None]:
         """Iterate over direct children with their info.
 
         Args:
             validate: If True, validate this is a container (default False)
             reverse: If True, yield in reverse insertion order (default False)
+            strict: If True, raise ``ContainerNotFoundError`` when this
+                container was never written (checked only on an empty result)
+            owner: Site to name in that error (default this container's site)
 
         Yields:
             Tuples of (child_key, NodeInfo)
@@ -281,14 +318,19 @@ class Container:
             StorageInterfaceError: If context doesn't support reads
         """
         yield from container_ops.iter_children(
-            self.site, self.ctx, validate=validate, reverse=reverse
+            self.site, self.ctx, validate=validate, reverse=reverse, strict=strict, owner=owner
         )
 
-    def count_children(self, *, validate: bool = False) -> int:
+    def count_children(
+        self, *, validate: bool = False, strict: bool = False, owner: site_.Site | None = None
+    ) -> int:
         """Count direct children.
 
         Args:
             validate: If True, validate this is a container (default False)
+            strict: If True, raise ``ContainerNotFoundError`` when this
+                container was never written (checked only on an empty result)
+            owner: Site to name in that error (default this container's site)
 
         Returns:
             Number of direct children
@@ -298,20 +340,29 @@ class Container:
             ContainerTypeError: If site is not a container (when validate=True)
             StorageInterfaceError: If context doesn't support reads
         """
-        return container_ops.count_children(self.site, self.ctx, validate=validate)
+        return container_ops.count_children(
+            self.site, self.ctx, validate=validate, strict=strict, owner=owner
+        )
 
-    def has_children(self, *, validate: bool = False) -> bool:
+    def has_children(
+        self, *, validate: bool = False, strict: bool = False, owner: site_.Site | None = None
+    ) -> bool:
         """Whether at least one direct child exists. Costs one row, not a count.
 
         Args:
             validate: If True, validate this is a container (default False)
+            strict: If True, raise ``ContainerNotFoundError`` when this
+                container was never written (checked only on an empty result)
+            owner: Site to name in that error (default this container's site)
 
         Raises:
             ContainerNotFoundError: If this container doesn't exist (when validate=True)
             ContainerTypeError: If site is not a container (when validate=True)
             StorageInterfaceError: If context doesn't support reads
         """
-        return container_ops.has_children(self.site, self.ctx, validate=validate)
+        return container_ops.has_children(
+            self.site, self.ctx, validate=validate, strict=strict, owner=owner
+        )
 
     # ========================================================================
     # CHILDREN: CREATE (Write operations)

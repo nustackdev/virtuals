@@ -29,7 +29,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 from logging import getLogger
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, TypeVar, cast
 
 from virtuals.loc.constants import DATA_ROOT, METADATA_ROOT
 from virtuals.tkv.filter import LengthFilter, PrefixFilter
@@ -45,9 +45,10 @@ from .exceptions import (
     ContainerExistsError,
     ContainerInvalidDepthError,
     ContainerTypeError,
+    absent_container,
 )
 from .marker import create_marker, is_marker
-from .node_ops import get_node_info, get_node_type
+from .node_ops import get_node_info, get_node_type, node_exists
 from .types import (
     ContainerProtocol,
     ContainerStructure,
@@ -62,7 +63,7 @@ from .validation_ops import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Iterator
 
     from virtuals.loc import site as site_
     from virtuals.tkv.storage import ReadWriteAccessProtocol, StorageContextType
@@ -91,11 +92,14 @@ __all__ = [
     "put_child_primitive",
     "put_child_primitive_unsafe",
     "reject_empty_value",
+    "scan_or_absent",
     "walk_descendants",
 ]
 
 
 logger = getLogger(__name__)
+
+T = TypeVar("T")
 
 # ============================================================================
 # CONTAINER LIFECYCLE
@@ -321,13 +325,23 @@ def move_child_subtree(
 # ============================================================================
 
 
-def exists_child(site: site_.Site, key: site_.SiteSegment, ctx: StorageContextType) -> bool:
+def exists_child(
+    site: site_.Site,
+    key: site_.SiteSegment,
+    ctx: StorageContextType,
+    *,
+    strict: bool = False,
+    owner: site_.Site | None = None,
+) -> bool:
     """Check if direct child exists.
 
     Args:
         site: Container site
         key: Child key
         ctx: Storage context (transaction, snapshot or write batch)
+        strict: If True, raise ``ContainerNotFoundError`` when this
+            container was never written (checked only on an empty result)
+        owner: Site to name in that error (default this container's site)
 
     Returns:
         True if child exists
@@ -343,7 +357,11 @@ def exists_child(site: site_.Site, key: site_.SiteSegment, ctx: StorageContextTy
     """
     child_site = (*site, key)
     child_type = get_node_type(child_site, ctx)
-    return child_type != NodeType.NOT_FOUND
+    if child_type != NodeType.NOT_FOUND:
+        return True
+    if strict and not node_exists(site, ctx):
+        raise absent_container(owner or site)
+    return False
 
 
 def get_child_type(site: site_.Site, key: site_.SiteSegment, ctx: StorageContextType) -> NodeType:
@@ -409,12 +427,91 @@ def _child_scan_options(
     )
 
 
+def _strict_child_scan(
+    site: site_.Site,
+    ctx: StorageContextType,
+    *,
+    reverse: bool = False,
+    values: bool = False,
+    limit: int | None = None,
+    owner: site_.Site | None = None,
+) -> Generator[tuple[site_.Site, object], None, None]:
+    """Direct children of ``site``, raising if the container itself is absent.
+
+    The child scan already starts at (forward) or ends on (reverse) the
+    container's own marker row, so the scan keeps that row instead of
+    filtering it out: seeing it, or any child, proves the container exists
+    and costs no extra read. A scan that sees nothing raises
+    ``ContainerNotFoundError`` naming ``owner`` (default ``site``).
+    ``max_depth`` keeps every row at the site or one level below.
+
+    ``limit`` counts children; the marker row is fetched on top of it.
+    """
+    base = _child_scan_options(site, ctx, reverse=reverse)
+    options = replace(
+        base,
+        filter=base.break_filter,
+        limit=None if limit is None else limit + 1,
+    )
+    scan = require_read_context(ctx).scan(options)
+    depth = len(site) + 1
+    seen = False
+    yielded = 0
+    rows = scan.items() if values else scan.keys()
+    try:
+        for row in rows:
+            seen = True
+            key = row[0] if values else row
+            if len(key) != depth:
+                continue  # the marker row (or a stray shallower row)
+            yield key, (row[1] if values else None)
+            yielded += 1
+            if limit is not None and yielded >= limit:
+                return
+    finally:
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
+    if not seen:
+        raise absent_container(owner or site)
+
+
+def scan_or_absent(
+    rows: Iterator[T],
+    site: site_.Site,
+    ctx: StorageContextType,
+    *,
+    owner: site_.Site | None = None,
+) -> Generator[T, None, None]:
+    """Pass ``rows`` through; if none came, require the container at ``site``.
+
+    For views that run their own scans (cursors, limits, internal layout):
+    any row proves the container exists, so only an empty scan costs one
+    marker read, raising ``ContainerNotFoundError`` (naming ``owner``,
+    default ``site``) when the container was never written. An empty scan
+    on an existing container ends normally.
+    """
+    seen = False
+    try:
+        for row in rows:
+            seen = True
+            yield row
+    finally:
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
+    if not seen and not node_exists(site, ctx):
+        raise absent_container(owner or site)
+
+
 def iter_child_keys(
     site: site_.Site,
     ctx: StorageContextType,
     validate: bool = False,
     *,
     reverse: bool = False,
+    strict: bool = False,
+    owner: site_.Site | None = None,
 ) -> Generator[site_.SiteSegment, None, None]:
     """Iterate over direct child keys.
 
@@ -423,6 +520,9 @@ def iter_child_keys(
         ctx: Storage context (transaction, snapshot or write batch)
         validate: If True, validate site is a container (default False)
         reverse: If True, yield in reverse insertion order (default False)
+        strict: If True, raise ``ContainerNotFoundError`` when this
+            container was never written (checked only on an empty result)
+        owner: Site to name in that error (default this container's site)
 
     Yields:
         Child keys (last segment of each child site)
@@ -438,6 +538,11 @@ def iter_child_keys(
     """
     if validate:
         validate_is_container(site, ctx)
+
+    if strict:
+        for key, _ in _strict_child_scan(site, ctx, reverse=reverse, owner=owner):
+            yield key[-1]
+        return
 
     for key in (
         require_read_context(ctx).scan(_child_scan_options(site, ctx, reverse=reverse)).keys()
@@ -483,6 +588,8 @@ def iter_children(
     validate: bool = False,
     *,
     reverse: bool = False,
+    strict: bool = False,
+    owner: site_.Site | None = None,
 ) -> Generator[tuple[site_.SiteSegment, NodeInfo], None, None]:
     """Iterate over direct children with their info.
 
@@ -491,6 +598,9 @@ def iter_children(
         ctx: Storage context (transaction, snapshot or write batch)
         validate: If True, validate site is a container (default False)
         reverse: If True, yield in reverse insertion order (default False)
+        strict: If True, raise ``ContainerNotFoundError`` when this
+            container was never written (checked only on an empty result)
+        owner: Site to name in that error (default this container's site)
 
     Yields:
         Tuples of (child_key, NodeInfo)
@@ -503,6 +613,11 @@ def iter_children(
     if validate:
         validate_is_container(site, ctx)
 
+    if strict:
+        for key, value in _strict_child_scan(site, ctx, reverse=reverse, values=True, owner=owner):
+            yield (key[-1], get_node_info(key, ctx, raw_value=cast("Value", value)))
+        return
+
     for key, value in (
         require_read_context(ctx).scan(_child_scan_options(site, ctx, reverse=reverse)).items()
     ):
@@ -513,6 +628,9 @@ def count_children(
     site: site_.Site,
     ctx: StorageContextType,
     validate: bool = False,
+    *,
+    strict: bool = False,
+    owner: site_.Site | None = None,
 ) -> int:
     """Count direct children.
 
@@ -520,6 +638,9 @@ def count_children(
         site: Container site
         ctx: Storage context (transaction, snapshot or write batch)
         validate: If True, validate site is a container (default False)
+        strict: If True, raise ``ContainerNotFoundError`` when this
+            container was never written (checked only on an empty result)
+        owner: Site to name in that error (default this container's site)
 
     Returns:
         Number of direct children
@@ -532,6 +653,9 @@ def count_children(
     if validate:
         validate_is_container(site, ctx)
 
+    if strict:
+        return sum(1 for _ in _strict_child_scan(site, ctx, owner=owner))
+
     counter = 0
     for _ in require_read_context(ctx).scan(_child_scan_options(site)).keys():
         counter += 1
@@ -542,6 +666,9 @@ def has_children(
     site: site_.Site,
     ctx: StorageContextType,
     validate: bool = False,
+    *,
+    strict: bool = False,
+    owner: site_.Site | None = None,
 ) -> bool:
     """Whether site has at least one direct child.
 
@@ -552,6 +679,9 @@ def has_children(
         site: Container site
         ctx: Storage context (transaction, snapshot or write batch)
         validate: If True, validate site is a container (default False)
+        strict: If True, raise ``ContainerNotFoundError`` when this
+            container was never written (checked only on an empty result)
+        owner: Site to name in that error (default this container's site)
 
     Returns:
         True if at least one direct child exists
@@ -563,6 +693,17 @@ def has_children(
     """
     if validate:
         validate_is_container(site, ctx)
+
+    if strict:
+        rows = _strict_child_scan(site, ctx, limit=1, owner=owner)
+        try:
+            next(rows)
+        except StopIteration:
+            return False
+        else:
+            return True
+        finally:
+            rows.close()
 
     options = replace(_child_scan_options(site), limit=1)
     keys = require_read_context(ctx).scan(options).keys()

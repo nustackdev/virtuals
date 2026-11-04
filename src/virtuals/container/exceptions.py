@@ -17,6 +17,7 @@ __all__ = [
     "ContainerParentMalformedError",
     "ContainerParentNotFoundError",
     "ContainerTypeError",
+    "absent_container",
 ]
 
 
@@ -28,12 +29,35 @@ class ContainerError(Exception):
     """
 
 
-class ContainerNotFoundError(ContainerError):
+class ContainerNotFoundError(ContainerError, KeyError):
     """Site does not exist in storage.
 
     Raised when attempting to access or validate a site that
-    doesn't exist in the underlying storage.
+    doesn't exist in the underlying storage, and by view reads that need
+    the container itself (``len``, iteration, membership) on a container
+    that was never written. A ``KeyError``, like ``d['a']['b']`` on a
+    missing ``'a'``, so point-read handlers treat it as absence.
+
+    Attributes:
+        site: The missing site, when known.
     """
+
+    def __init__(self, message: str = "", site: object = None) -> None:
+        """Keep the message as the only arg, the site as an attribute."""
+        super().__init__(message)
+        self.site = site
+
+    def __str__(self) -> str:
+        # KeyError quotes its single argument; keep the message plain.
+        return Exception.__str__(self)
+
+    def __reduce__(self) -> tuple[object, ...]:
+        return (type(self), (Exception.__str__(self), self.site))
+
+
+def absent_container(site: object) -> ContainerNotFoundError:
+    """The error a read raises on a container that was never written."""
+    return ContainerNotFoundError(f"Container does not exist: {site}", site)
 
 
 class ContainerExistsError(ContainerError):

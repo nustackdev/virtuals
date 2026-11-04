@@ -63,6 +63,7 @@ from .container_ops import (
     put_child_primitive,
     put_child_primitive_unsafe,
     reject_empty_value,
+    scan_or_absent,
     walk_descendants,
 )
 
@@ -211,6 +212,7 @@ __all__ = [  # noqa: RUF022
     "put_child_primitive",
     "put_child_primitive_unsafe",
     "reject_empty_value",
+    "scan_or_absent",
     "delete_child",
     "delete_child_primitive_unsafe",
     "clear_children",
