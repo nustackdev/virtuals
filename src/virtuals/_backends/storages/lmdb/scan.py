@@ -1,4 +1,12 @@
-"""Scan iterator for LMDB storage."""
+"""Scan iterator for LMDB storage.
+
+The cursor is live on the transaction, so a write made through the same
+transaction while a scan is in flight is seen as soon as the cursor reaches
+it, unlike the page-fetching backends. Whether an in-flight scan sees such
+a write is unspecified across backends (contract section 1); callers should
+not rely on either outcome. Deleting keys the scan has already yielded is
+safe.
+"""
 
 from __future__ import annotations
 
