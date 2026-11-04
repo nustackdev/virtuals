@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import rdbpy
 
+from virtuals._backends.storages._empty import empty_error
 from virtuals.tkv.storage import (
     ScanProtocol,
     StorageClosedError,
@@ -428,6 +429,8 @@ class WriteOperationsMixin:
             StorageClosedError: If context is closed
         """
         self._require_active()
+        if value is EMPTY:
+            raise empty_error(key)
         codec = self._storage.codec
 
         try:

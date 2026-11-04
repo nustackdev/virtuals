@@ -6,6 +6,7 @@ import sqlite3
 from logging import getLogger
 from typing import TYPE_CHECKING
 
+from virtuals._backends.storages._empty import empty_error
 from virtuals.tkv.storage import (
     StorageClosedError,
     StorageError,
@@ -14,6 +15,7 @@ from virtuals.tkv.storage import (
     StorageTransactionError,
     WriteBatchProtocol,
 )
+from virtuals.tkv.types import EMPTY
 
 from .context import ContextBase, is_busy_error
 
@@ -65,6 +67,8 @@ class SQLiteWriteBatch(ContextBase, WriteBatchProtocol):
     def put(self, key: Key, value: Value) -> None:
         """Queue a put."""
         self._require_open_batch()
+        if value is EMPTY:
+            raise empty_error(key)
         codec = self._storage.codec
         try:
             encoded_key = codec.encode_key(key)
