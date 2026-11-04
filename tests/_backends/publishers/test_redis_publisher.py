@@ -390,3 +390,34 @@ def test_unroutable_key_counted_once_across_retries(redis_url, prefix, sub):
         assert sub.read() == [(h, {"iid": pub._instance_id, "keys": [["ok"]]})]
     finally:
         pub.disconnect()
+
+
+def test_flush_returns_at_its_timeout_while_the_queue_is_full(redis_url, unique_channel_prefix):
+    """``flush(timeout)`` is bounded by its timeout with the worker stuck and the queue full."""
+    from virtuals._backends.publishers.redis_pubsub import RedisPublisher
+
+    pub = RedisPublisher(
+        redis_url=redis_url,
+        channel_prefix=unique_channel_prefix,
+        queue_maxsize=2,
+        notify_timeout=0.05,
+    )
+    release = threading.Event()
+    pub._send_chunk = lambda prepared: release.wait(10)  # the worker is stuck in a send
+    pub.connect()
+    try:
+        for i in range(10):
+            pub.notify(("k", i))  # past the first chunk these time out and drop
+        deadline = time.monotonic() + 5.0
+        while not pub._queue.full() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert pub._queue.full()
+
+        t0 = time.monotonic()
+        with pytest.raises(PublisherOperationError):  # the drops, raised once
+            pub.flush(timeout=0.3)
+        elapsed = time.monotonic() - t0
+        assert 0.25 <= elapsed < 2.0, elapsed
+    finally:
+        release.set()
+        pub.disconnect()

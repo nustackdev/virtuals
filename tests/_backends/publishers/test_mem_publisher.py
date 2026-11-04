@@ -80,3 +80,36 @@ def test_flush_drains_before_returning():
         pub.flush(timeout=2.0)
     flat = [k for b in t.batches for k in b]
     assert len(flat) == 100
+
+
+def test_flush_returns_at_its_timeout_while_the_queue_is_full():
+    """``flush(timeout)`` is bounded by its timeout even when the sentinel cannot be queued."""
+    import threading
+    import time
+
+    t = InMemoryTransport()
+    release = threading.Event()
+    t.register(lambda batch: release.wait(10))
+    pub = InMemoryPublisher(t, queue_maxsize=2)  # notify_timeout=None: pure backpressure
+    pub.connect()
+
+    def fill() -> None:
+        for i in range(10):
+            pub.notify(("k", i))
+
+    th = threading.Thread(target=fill, daemon=True)
+    th.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while not pub._queue.full() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert pub._queue.full()
+
+        t0 = time.monotonic()
+        pub.flush(timeout=0.3)
+        elapsed = time.monotonic() - t0
+        assert 0.25 <= elapsed < 2.0, elapsed
+    finally:
+        release.set()
+        th.join(5)
+        pub.disconnect()
