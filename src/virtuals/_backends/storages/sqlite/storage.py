@@ -491,6 +491,10 @@ class SQLiteStorage:
                 slot.
             StorageLockTimeoutError: If the slot or the file lock is not
                 free within ``busy_timeout``.
+            StorageClosedError: If the storage is closed, or closes while
+                the reservation waits. A reservation that straddles a
+                close() and open() is refused this way too, holding
+                nothing; the reopened storage accepts a new one.
         """
         if self._read_only:
             raise StorageError("Cannot reserve the write slot in read only mode.")

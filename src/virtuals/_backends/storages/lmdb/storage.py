@@ -126,21 +126,46 @@ class LMDBWriteSlot(WriteSlot):
 
         Refuses a stale slot, one whose lock is no longer the storage's
         writer lock because the storage was closed (or the process
-        forked) since it was reserved, and gives back what it may still
-        carry before the refusal: a begun transaction is aborted on the
-        writer thread, queued and not waited for, since this runs under
-        the writer lock's guard. The gate is never a stale slot's to
-        release: a reservation that straddled a close never comes back
-        with one (``areserve_write_slot``), and close() drops the gate
-        it held. In a forked child the slot is the parent's and is left
-        alone.
+        forked) since it was reserved. It carries nothing by then: close()
+        ended its transaction and dropped the gate, a fork parked it, and
+        a reservation that straddled a close and open never comes back
+        as a slot (``areserve_write_slot``). A transaction it would still
+        carry is aborted on the writer thread, queued and not waited for:
+        this runs under the writer lock's guard and takes no storage lock.
         """
         if self._state == "held" and self._lock is not self._storage._writer.lock:
             self._state = "released"
-            if os.getpid() == self._pid:
-                self._storage._release_reserved(self, finalizing=True)  # type: ignore[attr-defined]
+            lmdb_txn, self._lmdb_txn = self._lmdb_txn, None
+            if lmdb_txn is not None and os.getpid() == self._pid:
+                self._storage._end_write_from_finalizer(lmdb_txn)  # type: ignore[attr-defined]
             raise StorageError("Write slot is stale: the storage was closed after it was reserved")
         super()._take(storage)
+
+
+class _SlotGuard:
+    """Context for the gate take: under ``_env_lock``, the slot is still the storage's.
+
+    A plain object rather than a generator context manager: it is on the
+    path of every write.
+    """
+
+    __slots__ = ("_lock", "_storage")
+
+    def __init__(self, storage: LMDBStorage, lock: threading.Lock | None) -> None:
+        self._storage = storage
+        self._lock = lock
+
+    def __enter__(self) -> None:
+        env_lock = self._storage._env_lock
+        env_lock.acquire()
+        try:
+            self._storage._require_slot_current(self._lock)
+        except BaseException:
+            env_lock.release()
+            raise
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._storage._env_lock.release()
 
 
 # Storages with locks to replace in a forked child (see ``_after_fork_in_child``).
@@ -939,6 +964,10 @@ class LMDBStorage:
                 slot.
             StorageLockTimeoutError: If it is not free within
                 ``busy_timeout``.
+            StorageClosedError: If the storage is closed, or closes while
+                the reservation waits. A reservation that straddles a
+                close() and open() is refused this way too, holding
+                nothing; the reopened storage accepts a new one.
         """
         if self._read_only:
             raise StorageError("Cannot reserve the write slot in read only mode.")
@@ -992,7 +1021,11 @@ class LMDBStorage:
                     )
                 finally:
                     self._writer_thread._unstamp_soft(stamp)
-                self._gate_held = True
+                with self._env_lock:
+                    # A close() since the take dropped the gate: the flag
+                    # is set only for a gate this reservation still holds.
+                    self._require_slot_current(lock)
+                    self._gate_held = True
             # With the gate held the begin is not a wait on a virtuals peer,
             # so it gets the full timeout (a writer outside virtuals bounds).
             lmdb_txn = await self._writer_thread.arun(
@@ -1020,7 +1053,9 @@ class LMDBStorage:
                 # A stale lock: the gate was never this reservation's to keep.
                 self._release_write_slot(lock)
             else:
-                self._release_gate()
+                # The gate is taken only once the slot is bound: with no
+                # slot there is none to give back, and the flag describes
+                # the live holder's.
                 self._writer.release_if_owned(me, since)
             raise
 
@@ -1053,17 +1088,14 @@ class LMDBStorage:
                 "Storage was closed and reopened while the write slot was being taken"
             )
 
-    @contextmanager
-    def _slot_guard(self, lock: threading.Lock | None) -> Iterator[None]:
+    def _slot_guard(self, lock: threading.Lock | None) -> _SlotGuard:
         """The gate is attached inside this: the slot is the storage's as it is taken.
 
         Without it a close() and open() landing between the slot grant
         and the gate take would hand the reopened storage's gate to a
         holder of a replaced slot, which nothing would ever release.
         """
-        with self._env_lock:
-            self._require_slot_current(lock)
-            yield
+        return _SlotGuard(self, lock)
 
     def _acquire_gate(self, lock: threading.Lock, deadline: float) -> None:
         """Take the cross-process gate, waiting until ``deadline`` at most.
@@ -1082,9 +1114,16 @@ class LMDBStorage:
         if on_loop:
             timeout = min(timeout, LOOP_THREAD_WAIT_CAP)
         stamp = self._writer_thread._stamp_soft()  # flock releases the GIL: see yield_to_writer
+        # The take is refused unless the slot is still current, so it is
+        # made under this generation if at all.
+        generation = self._gate.generation
         try:
             self._gate.acquire(timeout, guard=self._slot_guard(lock))
-            self._gate_held = True
+            with self._env_lock:
+                # A close() since the take dropped the gate: the flag is
+                # set only for a gate this caller still holds.
+                self._require_slot_current(lock)
+                self._gate_held = True
         except StorageLockTimeoutError:
             if not on_loop:
                 raise
@@ -1096,9 +1135,11 @@ class LMDBStorage:
             # gate held and unflagged, so never released: give it back
             # whatever the state. The slot is held, so nobody else in this
             # process can own the gate, and an unlock of a lock not held
-            # is a no-op.
-            self._gate_held = False
-            self._gate.release()
+            # is a no-op. Unless a close() and open() landed since the
+            # take: the gate is then the reopened storage's, its holder's
+            # own, and the release by generation touches nothing.
+            if self._gate.release(generation):
+                self._gate_held = False
             raise
         finally:
             self._writer_thread._unstamp_soft(stamp)
@@ -1258,7 +1299,9 @@ class LMDBStorage:
         nobody releases wedges every writer in this process until close().
         """
         if lock is not None and lock is not self._writer.lock:
-            return  # a fork reset the slot since; the gate was reopened too
+            # A close() (and open()) or a fork replaced the slot since: the
+            # old lock holds nothing, and the gate went with the close.
+            return
         try:
             self._release_gate()
         finally:
