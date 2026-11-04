@@ -56,10 +56,11 @@ def test_interrupts_never_wedge_or_misreport(backend: str, mode: str) -> None:
 def test_interrupts_never_wedge_or_misreport_long(backend: str, mode: str) -> None:
     """Three seeds of 2000 with the side writer, two with the async shape.
 
-    The interrupt count scales with the box (713 to 896 per run on red),
-    so a quarter of the transactions is the floor.
+    The interrupt count scales with the box and its load (713 to 896 per
+    run on an idle red, 493 under a parallel slow tier), so a tenth of the
+    transactions is the floor: it only proves interrupts were delivered.
     """
     for seed, use_async in ((1, False), (2, True), (3, True)):
         report = _fuzz(backend, 2000, seed, True, mode, timeout=900, use_async=use_async)
-        assert report["interrupts"] > 2000 / 4, report
+        assert report["interrupts"] > 2000 / 10, report
         assert report["bad"] == [], report  # a wedge (report["wedged"]) is measured, not asserted
