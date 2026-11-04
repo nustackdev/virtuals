@@ -29,7 +29,7 @@ from virtuals.tkv.storage import (
     WriteBatchProtocol,
 )
 
-from .._write_slot import LOOP_THREAD_WAIT_CAP, WriterLock, signals_held, signals_released
+from .._write_slot import LOOP_THREAD_WAIT_CAP, WriterLock
 from .context import is_busy_error
 from .snapshot import SQLiteSnapshot
 from .transaction import SQLiteTransaction
@@ -454,17 +454,16 @@ class SQLiteStorage:
             raise StorageError("Cannot start transaction in read only mode.")
         self._require_open()
 
-        with signals_held():  # until the transaction owns the connection and the slot
-            conn, writer_lock = self._begin_write_connection(write_slot)
-            transaction = SQLiteTransaction(self, conn, writer_lock)
-            with self._state_lock:
-                # Open, and the slot taken is still the slot: a close (and a
-                # reopen) since the begin did not see this transaction.
-                if self._opened and writer_lock is self._writer.lock:
-                    self._active_transactions.add(transaction)
-                    return transaction
-            transaction.abort()
-            raise StorageClosedError("Storage was closed while beginning the transaction")
+        conn, writer_lock = self._begin_write_connection(write_slot)
+        transaction = SQLiteTransaction(self, conn, writer_lock)
+        with self._state_lock:
+            # Open, and the slot taken is still the slot: a close (and a
+            # reopen) since the begin did not see this transaction.
+            if self._opened and writer_lock is self._writer.lock:
+                self._active_transactions.add(transaction)
+                return transaction
+        transaction.abort()
+        raise StorageClosedError("Storage was closed while beginning the transaction")
 
     async def areserve_write_slot(self) -> SQLiteWriteSlot:
         """Wait for the write lock without blocking the event loop.
@@ -499,17 +498,28 @@ class SQLiteStorage:
         self._check_fork()
         self._require_writable_after_fork()
         deadline = time.monotonic() + max(self._busy_timeout, 0)
-        lock = await self._writer.areserve(self._busy_timeout)
+        # A handler may raise as any ``await`` resumes, before its result
+        # is bound, and a cancellation lands there too. The slot is then
+        # given back by its owner (``release_if_owned``); a begun
+        # connection lost that way is collected at once, which rolls it
+        # back and frees the file lock.
+        me = self._writer.caller()
+        since = self._writer.hold_token()
+        lock: threading.Lock | None = None
         try:
+            lock = await self._writer.areserve(self._busy_timeout)
             conn = await self._abegin_immediate(deadline)
+            slot = SQLiteWriteSlot(self, lock, conn)
+            with self._state_lock:
+                if self._opened:
+                    self._reserved_slots.add(slot)
+                    return slot
         except BaseException:
-            self._writer.release(lock)
+            if lock is not None:
+                self._writer.release(lock)
+            else:
+                self._writer.release_if_owned(me, since)
             raise
-        slot = SQLiteWriteSlot(self, lock, conn)
-        with self._state_lock:
-            if self._opened:
-                self._reserved_slots.add(slot)
-                return slot
         # close() ran while the reservation polled and did not see it: the
         # file lock just taken must not outlive the closed storage.
         slot.release()
@@ -698,61 +708,57 @@ class SQLiteStorage:
         """
         self._check_fork()
         self._require_writable_after_fork()
-        # Signals are held from the take of the slot on (the caller holds
-        # them until a context owns the connection and the slot); the
-        # slot wait and the file lock wait let them through.
-        with signals_held():
-            # The lock taken, read from the take itself: a close() replacing the
-            # slot between the take and a later read would hand the context a
-            # lock it never held.
-            writer_lock, give_back_slot = self._writer.take_slot(
-                self, write_slot, self._busy_timeout
-            )
+        # From the take of the slot to the context that owns it the
+        # bookkeeping is a few bytecodes; the slot wait and the file lock
+        # wait undo themselves when interrupted.
+        # The lock taken, read from the take itself: a close() replacing the
+        # slot between the take and a later read would hand the context a
+        # lock it never held.
+        writer_lock, give_back_slot = self._writer.take_slot(self, write_slot, self._busy_timeout)
 
-            try:
-                conn = write_slot._detach_conn() if write_slot is not None else None
-                if conn is not None:
-                    return conn, writer_lock
-                conn = self._acquire_connection()
-            except BaseException:
-                give_back_slot()
-                raise
+        try:
+            conn = write_slot._detach_conn() if write_slot is not None else None
+            if conn is not None:
+                return conn, writer_lock
+            conn = self._acquire_connection()
+        except BaseException:
+            give_back_slot()
+            raise
 
-            # On an event loop thread the file lock wait is capped like the slot
-            # wait: SQLite's busy handler sleeps for the whole busy_timeout
-            # otherwise, with the loop stalled behind it (contract section 4).
-            on_loop = asyncio._get_running_loop() is not None
+        # On an event loop thread the file lock wait is capped like the slot
+        # wait: SQLite's busy handler sleeps for the whole busy_timeout
+        # otherwise, with the loop stalled behind it (contract section 4).
+        on_loop = asyncio._get_running_loop() is not None
+        try:
+            if on_loop:
+                conn.execute(f"PRAGMA busy_timeout = {int(LOOP_THREAD_WAIT_CAP * 1000)}")
             try:
+                conn.execute("BEGIN IMMEDIATE")
+            finally:
                 if on_loop:
-                    conn.execute(f"PRAGMA busy_timeout = {int(LOOP_THREAD_WAIT_CAP * 1000)}")
-                try:
-                    with signals_released():
-                        conn.execute("BEGIN IMMEDIATE")
-                finally:
-                    if on_loop:
-                        conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout * 1000)}")
-            except BaseException as e:
-                try:
-                    self._release_connection(conn)
-                finally:
-                    give_back_slot()
-                if not isinstance(e, Exception):
-                    raise
-                if is_busy_error(e):
-                    if on_loop:
-                        raise self._writer.loop_cap_timeout("the database's write lock") from e
-                    raise StorageLockTimeoutError(
-                        f"Timed out after {self._busy_timeout}s waiting for the write lock: {e}"
-                    ) from e
-                raise StorageError(f"Failed to begin write transaction: {e}") from e
-            if writer_lock is not self._writer.lock:
-                # close() ran while BEGIN IMMEDIATE waited in the busy handler and
-                # released the slot on this caller's behalf; a reopen since may
-                # have handed the fresh slot to someone else. This transaction
-                # would run without a slot, so it does not start.
+                    conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout * 1000)}")
+        except BaseException as e:
+            try:
                 self._release_connection(conn)
-                raise StorageClosedError("Storage was closed while beginning the transaction")
-            return conn, writer_lock
+            finally:
+                give_back_slot()
+            if not isinstance(e, sqlite3.Error):
+                raise  # an interrupt, as it is
+            if is_busy_error(e):
+                if on_loop:
+                    raise self._writer.loop_cap_timeout("the database's write lock") from e
+                raise StorageLockTimeoutError(
+                    f"Timed out after {self._busy_timeout}s waiting for the write lock: {e}"
+                ) from e
+            raise StorageError(f"Failed to begin write transaction: {e}") from e
+        if writer_lock is not self._writer.lock:
+            # close() ran while BEGIN IMMEDIATE waited in the busy handler and
+            # released the slot on this caller's behalf; a reopen since may
+            # have handed the fresh slot to someone else. This transaction
+            # would run without a slot, so it does not start.
+            self._release_connection(conn)
+            raise StorageClosedError("Storage was closed while beginning the transaction")
+        return conn, writer_lock
 
     def _check_fork(self) -> None:
         """Drop state inherited across a fork.
@@ -855,8 +861,7 @@ class SQLiteStorage:
                 released when it is no longer the storage's lock (a fork
                 reset the slot since).
         """
-        with signals_held():
-            self._writer.release(lock)
+        self._writer.release(lock)
 
     # =========================================================================
     # Internal Methods

@@ -5,8 +5,11 @@ from __future__ import annotations
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
 
+import lmdb
+
 from virtuals.tkv.storage import (
     StorageClosedError,
+    StorageError,
     StorageLockTimeoutError,
     StorageTransactionAbortedError,
     StorageTransactionConflictError,
@@ -14,7 +17,6 @@ from virtuals.tkv.storage import (
     TransactionProtocol,
 )
 
-from .._write_slot import signals_held
 from ._writer import NOT_RUN
 from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin
 
@@ -95,17 +97,14 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
             if pending is None:
                 raise StorageClosedError("Context handle is invalid")
             storage = self._storage
-            with (
-                signals_held()
-            ):  # from the begun handle to its place here; the hop lets them through
-                if not pending:  # read first: just the begin, nothing to replay
-                    txn = storage._begin_on_writer()
-                else:
-                    txn, missing = storage._begin_pending(pending)
-                    for encoded_key in missing:
-                        self._modified_keys.discard(pending[encoded_key][0])
-                self._lmdb_txn = txn
-                self._pending = None
+            if not pending:  # read first: just the begin, nothing to replay
+                txn = storage._begin_on_writer()
+            else:
+                txn, missing = storage._begin_pending(pending)
+                for encoded_key in missing:
+                    self._modified_keys.discard(pending[encoded_key][0])
+            self._lmdb_txn = txn
+            self._pending = None
         return txn
 
     def commit(self) -> None:
@@ -122,15 +121,14 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         committed, notified, slot and gate given back, and the interrupt
         is then raised as it is. One that arrives before the commit
         started (a write-only transaction whose begin had not landed)
-        commits nothing and leaves the transaction pending for the abort
-        that follows.
+        commits nothing: the transaction is aborted and the interrupt
+        raised as it is.
         """
         deferred: list[BaseException] = []
-        # Signals are held throughout (the staged commit's begin wait lets
-        # them through): a signal lands once the commit is settled and
-        # reported. ``deferred`` covers an interrupt raised without a
-        # signal (``_thread.interrupt_main``) the same way.
-        with signals_held(), self._call_lock:
+        # ``deferred`` collects the interrupts that land in the commit's
+        # wait; the commit is reported first, then the first of them is
+        # raised as it is.
+        with self._call_lock:
             if self._closed:
                 logger.error("Cannot commit, transaction is closed")
                 raise StorageClosedError("Transaction is closed")
@@ -161,9 +159,16 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
                     raise deferred[0] from e  # the interrupt, with the failure as its cause
                 if isinstance(e, (StorageLockTimeoutError, StorageTransactionConflictError)):
                     raise  # retryable as it is: the whole transaction is to be re-run
+                if not isinstance(e, (lmdb.Error, StorageError)):
+                    raise  # an interrupt raised as a plain exception: as it is
                 raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
             if missing is NOT_RUN:
-                raise deferred[0]  # nothing ran: still pending, see the docstring
+                # Nothing ran: aborted, as on sqlite, and the interrupt as it is.
+                self._pending = None
+                self._aborted = True
+                self._mark_closed()
+                self._storage._untrack_transaction(self)
+                raise deferred[0]
             for encoded_key in missing:
                 self._modified_keys.discard(pending[encoded_key][0])  # type: ignore[index]
             self._pending = None
@@ -194,7 +199,7 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
             # release; waiting for that lock would wait on close itself.
             logger.debug("Abort called on closed transaction")
             return
-        with signals_held(), self._call_lock:
+        with self._call_lock:
             if self._closed:
                 return
             failure: Exception | None = None

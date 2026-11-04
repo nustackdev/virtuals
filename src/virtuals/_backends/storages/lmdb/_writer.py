@@ -47,8 +47,6 @@ from typing import TYPE_CHECKING, Any
 
 from virtuals.tkv.storage import StorageClosedError, StorageError, StorageLockTimeoutError
 
-from .._write_slot import signals_held, signals_released
-
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -168,9 +166,10 @@ class WriterThread:
 
     def _unstamp(self, token: int) -> None:
         """Clear the stamp, unless somebody else has stamped since."""
-        if self._owner == token:
-            self._waiting = False
-            self._wait_since = 0.0
+        with self._lock:
+            if self._owner == token:
+                self._waiting = False
+                self._wait_since = 0.0
 
     def _progress(self) -> None:
         """Refresh the owner's stamp from the thread (a long replay is progress)."""
@@ -339,8 +338,7 @@ class WriterThread:
             try:
                 if deferred is not None:
                     return self._wait(future, timeout, deferred)
-                with signals_released():  # a wait a caller holding signals may interrupt
-                    return future.result(timeout)
+                return future.result(timeout)
             except FutureTimeoutError:
                 pass
             except BaseException as e:
@@ -353,8 +351,7 @@ class WriterThread:
             try:
                 if deferred is not None:
                     return self._wait(future, None, deferred)
-                with signals_released():
-                    return future.result()
+                return future.result()
             except BaseException as e:
                 self._left(future, e, abandoned)
                 raise
@@ -393,8 +390,7 @@ class WriterThread:
         try:
             self._submit(fn, begun, abandoned, then, done)
             try:
-                with signals_released():  # interruptible while the begin may still be undone
-                    return done.result(timeout)
+                return done.result(timeout)
             except FutureTimeoutError:
                 pass
             except BaseException as e:
@@ -673,7 +669,7 @@ class WriterGate:
 
     def _attach(self) -> Future | None:
         """Take the gate now (None) or return the future the helper will deliver it on."""
-        with signals_held(), self._mu:
+        with self._mu:
             if not self._waiting:
                 if self._try_nb():
                     return None
@@ -757,7 +753,7 @@ class WriterGate:
 
     def release(self) -> None:
         """Give the gate back. A no-op once the file is closed."""
-        with signals_held(), self._mu:
+        with self._mu:
             fd = self._fd
             if fd is None:
                 return
@@ -778,8 +774,7 @@ class WriterGate:
             return
         try:
             try:
-                with signals_released():  # a wait a caller holding signals may interrupt
-                    consumer.result(max(timeout, 0))
+                consumer.result(max(timeout, 0))
             except FutureTimeoutError:
                 if self._detach(consumer):
                     raise self._timed_out(timeout) from None
