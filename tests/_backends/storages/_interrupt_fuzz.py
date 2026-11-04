@@ -394,6 +394,9 @@ def run(
     return report
 
 
+SIDE_LOCK_TIMEOUT = "side_err_StorageLockTimeoutError"
+
+
 def wedged(report: dict) -> list[str]:
     """What a wedge left behind, if the run ended in one; empty otherwise."""
     out = []
@@ -413,8 +416,10 @@ def check(report: dict) -> list[str]:
 
     Nothing a caller saw succeed is lost, nothing is applied twice or
     torn, a present key never came with a storage error, values are
-    intact, and the peers failed only with the retryable lock timeout. A
-    wedge is not in here: see ``wedged``.
+    intact, and the peers and the side writer failed only with the
+    retryable lock timeout (a loaded box, or a wedge starving them: the
+    side writer's timeouts are reported in ``side_lock_timeouts``, not
+    asserted). A wedge is not in here: see ``wedged``.
     """
     bad = []
     for name in ("peer", "fresh_peer"):
@@ -438,7 +443,11 @@ def check(report: dict) -> list[str]:
         bad.append(f"present but reported as a failure: {report['present_misreported'][:10]}")
     if report["notify_for_absent"]:
         bad.append(f"notified absent: {report['notify_for_absent'][:10]}")
-    side_errors = {k: v for k, v in report["stats"].items() if k.startswith("side_err_")}
+    side_errors = {
+        k: v
+        for k, v in report["stats"].items()
+        if k.startswith("side_err_") and k != SIDE_LOCK_TIMEOUT
+    }
     if side_errors:
         bad.append(f"side writer errors: {side_errors}")
     return bad
@@ -450,4 +459,5 @@ if __name__ == "__main__":
     result = run(backend, int(n), int(seed), float(lo), float(hi), side == "1", mode, use_async)
     result["bad"] = check(result)
     result["wedged"] = wedged(result)
+    result["side_lock_timeouts"] = result["stats"].get(SIDE_LOCK_TIMEOUT, 0)
     print(json.dumps(result, default=str))

@@ -5,7 +5,9 @@ Each run is its own process, so a wedged storage never wedges the suite.
 The short runs are the smoke; the long ones carry the ``slow`` marker. A
 run that ends wedged (an interrupt in one of the documented bookkeeping
 windows) still has to be correct about what landed; the wedge rate is
-measured from the reports, not asserted.
+measured from the reports, not asserted. The side writer's lock timeouts
+are measured the same way: they come from a loaded box or from a wedge
+starving it, and both are retryable to a caller.
 """
 
 from __future__ import annotations
@@ -16,6 +18,19 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from tests._backends.storages._interrupt_fuzz import SIDE_LOCK_TIMEOUT, check
+
+
+def _measured(report: dict) -> dict:
+    """What to print when a run fails: the verdict and what was measured."""
+    return {
+        "bad": report["bad"],
+        "wedged": report["wedged"],
+        "interrupts": report["interrupts"],
+        "side_lock_timeouts": report.get("side_lock_timeouts"),
+        "stats": report["stats"],
+    }
 
 
 def _fuzz(
@@ -45,8 +60,8 @@ def _fuzz(
 @pytest.mark.parametrize("backend", ["lmdb", "sqlite"])
 def test_interrupts_never_wedge_or_misreport(backend: str, mode: str) -> None:
     report = _fuzz(backend, 200, 7, False, mode, timeout=150, use_async=True)
-    assert report["interrupts"] > 3, report  # few land in virtuals frames in a short run
-    assert report["bad"] == [], report  # a wedge (report["wedged"]) is measured, not asserted
+    assert report["interrupts"] > 3, _measured(report)  # few land in virtuals frames
+    assert report["bad"] == [], _measured(report)  # a wedge is measured, not asserted
 
 
 @pytest.mark.slow
@@ -62,5 +77,32 @@ def test_interrupts_never_wedge_or_misreport_long(backend: str, mode: str) -> No
     """
     for seed, use_async in ((1, False), (2, True), (3, True)):
         report = _fuzz(backend, 2000, seed, True, mode, timeout=900, use_async=use_async)
-        assert report["interrupts"] > 2000 / 10, report
-        assert report["bad"] == [], report  # a wedge (report["wedged"]) is measured, not asserted
+        assert report["interrupts"] > 2000 / 10, _measured(report)
+        # a wedge and the side writer's lock timeouts are measured, not asserted
+        assert report["bad"] == [], _measured(report)
+
+
+def _clean_report(**stats: int) -> dict:
+    return {
+        "peer": ["PEER ok"],
+        "fresh_peer": ["PEER ok"],
+        "peer_errors": ["StorageLockTimeoutError: busy"],
+        "counter": 3,
+        "counter_expected": 3,
+        "values_consistent": True,
+        "lost": [],
+        "present_misreported": [],
+        "notify_for_absent": [],
+        "stats": {"side_ok": 10, **stats},
+    }
+
+
+def test_check_counts_side_writer_lock_timeouts_as_retryable() -> None:
+    """A side writer that timed out on the lock is load or a wedge, not a defect.
+
+    Any other side writer error class still fails the run.
+    """
+    assert check(_clean_report()) == []
+    assert check(_clean_report(**{SIDE_LOCK_TIMEOUT: 12})) == []
+    bad = check(_clean_report(**{SIDE_LOCK_TIMEOUT: 12, "side_err_StorageOperationError": 1}))
+    assert bad == ["side writer errors: {'side_err_StorageOperationError': 1}"], bad
