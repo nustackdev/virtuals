@@ -150,7 +150,7 @@ class RegexFilter(Filter):
         return self.pattern == other.pattern
 ```
 
-Custom filters work with scans as they are. A subscription also needs the filter's hash (`filter_hash`), which is built from `to_dict()`: the redis observer sends it at subscribe, and every observer keys resync wakes by it. A custom filter must override `to_dict()` with a literal dict of its fields to be subscribed on redis or to receive resync wakes; the `RegexFilter` above would need one. Without it `subscribe()` raises `NotImplementedError` on redis, and in-memory delivery works but misses resync wakes.
+Custom filters work with scans as they are. A subscription also needs the filter's hash (`filter_hash`), which is built from `to_dict()`: the redis observer sends it at subscribe, and every observer keys resync wakes by it. A custom filter must override `to_dict()` with a literal dict of its fields to be subscribed on redis or to receive resync wakes; the `RegexFilter` above would need one. Without it `subscribe()` raises `NotImplementedError` on redis. On the in-memory transport such a subscription works in full: keys are delivered, and its resync wake is keyed by the subscription itself (process-local, never sent across a transport), so it costs no other subscription its wake.
 
 **Performance note:** Custom filters cannot be indexed by the subscription registry. They are checked against every key change. For high-frequency notifications with many subscriptions, prefer built-in filter types.
 
