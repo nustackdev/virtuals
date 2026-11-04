@@ -14,12 +14,13 @@ from virtuals.tkv.storage import (
     TransactionProtocol,
 )
 
+from .._write_slot import signals_held
+from ._writer import NOT_RUN
 from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin
 
 
 if TYPE_CHECKING:
     import threading
-    from collections.abc import Iterable
     from types import TracebackType
 
     from virtuals.tkv.types import Key
@@ -53,7 +54,7 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
     A transaction from ``areserve_write_slot`` starts begun.
     """
 
-    __slots__ = ("_aborted", "_committed", "_interrupted", "_modified_keys", "_pending")
+    __slots__ = ("_aborted", "_committed", "_modified_keys", "_pending")
 
     def __init__(
         self, storage: LMDBStorage, lmdb_txn: object, write_lock: threading.Lock | None = None
@@ -64,7 +65,6 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         self._modified_keys: set[Key] = set()
         self._committed = False
         self._aborted = False
-        self._interrupted = False  # a commit was left by an interrupt with its outcome open
 
     def __del__(self) -> None:
         """Abort a transaction dropped unended, so it cannot hold the writer lock."""
@@ -95,14 +95,17 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
             if pending is None:
                 raise StorageClosedError("Context handle is invalid")
             storage = self._storage
-            if not pending:  # read first: just the begin, nothing to replay
-                txn = storage._begin_on_writer()
-            else:
-                txn, missing = storage._begin_pending(pending)
-                for encoded_key in missing:
-                    self._modified_keys.discard(pending[encoded_key][0])
-            self._lmdb_txn = txn
-            self._pending = None
+            with (
+                signals_held()
+            ):  # from the begun handle to its place here; the hop lets them through
+                if not pending:  # read first: just the begin, nothing to replay
+                    txn = storage._begin_on_writer()
+                else:
+                    txn, missing = storage._begin_pending(pending)
+                    for encoded_key in missing:
+                        self._modified_keys.discard(pending[encoded_key][0])
+                self._lmdb_txn = txn
+                self._pending = None
         return txn
 
     def commit(self) -> None:
@@ -112,8 +115,22 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         began the transaction, so this may be called from any thread. A
         transaction that never read is begun, replayed and committed in
         one job there.
+
+        An interrupt (a signal handler raising, ``KeyboardInterrupt``)
+        while the commit is in flight never changes its outcome or how it
+        is reported: the commit is waited out, the transaction ends
+        committed, notified, slot and gate given back, and the interrupt
+        is then raised as it is. One that arrives before the commit
+        started (a write-only transaction whose begin had not landed)
+        commits nothing and leaves the transaction pending for the abort
+        that follows.
         """
-        with self._call_lock:
+        deferred: list[BaseException] = []
+        # Signals are held throughout (the staged commit's begin wait lets
+        # them through): a signal lands once the commit is settled and
+        # reported. ``deferred`` covers an interrupt raised without a
+        # signal (``_thread.interrupt_main``) the same way.
+        with signals_held(), self._call_lock:
             if self._closed:
                 logger.error("Cannot commit, transaction is closed")
                 raise StorageClosedError("Transaction is closed")
@@ -125,22 +142,12 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
                 raise StorageTransactionError("Transaction already aborted")
 
             pending = self._pending
-            # Interrupted while the commit is in flight (a signal), the
-            # commit still runs to its end on the writer thread, and
-            # ``settle`` finishes this bookkeeping from there; the
-            # interrupt itself propagates as is. Interrupted before the
-            # begin landed, nothing is committed and the transaction stays
-            # pending for the abort that follows.
             try:
                 if pending is not None:
-                    missing = self._storage._commit_pending(
-                        pending, settle=lambda missing: self._settle(pending, missing, late=True)
-                    )
+                    missing = self._storage._commit_pending(pending, deferred)
                 else:
                     txn = self._require_active()
-                    self._storage._end_write(
-                        txn, commit=True, settle=lambda _: self._settle(None, (), late=True)
-                    )
+                    self._storage._end_write(txn, commit=True, deferred=deferred)
                     missing = ()
             except Exception as e:
                 # LMDB frees a write transaction whose commit fails, so close
@@ -148,49 +155,27 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
                 self._aborted = True
                 self._pending = None
                 self._mark_closed()
-                failure: Exception | None = e
-            except BaseException:
-                self._interrupted = True  # the abort that follows lets the commit settle first
-                raise
-            else:
-                failure = None
-                self._settle(pending, missing)
-
-        if failure is not None:
-            self._storage._untrack_transaction(self)
-            logger.error("Transaction commit failed")
-            if isinstance(failure, (StorageLockTimeoutError, StorageTransactionConflictError)):
-                raise failure  # retryable as it is: the whole transaction is to be re-run
-            raise StorageTransactionError(f"Failed to commit transaction: {failure}") from failure
-
-        logger.debug("Transaction committed")
-        self._storage._notify_batch(self._modified_keys)
-        self._storage._untrack_transaction(self)
-
-    def _settle(
-        self, pending: Pending | None, missing: Iterable[bytes], *, late: bool = False
-    ) -> None:
-        """Bookkeeping of a commit that landed: the keys, the flags, the slot.
-
-        Under ``_call_lock`` on the committing thread, or ``late`` from the
-        writer thread after the committing thread was interrupted: then
-        it also notifies and untracks, since the interrupted ``commit``
-        never got to. The abort that usually follows an interrupt waits
-        for this to land and is then a no-op; an interrupt raised as a
-        plain ``Exception`` (a handler's choice) is taken for a failed
-        commit by ``commit`` instead, which releases the slot early and
-        marks the transaction aborted, and this then marks it committed
-        too, which it is.
-        """
-        for encoded_key in missing:
-            self._modified_keys.discard(pending[encoded_key][0])  # type: ignore[index]
-        self._pending = None
-        self._committed = True
-        self._mark_closed()
-        if late:
-            logger.warning("LMDB transaction committed after its commit was interrupted")
-            self._storage._notify_batch(self._modified_keys)
-            self._storage._untrack_transaction(self)
+                self._storage._untrack_transaction(self)
+                logger.error("Transaction commit failed")
+                if deferred:
+                    raise deferred[0] from e  # the interrupt, with the failure as its cause
+                if isinstance(e, (StorageLockTimeoutError, StorageTransactionConflictError)):
+                    raise  # retryable as it is: the whole transaction is to be re-run
+                raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
+            if missing is NOT_RUN:
+                raise deferred[0]  # nothing ran: still pending, see the docstring
+            for encoded_key in missing:
+                self._modified_keys.discard(pending[encoded_key][0])  # type: ignore[index]
+            self._pending = None
+            self._committed = True
+            self._mark_closed()
+            logger.debug("Transaction committed")
+            try:
+                self._storage._notify_batch(self._modified_keys)
+            finally:
+                self._storage._untrack_transaction(self)
+            if deferred:
+                raise deferred[0]
 
     def abort(self) -> None:
         """Abort transaction and discard all changes.
@@ -209,18 +194,13 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
             # release; waiting for that lock would wait on close itself.
             logger.debug("Abort called on closed transaction")
             return
-        with self._call_lock:
-            if self._interrupted:
-                # A commit left by an interrupt may still be landing on the
-                # writer thread; it settles there, ahead of any job queued
-                # here, so after this the transaction is committed or not.
-                self._storage._drain_writer()
+        with signals_held(), self._call_lock:
             if self._closed:
                 return
             failure: Exception | None = None
             try:
-                txn = self._lmdb_txn
-                if self._pending is None and txn is not None:
+                if self._pending is None:
+                    txn = self._require_active()
                     self._storage._end_write(txn, commit=False)
                 logger.debug("Transaction aborted")
             except Exception as e:
@@ -228,8 +208,7 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
                 failure = e
             finally:
                 self._pending = None
-                if not self._committed:
-                    self._aborted = True
+                self._aborted = True
                 self._mark_closed()
 
         self._storage._untrack_transaction(self)

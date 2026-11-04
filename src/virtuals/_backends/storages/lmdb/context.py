@@ -39,6 +39,8 @@ from virtuals.tkv.storage import (
 )
 from virtuals.tkv.types import EMPTY, Empty
 
+from .._write_slot import signals_held
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -255,13 +257,18 @@ class ContextBase:
         return self._lmdb_txn
 
     def _mark_closed(self) -> None:
-        """Mark context as closed, clear handle, and give back the writer slot."""
-        self._closed = True
-        self._lmdb_txn = None
-        with _SLOT_FLAG_LOCK:
-            holds, self._holds_write_slot = self._holds_write_slot, False
-        if holds:
-            self._storage._release_write_slot(self._write_lock)
+        """Mark context as closed, clear handle, and give back the writer slot.
+
+        Signals are held across it: nothing else would give the slot back
+        once the context reads as closed.
+        """
+        with signals_held():
+            self._closed = True
+            self._lmdb_txn = None
+            with _SLOT_FLAG_LOCK:
+                holds, self._holds_write_slot = self._holds_write_slot, False
+            if holds:
+                self._storage._release_write_slot(self._write_lock)
 
     def _forget(self) -> Any:  # noqa: ANN401
         """Mark the context closed without touching LMDB; returns its handle.
@@ -291,19 +298,20 @@ class ContextBase:
         """
         if self._closed or self._pid != os.getpid():
             return
-        txn, self._lmdb_txn = self._lmdb_txn, None
-        self._closed = True
-        holds, self._holds_write_slot = self._holds_write_slot, False
-        logger.warning(f"LMDB {what} dropped without commit or abort; aborting it")
-        try:
-            # Skipped when the writer thread is gone or the interpreter is
-            # exiting: process exit frees LMDB's writer lock and the gate
-            # anyway, and close() ends every live write itself.
-            if txn is not None and not self._storage._end_write_from_finalizer(txn):
-                logger.debug(f"LMDB {what} finalizer did not reach the writer thread")
-        finally:
-            if holds:
-                self._storage._release_write_slot(self._write_lock)
+        with signals_held():  # a handler raising in a finalizer is swallowed: never half done
+            txn, self._lmdb_txn = self._lmdb_txn, None
+            self._closed = True
+            holds, self._holds_write_slot = self._holds_write_slot, False
+            logger.warning(f"LMDB {what} dropped without commit or abort; aborting it")
+            try:
+                # Skipped when the writer thread is gone or the interpreter is
+                # exiting: process exit frees LMDB's writer lock and the gate
+                # anyway, and close() ends every live write itself.
+                if txn is not None and not self._storage._end_write_from_finalizer(txn):
+                    logger.debug(f"LMDB {what} finalizer did not reach the writer thread")
+            finally:
+                if holds:
+                    self._storage._release_write_slot(self._write_lock)
 
     @property
     def is_closed(self) -> bool:

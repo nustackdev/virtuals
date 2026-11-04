@@ -15,11 +15,12 @@ from virtuals.tkv.storage import (
     WriteBatchProtocol,
 )
 
+from .._write_slot import signals_held
+from ._writer import NOT_RUN
 from .context import ContextBase
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
     from types import TracebackType
 
     from virtuals.tkv.types import Key, Value
@@ -44,7 +45,7 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
     slow build keeps no writer waiting, in this process or another.
     """
 
-    __slots__ = ("_aborted", "_interrupted", "_modified_keys", "_ops", "_written")
+    __slots__ = ("_aborted", "_modified_keys", "_ops", "_written")
 
     def __init__(self, storage: LMDBStorage) -> None:
         """Initialize write batch."""
@@ -53,7 +54,6 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
         self._modified_keys: set[Key] = set()
         self._written = False
         self._aborted = False
-        self._interrupted = False  # a write was left by an interrupt with its outcome open
 
     @property
     def writable(self) -> bool:
@@ -96,7 +96,10 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
         Waits for the writer slot and the gate outside the batch's call
         lock, so a ``close()`` aborting the batch meanwhile is not held up
         by that wait; once both are held the batch is checked again and
-        applied under the lock.
+        applied under the lock. An interrupt while the commit is in flight
+        never changes its outcome or how it is reported (see
+        ``LMDBTransaction.commit``): the batch ends written and notified,
+        then the interrupt is raised as it is.
         """
         with self._call_lock:
             if self._closed:
@@ -110,77 +113,66 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
                 raise StorageTransactionError("Write batch already aborted")
 
         storage = self._storage
-        try:
-            if self._ops:
-                lock = storage._take_write_slot()
-                try:
+        deferred: list[BaseException] = []
+        with (
+            signals_held()
+        ):  # as in LMDBTransaction.commit; the slot, gate and begin waits let them through
+            try:
+                if self._ops:
+                    lock = storage._take_write_slot()
+                    try:
+                        with self._call_lock:
+                            if self._closed:
+                                raise StorageClosedError("Write batch was closed while writing")
+                            ops = self._ops
+                            missing = storage._commit_pending(ops, deferred)
+                            if missing is NOT_RUN:
+                                raise deferred[0]  # nothing ran: the batch stays as it was
+                            for encoded_key in missing:
+                                self._modified_keys.discard(ops[encoded_key][0])
+                            self._finish()
+                    finally:
+                        storage._release_write_slot(lock)
+                else:
                     with self._call_lock:
                         if self._closed:
                             raise StorageClosedError("Write batch was closed while writing")
-                        ops = self._ops
-                        # Interrupted (a signal) with the commit in flight,
-                        # it runs to its end on the writer thread and
-                        # ``_settle`` finishes from there; the interrupt
-                        # propagates as is.
-                        missing = storage._commit_pending(
-                            ops, settle=lambda missing: self._settle(ops, missing, late=True)
-                        )
-                        self._settle(ops, missing)
-                finally:
-                    storage._release_write_slot(lock)
-            else:
+                        self._finish()  # nothing to apply: just ends the batch
+            except Exception as e:
                 with self._call_lock:
-                    if self._closed:
-                        raise StorageClosedError("Write batch was closed while writing")
-                    self._finish()  # nothing to apply: just ends the batch
-        except BaseException as e:
-            if not isinstance(e, Exception):
-                self._interrupted = True  # the abort that follows lets the write settle first
-                raise
-            with self._call_lock:
-                if not self._closed:
-                    self._aborted = True
-                    self._ops = {}
-                    self._mark_closed()
-            storage._untrack_write_batch(self)
-            logger.error("Write batch write failed")
-            if isinstance(
-                e,
-                (
-                    StorageLockTimeoutError,
-                    StorageNestedTransactionError,
-                    StorageClosedError,
-                    StorageTransactionConflictError,
-                ),
-            ):
-                raise
-            raise StorageTransactionError(f"Failed to write batch: {e}") from e
+                    if not self._closed:
+                        self._aborted = True
+                        self._ops = {}
+                        self._mark_closed()
+                storage._untrack_write_batch(self)
+                logger.error("Write batch write failed")
+                if deferred:
+                    raise deferred[0] from e  # the interrupt, with the failure as its cause
+                if isinstance(
+                    e,
+                    (
+                        StorageLockTimeoutError,
+                        StorageNestedTransactionError,
+                        StorageClosedError,
+                        StorageTransactionConflictError,
+                    ),
+                ):
+                    raise
+                raise StorageTransactionError(f"Failed to write batch: {e}") from e
 
-        logger.debug("Write batch written")
-        storage._notify_batch(self._modified_keys)
-        storage._untrack_write_batch(self)
+            logger.debug("Write batch written")
+            try:
+                storage._notify_batch(self._modified_keys)
+            finally:
+                storage._untrack_write_batch(self)
+            if deferred:
+                raise deferred[0]
 
     def _finish(self) -> None:
         """Mark the batch written and closed. Under ``_call_lock``."""
         self._ops = {}
         self._written = True
         self._mark_closed()
-
-    def _settle(self, ops: Pending, missing: Iterable[bytes], *, late: bool = False) -> None:
-        """Bookkeeping of a write that landed: the keys and the flags.
-
-        Under ``_call_lock`` on the writing thread, or ``late`` from the
-        writer thread after the writing thread was interrupted: then it
-        also notifies and untracks, since the interrupted ``write`` never
-        got to, and the batch is marked written, which it is.
-        """
-        for encoded_key in missing:
-            self._modified_keys.discard(ops[encoded_key][0])
-        self._finish()
-        if late:
-            logger.warning("LMDB write batch written after its write was interrupted")
-            self._storage._notify_batch(self._modified_keys)
-            self._storage._untrack_write_batch(self)
 
     def abort(self) -> None:
         """Abort write batch and discard its buffered writes.
@@ -192,12 +184,7 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
         if self._closed:
             logger.debug("Abort called on closed write batch")
             return
-        with self._call_lock:
-            if self._interrupted:
-                # A write left by an interrupt may still be landing on the
-                # writer thread; it settles there, ahead of any job queued
-                # here, so after this the batch is written or not.
-                self._storage._drain_writer()
+        with signals_held(), self._call_lock:
             if self._closed:
                 return
             self._aborted = True
