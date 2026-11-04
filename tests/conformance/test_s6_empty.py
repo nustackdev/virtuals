@@ -8,11 +8,19 @@ exist, and show up in scans.
 
 from __future__ import annotations
 
+import copy
+import pickle
+
 import pytest
 
 from virtuals.tkv import StorageScanOptions
 from virtuals.tkv.filter import PrefixFilter
-from virtuals.tkv.types import EMPTY
+from virtuals.tkv.types import EMPTY, Empty
+
+
+def _copies() -> list[object]:
+    """EMPTY as it comes back from another process, a copy, or a fresh constructor."""
+    return [pickle.loads(pickle.dumps(EMPTY)), copy.deepcopy(EMPTY), copy.copy(EMPTY), Empty()]  # noqa: S301
 
 
 def _rows(storage, prefix):
@@ -23,7 +31,7 @@ def _rows(storage, prefix):
 
 @pytest.mark.timeout(20)
 def test_s6_raw_put_rejects_empty(storage):
-    """``tx.put`` and ``batch.put`` raise ``ValueError`` on EMPTY and store nothing."""
+    """``tx.put`` and ``batch.put`` raise ``ValueError`` on EMPTY, copies included, and store nothing."""
     with storage.transaction() as t:
         t.put(("p", 0), 0)
 
@@ -39,6 +47,13 @@ def test_s6_raw_put_rejects_empty(storage):
         with pytest.raises(ValueError, match="EMPTY"):
             b.put(("p", 3), EMPTY)
         b.put(("p", 4), 4)
+
+    # a copy of the sentinel is the sentinel: refused the same way on both doors
+    for i, value in enumerate(_copies()):
+        with storage.transaction() as t, pytest.raises(ValueError, match="EMPTY"):
+            t.put(("p", 10 + i), value)
+        with storage.batch_write() as b, pytest.raises(ValueError, match="EMPTY"):
+            b.put(("p", 20 + i), value)
 
     assert _rows(storage, ("p",)) == {("p", 0): 0, ("p", 2): 2, ("p", 4): 4}
     with storage.snapshot() as s:

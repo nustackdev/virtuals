@@ -13,7 +13,32 @@ __all__ = [
 
 
 class Empty:
-    """Sentinel for non-existent values."""
+    """Sentinel for non-existent values.
+
+    A true singleton: ``Empty()`` is ``EMPTY``, and so is a copy, a deep
+    copy or a pickle round trip (across processes included). So an
+    identity test against ``EMPTY`` is exact everywhere, and the raw
+    storage doors can refuse it at zero cost per put.
+    """
+
+    __slots__ = ()
+    _instance: Empty | None = None
+
+    def __new__(cls) -> Empty:
+        """Return the one instance."""
+        inst = cls._instance
+        if inst is None:
+            inst = cls._instance = super().__new__(cls)
+        return inst
+
+    def __reduce__(self) -> str:
+        return "EMPTY"  # unpickles to this module's EMPTY, never a second instance
+
+    def __copy__(self) -> Empty:
+        return self
+
+    def __deepcopy__(self, memo: dict) -> Empty:
+        return self
 
     def __repr__(self) -> str:
         """String representation for debugging."""
