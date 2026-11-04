@@ -57,6 +57,7 @@ from virtuals.view import (
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    is_view_key,
 )
 
 
@@ -374,7 +375,8 @@ class LogIndexedDictViewBase(
         return self.next_key_after(None) is not None
 
     def __contains__(self, obj: str | int) -> bool:
-        return self._data_container().exists_child(obj)
+        """Check if key exists. A key the view cannot hold is not in it."""
+        return is_view_key(obj) and self._data_container().exists_child(obj)
 
     def __iter__(self) -> Generator[str | int, None, None]:
         for _log_key, actual_key in self._scan_log_keys():
@@ -489,7 +491,7 @@ class LogIndexedDictViewBase(
         # raise KeyError -- matching Python dict semantics and letting ref
         # callers no-op via their KeyError/IndexError catch.
         dc = self._data_container()
-        if not dc.exists_child(address):
+        if not is_view_key(address) or not dc.exists_child(address):
             raise KeyError(address)
         dc.delete_child(address)
         # Drop the log entry: one reverse-index get, one get to confirm the
@@ -585,6 +587,8 @@ class LogIndexedDictViewBase(
     # -- Internal read helpers ---------------------------------------------
 
     def _read_child_from_data(self, address: str | int) -> tuple[object, bool]:
+        if not is_view_key(address):
+            raise KeyError(address)
         dc = self._data_container()
         child_site = (*dc.site, address)
         from virtuals.container import node_ops

@@ -36,9 +36,24 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ViewBase",
+    "is_view_key",
 ]
 
 logger = getLogger(__name__)
+
+_KEY_TYPES = (str, int)
+
+
+def is_view_key(address: object) -> bool:
+    """True if a dict view can hold ``address``: a str or an int (bool included).
+
+    Reads use it to treat any other key as absent, the way a dict holds no
+    key of a type it was never given: ``[]`` raises KeyError, ``get``
+    returns its default, ``in`` is False. Writes reject such a key with
+    TypeError (``_reject_empty``). The int range is a storage limit, checked
+    by the key codec, not here.
+    """
+    return isinstance(address, _KEY_TYPES)
 
 
 @attrs.frozen
@@ -202,8 +217,10 @@ class ViewBase(ABC):
 
         EMPTY is the absent sentinel and is never stored. Every write path
         checks here before ``ensure_created`` so a rejected write leaves an
-        absent view absent.
+        absent view absent. A key the view cannot hold (not str or int)
+        raises TypeError here too, before anything is written.
         """
+        self._reject_bad_key(address)
         reject_empty_value((*self._children_container().site, address), value)
 
     def _reject_empty_at(self, address: site_.SiteSegment, value: object) -> object:
@@ -215,12 +232,19 @@ class ViewBase(ABC):
         Checked before ``ensure_created`` so a rejected write leaves nothing
         behind.
         """
+        self._reject_bad_key(address)
         if isinstance(value, Iterable) and not isinstance(
             value, Mapping | list | tuple | set | frozenset | str | bytes | bytearray
         ):
             value = list(value)
         reject_empty_value((*self._children_container().site, address), value)
         return value
+
+    @staticmethod
+    def _reject_bad_key(address: object) -> None:
+        """Raise TypeError on a write under a key no view can hold (see ``is_view_key``)."""
+        if not is_view_key(address):
+            raise TypeError(f"view keys must be str or int, got {type(address).__name__}")
 
     def _reject_empty_in(self, value: object) -> object:
         """Raise ValueError if ``value`` is or contains EMPTY; return it, walkable.

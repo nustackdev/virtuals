@@ -45,6 +45,7 @@ from virtuals.view import (
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    is_view_key,
 )
 
 from .flat_list_view import FlatListView
@@ -160,7 +161,8 @@ class IndexedDictViewBase(
         return len(self._keys_view())
 
     def __contains__(self, obj: str | int) -> bool:
-        return self._data_container().exists_child(obj)
+        """Check if key exists. A key the view cannot hold is not in it."""
+        return is_view_key(obj) and self._data_container().exists_child(obj)
 
     def __iter__(self) -> Generator[str | int, None, None]:
         yield from self._keys_view()
@@ -239,7 +241,7 @@ class IndexedDictViewBase(
         # raise KeyError -- matching Python dict semantics and letting ref
         # callers no-op via their KeyError/IndexError catch.
         dc = self._data_container()
-        if not dc.exists_child(address):
+        if not is_view_key(address) or not dc.exists_child(address):
             raise KeyError(address)
         dc.delete_child(address)
         # Rebuild key index
@@ -291,6 +293,8 @@ class IndexedDictViewBase(
         Returns:
             (node_info, is_container) — the raw node info and whether it's a container
         """
+        if not is_view_key(address):
+            raise KeyError(address)
         dc = self._data_container()
         child_site = (*dc.site, address)
         from virtuals.container import node_ops

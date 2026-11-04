@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import EMPTY, Empty, Value
-from virtuals.view import ChildPrimitiveSetBase, UnsafePrimitiveOpsBase, ViewBase
+from virtuals.view import ChildPrimitiveSetBase, UnsafePrimitiveOpsBase, ViewBase, is_view_key
 
 
 if TYPE_CHECKING:
@@ -72,8 +72,10 @@ class LightDictView(
             Primitive value
 
         Raises:
-            KeyError: If key not found
+            KeyError: If key not found, or a key the view cannot hold
         """
+        if not is_view_key(key):
+            raise KeyError(key)
         value = self.container.get_child_primitive(key)
         if isinstance(value, Empty):
             raise KeyError(key)
@@ -98,13 +100,13 @@ class LightDictView(
 
         Silent if the key is missing; an absent view stays absent.
         """
-        if not self.container.exists():
+        if not is_view_key(key) or not self.container.exists():
             return
         self.container.delete_child(key)
 
     def __contains__(self, key: str | int) -> bool:
-        """Check if key exists."""
-        return self.container.exists_child(key)
+        """Check if key exists. A key the view cannot hold is not in it."""
+        return is_view_key(key) and self.container.exists_child(key)
 
     def __len__(self) -> int:
         """Count number of keys."""

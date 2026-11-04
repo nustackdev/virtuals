@@ -191,10 +191,33 @@ class Kh57ViewBase(
         return isinstance(address, int) and address >= 0
 
     def normalize_address(self, address: int) -> int:
-        """Encode an original int key to its kh57 child segment."""
+        """Encode an original int key to its kh57 child segment (the write path).
+
+        Raises:
+            TypeError: If ``address`` is not an int.
+            ValueError: If it is negative or past 57 bits (from ``kh57``).
+        """
         if not isinstance(address, int):
             raise TypeError(f"Kh57View keys must be int, got {type(address).__name__}")
         return kh57(address)
+
+    @staticmethod
+    def _read_key(address: object) -> int:
+        """The int key a read names, with Python's int-key semantics.
+
+        An int (bool included) names itself. A float names the int it
+        equals (``1.0 == 1``, so ``k[1.0]`` finds key 1) and is absent
+        otherwise. Anything else, and an int the view can never hold (a
+        negative one or one past 57 bits), is absent too.
+
+        Raises:
+            KeyError: If the view cannot hold ``address``.
+        """
+        if isinstance(address, float) and address.is_integer():
+            address = int(address)
+        if not isinstance(address, int) or address < 0 or address >> _LEVEL_BITS:
+            raise KeyError(address)
+        return address
 
     # -- Internal encoded-key ops -----------------------------------------
 
@@ -314,9 +337,11 @@ class Kh57ViewBase(
 
     def __contains__(self, obj: int) -> bool:
         """True if an item is stored under original int key `obj`."""
-        if not isinstance(obj, int):
+        try:
+            key = self._read_key(obj)
+        except KeyError:
             return False
-        return self.container.exists_child(kh57(obj))
+        return self.container.exists_child(kh57(key))
 
     # -- Mutations --------------------------------------------------------
 
@@ -326,7 +351,7 @@ class Kh57ViewBase(
 
     def __delitem__(self, address: int) -> None:
         """Delete item at original int key `address`."""
-        encoded = self.normalize_address(address)
+        encoded = kh57(self._read_key(address))
         if not self.container.exists_child(encoded):
             raise KeyError(address)
         self.container.delete_child(encoded)
@@ -491,7 +516,7 @@ class EagerKh57View(Kh57ViewBase):
 
     def __getitem__(self, address: int) -> object:
         """Get extracted Python value at original int key `address`."""
-        encoded = kh57(address)
+        encoded = kh57(self._read_key(address))
         child_site = (*self.container.site, encoded)
         info = node_ops.get_node_info(child_site, self.container.ctx)
         if not info.exists or info.node_type == NodeType.NOT_FOUND:
@@ -567,7 +592,7 @@ class LazyKh57View(Kh57ViewBase):
 
     def __getitem__(self, address: int) -> object:
         """Get child — View for containers, raw value for primitives."""
-        encoded = kh57(address)
+        encoded = kh57(self._read_key(address))
         child_site = (*self.container.site, encoded)
         info = node_ops.get_node_info(child_site, self.container.ctx)
         if not info.exists or info.node_type == NodeType.NOT_FOUND:

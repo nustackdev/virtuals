@@ -110,6 +110,7 @@ from virtuals.view import (
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    is_view_key,
 )
 
 from .fractional_index import (
@@ -209,7 +210,13 @@ class FractionalIndexedDictViewBase(
     # -- Order index primitives --------------------------------------------
 
     def _position_or_empty(self, address: Address) -> str | Empty:
-        """Order key of ``address``, EMPTY if it has none. One get."""
+        """Order key of ``address``, EMPTY if it has none. One get.
+
+        A key the view cannot hold has no position, so ``in`` and every
+        position read treat it as absent.
+        """
+        if not is_view_key(address):
+            return EMPTY
         return cast("str | Empty", self._pos_container().get_child_primitive_unsafe(address))
 
     def _require_position(self, address: Address) -> str:
@@ -692,6 +699,8 @@ class FractionalIndexedDictViewBase(
 
     def __delitem__(self, address: Address) -> None:
         # No ensure_created: a delete must not materialize the view.
+        if not is_view_key(address):
+            raise KeyError(address)
         dc = self._data_container()
         okey = self._position_or_empty(address)
         if is_empty(okey):
@@ -754,6 +763,8 @@ class FractionalIndexedDictViewBase(
     def _read_child(self, address: Address) -> tuple[object, bool]:
         from virtuals.container import node_ops
 
+        if not is_view_key(address):
+            raise KeyError(address)
         dc = self._data_container()
         node_info = node_ops.get_node_info((*dc.site, address), dc.ctx)
         if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
