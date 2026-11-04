@@ -19,6 +19,7 @@ from virtuals.view import (
     LiveChildrenCountBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    is_view_key,
 )
 
 
@@ -78,8 +79,10 @@ class FlatDictView(
             Primitive value
 
         Raises:
-            KeyError: If key not found
+            KeyError: If key not found, or a key the view cannot hold
         """
+        if not is_view_key(key):
+            raise KeyError(key)
         value = self.container.get_child_primitive(key)
         if isinstance(value, Empty):
             raise KeyError(key)
@@ -102,13 +105,13 @@ class FlatDictView(
         Args:
             key: Key to delete
         """
-        if not self.container.exists():
+        if not is_view_key(key) or not self.container.exists():
             return
         self.container.delete_child(key)
 
     def __contains__(self, key: str | int) -> bool:
-        """Check if key exists."""
-        return self.container.exists_child(key)
+        """Check if key exists. A key the view cannot hold is not in it."""
+        return is_view_key(key) and self.container.exists_child(key)
 
     def __iter__(self) -> Generator[str | int, None, None]:
         """Iterate over keys."""

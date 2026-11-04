@@ -11,7 +11,7 @@ Core components:
 
 from __future__ import annotations
 
-from .base import ViewBase
+from .base import ViewBase, is_view_key
 from .bases import (
     ChildNavigationBase,
     ChildNestedGetBase,
@@ -54,4 +54,5 @@ __all__ = [  # noqa: RUF022
     "ViewError",
     "ViewOperationError",
     "ViewRegistry",
+    "is_view_key",
 ]

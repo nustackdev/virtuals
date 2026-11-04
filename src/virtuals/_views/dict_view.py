@@ -35,6 +35,7 @@ from virtuals.view import (
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    is_view_key,
 )
 
 
@@ -112,8 +113,8 @@ class DictViewBase(
     # =========================================================================
 
     def __contains__(self, obj: str | int) -> bool:
-        """Check if key exists."""
-        return self.container.exists_child(obj)
+        """Check if key exists. A key the view cannot hold is not in it."""
+        return is_view_key(obj) and self.container.exists_child(obj)
 
     def __iter__(self) -> Generator[str | int, None, None]:
         """Iterate over keys."""
@@ -142,7 +143,7 @@ class DictViewBase(
         no-op after one existence read, so nothing is written and no
         parent bookkeeping fires.
         """
-        if not self.container.exists():
+        if not is_view_key(address) or not self.container.exists():
             return
         self.container.delete_child(address)
 
@@ -227,6 +228,8 @@ class EagerDictView(DictViewBase):
 
     def __getitem__(self, address: str | int) -> object | Empty:
         """Get value for key — returns extracted Python value."""
+        if not is_view_key(address):
+            raise KeyError(address)
         try:
             return self._get_child_value(address)
         except ContainerNotFoundError as e:
@@ -378,6 +381,8 @@ class LazyDictView(DictViewBase):
 
     def __getitem__(self, address: str | int) -> object:
         """Get child — returns View for containers, value for primitives."""
+        if not is_view_key(address):
+            raise KeyError(address)
         try:
             return self._get_child_view_or_value(address)
         except ContainerNotFoundError as e:
