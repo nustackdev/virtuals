@@ -375,14 +375,15 @@ class PublisherBase:
             self._record_drop(n, err)
             return
 
-    def flush(self, timeout: float = 1.0) -> None:
+    def flush(self, timeout: float | None = 1.0) -> None:
         """Wait for pending publishes to be sent.
 
         Places a sentinel in the queue. When the worker reaches it, all
         previously-enqueued keys have been handed to _publish_batch.
 
         Returns at the timeout whether or not the queue drained, including
-        when it is full and the sentinel cannot even be queued.
+        when it is full and the sentinel cannot even be queued. With
+        ``timeout=None`` it waits until the queue has drained.
 
         Raises:
             PublisherOperationError: if keys were dropped since the last
@@ -390,14 +391,18 @@ class PublisherBase:
                 Raised once; the error is cleared.
         """
         if self._connected:
-            deadline = time.monotonic() + timeout
             done = threading.Event()
-            try:
-                self._queue.put(done, timeout=timeout)  # sentinel after all pending keys
-            except queue.Full:
-                pass
+            if timeout is None:
+                self._queue.put(done)  # sentinel after all pending keys
+                done.wait()
             else:
-                done.wait(timeout=max(0.0, deadline - time.monotonic()))
+                deadline = time.monotonic() + timeout
+                try:
+                    self._queue.put(done, timeout=timeout)
+                except queue.Full:
+                    pass
+                else:
+                    done.wait(timeout=max(0.0, deadline - time.monotonic()))
         self._raise_last_error()
 
     def _record_drop(self, n: int, err: BaseException, *, resync: bool = True) -> None:

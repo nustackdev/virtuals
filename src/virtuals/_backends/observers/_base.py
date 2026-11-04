@@ -71,7 +71,7 @@ def _hash_of(sub: Subscription) -> str:
     """
     try:
         return sub.filter_hash
-    except NotImplementedError:
+    except Exception:  # no to_dict(), or one that does not serialise
         return f"local:{id(sub):x}"
 
 
@@ -497,7 +497,8 @@ class ObserverBase:
             if isinstance(item, _TaggedKey):
                 key = item.key
                 h = item.filter_hash
-                matched = [s for s in registry.match(key) if _hash_of(s) == h]
+                # tagged keys come from redis, where every subscription has a real hash
+                matched = [s for s in registry.match(key) if s.filter_hash == h]
             else:
                 key = item
                 matched = registry.match(key)

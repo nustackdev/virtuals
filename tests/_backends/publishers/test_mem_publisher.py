@@ -113,3 +113,32 @@ def test_flush_returns_at_its_timeout_while_the_queue_is_full():
         release.set()
         th.join(5)
         pub.disconnect()
+
+
+def test_flush_without_timeout_waits_until_drained():
+    """``flush(timeout=None)`` returns once every queued key was handed to the transport."""
+    import threading
+    import time
+
+    t = InMemoryTransport()
+    seen: list = []
+    release = threading.Event()
+
+    def slow_listener(batch: list) -> None:
+        release.wait(10)
+        seen.extend(batch)
+
+    t.register(slow_listener)
+    pub = InMemoryPublisher(t)
+    pub.connect()
+    try:
+        for i in range(5):
+            pub.notify(("k", i))
+        threading.Timer(0.2, release.set).start()
+        t0 = time.monotonic()
+        pub.flush(timeout=None)
+        assert time.monotonic() - t0 >= 0.15
+        assert sorted(seen) == [("k", i) for i in range(5)]
+    finally:
+        release.set()
+        pub.disconnect()
