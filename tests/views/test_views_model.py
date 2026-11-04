@@ -389,8 +389,11 @@ class ViewsMachine(RuleBasedStateMachine):
         assert len(got) == len(model) and {member(x) for x in got} == model, (got, model)
         for x in [0, 1, True, False, "x", (1,), frozenset({1}), *COLLIDING]:
             assert (x in v) == (member(x) in model), x
+        # extract() builds a python set, where True and 1 (False and 0) collapse
+        # into one member; the view keeps them distinct (pinned by
+        # test_true_and_1_are_distinct_set_members), so compare under python's rule.
         extracted = v.extract()
-        assert len(extracted) == len(model) and {member(x) for x in extracted} == model
+        assert extracted == set(got), (extracted, got)
         rows = rows_under(ctx, ("/", "s"))
         rows.pop(("/", "s"), None)
         assert len(rows) == len(model), (rows, model)
