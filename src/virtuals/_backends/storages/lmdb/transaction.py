@@ -131,7 +131,7 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         # wait; the commit is reported first, then the first of them is
         # raised as it is.
         with self._call_lock:
-            if self._closed:
+            if self._ended():
                 logger.error("Cannot commit, transaction is closed")
                 raise StorageClosedError("Transaction is closed")
 
@@ -196,7 +196,7 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
             logger.debug("Abort called on closed transaction")
             return
         with self._call_lock:
-            if self._closed:
+            if self._ended():
                 return
             failure: Exception | None = None
             try:
@@ -217,6 +217,24 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
             raise StorageTransactionAbortedError(
                 f"Failed to abort transaction: {failure}"
             ) from failure
+
+    def _ended(self) -> bool:
+        """True once the transaction ended, finishing an end an interrupt cut short.
+
+        Under ``_call_lock``. The committed or aborted flag is set one
+        statement before ``_mark_closed``; an interrupt between the two
+        leaves the LMDB work done and only the bookkeeping missing. A
+        retried commit or abort completes it here instead of running the
+        end again.
+        """
+        if self._closed:
+            return True
+        if self._committed or self._aborted:
+            self._pending = None
+            self._mark_closed()
+            self._storage._untrack_transaction(self)
+            return True
+        return False
 
     def __enter__(self) -> LMDBTransaction:
         """Enter context manager."""

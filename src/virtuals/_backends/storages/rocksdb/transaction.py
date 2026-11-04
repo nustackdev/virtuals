@@ -110,7 +110,7 @@ class RocksDBTransaction(
             StorageClosedError: If the transaction already ended or its
                 storage closed
         """
-        if self._closed:
+        if self._ended():
             logger.error("Cannot commit, transaction is closed")
             raise StorageClosedError("Transaction is closed")
 
@@ -140,7 +140,7 @@ class RocksDBTransaction(
         Raises:
             StorageTransactionAbortedError: If abort fails
         """
-        if self._closed:
+        if self._ended():
             logger.debug("Abort called on closed transaction")
             return
 
@@ -155,6 +155,22 @@ class RocksDBTransaction(
             self._aborted = True
             self._mark_closed()
             self._storage._untrack_transaction(self)
+
+    def _ended(self) -> bool:
+        """True once the transaction ended, finishing an end an interrupt cut short.
+
+        The committed or aborted flag is set one statement before
+        ``_mark_closed``; an interrupt between the two leaves the backend
+        work done and only the bookkeeping missing. A retried commit or
+        abort completes it here instead of running the end again.
+        """
+        if self._closed:
+            return True
+        if self._committed or self._aborted:
+            self._mark_closed()
+            self._storage._untrack_transaction(self)
+            return True
+        return False
 
     def __del__(self) -> None:
         """Last resort: end a transaction dropped without commit or abort.

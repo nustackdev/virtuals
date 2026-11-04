@@ -94,7 +94,7 @@ class SQLiteWriteBatch(ContextBase, WriteBatchProtocol):
 
         A batch already written or aborted raises ``StorageClosedError``.
         """
-        if self._closed:
+        if self._closed or self._written or self._aborted:
             logger.error("Cannot write, batch is closed")
             raise StorageClosedError("Write batch is closed")
 
