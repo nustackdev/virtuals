@@ -42,6 +42,7 @@ import threading
 import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import AbstractContextManager, nullcontext
 from logging import getLogger
 from typing import TYPE_CHECKING, Any
 
@@ -762,14 +763,22 @@ class WriterGate:
             except OSError as e:
                 logger.error(f"Failed to release the LMDB writer gate: {e}")
 
-    def acquire(self, timeout: float) -> None:
+    def acquire(self, timeout: float, *, guard: AbstractContextManager[Any] | None = None) -> None:
         """Block for the gate up to ``timeout`` seconds.
+
+        Args:
+            timeout: How long to wait for a peer to release it.
+            guard: Entered around the take: the caller's own check, under
+                its own lock, that it still holds what entitles it to the
+                gate (the in-process slot), so the check and the take are
+                one step. Raising inside it takes nothing.
 
         Raises:
             StorageLockTimeoutError: If a peer holds it past ``timeout``.
             StorageClosedError: If the storage closes while waiting.
         """
-        consumer = self._attach()
+        with guard if guard is not None else nullcontext():
+            consumer = self._attach()
         if consumer is None:
             return
         try:
@@ -794,9 +803,12 @@ class WriterGate:
                     self.release()  # landed, but the requester is gone
             raise
 
-    async def aacquire(self, timeout: float) -> None:
+    async def aacquire(
+        self, timeout: float, *, guard: AbstractContextManager[Any] | None = None
+    ) -> None:
         """Like ``acquire`` but waits on the event loop instead of blocking it."""
-        consumer = self._attach()
+        with guard if guard is not None else nullcontext():
+            consumer = self._attach()
         if consumer is None:
             return
         try:
