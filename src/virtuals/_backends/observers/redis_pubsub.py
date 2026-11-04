@@ -35,12 +35,15 @@ so a slow subscriber never stalls a subscribe() from another thread or from
 inside a callback. What this observer holds is then at most twice the queue
 plus the worker's batch in hand (`DISPATCH_BATCH_MAX` keys), on top of what
 redis-py and the server buffer for the socket. Only once the overflow is
-full too does it stop reading the socket (backpressure into valkey); a
-SUBSCRIBE confirmation sent in that state is read when the backlog clears,
-so a subscribe() can time out. Subscribe from another thread when callbacks
-can face that much backlog. A keyless wake (reconnect or a publisher's
-drop) is parked at most once per hash until delivered, so W publishers
-dropping in one stall cost one re-read per subscription, not W.
+full too does it stop reading the socket (backpressure into valkey), unless
+a SUBSCRIBE awaits its confirmation: then it reads whatever the backlog, so
+the confirmation is never behind it and a subscribe() never times out on a
+slow receiver. While one is pending the overflow is unbounded; the real cap
+is valkey's client output buffer limit, past which valkey disconnects the
+client, which degrades to a reconnect and a resync wake. A keyless wake
+(reconnect or a publisher's drop) is parked at most once per hash until
+delivered, so W publishers dropping in one stall cost one re-read per
+subscription, not W.
 
 Timeouts. Both connections have a socket and connect timeout and at most one
 transparent redis-py retry, so a stalled server bounds `nu1_reg` (and with it
