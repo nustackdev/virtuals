@@ -13,7 +13,6 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "inmemdb: In-memory storage tests")
     config.addinivalue_line("markers", "tupkey: Tuple codec tests")
     config.addinivalue_line("markers", "codec: Codec-specific tests")
-    config.addinivalue_line("markers", "slow: Slow-running tests")
     config.addinivalue_line(
         "markers",
         "redis: Tests requiring redis-py + msgpack installed and a reachable "

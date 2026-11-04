@@ -20,14 +20,14 @@ Three files drive the storages and views with random operations against a refere
 | `views/test_views_model.py` | random ops on five views (dict, log indexed, fractional indexed, list, set) against python models, every view and every raw storage row checked after each op |
 
 - `fast` runs in the default suite: a fixed seed, a few short examples, about 5 seconds per backend across the three files. The same seed draws the same operations every run.
-- `slow` is excluded by default and runs with `-m slow`: about 1 to 2 minutes per backend. `CONFORMANCE_MODEL_EXAMPLES` and `CONFORMANCE_MODEL_SEED` size and seed the two state machines, `CONFORMANCE_MODEL_SECONDS` scales the concurrent runs (30 is the default).
+- `slow` is excluded by default through `addopts = -m 'not slow'` in `pyproject.toml` and runs with `-m slow`: about 1 to 2 minutes per backend. Any explicit `-m` on the command line replaces that default, so `-m "not functional"` includes the slow tier; add `and not slow` when that matters. `CONFORMANCE_MODEL_EXAMPLES` and `CONFORMANCE_MODEL_SEED` size and seed the two state machines, `CONFORMANCE_MODEL_SECONDS` scales the concurrent runs (30 is the default).
 
 ```sh
 .venv/bin/python -m pytest -q -p no:cacheprovider -m slow tests                      # the slow tier
 CONFORMANCE_MODEL_EXAMPLES=500 .venv/bin/python -m pytest -q -p no:cacheprovider -m slow tests/views/test_views_model.py -k lmdb
 ```
 
-A failure prints the shrunk sequence of steps that reproduces it.
+A failure prints the shrunk sequence of steps that reproduces it. Each run also prints its op counts per rule (`-s`), so a starved rule is visible. Fast tier, per backend: storage model about 800 ops with put 200, delete 70, commit 70, snapshot reads 120, close and reopen under 15; views model about 400 ops spread over 45 rules.
 
 ## Layout
 

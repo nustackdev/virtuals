@@ -81,8 +81,9 @@ Races are forced, not hoped for. In lost update a pause sits between each read a
 | `test_s7_storage_delete_time_flat` | 7 | median `txn.delete` time grows under 10x from 100 to 10k siblings |
 | `test_s7_view_dict_delete_is_point_delete` | 7 | deleting one dict view key handles as many keys at 10 as at 1000 siblings |
 | `test_s1_randomized_mixed` | 1, 4 | threads, coroutines and processes under random load keep the bank sum, lose no claim on a scanned range and no ops count; fast and slow tier |
-| `test_s1_randomized_busy_timeout` | 1, 3, 4 | same with a 20ms busy timeout: the retry paths run and only retryable classes appear |
+| `test_s1_randomized_busy_timeout` | 1, 3, 4 | same with a 20ms busy timeout and 10ms writes: the retry paths run on every backend and only retryable classes appear |
 | `test_s1_randomized_kill` | 1, 4 | same with writer processes SIGKILLed mid run: survivors keep going, every logged commit is present (multi-process backends only) |
+| `test_s8_key_order_is_golden` | 2 | the codec orders keys as the model does: component-wise, ints before strings, prefix first |
 | `test_s8_storage_model` | 1, 2, 3, 4 | a Hypothesis state machine of random transactions, batches, snapshots, drops, reopen, bulk rows, big values and odd keys matches a reference model |
 
 Concurrency cases retry only `RETRYABLE` errors; any other class fails the case. Every case in sections 1 to 4 and 7 carries a `pytest.mark.timeout`, so a stall fails instead of hanging; the section 5 cases wait on `flush()` barriers with their own timeouts, and the process model case is a plain assertion. There is no suite-wide timeout. The two coroutine writer cases of section 4 run twice: `slot` waits in the backend's `areserve_write_slot()` where it has one, `plain` calls `begin_transaction()` directly and retries.
