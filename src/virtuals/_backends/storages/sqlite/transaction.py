@@ -73,7 +73,9 @@ class SQLiteTransaction(
         outcome or how it is reported: the transaction ends committed and
         notified, then the interrupt is raised as it is. One that arrives
         before the COMMIT ran aborts the transaction and is raised the
-        same way.
+        same way. An interrupt in the few bytecodes right after the
+        COMMIT can cost it its notification; the data is committed
+        either way.
         """
         if self._closed:
             logger.error("Cannot commit, transaction is closed")

@@ -565,8 +565,8 @@ class WriterLock:
                 waiter = _Waiter(loop)
                 self._waiters.append(waiter)
         except BaseException:
-            # A deferred handler raising as the section ends, with the slot
-            # taken for this task or the waiter queued: give either back.
+            # An interrupt landing with the slot taken for this task or the
+            # waiter queued: give either back.
             self.release_if_owned(me, since)
             if waiter is not None:
                 self._pass_on_or_leave(waiter)
@@ -593,7 +593,7 @@ class WriterLock:
         try:
             return self._granted(me, waiter)
         except BaseException:
-            self.release_if_owned(me, since)  # a deferred handler raised with it recorded as ours
+            self.release_if_owned(me, since)  # an interrupt landed with it recorded as ours
             raise
 
     def _pass_on_or_leave(self, waiter: _Waiter) -> None:
