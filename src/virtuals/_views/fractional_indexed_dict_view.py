@@ -539,7 +539,8 @@ class FractionalIndexedDictViewBase(
         """``(order key, id)`` rows in order."""
         return self._scan_order(reverse=reverse)
 
-    def get(self, address: Address, default: object = None) -> object:
+    def get(self, address: Address, default: object | Empty = EMPTY) -> object | Empty:
+        """Value at ``address``, or ``default`` (EMPTY) when the id is absent."""
         try:
             return self[address]  # type: ignore[index]
         except KeyError:

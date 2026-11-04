@@ -147,10 +147,10 @@ class DictViewBase(
         self.container.delete_child(address)
 
     def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        """Get value with default fallback."""
+        """Value at ``address``, or ``default`` (EMPTY) when the key is absent."""
         try:
             return self[address]
-        except Exception:
+        except KeyError:
             return default
 
     def clear(self) -> None:
