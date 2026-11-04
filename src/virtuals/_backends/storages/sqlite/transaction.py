@@ -80,7 +80,7 @@ class SQLiteTransaction(
         COMMIT can cost it its notification; the data is committed
         either way.
         """
-        if self._closed:
+        if self._closed or self._committed or self._aborted:
             logger.error("Cannot commit, transaction is closed")
             raise StorageClosedError("Transaction is closed")
 

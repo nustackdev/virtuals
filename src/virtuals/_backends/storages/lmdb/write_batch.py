@@ -106,7 +106,7 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
         then the interrupt is raised as it is.
         """
         with self._call_lock:
-            if self._closed:
+            if self._ended():
                 logger.error("Cannot write, batch is closed")
                 raise StorageClosedError("Write batch is closed")
 
@@ -182,7 +182,7 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
             logger.debug("Abort called on closed write batch")
             return
         with self._call_lock:
-            if self._closed:
+            if self._ended():
                 return
             self._aborted = True
             self._ops = {}
@@ -190,6 +190,20 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
             logger.debug("Write batch aborted")
 
         self._storage._untrack_write_batch(self)
+
+    def _ended(self) -> bool:
+        """True once the batch ended, finishing an end an interrupt cut short.
+
+        Under ``_call_lock``. See ``LMDBTransaction._ended``.
+        """
+        if self._closed:
+            return True
+        if self._written or self._aborted:
+            self._ops = {}
+            self._mark_closed()
+            self._storage._untrack_write_batch(self)
+            return True
+        return False
 
     def __enter__(self) -> LMDBWriteBatch:
         """Enter context manager."""

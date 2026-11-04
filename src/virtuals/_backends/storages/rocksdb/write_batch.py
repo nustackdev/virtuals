@@ -132,29 +132,36 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
             StorageTransactionError: If the write fails
             StorageClosedError: If already written or aborted
         """
-        if self._closed:
+        if self._ended():
             logger.error("Cannot write, batch is closed")
             raise StorageClosedError("Write batch is closed")
 
         batch = self._rdbpy_batch
         self._storage._require_open()
 
+        # The end is claimed before the native write, so a second write()
+        # after an interrupt anywhere past it can never apply the batch
+        # twice. A failed write ends the batch too (as on sqlite and lmdb):
+        # a retryable error means a new batch, not a second write().
+        self._written = True
         try:
             self._storage._write_batch(batch)
         except Exception:
+            self._aborted = True
+            self._mark_closed()
+            self._storage._untrack_write_batch(self)
             logger.error("Write batch write failed")
             raise
 
         logger.debug("Write batch written")
 
-        self._written = True
         self._mark_closed()
         self._storage._notify_batch(self._modified_keys)
         self._storage._untrack_write_batch(self)
 
     def abort(self) -> None:
         """Abort write batch and discard changes."""
-        if self._closed:
+        if self._ended():
             logger.debug("Abort called on closed write batch")
             return
 
@@ -162,6 +169,19 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
         self._mark_closed()
         self._storage._untrack_write_batch(self)
         logger.debug("Write batch aborted")
+
+    def _ended(self) -> bool:
+        """True once the batch ended, finishing an end an interrupt cut short.
+
+        See ``RocksDBTransaction._ended``.
+        """
+        if self._closed:
+            return True
+        if self._written or self._aborted:
+            self._mark_closed()
+            self._storage._untrack_write_batch(self)
+            return True
+        return False
 
     def __enter__(self) -> RocksDBWriteBatch:
         """Enter context manager."""
