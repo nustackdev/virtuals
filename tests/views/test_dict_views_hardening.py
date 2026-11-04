@@ -31,7 +31,11 @@ from virtuals._views import (
     FlatDictView,
     FlatListView,
     LazyDictView,
+    LazyFractionalIndexedDictView,
+    LazyIndexedDictView,
+    LazyKh57View,
     LazyListView,
+    LazyLogIndexedDictView,
     LightDictView,
     SetView,
 )
@@ -60,7 +64,7 @@ SILENT_DELETE_VIEWS = (EagerDictView, LazyDictView, FlatDictView, LightDictView)
 
 def _key(view_cls, i):
     """A key of the type the view takes (Kh57 takes ints only)."""
-    return i if view_cls is EagerKh57View else f"k{i}"
+    return i if view_cls in (EagerKh57View, LazyKh57View) else f"k{i}"
 
 
 # ============================================================================
@@ -845,7 +849,7 @@ def test_fractional_nested_empty_insert_leaves_no_trace(root):
     assert "x" not in view
     assert len(view) == 2
     assert list(view) == ["a", "b"]
-    assert view.get("x") is None
+    assert view.get("x") is EMPTY
     assert not view._data_container().exists_child("x")
     assert list(view.items()) == [("a", 1), ("b", 2)]
     with pytest.raises(ValueError, match="EMPTY"):
@@ -1032,6 +1036,80 @@ def test_none_is_a_stored_list_item(storage):
         assert lst[0] is None
         assert None in lst
         assert len(lst) == 3
+
+
+# ============================================================================
+# ACCESS: every dict-like view mimics dict, with EMPTY as the absent default
+# ============================================================================
+
+ACCESS_VIEWS = (
+    *DICT_VIEWS,
+    LazyIndexedDictView,
+    LazyLogIndexedDictView,
+    LazyFractionalIndexedDictView,
+    LazyKh57View,
+)
+"""Every dict-like view and facet. A new dict view belongs here."""
+
+
+@pytest.mark.parametrize("view_cls", ACCESS_VIEWS)
+def test_access_mimics_dict_with_empty_as_the_absent_default(storage, view_cls):
+    """The three access rules, on an absent view, in a transaction and in a snapshot.
+
+    ``view[key]`` on an absent key raises KeyError. ``view.get(key)`` returns
+    EMPTY, never None, and ``view.get(key, default)`` returns the given
+    default. None is a stored value, never a marker for absent. ``pop``
+    follows ``get``. A read never creates the view.
+    """
+    key, absent = _key(view_cls, 1), _key(view_cls, 2)
+
+    def check_absent_key(view):
+        with pytest.raises(KeyError):
+            view[absent]
+        assert view.get(absent) is EMPTY
+        assert view.get(absent, "dflt") == "dflt"
+        assert view.get(absent, None) is None
+        assert absent not in view
+
+    def check_stored_none(view):
+        assert key in view
+        assert view[key] is None
+        assert view.get(key) is None
+        assert view.get(key, "dflt") is None
+
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        check_absent_key(view)
+        assert not view.container.exists()
+        view[key] = None
+        check_absent_key(view)
+        check_stored_none(view)
+    with storage.snapshot() as snap:
+        view = Navigator(storage).root(snap).open_child("d", view_cls)
+        check_absent_key(view)
+        check_stored_none(view)
+    if not hasattr(view_cls, "pop"):
+        return
+    with storage.transaction() as tx:
+        view = Navigator(storage).root(tx).open_child("d", view_cls)
+        with pytest.raises(KeyError):
+            view.pop(absent)
+        assert view.pop(absent, "dflt") == "dflt"
+        assert view.pop(key) is None
+        assert key not in view
+
+
+@pytest.mark.parametrize("view_cls", ACCESS_VIEWS)
+def test_get_returns_the_default_only_for_an_absent_key(root, view_cls, monkeypatch):
+    """``get`` is ``[]`` plus a KeyError catch: any other error propagates."""
+    view = root.open_child("d", view_cls)
+
+    def boom(self, address):
+        raise RuntimeError("storage failed")
+
+    monkeypatch.setattr(view_cls, "__getitem__", boom)
+    with pytest.raises(RuntimeError, match="storage failed"):
+        view.get(_key(view_cls, 1))
 
 
 # ============================================================================
