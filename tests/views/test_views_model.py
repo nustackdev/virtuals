@@ -67,7 +67,7 @@ class Tier:
     seed: int
 
 
-FAST = Tier("fast", examples=8, steps=40, seed=424242)
+FAST = Tier("fast", examples=10, steps=50, seed=424242)
 SLOW = Tier(
     "slow",
     examples=int(os.environ.get("CONFORMANCE_MODEL_EXAMPLES", 150)),
@@ -90,6 +90,7 @@ def hypothesis_settings(tier: Tier) -> settings:
         suppress_health_check=list(HealthCheck),
         phases=[Phase.generate, Phase.shrink],
         print_blob=True,
+        report_multiple_bugs=False,  # one shrunk repro, well inside the case timeout
     )
 
 
@@ -105,8 +106,16 @@ ids_st = st.sampled_from(IDS)
 prim_st = st.one_of(st.integers(-3, 3), st.sampled_from(["x", "y", ""]), st.none(), st.booleans())
 compound_st = st.dictionaries(st.sampled_from(["p", "q"]), prim_st, max_size=2)
 value_st = st.one_of(prim_st, prim_st, compound_st)
-set_prim_st = st.one_of(st.integers(-3, 3), st.sampled_from(["x", "y"]), st.none())
-set_compound_st = st.one_of(st.tuples(st.integers(0, 2)), st.just(frozenset({1})))
+# Booleans are drawn on purpose: SetView keys members by type and value, so 1
+# and True are two members (see test_true_and_1_are_distinct_set_members).
+set_prim_st = st.one_of(st.integers(-3, 3), st.sampled_from(["x", "y"]), st.none(), st.booleans())
+# Equal members built differently: frozenset([1, 9]) and frozenset([9, 1])
+# iterate in different orders (1 and 9 collide in the 8 slot table), so only a
+# canonical member key makes them one row. A tuple holding one does the same.
+COLLIDING = [frozenset([1, 9]), frozenset([9, 1]), (0, frozenset([9, 1])), (0, frozenset([1, 9]))]
+set_compound_st = st.one_of(
+    st.tuples(st.integers(0, 2)), st.just(frozenset({1})), st.sampled_from(COLLIDING)
+)
 setval_st = st.one_of(
     set_prim_st, set_compound_st
 )  # a tuple or frozenset is a member like any other
@@ -117,6 +126,33 @@ MISSING = object()
 
 def kind(v) -> str:
     return "c" if isinstance(v, dict) else "p"
+
+
+def typed(v):
+    """A value with its type, recursively, so 1, True and 1.0 compare as different."""
+    if isinstance(v, dict):
+        return ("dict", tuple(sorted((typed(k), typed(x)) for k, x in v.items())))
+    if isinstance(v, tuple):
+        return ("tuple", tuple(typed(x) for x in v))
+    if isinstance(v, frozenset):
+        return ("frozenset", frozenset(typed(x) for x in v))
+    return (type(v).__name__, v)
+
+
+def same(a, b) -> bool:
+    return typed(a) == typed(b)
+
+
+def same_seq(a, b) -> bool:
+    return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b, strict=True))
+
+
+# Set members are modelled by typed value: SetView keys a member by its pickle,
+# so 1 and True are distinct members (python says equal). Pinned in
+# test_true_and_1_are_distinct_set_members; listed as a proposal in the lane V
+# progress file (True/1 key collision).
+def member(v):
+    return typed(v)
 
 
 def expect(exc, fn, what: str) -> None:
@@ -252,10 +288,12 @@ class ViewsMachine(RuleBasedStateMachine):
             assert (k in v) == (k in model), k
             got = v.get(k)
             if k in model:
-                assert got == model[k], (k, got, model[k])
+                assert same(got, model[k]), (k, got, model[k])
             else:
-                assert is_empty(got) or got is None, (k, got)
-        assert dict(v.items()) == model
+                assert is_empty(got), (k, got)  # get of an absent key is EMPTY, never None
+        got_items = dict(v.items())
+        assert list(got_items) == list(model) or set(got_items) == set(model)
+        assert all(same(got_items[k], model[k]) for k in model), (got_items, model)
         rows = rows_under(ctx, ("/", "d"))
         if model or rows:
             assert ("/", "d") in rows or not model, "dict has children but no marker"
@@ -274,7 +312,7 @@ class ViewsMachine(RuleBasedStateMachine):
         for k in IDS:
             assert (k in v) == (k in model), k
             if k in model:
-                assert v[k] == model[k], (k, v[k], model[k])
+                assert same(v[k], model[k]), (k, v[k], model[k])
         rows = rows_under(ctx, ("/", "l"))
         keys_rows = {k[3]: val for k, val in rows.items() if len(k) == 4 and k[2] == "__keys__"}
         log_rows = {k[3]: val for k, val in rows.items() if len(k) == 4 and k[2] == "__log__"}
@@ -294,13 +332,13 @@ class ViewsMachine(RuleBasedStateMachine):
         assert list(reversed(v)) == ids[::-1]
         assert list(v.keys()) == ids
         assert [k for k, _ in v.items()] == ids
-        assert [x for _, x in v.items()] == [vals[i] for i in ids]
+        assert same_seq([x for _, x in v.items()], [vals[i] for i in ids])
         assert v.first() == (ids[0] if ids else None)
         assert v.last() == (ids[-1] if ids else None)
         for k in IDS:
             assert (k in v) == (k in vals), k
             if k in vals:
-                assert v[k] == vals[k], (k, v[k], vals[k])
+                assert same(v[k], vals[k]), (k, v[k], vals[k])
                 i = ids.index(k)
                 assert v.next_after(k) == (ids[i + 1] if i + 1 < len(ids) else None)
                 assert v.prev_before(k) == (ids[i - 1] if i > 0 else None)
@@ -320,10 +358,10 @@ class ViewsMachine(RuleBasedStateMachine):
 
     def check_list(self, ctx, v, model: list) -> None:
         assert len(v) == len(model), (len(v), model)
-        assert list(v) == model, (list(v), model)
-        assert list(reversed(v)) == model[::-1]
+        assert same_seq(list(v), model), (list(v), model)
+        assert same_seq(list(reversed(v)), model[::-1])
         for i in range(len(model)):
-            assert v[i] == model[i], (i, v[i], model[i])
+            assert same(v[i], model[i]), (i, v[i], model[i])
         for x in [0, 1, "x", None, {"p": 1}]:
             assert (x in v) == (x in model), x
         rows = rows_under(ctx, ("/", "ls"))
@@ -337,16 +375,18 @@ class ViewsMachine(RuleBasedStateMachine):
             assert meta == len(model), (meta, len(model))
 
     def check_set(self, ctx, v, model: set) -> None:
+        """``model`` holds typed members (see ``member``)."""
         assert len(v) == len(model), (len(v), model)
         got = list(v)
-        assert len(got) == len(model) and set(got) == model, (got, model)
-        for x in [0, 1, "x", (1,), frozenset({1})]:
-            assert (x in v) == (x in model), x
-        assert v.extract() == model
+        assert len(got) == len(model) and {member(x) for x in got} == model, (got, model)
+        for x in [0, 1, True, False, "x", (1,), frozenset({1}), *COLLIDING]:
+            assert (x in v) == (member(x) in model), x
+        extracted = v.extract()
+        assert len(extracted) == len(model) and {member(x) for x in extracted} == model
         rows = rows_under(ctx, ("/", "s"))
         rows.pop(("/", "s"), None)
         assert len(rows) == len(model), (rows, model)
-        assert set(rows.values()) == model
+        assert {member(x) for x in rows.values()} == model
         meta = ctx.get(("/m", "s", "__len__"))
         if is_empty(meta):
             assert len(model) == 0, "len meta absent with items"
@@ -504,10 +544,10 @@ class ViewsMachine(RuleBasedStateMachine):
         self.count("frac_insert")
         ids = self._fids()
         fn = self.f.insert_before if before else self.f.insert_after
-        if ref not in ids or k in ids:
-            expect(
-                (KeyError, ValueError), lambda: fn(ref, k, v), "insert, absent ref or existing id"
-            )
+        if ref not in ids:
+            expect(KeyError, lambda: fn(ref, k, v), "insert at an absent ref")  # checked first
+        elif k in ids:
+            expect(ValueError, lambda: fn(ref, k, v), "insert of an existing id")
         else:
             fn(ref, k, v)
             i = ids.index(ref)
@@ -522,11 +562,7 @@ class ViewsMachine(RuleBasedStateMachine):
         if k not in ids or ref not in ids:
             expect(KeyError, lambda: fn(k, ref), "move with absent id, self move too")
         elif k == ref:
-            try:
-                fn(k, ref)
-            except (KeyError, ValueError):
-                pass
-            # either way the order is unchanged
+            fn(k, ref)  # a present id moved next to itself: a no-op, order unchanged
         else:
             fn(k, ref)
             item = self.m_frac.pop(ids.index(k))
@@ -717,7 +753,19 @@ class ViewsMachine(RuleBasedStateMachine):
     def set_add(self, v):
         self.count("set_add")
         self.s.add(v)
-        self.m_set.add(v)
+        self.m_set.add(member(v))
+        self.check_all()
+
+    @rule(i=st.integers(0, 1))
+    def set_add_colliding_pair(self, i):
+        """Both spellings of one unordered member land on one row."""
+        self.count("set_add_colliding")
+        a, b = COLLIDING[2 * i], COLLIDING[2 * i + 1]
+        self.s.add(a)
+        assert b in self.s, (a, b)
+        self.s.add(b)
+        self.m_set.add(member(a))
+        assert member(a) == member(b)
         self.check_all()
 
     @rule(v=unhashable_st)
@@ -729,9 +777,9 @@ class ViewsMachine(RuleBasedStateMachine):
     @rule(v=setval_st)
     def set_remove(self, v):
         self.count("set_remove")
-        if v in self.m_set:
+        if member(v) in self.m_set:
             self.s.remove(v)
-            self.m_set.remove(v)
+            self.m_set.remove(member(v))
         else:
             expect(KeyError, lambda: self.s.remove(v), "set remove of absent value")
         self.check_all()
@@ -740,7 +788,7 @@ class ViewsMachine(RuleBasedStateMachine):
     def set_discard(self, v):
         self.count("set_discard")
         self.s.discard(v)
-        self.m_set.discard(v)
+        self.m_set.discard(member(v))
         self.check_all()
 
     @rule()
@@ -754,7 +802,7 @@ class ViewsMachine(RuleBasedStateMachine):
     def set_store(self, vs):
         self.count("set_store")
         self.s.store(vs)
-        self.m_set = set(vs)
+        self.m_set = {member(x) for x in vs}
         self.check_all()
 
     def teardown(self) -> None:
@@ -766,7 +814,34 @@ class ViewsMachine(RuleBasedStateMachine):
             shutil.rmtree(self.root, ignore_errors=True)
 
 
-# ---------------------------------------------------------------------------- case
+# ---------------------------------------------------------------------------- cases
+
+
+def test_true_and_1_are_distinct_set_members(backend: BackendSpec, tmp_path):
+    """Pins today's key collision behaviour, listed as a proposal for the owner.
+
+    SetView keys a member by its pickle, so ``1`` and ``True`` are two members
+    and ``1.0`` is a third; a python set holds one. DictView keys through the
+    codec, where ``1`` and ``True`` are one key, like a python dict. See the
+    True/1 key collision proposal in the lane V progress file.
+    """
+    st_ = backend.make(tmp_path)
+    st_.open()
+    try:
+        with st_.transaction() as tx:
+            r = Navigator(st_).root(tx)
+            s = r.open_child("s", SetView)
+            s.add(1)
+            assert 1 in s and True not in s and 1.0 not in s
+            s.add(True)
+            s.add(1.0)
+            assert len(s) == 3 and {member(x) for x in s} == {member(1), member(True), member(1.0)}
+            d = r.open_child("d", EagerDictView)
+            d[1] = "one"
+            d[True] = "true"
+            assert len(d) == 1 and d[1] == "true" and d[True] == "true"
+    finally:
+        st_.close()
 
 
 @pytest.mark.parametrize("tier", TIERS)

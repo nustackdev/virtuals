@@ -68,10 +68,11 @@ _SLOW_SCALE = float(os.environ.get("CONFORMANCE_MODEL_SECONDS", 30)) / 30
 
 FAST_MIXED = Load("fast", threads=2, coros=2, procs=1, seconds=0.8)
 SLOW_MIXED = Load("slow", threads=4, coros=4, procs=3, seconds=30 * _SLOW_SCALE)
-# The busy cases hold each write a little longer so the slot wait of four
-# queued writers passes 20ms and the retry paths run even in the fast tier.
-FAST_BUSY = Load("fast", threads=4, coros=4, procs=1, seconds=0.8, busy=0.02, pause=0.004, seed=99)
-SLOW_BUSY = replace(SLOW_MIXED, seconds=15 * _SLOW_SCALE, busy=0.02, pause=0.004, seed=99)
+# The busy cases hold each write 10ms, so with four threads queued the slot
+# wait passes the 20ms busy timeout and the retry paths run on every backend,
+# in the fast tier too (4ms was not enough on mem and rocksdb).
+FAST_BUSY = Load("fast", threads=4, coros=4, procs=1, seconds=0.8, busy=0.02, pause=0.01, seed=99)
+SLOW_BUSY = replace(SLOW_MIXED, seconds=15 * _SLOW_SCALE, busy=0.02, pause=0.01, seed=99)
 FAST_KILL = Load("fast", threads=2, coros=2, procs=2, seconds=2.0, kills=1, seed=11)
 SLOW_KILL = Load("slow", threads=2, coros=2, procs=4, seconds=25 * _SLOW_SCALE, kills=3, seed=11)
 
@@ -86,7 +87,7 @@ def tiers(fast: Load, slow: Load) -> list:
 ACCOUNTS = 8
 NSLOTS = 100_000
 TOTAL = ACCOUNTS * 1000
-KILL_WARMUP = 0.8  # seconds before the first kill: the victim has opened and committed
+KILL_WARMUP = 0.8  # seconds before the first kill; a victim is only a process that reported ready
 
 
 # ---------------------------------------------------------------------------- bodies
@@ -516,7 +517,10 @@ def run_load(spec: BackendSpec, root: Path, load: Load) -> dict:
         "time": round(time.monotonic() - t0, 1),
     }
     print(f"[s1 randomized {spec.name} {load.name}] seed={load.seed} procs={procs_n} {stats}")
-    assert kills == kills_n, f"only {kills} of {kills_n} kills landed on a ready process"
+    # A kill needs a ready process in its window; a slow spawn under load is not a storage bug,
+    # so the fast tier settles for at least one kill.
+    wanted = kills_n if load.name == "slow" else min(1, kills_n)
+    assert kills >= wanted, f"only {kills} of {kills_n} kills landed on a ready process"
     assert ops > 0 and stats["snapshots"] > 0
     return stats
 
@@ -534,9 +538,7 @@ def test_s1_randomized_mixed(backend: BackendSpec, load: Load, tmp_path):
 def test_s1_randomized_busy_timeout(backend: BackendSpec, load: Load, tmp_path):
     """Same with a 20ms busy timeout: the retry paths run, only retryable classes appear."""
     stats = run_load(backend, tmp_path, load)
-    if load.name == "slow":
-        # In 0.8s a fast backend can serve eight writers without one 20ms wait; 15s cannot.
-        assert stats["retries"] > 0, "a 20ms busy timeout never made a writer retry"
+    assert stats["retries"] > 0, "a 20ms busy timeout never made a writer retry"
 
 
 @pytest.mark.parametrize("load", tiers(FAST_KILL, SLOW_KILL))

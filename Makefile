@@ -99,7 +99,7 @@ build-codecs:
 # Testing
 # ============================================================================
 test:
-	@echo "$(BLUE)Running all tests...$(NC)"
+	@echo "$(BLUE)Running all tests (slow tier excluded, see tests/README.md)...$(NC)"
 	pytest $(TEST_DIR) -n 4
 
 test-fast:
