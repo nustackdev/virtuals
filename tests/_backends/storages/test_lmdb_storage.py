@@ -1279,6 +1279,116 @@ def test_slot_release_racing_close_leaves_no_live_write(ctx, tmp_path: Path, mon
     peer()
 
 
+def _gate_is_free(tmp_path: Path) -> None:
+    fd = os.open(tmp_path / "db" / "writer.lock", os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _holds_nothing_and_writes(ctx, st: LMDBStorage, tmp_path: Path) -> None:
+    """The storage holds no gate, slot or live write; a thread and a peer write at once."""
+    assert not st._live_writes
+    assert not st._gate_held
+    assert not st._writer.lock.locked()
+    assert not st._reserved_slots
+    _gate_is_free(tmp_path)
+    t0 = time.monotonic()
+    with st.transaction() as tx:
+        tx.put(("after",), b"1")
+    assert time.monotonic() - t0 < 1.0
+    _peer_can_write_now(ctx, tmp_path)()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("where", ["before_gate", "before_begin", "after_begin"])
+def test_reservation_straddling_close_and_open_holds_nothing(
+    ctx, tmp_path: Path, where: str, monkeypatch
+) -> None:
+    """close() and open() land mid-reservation: it is refused and keeps nothing of the reopened storage.
+
+    Round 4 audit C1. With the reopen between the in-process slot grant
+    and the gate take, the reservation took the reopened storage's gate,
+    began a transaction on its writer thread and came back as a slot with
+    the old lock; the stale refusal then released nothing, every write in
+    the process failed at once and every peer waited on LMDB's mutex until
+    the next close(). The other two points are the reopen between the gate
+    take and the begin, and between the begin and the slot's creation.
+    """
+    from virtuals._backends.storages.lmdb._writer import WriterGate, WriterThread
+
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    fired: list = []
+
+    def reopen() -> None:  # the other thread wins the race at this point
+        if not fired:
+            fired.append(1)
+            st.close()
+            st.open()
+
+    if where == "before_gate":
+        orig_aacquire = WriterGate.aacquire
+
+        async def aacquire(self, timeout, **kw):
+            reopen()
+            return await orig_aacquire(self, timeout, **kw)
+
+        monkeypatch.setattr(WriterGate, "aacquire", aacquire)
+    else:
+        orig_arun = WriterThread.arun
+
+        async def arun(self, fn, **kw):
+            if where == "before_begin":
+                reopen()
+            result = await orig_arun(self, fn, **kw)
+            if where == "after_begin":
+                reopen()
+            return result
+
+        monkeypatch.setattr(WriterThread, "arun", arun)
+
+    async def reserve() -> None:
+        with pytest.raises(StorageClosedError):
+            await st.areserve_write_slot()
+
+    asyncio.run(reserve())
+    assert fired
+    try:
+        _holds_nothing_and_writes(ctx, st, tmp_path)
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(60)
+def test_sync_begin_straddling_close_and_open_holds_nothing(
+    ctx, tmp_path: Path, monkeypatch
+) -> None:
+    """The sync shape of the above: close() and open() between the slot take and the gate take."""
+    from virtuals._backends.storages.lmdb._writer import WriterGate
+
+    st = _open(str(tmp_path), busy_timeout=2.0)
+    fired: list = []
+    orig_acquire = WriterGate.acquire
+
+    def acquire(self, timeout, **kw):
+        if not fired:
+            fired.append(1)
+            st.close()
+            st.open()
+        return orig_acquire(self, timeout, **kw)
+
+    monkeypatch.setattr(WriterGate, "acquire", acquire)
+    with pytest.raises(StorageClosedError):
+        st.begin_transaction()
+    assert fired
+    try:
+        _holds_nothing_and_writes(ctx, st, tmp_path)
+    finally:
+        st.close()
+
+
 @pytest.mark.timeout(30)
 def test_gate_helper_never_locks_a_reused_descriptor_number(tmp_path: Path, monkeypatch) -> None:
     """The helper flocks its own duplicate, so an fd number reused after close() is never locked.
