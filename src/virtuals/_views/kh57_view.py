@@ -295,6 +295,8 @@ class Kh57ViewBase(
             start=(*site, lo_int),
             break_filter=prefix,
             filter=prefix & child_len,
+            # seek over each child's subtree: O(children), not O(descendants)
+            max_depth=len(site) + 1,
         )
         from virtuals.container.context import require_read_context
 

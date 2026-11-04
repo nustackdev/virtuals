@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from virtuals._views import EagerDictView, FlatDictView
+from virtuals._views import EagerDictView, EagerKh57View, FlatDictView, LazyKh57View
+from virtuals._views.kh57_view import _LEVELS as KH57_LEVELS
 from virtuals.codecs import BinaryCodec
 from virtuals.navigator import Navigator
 
@@ -265,3 +266,54 @@ def test_flat_dict_scan_cost_is_linear_in_keys(storage, counts):
 
     for n in SIZES:
         assert n <= costs[n]["scan_rows"] <= n + 2, costs
+
+
+# =============================================================================
+# KH57: ITERATION IS O(CHILDREN) TOO
+# =============================================================================
+
+
+def _fill_kh57(storage: StorageProtocol, n: int, value: Callable[[int], object]) -> None:
+    with storage.transaction() as tx:
+        d = Navigator(storage).root(tx).open_child("h", EagerKh57View)
+        d.store({i: value(i) for i in range(n)})
+
+
+def _kh57_keys(view_cls: type) -> Callable[[EagerDictView], object]:
+    return lambda root: [k for k in root.open_child("h", view_cls).keys()]  # noqa: C416
+
+
+def _kh57_lazy_items(view_cls: type) -> Callable[[EagerDictView], object]:
+    return lambda root: [kv for kv in root.open_child("h", view_cls).items()]  # noqa: C416
+
+
+def _kh57_range(view_cls: type) -> Callable[[EagerDictView], object]:
+    return lambda root: [k for k, _ in root.open_child("h", view_cls).range(0, 1 << 57)]
+
+
+@pytest.mark.parametrize(
+    "view_cls, op_name",
+    [
+        (EagerKh57View, "keys"),
+        (LazyKh57View, "keys"),
+        (LazyKh57View, "items"),
+        (LazyKh57View, "range"),
+    ],
+)
+def test_kh57_scan_cost_scales_with_children_not_descendants(storage, counts, view_cls, op_name):
+    """10 children with 50 descendants each cost the same scan as with 500 each.
+
+    Kh57 scans one range per level (64 of them), so the per-call overhead
+    is one row per level, not one per descendant.
+    """
+    op = {"keys": _kh57_keys, "items": _kh57_lazy_items, "range": _kh57_range}[op_name](view_cls)
+    children = 10
+
+    costs = {}
+    for width in (50, 500):
+        _fill_kh57(storage, children, _compound(width))
+        costs[width] = _measure(storage, counts, op)
+
+    assert costs[50] == costs[500], costs
+    # one row per child, one peek into each subtree before the seek, one row per level
+    assert costs[500]["scan_rows"] <= 2 * children + KH57_LEVELS + 2, costs
