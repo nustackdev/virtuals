@@ -92,3 +92,35 @@ def test_is_empty_with_non_empty() -> None:
     assert is_empty(0) is False
     assert is_empty(False) is False
     assert is_empty([]) is False
+
+
+# ============================================================================
+# TRUE SINGLETON: COPIES AND PICKLES ARE EMPTY
+# ============================================================================
+
+
+def _from_worker() -> object:
+    return EMPTY
+
+
+def test_empty_is_a_true_singleton() -> None:
+    """``Empty()``, copy, deepcopy and a pickle round trip all give the one ``EMPTY``."""
+    import copy
+    import pickle
+
+    assert Empty() is EMPTY
+    assert copy.copy(EMPTY) is EMPTY
+    assert copy.deepcopy(EMPTY) is EMPTY
+    assert copy.deepcopy({"n": [EMPTY]})["n"][0] is EMPTY
+    for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+        assert pickle.loads(pickle.dumps(EMPTY, protocol=proto)) is EMPTY  # noqa: S301
+
+
+def test_empty_from_a_spawned_worker_is_the_singleton() -> None:
+    """An EMPTY that crossed a process boundary (host plus workers) is still ``EMPTY``."""
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+
+    with ProcessPoolExecutor(1, mp_context=mp.get_context("spawn")) as pool:
+        value = pool.submit(_from_worker).result(timeout=60)
+    assert value is EMPTY
