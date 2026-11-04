@@ -134,12 +134,6 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
             if self._closed:
                 logger.error("Cannot commit, transaction is closed")
                 raise StorageClosedError("Transaction is closed")
-            if self._committed:
-                logger.error("Cannot commit, transaction already committed")
-                raise StorageTransactionError("Transaction already committed")
-            if self._aborted:
-                logger.error("Cannot commit, transaction already aborted")
-                raise StorageTransactionError("Transaction already aborted")
 
             pending = self._pending
             try:

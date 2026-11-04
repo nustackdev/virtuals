@@ -62,7 +62,7 @@ def classify_rdbpy(e: BaseException, message: str) -> StorageError:
     """Map an rdbpy exception onto the storage exception hierarchy.
 
     Mapping is by exception class (rdbpy types every rocksdb status), so
-    the retryable classes ``RetryOnConflict`` targets are exact:
+    the two retryable classes of contract section 3 are exact:
     Busy / Deadlock / TryAgain / Expired become
     ``StorageTransactionConflictError``, TimedOut / LockLimit become
     ``StorageLockTimeoutError``. rdbpy raises ``RuntimeError`` for a handle

@@ -54,6 +54,7 @@ Races are forced, not hoped for. In lost update a pause sits between each read a
 | `test_s3_closed_storage_error_not_retryable` | 3 | a write to a closed storage raises a non-retryable `StorageError` |
 | `test_s3_scan_after_context_close_raises_closed` | 3 | a scan resumed after its snapshot or transaction closed raises `StorageClosedError`, never a buffered row |
 | `test_s3_scan_after_storage_close_raises_closed` | 3 | same after the storage closed |
+| `test_s3_ended_context_raises_closed` | 3 | a second commit or write, or any use after an end, raises `StorageClosedError`: an ended transaction or batch is a closed one |
 | `test_s4_coroutine_writers_serialize` | 4 | N coroutines doing read, await, write all land, in bounded time |
 | `test_s4_coroutine_writers_do_not_block_loop` | 4 | writers holding a write across an await never block the loop for 200ms |
 | `test_s4_cross_process_sync_begin_on_loop_is_bounded` | 4 | with another process holding the write lock, a sync begin or batch write from a coroutine gives up within the in-process cap, not the whole `busy_timeout` (multi-process backends only) |

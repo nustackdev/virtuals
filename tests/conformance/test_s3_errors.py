@@ -166,3 +166,47 @@ def test_s3_scan_after_storage_close_raises_closed(backend, tmp_path):
         _scan_after_close(st, st.begin_transaction, lambda ctx: st.close())
     finally:
         st.close()
+
+
+@pytest.mark.timeout(20)
+def test_s3_ended_context_raises_closed(storage):
+    """A second commit, write or use after an end raises ``StorageClosedError``.
+
+    An ended transaction or batch is a closed one, on every backend: the
+    same class as a closed storage, so a caller has one class to handle
+    for "this context is over".
+    """
+    tx = storage.begin_transaction()
+    tx.put(("e", 1), 1)
+    tx.commit()
+    with pytest.raises(StorageClosedError):
+        tx.commit()
+    tx.abort()  # a no-op after the end
+    with pytest.raises(StorageClosedError):
+        tx.put(("e", 2), 2)
+
+    tx = storage.begin_transaction()
+    tx.put(("e", 3), 3)
+    tx.abort()
+    with pytest.raises(StorageClosedError):
+        tx.commit()
+
+    b = storage.begin_write_batch()
+    b.put(("e", 4), 4)
+    b.write()
+    with pytest.raises(StorageClosedError):
+        b.write()
+    with pytest.raises(StorageClosedError):
+        b.put(("e", 5), 5)
+
+    b = storage.begin_write_batch()
+    b.put(("e", 6), 6)
+    b.abort()
+    with pytest.raises(StorageClosedError):
+        b.write()
+
+    with storage.snapshot() as s:
+        assert s.get(("e", 1)) == 1
+        assert s.get(("e", 4)) == 4
+        assert not s.exists(("e", 3))
+        assert not s.exists(("e", 6))

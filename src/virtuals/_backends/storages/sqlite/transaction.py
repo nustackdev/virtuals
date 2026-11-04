@@ -69,6 +69,9 @@ class SQLiteTransaction(
     def commit(self) -> None:
         """Commit all changes in the transaction.
 
+        An ended transaction (committed, aborted, or closed with the
+        storage) raises ``StorageClosedError``, on every backend.
+
         An interrupt while the COMMIT is in flight never changes its
         outcome or how it is reported: the transaction ends committed and
         notified, then the interrupt is raised as it is. One that arrives
@@ -80,12 +83,6 @@ class SQLiteTransaction(
         if self._closed:
             logger.error("Cannot commit, transaction is closed")
             raise StorageClosedError("Transaction is closed")
-        if self._committed:
-            logger.error("Cannot commit, transaction already committed")
-            raise StorageTransactionError("Transaction already committed")
-        if self._aborted:
-            logger.error("Cannot commit, transaction already aborted")
-            raise StorageTransactionError("Transaction already aborted")
 
         self._require_active()
 
