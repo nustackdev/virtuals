@@ -11,15 +11,16 @@ PyPI: `virtuals-py` | Import: `virtuals`
 ## What It Does
 
 ```python
-from virtuals import View, Container
+from virtuals import Navigator
+from virtuals.codecs import BinaryCodec
 from virtuals.storages.mem import InMemoryStorage
-from virtuals.codecs import NoOpCodec
+from virtuals.views import EagerDictView
 
-storage = InMemoryStorage(codec=NoOpCodec())
+storage = InMemoryStorage(codec=BinaryCodec())
 storage.open()
 
 with storage.transaction() as tx:
-    users = DictView.open_root(tx)
+    users = Navigator(storage).root(tx).open_child("users", EagerDictView)
     users["alice"] = {"name": "Alice", "age": 30}
     users["bob"] = {"name": "Bob", "age": 25}
 
@@ -27,37 +28,52 @@ with storage.transaction() as tx:
     for user_id, profile in users.items():
         print(f"{user_id}: {profile['name']}")
 
-# Under the hood: flat KV pairs with tuple keys
-# ("users", "alice", "name") -> "Alice"
-# ("users", "alice", "age")  -> 30
+# Under the hood: flat KV rows with tuple keys, under the "/" root
+# ("/", "users", "alice", "name") -> "Alice"
+# ("/", "users", "alice", "age")  -> 30
 ```
 
 ## Three Layers
 
 ### Layer 1: Storage
-Generic tuple-key KV store with lexicographic ordering.
+Generic tuple-key KV store with lexicographic ordering. Reads and writes go through a context: a transaction, a snapshot or a write batch.
 
 ```python
-storage.put(("users", "alice", "name"), "Alice")
-value = storage.get(("users", "alice", "name"))
+from virtuals.tkv.types import EMPTY
+
+with storage.transaction() as tx:
+    tx.put(("raw", "alice", "name"), "Alice")
+
+with storage.snapshot() as snap:
+    assert snap.get(("raw", "alice", "name")) == "Alice"
+    assert snap.get(("raw", "nobody")) is EMPTY  # absent, never None
 ```
 
 ### Layer 2: Container
 Hierarchy and parent-child relationships over flat keys.
 
 ```python
-container = Container(storage, ("users", "alice"))
-container.create()
-children = container.children()  # ["name", "age"]
+from virtuals import Container
+
+with storage.snapshot() as snap:
+    alice = Container(ctx=snap, site=("/", "users", "alice"))
+    assert alice.exists()
+    assert sorted(alice.iter_child_keys()) == ["age", "name"]
 ```
 
 ### Layer 3: View
 Data structure abstractions (dict, list, set) over containers.
 
 ```python
-users = DictView.open_root(tx)
-users["alice"] = "data"
+with storage.transaction() as tx:
+    users = Navigator(storage).root(tx).open_child("users", EagerDictView)
+    users["carol"] = {"name": "Carol", "age": 41}
+    assert len(users) == 3
+
+storage.close()
 ```
+
+The storage pages under `docs/storage/` carry the contract every backend meets; `tests/README.md` says how to run the suite and its tiers.
 
 ## Installation
 

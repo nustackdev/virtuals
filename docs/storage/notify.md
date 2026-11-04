@@ -37,7 +37,7 @@ Writes are published after they commit. Observers wake subscribers whose filter 
 | `subscribe_timeout` | redis observer | 2s | how long `subscribe()` waits for the server to confirm and register |
 | `queue_maxsize` | publisher | 100000 keys | queue capacity before backpressure |
 
-A stalled server bounds `subscribe()` at about the subscribe timeout plus twice the socket timeout. A slow receiver does not stall a `subscribe()` from another thread until both the dispatch queue and the overflow buffer are full: the listener parks inbound keys in the overflow buffer and keeps serving commands. Past that point it stops reading the socket, and a `subscribe()` can time out.
+A stalled server bounds `subscribe()` at about the subscribe timeout plus twice the socket timeout. A slow receiver never stalls a `subscribe()` from another thread: the listener parks inbound keys in an overflow buffer and keeps serving commands, and while a subscribe awaits its confirmation it reads the socket whatever the backlog, so the confirmation is never behind it. Past the overflow cap with no subscribe pending it stops reading the socket; with one pending the overflow is unbounded, and the real cap is valkey's client output buffer limit, past which the client is disconnected, reconnects and resyncs.
 
 ## Lifecycle
 

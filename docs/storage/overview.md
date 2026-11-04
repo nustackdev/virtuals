@@ -18,7 +18,7 @@ db[("user", "alice", "name")] = "Alice"
 
 Keys are tuples of components: `("users", "alice", "profile")`
 
-- Components can be strings, ints, bytes, etc.
+- Components are strings and ints (a bool is an int); any other type is rejected by the key codec
 - Tuples are immutable and hashable
 
 ### Lexicographic Ordering
