@@ -313,6 +313,10 @@ class ViewsMachine(RuleBasedStateMachine):
             assert (k in v) == (k in model), k
             if k in model:
                 assert same(v[k], model[k]), (k, v[k], model[k])
+                assert same(v.get(k), model[k])
+            else:
+                assert is_empty(v.get(k)), (k, v.get(k))  # get of an absent key is EMPTY
+                expect(KeyError, lambda k=k: v[k], "getitem of an absent key")
         rows = rows_under(ctx, ("/", "l"))
         keys_rows = {k[3]: val for k, val in rows.items() if len(k) == 4 and k[2] == "__keys__"}
         log_rows = {k[3]: val for k, val in rows.items() if len(k) == 4 and k[2] == "__log__"}
@@ -339,9 +343,13 @@ class ViewsMachine(RuleBasedStateMachine):
             assert (k in v) == (k in vals), k
             if k in vals:
                 assert same(v[k], vals[k]), (k, v[k], vals[k])
+                assert same(v.get(k), vals[k])
                 i = ids.index(k)
                 assert v.next_after(k) == (ids[i + 1] if i + 1 < len(ids) else None)
                 assert v.prev_before(k) == (ids[i - 1] if i > 0 else None)
+            else:
+                assert is_empty(v.get(k)), (k, v.get(k))  # get of an absent key is EMPTY
+                expect(KeyError, lambda k=k: v[k], "getitem of an absent id")
         pos = list(v.positions())
         okeys = [o for o, _ in pos]
         assert okeys == sorted(okeys) and len(set(okeys)) == len(okeys), okeys
