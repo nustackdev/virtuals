@@ -122,7 +122,9 @@ class LMDBTransaction(ContextBase, ReadOperationsMixin, WriteOperationsMixin, Tr
         is then raised as it is. One that arrives before the commit
         started (a write-only transaction whose begin had not landed)
         commits nothing: the transaction is aborted and the interrupt
-        raised as it is.
+        raised as it is. An interrupt in the few bytecodes right after
+        the commit can cost the commit its notification; the data is
+        committed either way.
         """
         deferred: list[BaseException] = []
         # ``deferred`` collects the interrupts that land in the commit's
