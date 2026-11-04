@@ -13,6 +13,7 @@ import concurrent.futures
 import gc
 import os
 import random
+import signal
 import subprocess
 import sys
 import textwrap
@@ -1709,13 +1710,42 @@ def test_areserve_timeout_meeting_a_release_is_a_lock_timeout(storage) -> None:
 
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("what", ["transaction", "batch"])
-def test_interrupted_commit_settles_once_it_lands(tmp_path: Path, what: str) -> None:
+def test_interrupted_commit_settles_once_it_lands(tmp_path: Path, what: str, monkeypatch) -> None:
     """A signal while the COMMIT is in flight: committed, notified once, then the interrupt as it is.
 
-    Before, the interrupt surfaced after the COMMIT with the transaction
-    neither committed nor notified (and wrapped as a failed commit when
-    the handler raised a plain ``Exception``).
+    The signal is sent from inside the end of the context, so it lands in
+    the COMMIT itself (a batch applies its writes first, and an interrupt
+    there aborts, as designed). Before, the interrupt surfaced after the
+    COMMIT with the transaction neither committed nor notified (and
+    wrapped as a failed commit when the handler raised a plain
+    ``Exception``).
     """
+    from virtuals._backends.storages.sqlite.context import ContextBase
+
+    original = ContextBase._end_locked
+
+    class CommitThenSignal:
+        """The connection, with the signal sent right after a statement ran: handled inside the end."""
+
+        def __init__(self, conn) -> None:
+            self._conn = conn
+            self._fired = False
+
+        def execute(self, sql, *args):
+            cursor = self._conn.execute(sql, *args)
+            if not self._fired:  # once: the proxy goes back to the pool with the connection
+                self._fired = True
+                os.kill(os.getpid(), signal.SIGUSR1)  # the handler runs at the next bytecode
+            return cursor
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def end_with_signal(self, sql, deferred=None):
+        self._conn = CommitThenSignal(self._conn)
+        return original(self, sql, deferred)
+
+    monkeypatch.setattr(ContextBase, "_end_locked", end_with_signal)
     seen: list[set] = []
 
     class Recorder:
@@ -1731,17 +1761,18 @@ def test_interrupted_commit_settles_once_it_lands(tmp_path: Path, what: str) -> 
         if what == "batch":
             with pytest.raises(cases.Interrupt), st.batch_write() as ctx:
                 for key in keys:
-                    ctx.put(key, os.urandom(100_000))  # 30MB: the COMMIT takes a while
-                with cases.interrupt_after(0.01):
+                    ctx.put(key, os.urandom(100_000))
+                with cases.interrupt_after(60):
                     ctx.write()
             assert ctx._written and not ctx._aborted
         else:
             with pytest.raises(cases.Interrupt), st.transaction() as ctx:
                 for key in keys:
                     ctx.put(key, os.urandom(100_000))
-                with cases.interrupt_after(0.01):
+                with cases.interrupt_after(60):
                     ctx.commit()
             assert ctx._committed and not ctx._aborted
+        monkeypatch.undo()  # before any other end runs the proxy's signal with no handler installed
         assert ctx.is_closed
         assert seen == [keys]
         assert not st._writer.lock.locked()
@@ -1751,31 +1782,3 @@ def test_interrupted_commit_settles_once_it_lands(tmp_path: Path, what: str) -> 
             tx.put(("after",), b"1")
     finally:
         st.close()
-
-
-@pytest.mark.timeout(30)
-def test_signal_in_the_slot_release_runs_after_it(storage: SQLiteStorage, monkeypatch) -> None:
-    """A signal that lands in the commit's cleanup is handled once the slot is given back."""
-    from virtuals._backends.storages.sqlite import storage as storage_module
-
-    def kill_then(original):
-        import signal
-
-        def wrapped(*args, **kwargs):
-            os.kill(os.getpid(), signal.SIGUSR1)
-            time.sleep(0.002)
-            return original(*args, **kwargs)
-
-        return wrapped
-
-    monkeypatch.setattr(
-        storage_module.SQLiteStorage,
-        "_release_connection",
-        kill_then(storage_module.SQLiteStorage._release_connection),
-    )
-    with cases.interrupt_after(60), pytest.raises(cases.Interrupt), storage.transaction() as tx:
-        tx.put(("k",), b"1")
-    monkeypatch.undo()
-    assert tx._committed and not storage._writer.lock.locked()
-    with storage.transaction() as tx:  # before: the slot stayed held by nobody
-        tx.put(("k",), b"2")

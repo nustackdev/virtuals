@@ -16,8 +16,6 @@ from virtuals.tkv.storage import (
 )
 from virtuals.tkv.types import EMPTY, Empty
 
-from .._write_slot import signals_held
-
 
 if TYPE_CHECKING:
     from virtuals.tkv.types import Key, Value
@@ -189,10 +187,7 @@ class ContextBase:
         a collection may run on a thread that holds it. A connection
         inherited across a fork is parked, never closed.
         """
-        with (
-            signals_held(),
-            self._lock,
-        ):  # a handler raising in a finalizer is swallowed: never half done
+        with self._lock:  # a handler raising in a finalizer is swallowed: never half done
             conn, self._conn = self._conn, None
             holds, self._holds_write_lock = self._holds_write_lock, False
             writer_lock, self._writer_lock = self._writer_lock, None
@@ -261,7 +256,7 @@ class ReadOperationsMixin:
             conn = self._require_active()
             try:
                 row = conn.execute("SELECT v FROM kv WHERE k = ?", (encoded_key,)).fetchone()
-            except Exception as e:
+            except sqlite3.Error as e:
                 raise StorageOperationError(f"Failed to get key {key}: {e}") from e
 
         if row is None:
@@ -285,7 +280,7 @@ class ReadOperationsMixin:
             conn = self._require_active()
             try:
                 row = conn.execute("SELECT 1 FROM kv WHERE k = ?", (encoded_key,)).fetchone()
-            except Exception as e:
+            except sqlite3.Error as e:
                 raise StorageOperationError(f"Failed to check key {key}: {e}") from e
         return row is not None
 
@@ -339,7 +334,7 @@ class WriteOperationsMixin:
                 conn.execute(
                     "INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", (encoded_key, encoded_value)
                 )
-            except Exception as e:
+            except sqlite3.Error as e:
                 if is_busy_error(e):
                     raise StorageLockTimeoutError(f"Timed out writing key {key}: {e}") from e
                 raise StorageOperationError(f"Failed to put key {key}: {e}") from e
@@ -359,7 +354,7 @@ class WriteOperationsMixin:
             conn = self._require_active()
             try:
                 deleted = conn.execute("DELETE FROM kv WHERE k = ?", (encoded_key,)).rowcount
-            except Exception as e:
+            except sqlite3.Error as e:
                 if is_busy_error(e):
                     raise StorageLockTimeoutError(f"Timed out deleting key {key}: {e}") from e
                 raise StorageOperationError(f"Failed to delete key {key}: {e}") from e

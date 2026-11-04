@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
+import sqlite3
 from logging import getLogger
 from typing import TYPE_CHECKING
 
 from virtuals.tkv.storage import (
     StorageClosedError,
+    StorageError,
     StorageLockTimeoutError,
-    StorageNestedTransactionError,
     StorageOperationError,
     StorageTransactionError,
     WriteBatchProtocol,
 )
 
-from .._write_slot import signals_held
 from .context import ContextBase, is_busy_error
 
 
@@ -103,8 +103,7 @@ class SQLiteWriteBatch(ContextBase, WriteBatchProtocol):
         # An interrupt while the COMMIT is in flight never changes its
         # outcome or how it is reported (see ``SQLiteTransaction.commit``).
         deferred: list[BaseException] = []
-        with signals_held():  # the slot and file lock waits inside let them through
-            self._write_held(puts, deletes, deferred)
+        self._write_held(puts, deletes, deferred)
 
     def _write_held(self, puts: list, deletes: list, deferred: list[BaseException]) -> None:
         """``write`` with signals held."""
@@ -138,10 +137,8 @@ class SQLiteWriteBatch(ContextBase, WriteBatchProtocol):
             logger.error("Write batch write failed")
             if deferred:
                 raise deferred[0] from e  # the interrupt, with the failure as its cause
-            if isinstance(
-                e, (StorageLockTimeoutError, StorageNestedTransactionError, StorageClosedError)
-            ):
-                raise
+            if not isinstance(e, sqlite3.Error) or isinstance(e, StorageError):
+                raise  # storage errors, and interrupts, as they are
             if is_busy_error(e):
                 raise StorageLockTimeoutError(f"Timed out writing batch: {e}") from e
             raise StorageTransactionError(f"Failed to write batch: {e}") from e
@@ -168,17 +165,16 @@ class SQLiteWriteBatch(ContextBase, WriteBatchProtocol):
         if self._closed:
             logger.debug("Abort called on closed write batch")
             return
-        with signals_held():
-            self._aborted = True
-            # Goes through the context lock: a write in flight on another thread
-            # finishes first, and an apply begun but not committed is rolled back.
-            try:
-                self._end("ROLLBACK")
-            except Exception as e:
-                logger.error(f"Write batch abort failed: {e}")
-            self._ops.clear()
-            self._storage._untrack_write_batch(self)
-            logger.debug("Write batch aborted")
+        self._aborted = True
+        # Goes through the context lock: a write in flight on another thread
+        # finishes first, and an apply begun but not committed is rolled back.
+        try:
+            self._end("ROLLBACK")
+        except Exception as e:
+            logger.error(f"Write batch abort failed: {e}")
+        self._ops.clear()
+        self._storage._untrack_write_batch(self)
+        logger.debug("Write batch aborted")
 
     def __enter__(self) -> SQLiteWriteBatch:
         """Enter context manager."""

@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 from logging import getLogger
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import lmdb
 
 from virtuals.tkv.storage import (
     StorageClosedError,
-    StorageLockTimeoutError,
-    StorageNestedTransactionError,
+    StorageError,
     StorageOperationError,
-    StorageTransactionConflictError,
     StorageTransactionError,
     WriteBatchProtocol,
 )
 
-from .._write_slot import signals_held
 from ._writer import NOT_RUN
 from .context import ContextBase
 
@@ -114,59 +113,58 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
 
         storage = self._storage
         deferred: list[BaseException] = []
-        with (
-            signals_held()
-        ):  # as in LMDBTransaction.commit; the slot, gate and begin waits let them through
-            try:
-                if self._ops:
-                    lock = storage._take_write_slot()
-                    try:
-                        with self._call_lock:
-                            if self._closed:
-                                raise StorageClosedError("Write batch was closed while writing")
-                            ops = self._ops
-                            missing = storage._commit_pending(ops, deferred)
-                            if missing is NOT_RUN:
-                                raise deferred[0]  # nothing ran: the batch stays as it was
-                            for encoded_key in missing:
-                                self._modified_keys.discard(ops[encoded_key][0])
-                            self._finish()
-                    finally:
-                        storage._release_write_slot(lock)
-                else:
+        missing: Any = NOT_RUN
+        try:
+            if self._ops:
+                lock = storage._take_write_slot()
+                try:
                     with self._call_lock:
                         if self._closed:
                             raise StorageClosedError("Write batch was closed while writing")
-                        self._finish()  # nothing to apply: just ends the batch
-            except Exception as e:
+                        ops = self._ops
+                        missing = storage._commit_pending(ops, deferred)
+                        if missing is not NOT_RUN:
+                            for encoded_key in missing:
+                                self._modified_keys.discard(ops[encoded_key][0])
+                            self._finish()
+                finally:
+                    storage._release_write_slot(lock)
+            else:
                 with self._call_lock:
-                    if not self._closed:
-                        self._aborted = True
-                        self._ops = {}
-                        self._mark_closed()
-                storage._untrack_write_batch(self)
-                logger.error("Write batch write failed")
-                if deferred:
-                    raise deferred[0] from e  # the interrupt, with the failure as its cause
-                if isinstance(
-                    e,
-                    (
-                        StorageLockTimeoutError,
-                        StorageNestedTransactionError,
-                        StorageClosedError,
-                        StorageTransactionConflictError,
-                    ),
-                ):
-                    raise
-                raise StorageTransactionError(f"Failed to write batch: {e}") from e
-
-            logger.debug("Write batch written")
-            try:
-                storage._notify_batch(self._modified_keys)
-            finally:
-                storage._untrack_write_batch(self)
+                    if self._closed:
+                        raise StorageClosedError("Write batch was closed while writing")
+                    self._finish()  # nothing to apply: just ends the batch
+                missing = ()
+        except Exception as e:
+            self._abort_after_failure()
+            logger.error("Write batch write failed")
             if deferred:
-                raise deferred[0]
+                raise deferred[0] from e  # the interrupt, with the failure as its cause
+            if not isinstance(e, lmdb.Error) or isinstance(e, StorageError):
+                raise  # storage errors, and interrupts, as they are
+            raise StorageTransactionError(f"Failed to write batch: {e}") from e
+        if missing is NOT_RUN:
+            # Nothing ran (interrupted before the begin landed): aborted,
+            # and the interrupt as it is.
+            self._abort_after_failure()
+            raise deferred[0]
+
+        logger.debug("Write batch written")
+        try:
+            storage._notify_batch(self._modified_keys)
+        finally:
+            storage._untrack_write_batch(self)
+        if deferred:
+            raise deferred[0]
+
+    def _abort_after_failure(self) -> None:
+        """Mark the batch aborted and closed after a write that did not land, and untrack it."""
+        with self._call_lock:
+            if not self._closed:
+                self._aborted = True
+                self._ops = {}
+                self._mark_closed()
+        self._storage._untrack_write_batch(self)
 
     def _finish(self) -> None:
         """Mark the batch written and closed. Under ``_call_lock``."""
@@ -184,7 +182,7 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
         if self._closed:
             logger.debug("Abort called on closed write batch")
             return
-        with signals_held(), self._call_lock:
+        with self._call_lock:
             if self._closed:
                 return
             self._aborted = True

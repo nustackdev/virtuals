@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from virtuals.tkv.storage import StorageError
 
-from .._write_slot import WriteSlot, signals_held
+from .._write_slot import WriteSlot
 
 
 if TYPE_CHECKING:
@@ -75,9 +75,8 @@ class SQLiteWriteSlot(WriteSlot):
         """Give the slot back if no transaction took it."""
         if self._state != "held":
             return
-        with signals_held():
-            self._drop_conn()
-            super().release()
+        self._drop_conn()
+        super().release()
 
     def __del__(self) -> None:
         """Last resort: free a held slot that became unreachable unreleased.

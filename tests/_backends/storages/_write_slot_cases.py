@@ -730,8 +730,8 @@ def interrupt_after(delay: float):
     """Deliver SIGUSR1 to this process after ``delay``; its handler raises ``Interrupt``.
 
     The handler runs on the main thread, inside whatever wait it is in
-    (a future's lock acquire is interruptible), or once a section that
-    holds signals ends. SIGUSR1, so pytest-timeout's SIGALRM is left alone.
+    (a future's lock acquire is interruptible). SIGUSR1, so pytest-timeout's
+    SIGALRM is left alone.
     """
     import signal
 
@@ -739,11 +739,6 @@ def interrupt_after(delay: float):
         raise Interrupt
 
     previous = signal.signal(signal.SIGUSR1, handler)
-    # A handler installed between two sections is wrapped at the next check,
-    # which the storage runs at most every 0.1s: make this one now.
-    from virtuals._backends.storages import _write_slot
-
-    _write_slot._signal_state.checked = 0.0
     timer = threading.Timer(delay, os.kill, (os.getpid(), signal.SIGUSR1))
     timer.start()
     try:
