@@ -1374,6 +1374,54 @@ def test_fork_without_write_child_writes(
 
 
 @pytest.mark.timeout(20)
+def test_reservation_straddling_close_and_open_holds_nothing(db_path: Path, monkeypatch) -> None:
+    """close() and open() land between the slot grant and the file lock take: refused, nothing kept.
+
+    The lmdb shape of round 4 audit C1, on sqlite: the reservation is
+    refused instead of coming back as a slot the reopened storage does
+    not honor, the file lock it took is given back, and a thread writes
+    at once.
+    """
+    import sqlite3
+
+    st = SQLiteStorage(path=db_path, codec=BinaryCodec(), busy_timeout=2.0)
+    st.open()
+    fired: list = []
+    orig = SQLiteStorage._abegin_immediate
+
+    async def abegin_immediate(self, deadline):
+        if not fired:  # the other thread wins the race at this point
+            fired.append(1)
+            st.close()
+            st.open()
+        return await orig(self, deadline)
+
+    monkeypatch.setattr(SQLiteStorage, "_abegin_immediate", abegin_immediate)
+
+    async def reserve() -> None:
+        with pytest.raises(StorageClosedError):
+            await st.areserve_write_slot()
+
+    asyncio.run(reserve())
+    assert fired
+    try:
+        assert not st._writer.lock.locked()
+        assert not st._reserved_slots
+        raw = sqlite3.connect(db_path, timeout=0)  # the file lock is free: taken at once
+        try:
+            raw.execute("BEGIN IMMEDIATE")
+            raw.rollback()
+        finally:
+            raw.close()
+        t0 = time.monotonic()
+        with st.transaction() as tx:
+            tx.put(("after",), b"1")
+        assert time.monotonic() - t0 < 1.0
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(20)
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 def test_fork_with_reserved_slot_child_refuses_stale_slot(storage: SQLiteStorage) -> None:
     """A slot reserved before the fork cannot begin a transaction in the child."""

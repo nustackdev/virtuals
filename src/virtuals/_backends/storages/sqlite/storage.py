@@ -511,7 +511,7 @@ class SQLiteStorage:
             conn = await self._abegin_immediate(deadline)
             slot = SQLiteWriteSlot(self, lock, conn)
             with self._state_lock:
-                if self._opened:
+                if self._opened and lock is self._writer.lock:
                     self._reserved_slots.add(slot)
                     return slot
         except BaseException:
@@ -520,8 +520,10 @@ class SQLiteStorage:
             else:
                 self._writer.release_if_owned(me, since)
             raise
-        # close() ran while the reservation polled and did not see it: the
-        # file lock just taken must not outlive the closed storage.
+        # close() ran while the reservation polled and did not see it (and
+        # open() may have followed, replacing the slot): the file lock just
+        # taken must not outlive the closed storage, and a slot the
+        # reopened storage does not honor is not returned.
         slot.release()
         raise StorageClosedError("Storage was closed while reserving the write slot")
 
