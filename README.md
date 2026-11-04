@@ -1,6 +1,6 @@
-# virtuals – virtual collections over any storage
+# virtuals
 
-Native Python dicts, lists and sets that live in a KV store, not in memory.
+Native Python dicts, lists and sets that live in a KV store.
 
 [![PyPI - Python Version](https://img.shields.io/badge/python-%3E%3D%203.10-blue)](https://pypi.org/project/virtuals-py/)
 [![PyPI Package](https://img.shields.io/pypi/v/virtuals-py?color=yellow)](https://pypi.org/project/virtuals-py/)
@@ -9,7 +9,7 @@ Native Python dicts, lists and sets that live in a KV store, not in memory.
 
 ## About
 
-Dicts, lists, sets and ordered collections that look and feel like native Python, but sit in a KV storage.
+Dicts, lists, sets and ordered collections that look and feel like native Python, but sit in a KV store.
 Each one is a lazy view over an ordered key-value store: reads stream in from disk on access, writes land as rows, and a nested dict of a billion entries costs nothing until you touch it.
 
 Current backends: SQLite, LMDB, RocksDB, in-memory.
