@@ -1,4 +1,11 @@
-"""Scan iterator for RocksDB storage."""
+"""Scan iterator for RocksDB storage.
+
+Rows are fetched in batches, so a write made through the same transaction
+while a scan is in flight is seen only once the scan moves past the batch
+it already holds. Whether an in-flight scan sees such a write is
+unspecified across backends (contract section 1); callers should not rely
+on either outcome. Deleting keys the scan has already yielded is safe.
+"""
 
 from __future__ import annotations
 

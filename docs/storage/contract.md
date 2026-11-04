@@ -7,7 +7,7 @@ Backends: sqlite, lmdb, rocksdb, mem. A backend ships only if it passes the conf
 ## 1. Transactions
 
 - A transaction is serializable. Point reads and scans inside it see one state, and committed transactions are equivalent to some serial order. No lost update, no write skew, no phantom.
-- Read your own writes: a get or scan inside a transaction sees its pending puts and deletes.
+- Read your own writes: a get or scan inside a transaction sees its pending puts and deletes. This holds for scans started after the write. A scan already in flight may or may not see a write the same transaction makes after it started (lmdb's live cursor does, the other three yield the page they already fetched): unspecified, do not rely on either outcome. Deleting keys a scan has already yielded is safe on every backend.
 - Commit is atomic. A pending multi-key transaction is invisible to other readers, then visible whole. Abort, by `abort()` or by an exception inside the block, leaves no key.
 - One writer at a time per storage. Writers in one process queue on an in-process writer slot before they reach the backend. Threads hand off directly, coroutines wait without blocking their loop.
 - A second write transaction from the holder of the slot (the same task or thread, a `to_thread` worker below it, or an `asyncio.run` inside it) raises `StorageNestedTransactionError`. It is not retryable.

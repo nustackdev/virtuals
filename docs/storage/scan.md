@@ -26,6 +26,7 @@ It is a **system-level iteration primitive**, not a collection.
 
 - `scan` does not imply isolation beyond the context
 - `scan` does not observe uncommitted writes outside the context
+- a scan in flight may or may not see writes its own transaction makes after it started; only scans started after a write are guaranteed to see it (see [contract](contract.md), section 1)
 - `scan` performs no implicit buffering or retries
 
 ## Role
