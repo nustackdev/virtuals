@@ -182,9 +182,10 @@ def plain_scan() -> Scan:
 # Values stay well under the 64MB LMDB map of the conformance spec, even when
 # one transaction writes a few of them (freed pages return after commit).
 BIG_SIZES = [1 << 16, 1 << 20, 2 << 20]
-# Encoded key bytes a backend accepts; a longer key is refused with
-# StorageOperationError before anything is written. Only lmdb has a limit
-# (its 511 byte default); the others store every length drawn here.
+# Encoded key bytes a backend accepts; a put of a longer key is refused with
+# StorageOperationError before anything is written, a delete of one is a
+# no-op. Only lmdb has a limit (its 511 byte default); the others store every
+# length drawn here.
 MAX_KEY_BYTES = {"lmdb": 511}
 KEY_LENGTHS = [200, 480, 509, 510, 600, 4000]  # 509 chars encode to 511 bytes, 510 to 512
 # Stored and scanned back on every backend, never refused.
@@ -507,20 +508,22 @@ class StorageMachine(RuleBasedStateMachine):
     @precondition(lambda s: s.opened and s.txn is not None)
     @rule(n=st.sampled_from(KEY_LENGTHS), which=st.sampled_from(["put", "delete"]))
     def oversized_key(self, n, which):
-        """A key past the backend's limit is refused cleanly; one inside it is stored and read back."""
+        """A put past the backend's limit is refused cleanly, a delete of such a key is a no-op.
+
+        Inside the limit the key is stored and read back like any other.
+        """
         self.count("oversized_key")
         k = ("k" * n,)
         limit = MAX_KEY_BYTES.get(self.spec.name)
-        op = (self.txn.put, k, n) if which == "put" else (self.txn.delete, k)
-        if limit is not None and len(self.codec.encode_key(k)) > limit:
+        if which == "put" and limit is not None and len(self.codec.encode_key(k)) > limit:
             self.count("oversized_key_refused")
-            expect(StorageOperationError, lambda: self.on(*op))
+            expect(StorageOperationError, lambda: self.on(self.txn.put, k, n))
             # refused cleanly: the txn must still work and the key must not be there
             assert is_empty(self.on(self.txn.get, k))
             self.on(self.txn.put, ("after_oversized",), 1)
             self.pending[("after_oversized",)] = 1
             return
-        self.on(*op)
+        self.on(self.txn.put, k, n) if which == "put" else self.on(self.txn.delete, k)
         if which == "put":
             self.pending[k] = n
             assert self.on(self.txn.get, k) == n
