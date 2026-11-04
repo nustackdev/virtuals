@@ -60,6 +60,21 @@ if TYPE_CHECKING:
     from virtuals.tkv.types import Key
 
 
+def _hash_of(sub: Subscription) -> str:
+    """``sub.filter_hash``, or a process-local stand-in for a filter without ``to_dict()``.
+
+    Such a filter cannot be subscribed on redis (its hash is sent at
+    subscribe), but on the in-memory transport it delivers keys, so its
+    resync wake is keyed by the subscription itself. The stand-in never
+    reaches a transport, and one subscription that cannot be hashed never
+    costs the others their wake.
+    """
+    try:
+        return sub.filter_hash
+    except NotImplementedError:
+        return f"local:{id(sub):x}"
+
+
 @dataclass(frozen=True, slots=True)
 class _TaggedKey:
     """A key tagged with a filter hash for hash-scoped delivery."""
@@ -389,7 +404,7 @@ class ObserverBase:
         registry = self._registry
         if not self._connected or registry is None:
             return
-        for h in {s.filter_hash for s in registry.subscriptions()}:
+        for h in {_hash_of(s) for s in registry.subscriptions()}:
             item = self._resync_item(h)
             if item is not None:
                 self._enqueue(item)
@@ -475,14 +490,14 @@ class ObserverBase:
         for item in batch:
             if isinstance(item, _Resync):
                 h = item.filter_hash
-                woken = [s for s in registry.subscriptions() if s.filter_hash == h]
+                woken = [s for s in registry.subscriptions() if _hash_of(s) == h]
                 if woken:
                     notifications.append((None, woken))
                 continue
             if isinstance(item, _TaggedKey):
                 key = item.key
                 h = item.filter_hash
-                matched = [s for s in registry.match(key) if s.filter_hash == h]
+                matched = [s for s in registry.match(key) if _hash_of(s) == h]
             else:
                 key = item
                 matched = registry.match(key)
