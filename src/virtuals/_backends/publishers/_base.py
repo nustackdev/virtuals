@@ -381,15 +381,23 @@ class PublisherBase:
         Places a sentinel in the queue. When the worker reaches it, all
         previously-enqueued keys have been handed to _publish_batch.
 
+        Returns at the timeout whether or not the queue drained, including
+        when it is full and the sentinel cannot even be queued.
+
         Raises:
             PublisherOperationError: if keys were dropped since the last
                 flush (publish kept failing past `publish_retry_seconds`).
                 Raised once; the error is cleared.
         """
         if self._connected:
+            deadline = time.monotonic() + timeout
             done = threading.Event()
-            self._queue.put(done)  # sentinel after all pending keys
-            done.wait(timeout=timeout)
+            try:
+                self._queue.put(done, timeout=timeout)  # sentinel after all pending keys
+            except queue.Full:
+                pass
+            else:
+                done.wait(timeout=max(0.0, deadline - time.monotonic()))
         self._raise_last_error()
 
     def _record_drop(self, n: int, err: BaseException, *, resync: bool = True) -> None:
