@@ -61,6 +61,8 @@ Disallowed:
 WriteBatches do not observe storage state.
 They only record intended mutations.
 
+A batch applies at most once. `write()` ends the batch whether it succeeds or raises (a lock timeout, an interrupt, a storage error): a second `write()` on the same batch raises `StorageClosedError` and applies nothing. To retry, build a new batch.
+
 ---
 
 ## Transaction (Read + Write)
