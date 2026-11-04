@@ -90,16 +90,13 @@ class SQLiteWriteBatch(ContextBase, WriteBatchProtocol):
         self._modified_keys.add(key)
 
     def write(self) -> None:
-        """Apply the batch in one write transaction and make it permanent."""
+        """Apply the batch in one write transaction and make it permanent.
+
+        A batch already written or aborted raises ``StorageClosedError``.
+        """
         if self._closed:
             logger.error("Cannot write, batch is closed")
             raise StorageClosedError("Write batch is closed")
-        if self._written:
-            logger.error("Cannot write, batch already written")
-            raise StorageTransactionError("Write batch already written")
-        if self._aborted:
-            logger.error("Cannot write, batch already aborted")
-            raise StorageTransactionError("Write batch already aborted")
 
         puts = [(k, v) for k, v in self._ops.items() if v is not None]
         deletes = [(k,) for k, v in self._ops.items() if v is None]

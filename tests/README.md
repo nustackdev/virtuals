@@ -11,15 +11,16 @@ The full suite takes about 3 minutes serial and under a minute with `-n 8`. Ever
 
 ## Model-based tiers
 
-Three files drive the storages and views with random operations against a reference model and run in two tiers:
+Three files drive the storages and views with random operations against a reference model, and a fourth fires interrupts into writes; all four run in two tiers:
 
 | file | drives |
 |---|---|
 | `conformance/test_s8_model.py` | a Hypothesis state machine over one storage: transactions begun on the main thread, a loop thread or a worker thread, batches, snapshots, drop, close and reopen, bulk rows across scan pages, big values, odd and oversized keys, against a dict model with a pending overlay |
 | `conformance/test_s1_randomized.py` | threads, coroutines and spawned processes under random load: bank sum, insert race on a scanned range, atomic multi-key visibility, with the default and a 20ms busy timeout, and with SIGKILL of writer processes on sqlite and lmdb |
 | `views/test_views_model.py` | random ops on five views (dict, log indexed, fractional indexed, list, set) against python models, every view and every raw storage row checked after each op |
+| `_backends/storages/test_interrupt_fuzz.py` | a signal handler raising at random into sqlite and lmdb writes, each run its own process: nothing reported as landed is lost, nothing lands twice; the long runs add a side writer and a peer process |
 
-- `fast` runs in the default suite: a fixed seed, a few short examples, about 5 seconds per backend across the three files. The same seed draws the same operations every run.
+- `fast` runs in the default suite: a fixed seed, a few short examples, about 5 seconds per backend across the model files, plus the short interrupt runs. The same seed draws the same operations every run.
 - `slow` is excluded by default through `addopts = -m 'not slow'` in `pyproject.toml` and runs with `-m slow`: about 1 to 2 minutes per backend. Any explicit `-m` on the command line replaces that default, so `-m "not functional"` includes the slow tier; add `and not slow` when that matters. `CONFORMANCE_MODEL_EXAMPLES` and `CONFORMANCE_MODEL_SEED` size and seed the two state machines, `CONFORMANCE_MODEL_SECONDS` scales the concurrent runs (30 is the default).
 
 ```sh
@@ -41,7 +42,7 @@ A failure prints the shrunk sequence of steps that reproduces it. Each run also 
 | `functional/` | container and view behaviour through the public API, watches on subtrees and absent containers | mem |
 | `unit/` | pure units: key and path navigation, container types and markers, view registry and capabilities, fractional index keys | none |
 | `tkv/` | the tkv protocols: codecs, filters, transport, compliance suites a backend can import | compliance on sqlite, lmdb, rocksdb, mem; the rest none |
-| `support/` | shared helpers: `counting.py` (op counter for cost tests, `open_backend`), `valkey.py` (a private valkey for redis tests), `dict_view.py` | |
+| `support/` | shared helpers: `counting.py` (op counter for cost tests, `open_backend`), `valkey.py` (a private valkey for redis tests), `dict_view.py`, `set_members.py` | |
 
 ## Conventions
 

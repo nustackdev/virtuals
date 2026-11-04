@@ -105,7 +105,7 @@ namespaces = false
 # The slow tier (model-based soak cases) is excluded by default; `-m slow` runs it.
 addopts = "-m 'not slow'"
 markers = [
-    "slow: soak tier of the model-based tests, about a minute per backend; excluded by default, run with -m slow",
+    "slow: soak tier of the model-based tests and the long interrupt fuzz runs, about a minute per backend; excluded by default, run with -m slow",
 ]
 
 # ============================================================================

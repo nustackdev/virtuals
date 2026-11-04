@@ -106,18 +106,13 @@ class RocksDBTransaction(
             StorageTransactionConflictError: If rocksdb refused the commit
                 as a conflict (retryable)
             StorageLockTimeoutError: If rocksdb timed out on a lock (retryable)
-            StorageTransactionError: If commit fails or transaction is invalid
-            StorageClosedError: If context is closed
+            StorageTransactionError: If commit fails
+            StorageClosedError: If the transaction already ended or its
+                storage closed
         """
         if self._closed:
             logger.error("Cannot commit, transaction is closed")
             raise StorageClosedError("Transaction is closed")
-        if self._committed:
-            logger.error("Cannot commit, transaction already committed")
-            raise StorageTransactionError("Transaction already committed")
-        if self._aborted:
-            logger.error("Cannot commit, transaction already aborted")
-            raise StorageTransactionError("Transaction already aborted")
 
         txn = self._rdbpy_txn
         try:

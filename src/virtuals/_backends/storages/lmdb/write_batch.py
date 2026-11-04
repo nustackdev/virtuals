@@ -96,6 +96,7 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
     def write(self) -> None:
         """Apply the batch in one write transaction and make it permanent.
 
+        A batch already written or aborted raises ``StorageClosedError``.
         Waits for the writer slot and the gate outside the batch's call
         lock, so a ``close()`` aborting the batch meanwhile is not held up
         by that wait; once both are held the batch is checked again and
@@ -108,12 +109,6 @@ class LMDBWriteBatch(ContextBase, WriteBatchProtocol):
             if self._closed:
                 logger.error("Cannot write, batch is closed")
                 raise StorageClosedError("Write batch is closed")
-            if self._written:
-                logger.error("Cannot write, batch already written")
-                raise StorageTransactionError("Write batch already written")
-            if self._aborted:
-                logger.error("Cannot write, batch already aborted")
-                raise StorageTransactionError("Write batch already aborted")
 
         storage = self._storage
         deferred: list[BaseException] = []

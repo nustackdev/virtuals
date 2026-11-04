@@ -9,7 +9,6 @@ from virtuals._backends.storages._empty import empty_error
 from virtuals.tkv.storage import (
     StorageClosedError,
     StorageOperationError,
-    StorageTransactionError,
     WriteBatchProtocol,
 )
 from virtuals.tkv.types import EMPTY
@@ -136,12 +135,6 @@ class RocksDBWriteBatch(ContextBase, WriteBatchProtocol):
         if self._closed:
             logger.error("Cannot write, batch is closed")
             raise StorageClosedError("Write batch is closed")
-        if self._written:
-            logger.error("Cannot write, batch already written")
-            raise StorageTransactionError("Write batch already written")
-        if self._aborted:
-            logger.error("Cannot write, batch already aborted")
-            raise StorageTransactionError("Write batch already aborted")
 
         batch = self._rdbpy_batch
         self._storage._require_open()

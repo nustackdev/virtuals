@@ -108,7 +108,7 @@ class SQLiteStorage:
       - One writer per database file across every process. A transaction
         takes the write lock at begin (``BEGIN IMMEDIATE``); other writers
         wait up to ``busy_timeout`` and then raise
-        ``StorageLockTimeoutError``, which ``RetryOnConflict`` retries.
+        ``StorageLockTimeoutError``, a retryable class (contract section 3).
       - Locks are OS file locks: a process killed mid-transaction releases
         them, and its uncommitted writes are simply gone.
       - ``synchronous="NORMAL"`` in WAL never corrupts the database on
