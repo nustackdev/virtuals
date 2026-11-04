@@ -116,7 +116,8 @@ values_st = st.one_of(
     st.booleans(),
 )
 prefix_st = st.lists(st.sampled_from(ATOMS), min_size=0, max_size=2).map(tuple)
-puts_st = st.lists(st.tuples(keys_st, values_st), min_size=1, max_size=4)
+puts_st = st.lists(st.tuples(keys_st, values_st), min_size=1, max_size=6)
+batch_ops_st = st.lists(st.tuples(keys_st, values_st, st.booleans()), min_size=1, max_size=4)
 
 
 def model_order_key(k: tuple) -> tuple:
@@ -586,24 +587,27 @@ class StorageMachine(RuleBasedStateMachine):
 
     # ------------------------------------------------------------------ rules: write batch
     @precondition(lambda s: s.opened and s.txn is None and s.batch is None)
-    @rule()
-    def batch_begin(self):
+    @rule(ops=batch_ops_st)
+    def batch_begin(self, ops):
+        """Begin a write batch; every batch carries at least one put or delete."""
         self.count("batch_begin")
         self.batch = self.storage.begin_write_batch()
         self.batch_pending = {}
         for op in (lambda: self.batch.get(("a",)), lambda: self.batch.exists(("a",))):
             expect(AttributeError, op)  # a write batch has no read methods, on every backend
+        self.batch_op(ops)
 
     @precondition(lambda s: s.opened and s.batch is not None)
-    @rule(key=keys_st, value=values_st, delete=st.booleans())
-    def batch_op(self, key, value, delete):
-        self.count("batch_op")
-        if delete:
-            self.batch.delete(key)
-            self.batch_pending[key] = TOMB
-        else:
-            self.batch.put(key, value)
-            self.batch_pending[key] = value
+    @rule(ops=batch_ops_st)
+    def batch_op(self, ops):
+        for key, value, delete in ops:
+            self.count("batch_op")
+            if delete:
+                self.batch.delete(key)
+                self.batch_pending[key] = TOMB
+            else:
+                self.batch.put(key, value)
+                self.batch_pending[key] = value
 
     @precondition(lambda s: s.opened and s.batch is not None)
     @rule(write=st.booleans())
