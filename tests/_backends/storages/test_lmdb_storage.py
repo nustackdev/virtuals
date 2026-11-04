@@ -1279,22 +1279,13 @@ def test_slot_release_racing_close_leaves_no_live_write(ctx, tmp_path: Path, mon
     peer()
 
 
-def _gate_is_free(tmp_path: Path) -> None:
-    fd = os.open(tmp_path / "db" / "writer.lock", os.O_RDWR)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
 def _holds_nothing_and_writes(ctx, st: LMDBStorage, tmp_path: Path) -> None:
     """The storage holds no gate, slot or live write; a thread and a peer write at once."""
     assert not st._live_writes
     assert not st._gate_held
     assert not st._writer.lock.locked()
     assert not st._reserved_slots
-    _gate_is_free(tmp_path)
+    assert _gate_is_free(str(tmp_path))  # defined below: a fresh descriptor takes it
     t0 = time.monotonic()
     with st.transaction() as tx:
         tx.put(("after",), b"1")
@@ -1385,6 +1376,141 @@ def test_sync_begin_straddling_close_and_open_holds_nothing(
     assert fired
     try:
         _holds_nothing_and_writes(ctx, st, tmp_path)
+    finally:
+        st.close()
+
+
+def _hold_in_thread(st: LMDBStorage) -> tuple[threading.Thread, threading.Event]:
+    """A thread holding a begun write transaction (slot and gate) until ``done`` is set."""
+    held, done = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with st.transaction() as tx:
+            tx.get(("k",))  # begun: the gate and the slot are the thread's
+            held.set()
+            done.wait(20)
+
+    t = threading.Thread(target=holder, daemon=True)
+    t.start()
+    assert held.wait(10)
+    return t, done
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("how", ["timeout", "nested"])
+def test_failed_reservation_without_the_slot_leaves_the_holders_gate(
+    tmp_path: Path, how: str
+) -> None:
+    """An areserve that never got the slot gives nothing back: the live holder keeps its gate.
+
+    Review 52 R1. The failure path released the gate when it had no
+    slot, which was always somebody else's gate: a thread's behind a
+    timeout, or the task's own behind a nested refusal. Peers then fell
+    through to LMDB's own mutex and waited there unbounded.
+    """
+    st = _open(str(tmp_path), busy_timeout=0.3)
+    try:
+        if how == "timeout":
+            t, done = _hold_in_thread(st)
+            assert not _gate_is_free(str(tmp_path))
+
+            async def go() -> None:
+                with pytest.raises(StorageLockTimeoutError):
+                    await st.areserve_write_slot()
+
+            asyncio.run(go())
+            assert st._gate_held
+            assert not _gate_is_free(str(tmp_path))  # the thread's, still
+            done.set()
+            t.join(10)
+        else:
+
+            async def go() -> None:
+                slot = await st.areserve_write_slot()
+                assert not _gate_is_free(str(tmp_path))
+                with pytest.raises(StorageNestedTransactionError):
+                    await st.areserve_write_slot()
+                assert st._gate_held
+                assert not _gate_is_free(str(tmp_path))  # the task's own, still
+                tx = st.begin_transaction(write_slot=slot)
+                tx.put(("k",), b"1")
+                tx.commit()
+
+            asyncio.run(go())
+        assert _gate_is_free(str(tmp_path))
+        _peer_can_write_now(mp.get_context("spawn"), tmp_path)()
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("how", ["async", "sync"])
+def test_interrupt_after_gate_take_across_reopen_leaves_the_new_holders_gate(
+    tmp_path: Path, how: str, monkeypatch
+) -> None:
+    """A cancel or interrupt that lands after the gate take, with a close() and open() in between.
+
+    Review 52 R2. The release on that path unlocked whatever descriptor
+    the gate had by then: the reopened storage's, under its new holder.
+    A release is tied to the generation of its take and touches nothing
+    once that changed.
+    """
+    from virtuals._backends.storages.lmdb import _writer
+
+    st = _open(str(tmp_path), busy_timeout=5.0)
+    holder: dict = {}
+
+    def reopen_then_hold() -> None:  # the other thread wins the race here
+        st.close()
+        st.open()
+        holder["t"], holder["done"] = _hold_in_thread(st)
+        assert not _gate_is_free(str(tmp_path))
+
+    if how == "async":
+        peer = os.open(tmp_path / "db" / "writer.lock", os.O_RDWR)
+        fcntl.flock(peer, fcntl.LOCK_EX)  # a peer holds the gate: the reservation waits
+        threading.Timer(0.2, lambda: (fcntl.flock(peer, fcntl.LOCK_UN), os.close(peer))).start()
+        orig_await_done = _writer._await_done
+
+        async def await_done(consumer, timeout):
+            await orig_await_done(consumer, timeout)
+            assert consumer.done() and consumer.result()  # the gate landed on the waiter
+            t = threading.Thread(target=reopen_then_hold)
+            t.start()
+            t.join(20)
+            raise asyncio.CancelledError  # the cancel that landed as the wait resumed
+
+        monkeypatch.setattr(_writer, "_await_done", await_done)
+
+        async def go() -> None:
+            with pytest.raises(asyncio.CancelledError):
+                await st.areserve_write_slot()
+
+        asyncio.run(go())
+    else:
+        orig_acquire = _writer.WriterGate.acquire
+        fired: list = []
+
+        def acquire(self, timeout, **kw):
+            orig_acquire(self, timeout, **kw)
+            if not fired:
+                fired.append(1)
+                t = threading.Thread(target=reopen_then_hold)
+                t.start()
+                t.join(20)
+                raise KeyboardInterrupt  # lands right after the take
+
+        monkeypatch.setattr(_writer.WriterGate, "acquire", acquire)
+        with pytest.raises(KeyboardInterrupt):
+            st.begin_transaction()
+    try:
+        assert "t" in holder
+        assert st._gate_held
+        assert not _gate_is_free(str(tmp_path))  # the new holder's, still
+        holder["done"].set()
+        holder["t"].join(10)
+        assert _gate_is_free(str(tmp_path))
+        _holds_nothing_and_writes(mp.get_context("spawn"), st, tmp_path)
     finally:
         st.close()
 

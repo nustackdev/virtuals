@@ -668,17 +668,31 @@ class WriterGate:
             raise StorageError(f"Failed to take the LMDB writer gate: {e}") from e
         return True
 
-    def _attach(self) -> Future | None:
-        """Take the gate now (None) or return the future the helper will deliver it on."""
+    @property
+    def generation(self) -> int:
+        """The open file's generation: bumped by every open() and close().
+
+        A release that names the generation its take was made under is a
+        no-op once it changed, so an interrupt that lands after a close()
+        and open() never unlocks the reopened gate under its new holder.
+        """
+        with self._mu:
+            return self._generation
+
+    def _attach(self) -> tuple[Future | None, int]:
+        """Take the gate now (None) or return the future the helper will deliver it on.
+
+        The generation the take belongs to comes with it, for ``release``.
+        """
         with self._mu:
             if not self._waiting:
                 if self._try_nb():
-                    return None
+                    return None, self._generation
                 self._start_wait()  # marks the wait in flight once it is queued
             consumer: Future = Future()
             consumer.set_running_or_notify_cancel()
             self._consumer = consumer
-            return consumer
+            return consumer, self._generation
 
     def _start_wait(self) -> None:
         """Hand the helper thread a blocking wait for this generation. Under ``_mu``.
@@ -752,16 +766,27 @@ class WriterGate:
                 return True
         return False
 
-    def release(self) -> None:
-        """Give the gate back. A no-op once the file is closed."""
+    def release(self, generation: int | None = None) -> bool:
+        """Give the gate back. A no-op once the file is closed.
+
+        Args:
+            generation: The generation the take was made under, if the
+                caller cannot know that no close() landed since. A take
+                of an older generation holds nothing on this file, and
+                unlocking it would unlock the current holder's.
+
+        Returns:
+            Whether the unlock ran.
+        """
         with self._mu:
             fd = self._fd
-            if fd is None:
-                return
+            if fd is None or (generation is not None and generation != self._generation):
+                return False
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             except OSError as e:
                 logger.error(f"Failed to release the LMDB writer gate: {e}")
+            return True
 
     def acquire(self, timeout: float, *, guard: AbstractContextManager[Any] | None = None) -> None:
         """Block for the gate up to ``timeout`` seconds.
@@ -778,7 +803,7 @@ class WriterGate:
             StorageClosedError: If the storage closes while waiting.
         """
         with guard if guard is not None else nullcontext():
-            consumer = self._attach()
+            consumer, generation = self._attach()
         if consumer is None:
             return
         try:
@@ -800,7 +825,7 @@ class WriterGate:
                 except Exception:  # noqa: S110 (failed, nothing held)
                     pass
                 else:
-                    self.release()  # landed, but the requester is gone
+                    self.release(generation)  # landed, but the requester is gone
             raise
 
     async def aacquire(
@@ -808,7 +833,7 @@ class WriterGate:
     ) -> None:
         """Like ``acquire`` but waits on the event loop instead of blocking it."""
         with guard if guard is not None else nullcontext():
-            consumer = self._attach()
+            consumer, generation = self._attach()
         if consumer is None:
             return
         try:
@@ -820,7 +845,7 @@ class WriterGate:
                 except Exception:  # noqa: S110 (failed, nothing held)
                     pass
                 else:
-                    self.release()  # landed, but the requester is gone
+                    self.release(generation)  # landed, but the requester is gone
             raise
         if not consumer.done() and self._detach(consumer):
             raise self._timed_out(timeout)
