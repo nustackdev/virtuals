@@ -34,6 +34,7 @@ from virtuals.storages.rocksdb import RocksDBStorage
 from virtuals.storages.sqlite import SQLiteStorage
 from virtuals.tkv.storage import StorageLockTimeoutError, StorageTransactionConflictError
 from virtuals.tkv.transport import InMemoryTransport
+from virtuals.types import is_empty
 
 
 BACKENDS = ("mem", "sqlite", "lmdb", "rocksdb")
@@ -130,7 +131,7 @@ def test_empty(fdict):
     assert view.first() is None
     assert view.last() is None
     assert "a" not in view
-    assert view.get("a") is None
+    assert is_empty(view.get("a"))
     assert view.get("a", "dflt") == "dflt"
 
 
@@ -207,10 +208,10 @@ def test_set_primitive_blob(fdict):
     assert view["b"] == [1, 2]
 
 
-def test_get_missing_returns_none(fdict):
-    """Mapping contract: no default means None, never the EMPTY sentinel."""
+def test_get_missing_returns_empty(fdict):
+    """Dict access with EMPTY as the absent default: get of a missing id is EMPTY, never None."""
     view = fdict("lst", {"a": 1})
-    assert view.get("zz") is None
+    assert is_empty(view.get("zz"))
     assert view.get("a") == 1
 
 
@@ -870,7 +871,7 @@ def test_failed_value_write_leaves_no_trace(broot):
     assert list(view) == ["a", "b"]
     assert list(view.items()) == [("a", 1), ("b", 2)]
     assert view.extract() == {"a": 1, "b": 2}
-    assert view.get("x") is None
+    assert is_empty(view.get("x"))
     with pytest.raises(KeyError):
         view["x"]
     with pytest.raises(KeyError):
@@ -1573,7 +1574,7 @@ def test_failed_compound_write_leaves_no_data(broot):
     assert "x" not in view
     assert len(view) == 2
     assert list(view) == ["a", "b"]
-    assert view.get("x") is None
+    assert is_empty(view.get("x"))
     assert not view._data_container().exists_child("x")
     assert list(view.items()) == [("a", 1), ("b", 2)]
     _assert_consistent(view)
@@ -1592,6 +1593,6 @@ def test_failed_compound_write_over_stale_data_leaves_no_data(broot):
     with pytest.raises(RuntimeError, match="boom"):
         view.append("x", {"new": 1, "boom": 2})
     assert "x" not in view
-    assert view.get("x") is None
+    assert is_empty(view.get("x"))
     assert not view._data_container().exists_child("x")
     _assert_consistent(view)

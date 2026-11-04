@@ -459,9 +459,10 @@ class LogIndexedDictViewBase(
         return None
 
     def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
+        """Value at ``address``, or ``default`` (EMPTY) when the key is absent."""
         try:
             return self[address]
-        except (KeyError, Exception):
+        except KeyError:
             return default
 
     # -- Mutations ---------------------------------------------------------
