@@ -319,8 +319,10 @@ def test_dict_len_is_live_and_ignores_stale_counter(root_view):
 def test_dict_truthiness_follows_children(root_view, view_type):
     """``bool(d)`` is live like ``len(d)``, and ignores a stale counter."""
     d = root_view.open_child("d", view_type)
-    assert not d
+    with pytest.raises(ContainerNotFoundError):
+        bool(d)  # never written: truthiness needs the container
     d.ensure_created()
+    assert not d
     d.container.put_metadata("__len__", 99)
     assert not d
     d["a"] = 1

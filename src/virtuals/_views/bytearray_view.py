@@ -71,9 +71,9 @@ class ByteArrayView(
             Normalized positive index
 
         Raises:
-            IndexError: If index out of bounds
+            IndexError: If index out of bounds (also on an absent bytearray)
         """
-        length = len(self)
+        length = self._len()
 
         if address < 0:
             address = length + address
@@ -147,7 +147,7 @@ class ByteArrayView(
         """
         normalized = self.normalize_address(address)  # IndexError before any write
         self.ensure_created()
-        length = len(self)
+        length = self._len()
 
         self.container.delete_child(normalized)
 
@@ -171,7 +171,7 @@ class ByteArrayView(
             raise ValueError("byte must be in range(0, 256)")
 
         self.ensure_created()
-        index = len(self)
+        index = self._len()
         self.container.put_child_primitive(index, value)
         self._set_length(index + 1)
 
@@ -184,7 +184,7 @@ class ByteArrayView(
             raise ValueError("byte must be in range(0, 256)")
 
         self.ensure_created()
-        length = len(self)
+        length = self._len()
 
         if index < 0:
             index = max(0, length + index)
@@ -200,7 +200,7 @@ class ByteArrayView(
 
     def pop(self, index: int = -1) -> int:
         """Remove and return byte at index."""
-        if len(self) == 0:
+        if self._len() == 0:
             raise IndexError("pop from empty bytearray")
 
         value = self[index]
@@ -213,7 +213,9 @@ class ByteArrayView(
             self.append(value)
 
     def remove(self, value: int) -> None:
-        """Remove first occurrence of byte value."""
+        """Remove first occurrence of byte value. On an absent bytearray, as on an empty one."""
+        if self._len() == 0:
+            raise ValueError(f"{value!r} is not in bytearray")
         for i, byte in enumerate(self):
             if byte == value:
                 del self[i]
@@ -263,7 +265,7 @@ class ByteArrayView(
             self.clear()
             count = 0
         else:
-            count = len(self)
+            count = self._len()
         for byte in value:
             self.container.put_child_primitive(count, byte)
             count += 1

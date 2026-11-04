@@ -14,7 +14,7 @@ from logging import getLogger
 from typing import TYPE_CHECKING, Generic, TypeVar, cast
 
 from virtuals.container import Container, NodeType, node_ops
-from virtuals.types import Empty, is_empty
+from virtuals.types import EMPTY, Empty, is_empty
 
 
 if TYPE_CHECKING:
@@ -65,8 +65,24 @@ class MetadataBasedChildrenCountBase:
     def __len__(self) -> int:
         """Get number of children.
 
+        A stored counter proves the container exists, so only a missing
+        counter costs a marker read: 0 on an existing container, and
+        ``ContainerNotFoundError`` (a ``KeyError``) on one never written.
+
         Returns:
             Number of children tracked in metadata
+        """
+        length = self.container.get_metadata("__len__", default=EMPTY)
+        if is_empty(length) or length is None:
+            self.container.require_exists()
+            return 0
+        return int(cast("int", length))
+
+    def _len(self) -> int:
+        """Stored length, 0 when missing. No existence check.
+
+        For writes and index math, where an absent container acts as an
+        empty one (point reads raise ``IndexError``, writes create).
         """
         length = cast("int", self.container.get_metadata("__len__", default=0))
         return int(length) if length is not None else 0
@@ -148,14 +164,18 @@ class LiveChildrenCountBase:
     def __len__(self) -> int:
         """Get number of children by counting them.
 
+        Raises ``ContainerNotFoundError`` (a ``KeyError``) on a container
+        that was never written; the count scan sees its marker row, so
+        this costs no extra read.
+
         Returns:
             Number of children (counted on each call)
         """
-        return sum(1 for _ in self.container.iter_child_keys())
+        return self.container.count_children(strict=True)
 
     def __bool__(self) -> bool:
         """True if any child exists. One row, so ``if view:`` never counts."""
-        return self.container.has_children()
+        return self.container.has_children(strict=True)
 
 
 class AddressMappingBase(Generic[A]):

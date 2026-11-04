@@ -39,7 +39,7 @@ from virtuals._views import (
     LightDictView,
     SetView,
 )
-from virtuals.container import ContainerTypeError
+from virtuals.container import ContainerNotFoundError, ContainerTypeError
 from virtuals.navigator import Navigator
 from virtuals.types import EMPTY
 
@@ -115,10 +115,8 @@ def test_delete_on_absent_view_does_not_create_it(root, view_cls):
     else:
         with pytest.raises(KeyError):
             del view[key]
-    assert not view.container.exists()
-    assert len(view) == 0
-    assert key not in view
-    assert list(view) == []
+    _assert_absent(view)
+    assert _lacks(view, key)
 
 
 @pytest.mark.parametrize("view_cls", (EagerDictView, FlatDictView, LightDictView))
@@ -129,7 +127,7 @@ def test_delete_on_absent_nested_view_leaves_the_chain_absent(root, view_cls):
     del inner["k"]
     assert not inner.container.exists()
     assert not outer.container.exists()
-    assert "a" not in root
+    assert _lacks(root, "a")
 
 
 @pytest.mark.parametrize("view_cls", SILENT_DELETE_VIEWS)
@@ -182,7 +180,7 @@ def test_set_empty_raises_and_stores_nothing(root, view_cls):
     assert _rows_under(view) == rows
     assert len(view) == 1
     assert list(view) == [_key(view_cls, 1)]
-    assert _key(view_cls, 2) not in view
+    assert _lacks(view, _key(view_cls, 2))
     assert list(view.items()) == [(_key(view_cls, 1), 1)]
 
 
@@ -201,8 +199,8 @@ def test_store_and_update_with_empty_raise(root, view_cls):
         view.store({_key(view_cls, 1): 1, _key(view_cls, 2): EMPTY})
     with pytest.raises(ValueError, match="EMPTY"):
         view.update({_key(view_cls, 3): EMPTY})
-    assert _key(view_cls, 2) not in view
-    assert _key(view_cls, 3) not in view
+    assert _lacks(view, _key(view_cls, 2))
+    assert _lacks(view, _key(view_cls, 3))
 
 
 @pytest.mark.parametrize("view_cls", NESTED_VIEWS)
@@ -235,7 +233,7 @@ def test_fractional_insert_empty_leaves_no_trace(root):
     ):
         with pytest.raises(ValueError, match="EMPTY"):
             op()
-        assert "e" not in view
+        assert _lacks(view, "e")
         assert len(view) == 1
         assert list(view) == ["a"]
         assert view.get("e", "dflt") == "dflt"
@@ -273,13 +271,13 @@ def test_erase_then_len_agrees_everywhere(storage, view_cls):
         del view[keys[1]]
         assert len(view) == 2
         assert list(view) == [keys[0], keys[2]]
-        assert keys[1] not in view
+        assert _lacks(view, keys[1])
         assert bool(view)
     with storage.transaction() as tx:
         view = Navigator(storage).root(tx).open_child("d", view_cls)
         assert len(view) == 2
         assert sorted(view, key=str) == sorted([keys[0], keys[2]], key=str)
-        assert keys[1] not in view
+        assert _lacks(view, keys[1])
         del view[keys[0]]
         del view[keys[2]]
         assert len(view) == 0
@@ -301,7 +299,7 @@ def test_erase_compound_entry_then_len(storage, view_cls):
         assert len(view) == 2
         del view["b"]
         assert len(view) == 1
-        assert "b" not in view
+        assert _lacks(view, "b")
         assert list(view.items()) == [("a", 1)]
     with storage.transaction() as tx:
         view = Navigator(storage).root(tx).open_child("d", view_cls)
@@ -310,7 +308,8 @@ def test_erase_compound_entry_then_len(storage, view_cls):
         # Nothing of the old subtree is left under the key.
         child = view.open_child("b", EagerDictView)
         assert not child.container.exists()
-        assert len(child) == 0
+        with pytest.raises(ContainerNotFoundError):
+            len(child)
 
 
 @pytest.mark.parametrize("view_cls", [v for v in DICT_VIEWS if hasattr(v, "pop")])
@@ -373,7 +372,7 @@ def test_edge_keys_round_trip(storage, view_cls):
             del view[key]
         assert len(view) == len(keys) - len(keys[::2])
         for key in keys[::2]:
-            assert key not in view
+            assert _lacks(view, key)
         for key in keys[1::2]:
             assert key in view
 
@@ -435,7 +434,7 @@ def test_true_and_one_are_the_same_key(root, view_cls):
     # back an int, mem keeps the last object written. They compare equal.
     assert next(iter(view)) == 1
     del view[True]
-    assert 1 not in view
+    assert _lacks(view, 1)
     assert len(view) == 0
 
 
@@ -566,9 +565,10 @@ def test_bool_is_one_seek_on_every_live_counted_view(costed, view_cls):
 
 
 @pytest.mark.parametrize("view_cls", (LightDictView, EagerKh57View))
-def test_bool_on_absent_flat_view_is_false_and_writes_nothing(root, view_cls):
+def test_bool_on_absent_flat_view_raises_and_writes_nothing(root, view_cls):
     view = root.open_child("absent", view_cls)
-    assert not view
+    with pytest.raises(ContainerNotFoundError):
+        bool(view)
     assert not view.container.exists()
     assert _rows_under(view) == []
     view[_key(view_cls, 1)] = 1
@@ -668,7 +668,7 @@ def test_log_indexed_delete_with_stale_reverse_row_falls_back_to_scan(root):
     assert view._log_container().get_child_primitive_unsafe("a") == stale
     assert view["a"] == 10
     del view["a"]
-    assert "a" not in view
+    assert _lacks(view, "a")
     assert list(view) == ["c", "e"]
     assert len(view) == 2
     assert list(view.items()) == [("c", 3), ("e", 5)]
@@ -738,7 +738,7 @@ def test_log_indexed_old_data_survives_a_fresh_transaction(storage):
         view = Navigator(storage).root(tx).open_child("d", EagerLogIndexedDictView)
         assert list(view) == ["b"]
         assert len(view) == 1
-        assert "a" not in view
+        assert _lacks(view, "a")
 
 
 # ============================================================================
@@ -757,7 +757,7 @@ def test_nested_empty_leaves_no_partial_child(root, view_cls):
     ):
         with pytest.raises(ValueError, match="EMPTY"):
             view["y"] = bad
-        assert "y" not in view
+        assert _lacks(view, "y")
         assert len(view) == 1
         assert list(view) == ["keep"]
         assert not view.open_child("y", EagerDictView).container.exists()
@@ -779,7 +779,7 @@ def test_set_child_container_as_nested_empty_leaves_no_partial_child(root, view_
         with pytest.raises(ValueError, match="EMPTY"):
             view.set_child_container_as(bad, value, EagerDictView)
         assert _rows_under(view) == rows
-        assert bad not in view
+        assert _lacks(view, bad)
         assert len(view) == 1
         assert list(view) == [keep]
         assert not view.open_child(bad, EagerDictView).container.exists()
@@ -787,7 +787,7 @@ def test_set_child_container_as_nested_empty_leaves_no_partial_child(root, view_
     with pytest.raises(ValueError, match="EMPTY"):
         view.set_child_container_as(bad, (x for x in [1, {"y": EMPTY}]), EagerListView)
     assert _rows_under(view) == rows
-    assert bad not in view
+    assert _lacks(view, bad)
     assert list(view) == [keep]
     assert not view.open_child(bad, EagerListView).container.exists()
     # and a clean lazy iterable is stored once, whole
@@ -802,10 +802,8 @@ def test_set_child_container_as_nested_empty_on_absent_view_leaves_it_absent(roo
         view.set_child_container_as(_key(view_cls, 1), {"bad": EMPTY}, EagerDictView)
     with pytest.raises(ValueError, match="EMPTY"):
         view.set_child_container_as(_key(view_cls, 1), (x for x in [EMPTY]), EagerListView)
-    assert not view.container.exists()
     assert _rows_under(view) == []
-    assert len(view) == 0
-    assert list(view) == []
+    _assert_absent(view)
 
 
 def test_list_set_child_container_as_nested_empty_writes_nothing(root):
@@ -846,7 +844,7 @@ def test_fractional_nested_empty_insert_leaves_no_trace(root):
     view.store({"a": 1, "b": 2})
     with pytest.raises(ValueError, match="EMPTY"):
         view.insert_after("a", "x", {"ok": 1, "bad": {"z": EMPTY}})
-    assert "x" not in view
+    assert _lacks(view, "x")
     assert len(view) == 2
     assert list(view) == ["a", "b"]
     assert view.get("x") is EMPTY
@@ -1069,7 +1067,7 @@ def test_access_mimics_dict_with_empty_as_the_absent_default(storage, view_cls):
         assert view.get(absent) is EMPTY
         assert view.get(absent, "dflt") == "dflt"
         assert view.get(absent, None) is None
-        assert absent not in view
+        assert _lacks(view, absent)
 
     def check_stored_none(view):
         assert key in view
@@ -1096,7 +1094,7 @@ def test_access_mimics_dict_with_empty_as_the_absent_default(storage, view_cls):
             view.pop(absent)
         assert view.pop(absent, "dflt") == "dflt"
         assert view.pop(key) is None
-        assert key not in view
+        assert _lacks(view, key)
 
 
 @pytest.mark.parametrize("view_cls", ACCESS_VIEWS)
@@ -1168,7 +1166,7 @@ def test_a_key_the_view_cannot_hold_is_absent_on_reads_and_rejected_on_writes(ro
             view[bad]
         assert view.get(bad) is EMPTY
         assert view.get(bad, "dflt") == "dflt"
-        assert bad not in view
+        assert _lacks(view, bad)
         with pytest.raises((TypeError, ValueError)):
             view[bad] = 2
         if view_cls in SILENT_DELETE_VIEWS:
@@ -1193,7 +1191,7 @@ def test_kh57_reads_follow_python_int_key_semantics(root, view_cls):
         assert alias in view
         assert view[alias] == "one"
         assert view.get(alias) == "one"
-    assert 1.5 not in view
+    assert _lacks(view, 1.5)
     assert view.get(1.5) is EMPTY
     with pytest.raises(KeyError):
         view[1.5]
@@ -1202,7 +1200,7 @@ def test_kh57_reads_follow_python_int_key_semantics(root, view_cls):
     view[True] = "uno"
     assert view[1] == "uno"
     del view[1.0]
-    assert 1 not in view
+    assert _lacks(view, 1)
     assert len(view) == 0
 
 
@@ -1220,11 +1218,20 @@ ALL_CLEARABLE_VIEWS = (
 )
 
 
+def _lacks(view, key):
+    """``key not in view``; ``in`` on a never-written view raises, which also means not there."""
+    try:
+        return key not in view
+    except ContainerNotFoundError:
+        return not view.container.exists()
+
+
 def _assert_absent(view):
+    """Absent: no marker, and reads that need the container raise (a KeyError)."""
     assert not view.container.exists()
-    assert len(view) == 0
-    assert not view
-    assert list(view) == []
+    for read in (len, bool, list):
+        with pytest.raises(ContainerNotFoundError):
+            read(view)
 
 
 @pytest.mark.parametrize("view_cls", (EagerListView, LazyListView, ByteArrayView))
@@ -1259,7 +1266,7 @@ def test_set_discard_and_remove_on_absent_set_do_not_create_it(root):
     with pytest.raises(KeyError):
         view.remove("x")
     _assert_absent(view)
-    assert "x" not in view
+    assert _lacks(view, "x")
 
 
 def test_set_discard_of_a_member_still_deletes_it(root):
@@ -1270,7 +1277,7 @@ def test_set_discard_of_a_member_still_deletes_it(root):
     view.remove("y")
     assert view.container.exists()
     assert len(view) == 0
-    assert "x" not in view
+    assert _lacks(view, "x")
 
 
 @pytest.mark.parametrize("view_cls", (EagerListView, LazyListView, FlatListView, ByteArrayView))
@@ -1289,7 +1296,7 @@ def test_clear_on_absent_view_leaves_it_absent(root, view_cls):
     view = root.open_child("absent", view_cls)
     view.clear()
     _assert_absent(view)
-    assert "absent" not in root
+    assert _lacks(root, "absent")
 
 
 @pytest.mark.parametrize("view_cls", ALL_CLEARABLE_VIEWS)

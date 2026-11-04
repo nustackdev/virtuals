@@ -32,12 +32,19 @@ from __future__ import annotations
 
 import heapq
 from collections.abc import ItemsView, KeysView, ValuesView
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, TypeVar
 
 from kh57 import kh57
 from kh57 import sample as kh57_sample
 
-from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType, node_ops
+from virtuals.container import (
+    Container,
+    ContainerProtocol,
+    ContainerStructure,
+    NodeType,
+    node_ops,
+    scan_or_absent,
+)
 from virtuals.tkv.filter import LengthFilter, PrefixFilter
 from virtuals.tkv.storage import StorageScanOptions
 from virtuals.types import EMPTY, Empty
@@ -80,6 +87,7 @@ _KEY_MASK = (1 << _LEVEL_BITS) - 1
 # via the backend, which safely returns empty for out-of-range slices.
 _LEVELS = 64
 _MAX_INT64_PLUS_1 = 1 << 63
+T = TypeVar("T")
 
 
 # =============================================================================
@@ -343,7 +351,7 @@ class Kh57ViewBase(
             key = self._read_key(obj)
         except KeyError:
             return False
-        return self.container.exists_child(kh57(key))
+        return self.container.exists_child(kh57(key), strict=True)
 
     # -- Mutations --------------------------------------------------------
 
@@ -405,7 +413,7 @@ class Kh57ViewBase(
     def __iter__(self) -> Generator[int, None, None]:
         """Yield keys in original int order via k-way merge across levels."""
         level_iters = [self._iter_level_keys(level) for level in range(_LEVELS)]
-        yield from heapq.merge(*level_iters)
+        yield from self._or_absent(heapq.merge(*level_iters))
 
     # -- Range ------------------------------------------------------------
 
@@ -435,7 +443,7 @@ class Kh57ViewBase(
         if begin >= end:
             return
         level_iters = [self._iter_level_items(level, begin, end) for level in range(_LEVELS)]
-        for key, info in heapq.merge(*level_iters, key=lambda kv: kv[0]):
+        for key, info in self._or_absent(heapq.merge(*level_iters, key=lambda kv: kv[0])):
             if info.node_type == NodeType.PRIMITIVE:
                 yield key, info.primitive_value
             else:
@@ -466,7 +474,14 @@ class Kh57ViewBase(
         the queried range. Delegates to ``kh57.sample`` via the container
         adapter.
         """
-        return kh57_sample(self._make_backend(), n, begin, end, rng=rng)
+        samples = kh57_sample(self._make_backend(), n, begin, end, rng=rng)
+        if not samples:
+            self.container.require_exists()
+        return samples
+
+    def _or_absent(self, rows: Iterator[T]) -> Generator[T, None, None]:
+        """``rows``, raising on a never-written view when there are none."""
+        return scan_or_absent(rows, self.container.site, self.container.ctx)
 
     def get(self, address: int, default: object | Empty = EMPTY) -> object | Empty:
         """Return item at `address` or `default` if absent."""
@@ -536,7 +551,7 @@ class EagerKh57View(Kh57ViewBase):
         level_iters = [
             self._iter_level_items(level, 0, 1 << _LEVEL_BITS) for level in range(_LEVELS)
         ]
-        for key, info in heapq.merge(*level_iters, key=lambda kv: kv[0]):
+        for key, info in self._or_absent(heapq.merge(*level_iters, key=lambda kv: kv[0])):
             if info.node_type == NodeType.PRIMITIVE:
                 yield key, info.primitive_value
             else:
@@ -612,7 +627,7 @@ class LazyKh57View(Kh57ViewBase):
         level_iters = [
             self._iter_level_items(level, 0, 1 << _LEVEL_BITS) for level in range(_LEVELS)
         ]
-        for key, info in heapq.merge(*level_iters, key=lambda kv: kv[0]):
+        for key, info in self._or_absent(heapq.merge(*level_iters, key=lambda kv: kv[0])):
             if info.node_type == NodeType.PRIMITIVE:
                 yield key, info.primitive_value
             else:

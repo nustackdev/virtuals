@@ -102,8 +102,12 @@ class ListViewBase(
         return isinstance(address, int) and address >= 0
 
     def normalize_address(self, address: int) -> int:
-        """Normalize index, handling negative indices."""
-        length = len(self)
+        """Normalize index, handling negative indices.
+
+        Uses the stored length with no existence check: an index on an
+        absent list is out of range, like on an empty one.
+        """
+        length = self._len()
 
         if address < 0:
             address = length + address
@@ -174,7 +178,7 @@ class ListViewBase(
         """
         normalized = self.normalize_address(address)  # IndexError before any write
         self.ensure_created()
-        length = len(self)
+        length = self._len()
 
         self.container.delete_child(normalized)
 
@@ -191,7 +195,7 @@ class ListViewBase(
 
     def append(self, value: object) -> None:
         """Append value to end."""
-        index = len(self)
+        index = self._len()
         self._set_child_value(index, value)
         self._set_length(index + 1)
 
@@ -199,7 +203,7 @@ class ListViewBase(
         """Insert value at index, shifting later items."""
         self._reject_empty(address, value)
         self.ensure_created()
-        length = len(self)
+        length = self._len()
 
         if address < 0:
             address = max(0, length + address)
@@ -237,7 +241,9 @@ class ListViewBase(
             self.append(value)
 
     def remove(self, value: object) -> None:
-        """Remove first occurrence of value."""
+        """Remove first occurrence of value. On an absent list, as on an empty one."""
+        if self._len() == 0:
+            raise ValueError(f"{value!r} is not in list")
         for i, item in enumerate(self):
             if item == value:
                 del self[i]
@@ -257,7 +263,7 @@ class ListViewBase(
             self.clear()
             count = 0
         else:
-            count = len(self)
+            count = self._len()
         for item in value:
             self._set_child_value(count, item)
             count += 1
@@ -297,7 +303,7 @@ class EagerListView(ListViewBase):
 
     def __iter__(self) -> Generator[Value, None, None]:
         """Iterate over items — yields extracted Python values."""
-        for k, v in self.container.iter_children():
+        for k, v in self.container.iter_children(strict=True):
             if v.node_type == NodeType.PRIMITIVE:
                 yield v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
@@ -318,7 +324,7 @@ class EagerListView(ListViewBase):
 
     def pop(self, address: int = -1) -> object | Empty:
         """Remove and return item at index."""
-        if len(self) == 0:
+        if self._len() == 0:
             raise IndexError("pop from empty list")
 
         value = self[address]
@@ -423,7 +429,7 @@ class LazyListView(ListViewBase):
 
     def __iter__(self) -> Generator[object, None, None]:
         """Iterate — yields Views for containers, values for primitives."""
-        for k, v in self.container.iter_children():
+        for k, v in self.container.iter_children(strict=True):
             if v.node_type == NodeType.PRIMITIVE:
                 yield v.primitive_value
             elif v.node_type == NodeType.CONTAINER:

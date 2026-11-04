@@ -223,6 +223,18 @@ class ViewsMachine(RuleBasedStateMachine):
         self.storage.open()
         self.codec = self.storage.codec
         self.nav = Navigator(self.storage)
+        # the model starts from five existing, empty containers: reads on a
+        # never-written container raise, which the models do not track
+        with self.storage.transaction() as tx:
+            r = self.nav.root(tx)
+            for name, cls in (
+                ("d", EagerDictView),
+                ("l", EagerLogIndexedDictView),
+                ("f", EagerFractionalIndexedDictView),
+                ("ls", EagerListView),
+                ("s", SetView),
+            ):
+                r.ensure_child(name, cls)
         # committed models
         self.c_dict: dict = {}
         self.c_log: dict = {}  # insertion ordered

@@ -70,8 +70,8 @@ class FlatListView(
         return isinstance(address, int) and address >= 0
 
     def normalize_address(self, address: int) -> int:
-        """Normalize index, handling negative indices."""
-        length = len(self)
+        """Normalize index, handling negative indices. No existence check."""
+        length = self._len()
         if address < 0:
             address = length + address
         if address < 0 or address >= length:
@@ -90,7 +90,7 @@ class FlatListView(
 
     def __iter__(self) -> Generator[Value, None, None]:
         """Iterate over values via prefix scan (flat primitives only)."""
-        for _k, v in self.container.iter_children(validate=False):
+        for _k, v in self.container.iter_children(validate=False, strict=True):
             yield cast("Value", v.primitive_value)
 
     def __contains__(self, obj: object) -> bool:
@@ -105,7 +105,7 @@ class FlatListView(
         """Append a primitive value.  O(1): one primitive write + one metadata write."""
         self._reject_empty_in(value)
         self.ensure_created()
-        index = len(self)
+        index = self._len()
         self.container.put_child_primitive(index, value)
         self._set_length(index + 1)
 
@@ -137,7 +137,7 @@ class FlatListView(
             self.clear()
             count = 0
         else:
-            count = len(self)
+            count = self._len()
         for item in value:
             self.container.put_child_primitive(count, item)
             count += 1
@@ -150,7 +150,7 @@ class FlatListView(
         for item in values:
             if index is None:  # created on the first item: extend([]) writes nothing
                 self.ensure_created()
-                index = len(self)
+                index = self._len()
             self.container.put_child_primitive(index, item)
             index += 1
         if index is not None:

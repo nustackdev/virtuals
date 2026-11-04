@@ -28,7 +28,7 @@ from virtuals.collections import (
     is_sizeable,
     is_subscriptable,
 )
-from virtuals.container import Container
+from virtuals.container import Container, ContainerNotFoundError
 from virtuals.loc import DATA_ROOT
 from virtuals.navigator import Navigator
 from virtuals.tkv.storage import TransactionProtocol
@@ -160,7 +160,10 @@ class TestDictViewLength:
     """Test length tracking via metadata."""
 
     def test_len_empty(self, view: DictView) -> None:
-        """Test len() on empty view."""
+        """len() on a never-written view raises; on a created empty one it is 0."""
+        with pytest.raises(ContainerNotFoundError):
+            len(view)
+        view.ensure_created()
         assert len(view) == 0
 
     def test_len_after_single_insert(self, view: DictView) -> None:

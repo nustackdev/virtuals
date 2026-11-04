@@ -92,7 +92,7 @@ class FrozenSetView(
             True if value in set
         """
         key = self._make_key(obj)
-        return self.container.exists_child(key)
+        return self.container.exists_child(key, strict=True)
 
     def __iter__(self) -> Generator[object, None, None]:
         """Iterate over values.
@@ -100,7 +100,7 @@ class FrozenSetView(
         Yields:
             Values in set
         """
-        for key in self.container.iter_child_keys():
+        for key in self.container.iter_child_keys(strict=True):
             stored_value = self.container.get_child_primitive(key)
             if not is_empty(stored_value):
                 yield stored_value

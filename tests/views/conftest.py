@@ -74,6 +74,8 @@ def dict_factory(root_view: EagerDictView) -> Callable[[str, dict[str, Any] | No
         view = root_view.open_child(address, EagerDictView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()  # a factory makes the view, empty or not
         return view
 
     return _create
@@ -89,6 +91,8 @@ def list_factory(root_view: EagerDictView) -> Callable[[str, list[Any] | None], 
         view = root_view.open_child(address, EagerListView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()  # a factory makes the view, empty or not
         return view
 
     return _create
@@ -104,6 +108,8 @@ def set_factory(root_view: EagerDictView) -> Callable[[str, set[Any] | None], Vi
         view = root_view.open_child(address, SetView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()  # a factory makes the view, empty or not
         return view
 
     return _create
@@ -119,6 +125,8 @@ def tuple_factory(root_view: EagerDictView) -> Callable[[str, tuple[Any, ...] | 
         view = root_view.open_child(address, TupleView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()  # a factory makes the view, empty or not
         return view
 
     return _create
@@ -134,6 +142,8 @@ def frozenset_factory(root_view: EagerDictView) -> Callable[[str, frozenset[Any]
         view = root_view.open_child(address, FrozenSetView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()  # a factory makes the view, empty or not
         return view
 
     return _create
@@ -149,6 +159,8 @@ def bytearray_factory(root_view: EagerDictView) -> Callable[[str, bytearray | No
         view = root_view.open_child(address, ByteArrayView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()  # a factory makes the view, empty or not
         return view
 
     return _create
@@ -164,6 +176,8 @@ def flat_dict_factory(root_view: EagerDictView) -> Callable[[str, dict[str, Any]
         view = root_view.open_child(address, FlatDictView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()  # a factory makes the view, empty or not
         return view
 
     return _create
@@ -179,6 +193,8 @@ def flat_list_factory(root_view: EagerDictView) -> Callable[[str, list[Any] | No
         view = root_view.open_child(address, FlatListView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()  # a factory makes the view, empty or not
         return view
 
     return _create
@@ -194,6 +210,8 @@ def light_dict_factory(root_view: EagerDictView) -> Callable[[str, dict[str, Any
         view = root_view.open_child(address, LightDictView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()  # a factory makes the view, empty or not
         return view
 
     return _create
@@ -211,6 +229,8 @@ def log_indexed_dict_factory(
         view = root_view.open_child(address, EagerLogIndexedDictView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()  # a factory makes the view, empty or not
         return view
 
     return _create
@@ -228,6 +248,8 @@ def indexed_dict_factory(
         view = root_view.open_child(address, EagerIndexedDictView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()  # a factory makes the view, empty or not
         return view
 
     return _create
@@ -246,6 +268,8 @@ def kh57_factory(
         if data is not None:
             for k, v in data.items():
                 view[k] = v
+        else:
+            view.ensure_created()
         return view
 
     return _create

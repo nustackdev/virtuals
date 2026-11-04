@@ -18,6 +18,8 @@ def log_dict_factory(root_view):
         view = root_view.open_child(address, EagerLogIndexedDictView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()
         return view
 
     return _create

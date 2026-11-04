@@ -351,11 +351,13 @@ class LogIndexedDictViewBase(
                 filter=prefix & child_len,
             )
 
+        from virtuals.container import scan_or_absent
         from virtuals.container.context import require_read_context
 
         rctx = require_read_context(kc.ctx)
+        rows = scan_or_absent(rctx.scan(opts).items(), self.container.site, kc.ctx)
         yielded = 0
-        for key, value in rctx.scan(opts).items():
+        for key, value in rows:
             log_key = key[-1]
             if log_key == cursor:
                 continue
@@ -376,7 +378,9 @@ class LogIndexedDictViewBase(
 
     def __contains__(self, obj: str | int) -> bool:
         """Check if key exists. A key the view cannot hold is not in it."""
-        return is_view_key(obj) and self._data_container().exists_child(obj)
+        return is_view_key(obj) and self._data_container().exists_child(
+            obj, strict=True, owner=self.container.site
+        )
 
     def __iter__(self) -> Generator[str | int, None, None]:
         for _log_key, actual_key in self._scan_log_keys():

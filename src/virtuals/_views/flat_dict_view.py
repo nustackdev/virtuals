@@ -111,11 +111,11 @@ class FlatDictView(
 
     def __contains__(self, key: str | int) -> bool:
         """Check if key exists. A key the view cannot hold is not in it."""
-        return is_view_key(key) and self.container.exists_child(key)
+        return is_view_key(key) and self.container.exists_child(key, strict=True)
 
     def __iter__(self) -> Generator[str | int, None, None]:
         """Iterate over keys."""
-        yield from self.container.iter_child_keys(validate=False)
+        yield from self.container.iter_child_keys(validate=False, strict=True)
 
     def get(self, key: str | int, default: Value | Empty = EMPTY) -> Value | Empty:
         """Get value with default fallback."""
@@ -193,7 +193,7 @@ class _FlatValuesView(ValuesView):
     _mapping: FlatDictView
 
     def __iter__(self) -> Generator[Value, None, None]:  # type: ignore[override]
-        for _k, v in self._mapping.container.iter_children(validate=False):
+        for _k, v in self._mapping.container.iter_children(validate=False, strict=True):
             yield cast("Value", v.primitive_value)
 
 
@@ -203,7 +203,7 @@ class _FlatItemsView(ItemsView):
     _mapping: FlatDictView
 
     def __iter__(self) -> Generator[tuple[str | int, Value], None, None]:  # type: ignore[override]
-        for k, v in self._mapping.container.iter_children(validate=False):
+        for k, v in self._mapping.container.iter_children(validate=False, strict=True):
             yield k, cast("Value", v.primitive_value)
 
 

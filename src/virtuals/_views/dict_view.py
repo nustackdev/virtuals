@@ -114,11 +114,11 @@ class DictViewBase(
 
     def __contains__(self, obj: str | int) -> bool:
         """Check if key exists. A key the view cannot hold is not in it."""
-        return is_view_key(obj) and self.container.exists_child(obj)
+        return is_view_key(obj) and self.container.exists_child(obj, strict=True)
 
     def __iter__(self) -> Generator[str | int, None, None]:
         """Iterate over keys."""
-        yield from self.container.iter_child_keys(validate=False)
+        yield from self.container.iter_child_keys(validate=False, strict=True)
 
     def keys(self) -> KeysView[str | int]:
         """Get all keys as a set-like view.
@@ -254,7 +254,7 @@ class EagerDictView(DictViewBase):
 
     def _iter_values(self) -> Generator[object, None, None]:
         """Efficient single-pass value iteration over storage."""
-        for k, v in self.container.iter_children(validate=False):
+        for k, v in self.container.iter_children(validate=False, strict=True):
             if v.node_type == NodeType.PRIMITIVE:
                 yield v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
@@ -262,7 +262,7 @@ class EagerDictView(DictViewBase):
 
     def _iter_items(self) -> Generator[tuple[str | int, object], None, None]:
         """Efficient single-pass items iteration over storage."""
-        for k, v in self.container.iter_children(validate=False):
+        for k, v in self.container.iter_children(validate=False, strict=True):
             if v.node_type == NodeType.PRIMITIVE:
                 yield k, v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
@@ -270,7 +270,7 @@ class EagerDictView(DictViewBase):
 
     def _iter_values_reverse(self) -> Generator[object, None, None]:
         """Efficient single-pass reverse value iteration over storage."""
-        for k, v in self.container.iter_children(validate=False, reverse=True):
+        for k, v in self.container.iter_children(validate=False, strict=True, reverse=True):
             if v.node_type == NodeType.PRIMITIVE:
                 yield v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
@@ -278,7 +278,7 @@ class EagerDictView(DictViewBase):
 
     def _iter_items_reverse(self) -> Generator[tuple[str | int, object], None, None]:
         """Efficient single-pass reverse items iteration over storage."""
-        for k, v in self.container.iter_children(validate=False, reverse=True):
+        for k, v in self.container.iter_children(validate=False, strict=True, reverse=True):
             if v.node_type == NodeType.PRIMITIVE:
                 yield k, v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
@@ -404,7 +404,7 @@ class LazyDictView(DictViewBase):
 
     def _iter_values(self) -> Generator[object, None, None]:
         """Efficient single-pass value iteration over storage."""
-        for k, v in self.container.iter_children(validate=False):
+        for k, v in self.container.iter_children(validate=False, strict=True):
             if v.node_type == NodeType.PRIMITIVE:
                 yield v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
@@ -412,7 +412,7 @@ class LazyDictView(DictViewBase):
 
     def _iter_items(self) -> Generator[tuple[str | int, object], None, None]:
         """Efficient single-pass items iteration over storage."""
-        for k, v in self.container.iter_children(validate=False):
+        for k, v in self.container.iter_children(validate=False, strict=True):
             if v.node_type == NodeType.PRIMITIVE:
                 yield k, v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
@@ -420,7 +420,7 @@ class LazyDictView(DictViewBase):
 
     def _iter_values_reverse(self) -> Generator[object, None, None]:
         """Efficient single-pass reverse value iteration over storage."""
-        for k, v in self.container.iter_children(validate=False, reverse=True):
+        for k, v in self.container.iter_children(validate=False, strict=True, reverse=True):
             if v.node_type == NodeType.PRIMITIVE:
                 yield v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
@@ -428,7 +428,7 @@ class LazyDictView(DictViewBase):
 
     def _iter_items_reverse(self) -> Generator[tuple[str | int, object], None, None]:
         """Efficient single-pass reverse items iteration over storage."""
-        for k, v in self.container.iter_children(validate=False, reverse=True):
+        for k, v in self.container.iter_children(validate=False, strict=True, reverse=True):
             if v.node_type == NodeType.PRIMITIVE:
                 yield k, v.primitive_value
             elif v.node_type == NodeType.CONTAINER:

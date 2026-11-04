@@ -158,14 +158,20 @@ class IndexedDictViewBase(
     # -- Membership & keys (same for both facets) ---------------------------
 
     def __len__(self) -> int:
-        return len(self._keys_view())
+        """Key count from ``__keys__/``. Raises on a never-written view (a KeyError)."""
+        length = self._keys_view()._len()
+        if length == 0:
+            self.container.require_exists()
+        return length
 
     def __contains__(self, obj: str | int) -> bool:
         """Check if key exists. A key the view cannot hold is not in it."""
-        return is_view_key(obj) and self._data_container().exists_child(obj)
+        return is_view_key(obj) and self._data_container().exists_child(
+            obj, strict=True, owner=self.container.site
+        )
 
     def __iter__(self) -> Generator[str | int, None, None]:
-        yield from self._keys_view()
+        yield from self._iter_ordered_keys()
 
     def key_at(self, idx: int) -> str | int:
         """Get key at index — single O(1) read from __keys__ FlatListView."""
@@ -345,7 +351,9 @@ class IndexedDictViewBase(
     ) -> Generator[str | int, None, None]:
         """Yield actual keys from `__keys__/` in insertion order (or reversed)."""
         kc = self._keys_view().container
-        for _idx, node_info in kc.iter_children(validate=False, reverse=reverse):
+        for _idx, node_info in kc.iter_children(
+            validate=False, reverse=reverse, strict=True, owner=self.container.site
+        ):
             yield cast("str | int", node_info.primitive_value)
 
 

@@ -87,9 +87,9 @@ class TupleView(
             Normalized positive index
 
         Raises:
-            IndexError: If index out of bounds
+            IndexError: If index out of bounds (also on an absent tuple)
         """
-        length = len(self)
+        length = self._len()
 
         if address < 0:
             address = length + address
@@ -202,7 +202,7 @@ class TupleView(
             self.container.clear_children()
             count = 0
         else:
-            count = len(self)
+            count = self._len()
         for item in value:
             self._set_child_value(count, item)
             count += 1

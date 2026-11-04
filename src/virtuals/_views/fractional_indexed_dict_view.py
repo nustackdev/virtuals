@@ -92,7 +92,13 @@ import contextlib
 from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType
+from virtuals.container import (
+    Container,
+    ContainerProtocol,
+    ContainerStructure,
+    NodeType,
+    scan_or_absent,
+)
 from virtuals.container.context import require_read_context
 from virtuals.tkv.filter import LengthFilter, PrefixFilter, WildcardFilter
 from virtuals.tkv.observer import SubscriptionOptions
@@ -232,6 +238,7 @@ class FractionalIndexedDictViewBase(
         reverse: bool = False,
         limit: int | None = None,
         skip: tuple[str, ...] = (),
+        strict: bool = True,
     ) -> Generator[tuple[str, Address], None, None]:
         """Scan ``__order__/`` rows as ``(okey, id)``.
 
@@ -241,6 +248,9 @@ class FractionalIndexedDictViewBase(
             reverse: scan descending.
             limit: cap on yielded rows, counted after ``skip`` is applied.
             skip: order keys to drop (the cursor row, a moving row).
+            strict: reads: an empty scan on a never-written view raises
+                ``ContainerNotFoundError``; any row found proves the view
+                exists. Writes, which created the view already, pass False.
         """
         oc = self._order_container()
         site = oc.site
@@ -267,8 +277,11 @@ class FractionalIndexedDictViewBase(
                 filter=prefix & child_len,
             )
         rctx = require_read_context(oc.ctx)
+        rows = rctx.scan(opts).items()
+        if strict:
+            rows = scan_or_absent(rows, self.container.site, oc.ctx)
         yielded = 0
-        for key, value in rctx.scan(opts).items():
+        for key, value in rows:
             okey = key[-1]
             if okey in skip:
                 continue
@@ -277,9 +290,9 @@ class FractionalIndexedDictViewBase(
             if limit is not None and yielded >= limit:
                 return
 
-    def _edge(self, *, last: bool) -> tuple[str, Address] | None:
+    def _edge(self, *, last: bool, strict: bool = True) -> tuple[str, Address] | None:
         """First or last ``(okey, id)``. One seek."""
-        for row in self._scan_order(reverse=last, limit=1):
+        for row in self._scan_order(reverse=last, limit=1, strict=strict):
             return row
         return None
 
@@ -287,7 +300,10 @@ class FractionalIndexedDictViewBase(
         self, okey: str, *, before: bool, skip: tuple[str, ...] = ()
     ) -> tuple[str, Address] | None:
         """Row directly before or after ``okey``. One seek."""
-        for row in self._scan_order(start=okey, reverse=before, limit=1, skip=(okey, *skip)):
+        rows = self._scan_order(
+            start=okey, reverse=before, limit=1, skip=(okey, *skip), strict=False
+        )
+        for row in rows:
             return row
         return None
 
@@ -339,9 +355,11 @@ class FractionalIndexedDictViewBase(
             below = (
                 []
                 if prev is None
-                else list(self._scan_order(start=prev, reverse=True, limit=limit))
+                else list(self._scan_order(start=prev, reverse=True, limit=limit, strict=False))
             )
-            above = [] if nxt is None else list(self._scan_order(start=nxt, limit=limit))
+            above = (
+                [] if nxt is None else list(self._scan_order(start=nxt, limit=limit, strict=False))
+            )
             lo = hi = None
             if k is not None and len(below) > k:
                 lo, below = below[k][0], below[:k]
@@ -401,7 +419,7 @@ class FractionalIndexedDictViewBase(
         """
         if not is_empty(self._position_or_empty(address)):
             return
-        last = self._edge(last=True)
+        last = self._edge(last=True, strict=False)
         self._place(address, None if last is None else last[0], None)
 
     def _rebuild_bookkeeping(self) -> None:
@@ -417,7 +435,7 @@ class FractionalIndexedDictViewBase(
         data_keys = list(self._data_container().iter_child_keys(validate=False))
         present = set(data_keys)
         seen: dict[Address, str] = {}
-        for okey, address in list(self._scan_order()):
+        for okey, address in list(self._scan_order(strict=False)):
             if address in present and address not in seen:
                 seen[address] = okey
             else:
@@ -430,12 +448,12 @@ class FractionalIndexedDictViewBase(
                 pc.put_child_primitive(address, want, validate=False, validate_parent=False)
         for address in data_keys:
             if address not in seen:
-                last = self._edge(last=True)
+                last = self._edge(last=True, strict=False)
                 self._place(address, None if last is None else last[0], None)
 
     def respace(self) -> None:
         """Rewrite every order key short and evenly spaced. O(n), order kept."""
-        rows = list(self._scan_order())
+        rows = list(self._scan_order(strict=False))
         if not rows:
             return
         oc = self._order_container()
@@ -476,14 +494,17 @@ class FractionalIndexedDictViewBase(
 
     def __len__(self) -> int:
         """Live count of ``__pos__`` rows. O(n) over primitive rows, no stored length."""
-        return self._pos_container().count_children()
+        return self._pos_container().count_children(strict=True, owner=self.container.site)
 
     def __bool__(self) -> bool:
         """True if any id is ordered. One seek, so ``if view:`` never counts."""
         return self._edge(last=False) is not None
 
     def __contains__(self, obj: Address) -> bool:
-        return not is_empty(self._position_or_empty(obj))
+        if not is_empty(self._position_or_empty(obj)):
+            return True
+        self.container.require_exists()  # a miss: is the view itself there?
+        return False
 
     def __iter__(self) -> Generator[Address, None, None]:
         for _okey, address in self._scan_order():
@@ -563,7 +584,7 @@ class FractionalIndexedDictViewBase(
         ``_on_child_created`` only fires for a new data child.
         """
         if is_empty(self._position_or_empty(address)):
-            last = self._edge(last=True)
+            last = self._edge(last=True, strict=False)
             self._place(address, None if last is None else last[0], None)
 
     def __setitem__(self, address: Address, value: object) -> None:
@@ -633,14 +654,14 @@ class FractionalIndexedDictViewBase(
         """Add ``address`` at the end. Raises ValueError if it is present."""
         self._reject_empty(address, value)
         self.ensure_created()
-        last = self._edge(last=True)
+        last = self._edge(last=True, strict=False)
         self._insert(address, value, None if last is None else last[0], None)
 
     def prepend(self, address: Address, value: object = True) -> None:
         """Add ``address`` at the start. Raises ValueError if it is present."""
         self._reject_empty(address, value)
         self.ensure_created()
-        first = self._edge(last=False)
+        first = self._edge(last=False, strict=False)
         self._insert(address, value, None, None if first is None else first[0])
 
     def insert_before(self, ref: Address, address: Address, value: object = True) -> None:
@@ -684,7 +705,7 @@ class FractionalIndexedDictViewBase(
     def move_first(self, address: Address) -> None:
         """Move ``address`` to the start."""
         okey = self._require_position(address)
-        first = self._edge(last=False)
+        first = self._edge(last=False, strict=False)
         if first is None or first[0] == okey:
             return
         self._relocate(address, okey, None, first[0])
@@ -692,7 +713,7 @@ class FractionalIndexedDictViewBase(
     def move_last(self, address: Address) -> None:
         """Move ``address`` to the end."""
         okey = self._require_position(address)
-        last = self._edge(last=True)
+        last = self._edge(last=True, strict=False)
         if last is None or last[0] == okey:
             return
         self._relocate(address, okey, last[0], None)
@@ -744,7 +765,7 @@ class FractionalIndexedDictViewBase(
         """Fill from a mapping (id -> value) or an iterable of ids (value True), in order."""
         value = self._reject_empty_in(value)  # type: ignore[assignment]
         self.ensure_created()
-        if replace and self._edge(last=False) is not None:
+        if replace and self._edge(last=False, strict=False) is not None:
             self.clear()
         items = value.items() if hasattr(value, "items") else ((k, True) for k in value)
         for key, val in items:

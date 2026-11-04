@@ -23,7 +23,7 @@ from virtuals._views import (
 )
 from virtuals._views.fractional_index import validate_order_key
 from virtuals.codecs import BinaryCodec, NoOpCodec
-from virtuals.container import ContainerStructure
+from virtuals.container import ContainerNotFoundError, ContainerStructure
 from virtuals.loc.path_nav import navigate_and_ensure
 from virtuals.navigator import Navigator
 from virtuals.observers.mem import InMemoryObserver
@@ -94,6 +94,8 @@ def fdict(broot):
         view = broot.open_child(address, EagerFractionalIndexedDictView)
         if data is not None:
             view.store(data)
+        else:
+            view.ensure_created()
         return view
 
     return _create
@@ -299,8 +301,8 @@ def test_insert_missing_ref_raises(fdict):
     assert list(view) == ["a"]
 
 
-def test_insert_missing_ref_does_not_create_view(fdict):
-    view = fdict()
+def test_insert_missing_ref_does_not_create_view(broot):
+    view = broot.open_child("lst", EagerFractionalIndexedDictView)
     with pytest.raises(KeyError):
         view.insert_before("nope", "b", 2)
     with pytest.raises(KeyError):
@@ -450,8 +452,8 @@ def test_delete_missing_raises(fdict):
         del view["missing"]
 
 
-def test_delete_on_absent_view_raises_without_creating(fdict):
-    view = fdict()
+def test_delete_on_absent_view_raises_without_creating(broot):
+    view = broot.open_child("lst", EagerFractionalIndexedDictView)
     with pytest.raises(KeyError):
         del view["x"]
     assert not view.container.exists()
@@ -1443,9 +1445,10 @@ def test_key_touches_are_constant_in_n(backend, tmp_path):
 # ============================================================================
 
 
-def test_bool_on_absent_view_is_false_and_writes_nothing(broot):
+def test_bool_on_absent_view_raises_and_writes_nothing(broot):
     view = broot.open_child("absent", EagerFractionalIndexedDictView)
-    assert not view
+    with pytest.raises(ContainerNotFoundError):
+        bool(view)
     assert not view.container.exists()
     view.store({"a": 1})
     assert view
