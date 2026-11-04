@@ -47,16 +47,28 @@ from typing import TYPE_CHECKING, Any
 
 from virtuals.tkv.storage import StorageClosedError, StorageError, StorageLockTimeoutError
 
+from .._write_slot import signals_held, signals_released
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
 
-__all__ = ["WriterGate", "WriterThread"]
+__all__ = ["NOT_RUN", "WriterGate", "WriterThread"]
 
 
 logger = getLogger(__name__)
+
+
+# Returned by ``run_staged`` with ``deferred`` when an interrupt arrived before
+# its first stage landed: nothing ran, the interrupt is in ``deferred``.
+NOT_RUN = object()
+
+
+def _own_failure(future: Future, error: BaseException) -> bool:
+    """Whether ``error`` out of a wait on ``future`` is the call's own failure, not an interrupt."""
+    return future.done() and not future.cancelled() and future.exception() is error
 
 
 def _set_done(done: asyncio.Future) -> None:
@@ -148,10 +160,11 @@ class WriterThread:
 
     def _stamp(self) -> int:
         """Set the stamp; returns the token that clears it."""
-        self._owner += 1
-        self._waiting = True
-        self._wait_since = time.monotonic()
-        return self._owner
+        with self._lock:
+            self._owner += 1
+            self._waiting = True
+            self._wait_since = time.monotonic()
+            return self._owner
 
     def _unstamp(self, token: int) -> None:
         """Clear the stamp, unless somebody else has stamped since."""
@@ -185,7 +198,6 @@ class WriterThread:
         abandoned: Callable[[Any], None] | None,
         then: Callable[[Any], Any] | None = None,
         done: Future | None = None,
-        then_abandoned: Callable[[Any], None] | None = None,
         waited: bool = True,
     ) -> None:
         """Queue a job, starting the thread if needed.
@@ -195,9 +207,8 @@ class WriterThread:
         After ``stop`` nothing is accepted until ``start``: a job that
         started a fresh thread then would run against an environment
         being closed. ``waited`` says a requester waits for the result and
-        will clear the progress stamp itself. ``abandoned`` and
-        ``then_abandoned`` take a result its requester no longer waits for
-        (see ``run`` and ``run_staged``).
+        will clear the progress stamp itself. ``abandoned`` takes a
+        result its requester no longer waits for (see ``run``).
         """
         with self._lock:
             if self._stopped:
@@ -209,7 +220,7 @@ class WriterThread:
                 )
                 self._thread = thread
                 thread.start()
-            self._queue.put((fn, future, abandoned, then, done, then_abandoned, waited))
+            self._queue.put((fn, future, abandoned, then, done, waited))
 
     def _on_thread(self) -> bool:
         return threading.current_thread() is self._thread
@@ -219,7 +230,7 @@ class WriterThread:
             job = jobs.get()
             if job is None:
                 return
-            fn, future, abandoned, then, done, then_abandoned, waited = job
+            fn, future, abandoned, then, done, waited = job
             # A waited job keeps the requester's stamp through its short
             # steps (pickup, begin, hand-off): each is a point where the
             # GIL is needed back, and one continuous age covers them all.
@@ -230,12 +241,13 @@ class WriterThread:
             # requester's to clear.
             token: int | None = None
             if not waited:
-                if self._waiting:
-                    self._progress()
-                else:
-                    token = self._stamp()
+                with self._lock:  # against a requester stamping on its thread
+                    if self._waiting:
+                        self._progress()
+                    else:
+                        token = self._stamp()
             try:
-                self._run_job(fn, future, abandoned, then, done, then_abandoned)
+                self._run_job(fn, future, abandoned, then, done)
             finally:
                 if token is not None:
                     self._unstamp(token)
@@ -247,14 +259,13 @@ class WriterThread:
         abandoned: Callable[[Any], None] | None,
         then: Callable[[Any], Any] | None,
         done: Future | None,
-        then_abandoned: Callable[[Any], None] | None,
     ) -> None:
         try:
             result = fn()
         except BaseException as e:
             if future.set_running_or_notify_cancel():
                 future.set_exception(e)
-            if done is not None and done.set_running_or_notify_cancel():
+            if done is not None:
                 done.set_exception(e)
             return
         # The requester may have given up while ``fn`` ran. Marking the
@@ -267,19 +278,13 @@ class WriterThread:
         future.set_result(result)
         if then is not None:
             # The second stage runs right here, on the result the
-            # requester now owns: no second hop, and no cancel can cut it
-            # short (a commit is never abandoned half way). Its result is
-            # handed over the same way if the requester gave up meanwhile.
+            # requester now owns: no second hop, and nothing cuts it short
+            # (a commit is never abandoned half way: its requester waits
+            # it out, interrupts deferred, see ``run_staged``).
             try:
-                second = then(result)
+                done.set_result(then(result))  # type: ignore[union-attr]
             except BaseException as e:
-                if done.set_running_or_notify_cancel():  # type: ignore[union-attr]
-                    done.set_exception(e)  # type: ignore[union-attr]
-                return
-            if done.set_running_or_notify_cancel():  # type: ignore[union-attr]
-                done.set_result(second)  # type: ignore[union-attr]
-            else:
-                self._hand_over(then_abandoned, second)
+                done.set_exception(e)  # type: ignore[union-attr]
 
     @staticmethod
     def _hand_over(abandoned: Callable[[Any], None] | None, result: Any) -> None:  # noqa: ANN401
@@ -304,19 +309,26 @@ class WriterThread:
         *,
         timeout: float | None = None,
         abandoned: Callable[[Any], None] | None = None,
+        deferred: list[BaseException] | None = None,
     ) -> Any:  # noqa: ANN401
         """Run ``fn`` on the writer thread and return its result.
 
         Blocks the caller. With ``timeout`` the wait is bounded: a call
         still in flight then is abandoned and ``StorageLockTimeoutError``
         is raised. A result that lands just as the wait ends is taken, not
-        dropped. The wait left by any other exception (a signal handler
-        raising, ``KeyboardInterrupt``) abandons the call the same way.
+        dropped.
 
-        ``abandoned`` takes the result of an abandoned call once it lands,
-        on the writer thread: a begin nobody waits for is aborted, a commit
-        nobody waits for has its bookkeeping finished. Without it the
-        result is dropped (an abort needs nothing).
+        An exception out of the wait that is not the call's own failure (a
+        signal handler raising, ``KeyboardInterrupt``) is an interrupt.
+        Without ``deferred`` it abandons the call like a timeout does and
+        is re-raised; ``abandoned`` then takes the result once it lands,
+        on the writer thread (an abandoned begin is aborted). With
+        ``deferred``, a list, the call is never abandoned: the interrupt
+        is appended to it, and every later one, and the wait goes on
+        until the result is in, which is returned as usual; the caller
+        finishes its bookkeeping and then raises ``deferred[0]``. That is
+        the rule for a commit: an interrupt never changes its outcome or
+        how it is reported.
         """
         if self._on_thread():
             return fn()  # a job calling back in (e.g. a finalizer); never wait on ourselves
@@ -325,20 +337,26 @@ class WriterThread:
         try:
             self._submit(fn, future, abandoned)
             try:
-                return future.result(timeout)
+                if deferred is not None:
+                    return self._wait(future, timeout, deferred)
+                with signals_released():  # a wait a caller holding signals may interrupt
+                    return future.result(timeout)
             except FutureTimeoutError:
                 pass
             except BaseException as e:
-                self._left(future, future, e, abandoned)
+                self._left(future, e, abandoned)
                 raise
             if future.cancel():
                 raise StorageLockTimeoutError(
                     f"Timed out after {timeout}s waiting for LMDB's writer lock"
                 )
             try:
-                return future.result()
+                if deferred is not None:
+                    return self._wait(future, None, deferred)
+                with signals_released():
+                    return future.result()
             except BaseException as e:
-                self._left(future, future, e, abandoned)
+                self._left(future, e, abandoned)
                 raise
         finally:
             self._unstamp(token)
@@ -350,7 +368,7 @@ class WriterThread:
         *,
         timeout: float,
         abandoned: Callable[[Any], None],
-        then_abandoned: Callable[[Any], None] | None = None,
+        deferred: list[BaseException],
     ) -> Any:  # noqa: ANN401
         """Run ``fn`` and then ``then(result)`` on the writer thread, one hop.
 
@@ -360,9 +378,12 @@ class WriterThread:
         runs to the end and the caller waits for it. For a write-only
         transaction ``fn`` is the begin and ``then`` replays and commits,
         so a begin behind a writer outside virtuals stays bounded while a
-        commit is never cut short. A wait left by any other exception
-        abandons ``fn`` the same way if it has not landed; if it has,
-        ``then`` runs to the end and ``then_abandoned`` takes its result.
+        commit is never cut short.
+
+        An interrupt (see ``run``) while ``fn`` is in flight abandons it
+        the same way and returns ``NOT_RUN`` with the interrupt in
+        ``deferred``: nothing ran. Once ``fn`` has landed, interrupts are
+        deferred and the wait goes on until ``then`` is done.
         """
         if self._on_thread():
             return then(fn())
@@ -370,50 +391,60 @@ class WriterThread:
         done: Future = Future()
         token = self._stamp()
         try:
-            self._submit(fn, begun, abandoned, then, done, then_abandoned)
+            self._submit(fn, begun, abandoned, then, done)
             try:
-                return done.result(timeout)
+                with signals_released():  # interruptible while the begin may still be undone
+                    return done.result(timeout)
             except FutureTimeoutError:
                 pass
             except BaseException as e:
-                self._left(begun, done, e, then_abandoned)
-                raise
+                if _own_failure(done, e):
+                    raise
+                deferred.append(e)
+                if begun.cancel():
+                    return NOT_RUN  # the thread hands the begin to ``abandoned``
+                return self._wait(done, None, deferred)
             if begun.cancel():
                 raise StorageLockTimeoutError(
                     f"Timed out after {timeout}s waiting for LMDB's writer lock"
                 )
-            try:
-                return done.result()
-            except BaseException as e:
-                self._left(begun, done, e, then_abandoned)
-                raise
+            return self._wait(done, None, deferred)
         finally:
             self._unstamp(token)
 
-    def _left(
-        self,
-        job: Future,
-        result: Future,
-        error: BaseException,
-        abandoned: Callable[[Any], None] | None,
-    ) -> None:
-        """A wait on ``result`` ended with ``error``: abandon the job if that was not its own failure.
+    @staticmethod
+    def _wait(future: Future, timeout: float | None, deferred: list[BaseException] | None) -> Any:  # noqa: ANN401
+        """``future.result(timeout)``; with ``deferred`` interrupts are collected and the wait goes on."""
+        if deferred is None:
+            return future.result(timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            try:
+                return future.result(
+                    None if deadline is None else max(deadline - time.monotonic(), 0)
+                )
+            except FutureTimeoutError:
+                raise
+            except BaseException as e:
+                if _own_failure(future, e):
+                    raise
+                deferred.append(e)
 
-        A stage still in flight is cancelled: the thread hands its result
-        to its abandoned handler right after the call, before any later
-        job. A result already in is handed over now, by a job queued
-        here, before the caller sees the error. Either way nothing the
-        thread begins or commits is left unobserved, and the handler runs
-        before any job the caller queues afterwards (an abort).
+    def _left(
+        self, future: Future, error: BaseException, abandoned: Callable[[Any], None] | None
+    ) -> None:
+        """A wait on ``future`` ended with ``error``: abandon the call if that was not its own failure.
+
+        A call still in flight is cancelled: the thread hands its result
+        to ``abandoned`` right after the call, before any later job. A
+        result already in is handed over by a job queued here, before the
+        caller sees the error. Either way nothing the thread begins is
+        left unobserved.
         """
-        if result.done() and not result.cancelled() and result.exception() is error:
-            return  # the call itself failed: nothing landed
-        if job.cancel():
-            return  # the first stage is in flight: the thread hands over its result
-        if result is not job and result.cancel():
-            return  # the second stage is in flight: the thread hands over its result
-        if abandoned is not None:
-            result.add_done_callback(lambda f: self._abandoned_later(f, abandoned))
+        if _own_failure(future, error):
+            return
+        if not future.cancel() and abandoned is not None:
+            future.add_done_callback(lambda f: self._abandoned_later(f, abandoned))
 
     def try_fire(self, fn: Callable[[], Any]) -> bool:
         """``fire`` for finalizers: queued, never waited for, never at exit.
@@ -542,6 +573,7 @@ class WriterGate:
         "_requests",
         "_thread",
         "_wait_fd",
+        "_wait_seq",
         "_waiting",
     )
 
@@ -558,6 +590,7 @@ class WriterGate:
         self._waiting = False  # a blocking wait is in flight for this generation
         self._consumer: Future | None = None  # the requester attached to that wait
         self._wait_fd: int | None = None  # the helper's duplicate for that wait
+        self._wait_seq = 0  # bumped per wait started: the helper serves only the latest
         self._requests: queue.SimpleQueue = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
 
@@ -608,6 +641,7 @@ class WriterGate:
         self._requests = queue.SimpleQueue()
         self._waiting = False
         self._consumer = None
+        self._wait_seq += 1  # an inherited request, if any, is stale
         fd, self._wait_fd = self._wait_fd, None
         if fd is not None:
             try:
@@ -639,12 +673,11 @@ class WriterGate:
 
     def _attach(self) -> Future | None:
         """Take the gate now (None) or return the future the helper will deliver it on."""
-        with self._mu:
+        with signals_held(), self._mu:
             if not self._waiting:
                 if self._try_nb():
                     return None
-                self._waiting = True
-                self._start_wait()
+                self._start_wait()  # marks the wait in flight once it is queued
             consumer: Future = Future()
             consumer.set_running_or_notify_cancel()
             self._consumer = consumer
@@ -656,6 +689,12 @@ class WriterGate:
         The helper gets its own duplicate of the descriptor (same open file
         description, so the same lock), never the number: close() may free
         that number and any later open in the process may reuse it.
+
+        The request is queued first and the wait marked in flight last,
+        so an interrupt (a signal handler raising) in between leaves a
+        queued request the helper discards (the flag is down, or the
+        sequence is stale once a later wait has started), never a wait
+        marked in flight that nobody serves.
         """
         thread = self._thread
         if thread is None or not thread.is_alive():
@@ -664,16 +703,28 @@ class WriterGate:
             )
             self._thread = thread
             thread.start()
+        self._wait_seq += 1
         fd = os.dup(self._fd)
+        self._requests.put((fd, self._generation, self._wait_seq))
         self._wait_fd = fd  # for a forked child to close (``reset_after_fork``)
-        self._requests.put((fd, self._generation))
+        self._waiting = True
+
+    def _close_wait_fd(self, fd: int) -> None:
+        """Close a wait's duplicate. Under ``_mu``."""
+        if self._wait_fd == fd:
+            self._wait_fd = None  # cleared first: a child never closes a reused number
+        os.close(fd)
 
     def _serve(self, requests: queue.SimpleQueue) -> None:
         while True:
             request = requests.get()
             if request is None:
                 return
-            fd, generation = request
+            fd, generation, seq = request
+            with self._mu:
+                if generation != self._generation or seq != self._wait_seq or not self._waiting:
+                    self._close_wait_fd(fd)  # a wait nobody marked in flight, or closed
+                    continue
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 error: Exception | None = None
@@ -688,9 +739,7 @@ class WriterGate:
                         fcntl.flock(fd, fcntl.LOCK_UN)  # nobody wants it any more
                 # else: the gate was closed meanwhile, and closing this last
                 # duplicate drops the lock with the file.
-                if self._wait_fd == fd:
-                    self._wait_fd = None  # cleared first: a child never closes a reused number
-                os.close(fd)  # the storage's own descriptor keeps a landed lock
+                self._close_wait_fd(fd)  # the storage's own descriptor keeps a landed lock
             if consumer is None:
                 continue
             if error is not None:
@@ -708,7 +757,7 @@ class WriterGate:
 
     def release(self) -> None:
         """Give the gate back. A no-op once the file is closed."""
-        with self._mu:
+        with signals_held(), self._mu:
             fd = self._fd
             if fd is None:
                 return
@@ -728,11 +777,15 @@ class WriterGate:
         if consumer is None:
             return
         try:
-            consumer.result(max(timeout, 0))
-        except FutureTimeoutError:
-            if self._detach(consumer):
-                raise self._timed_out(timeout) from None
-            consumer.result()  # landed as the wait ended: ours
+            try:
+                with signals_released():  # a wait a caller holding signals may interrupt
+                    consumer.result(max(timeout, 0))
+            except FutureTimeoutError:
+                if self._detach(consumer):
+                    raise self._timed_out(timeout) from None
+                consumer.result()  # landed as the wait ended: ours
+        except StorageLockTimeoutError:
+            raise
         except BaseException:
             # Left by a signal or an interrupt: the lock must not land on a
             # consumer nobody reads (the gate would then be held by no one

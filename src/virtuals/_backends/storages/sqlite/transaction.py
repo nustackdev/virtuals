@@ -13,6 +13,7 @@ from virtuals.tkv.storage import (
     TransactionProtocol,
 )
 
+from .._write_slot import signals_held
 from .context import ContextBase, ReadOperationsMixin, WriteOperationsMixin, is_busy_error
 
 
@@ -67,7 +68,14 @@ class SQLiteTransaction(
         return True
 
     def commit(self) -> None:
-        """Commit all changes in the transaction."""
+        """Commit all changes in the transaction.
+
+        An interrupt while the COMMIT is in flight never changes its
+        outcome or how it is reported: the transaction ends committed and
+        notified, then the interrupt is raised as it is. One that arrives
+        before the COMMIT ran aborts the transaction and is raised the
+        same way.
+        """
         if self._closed:
             logger.error("Cannot commit, transaction is closed")
             raise StorageClosedError("Transaction is closed")
@@ -80,25 +88,44 @@ class SQLiteTransaction(
 
         self._require_active()
 
-        try:
-            if not self._end("COMMIT"):
-                raise StorageClosedError("Transaction was closed while committing")
-        except Exception as e:
-            # The connection went back to the pool rolled back: treat as aborted.
-            self._aborted = True
-            self._storage._untrack_transaction(self)
-            logger.error("Transaction commit failed")
-            if isinstance(e, StorageClosedError):
-                raise  # the storage's close ended it first: say so, as every backend does
-            if is_busy_error(e):
-                raise StorageLockTimeoutError(f"Timed out committing transaction: {e}") from e
-            raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
+        # An interrupt (a signal handler raising, ``KeyboardInterrupt``)
+        # never changes the commit's outcome or how it is reported:
+        # signals are held until the outcome is reported (committed and
+        # notified, or aborted if the interrupt came before the COMMIT),
+        # and an interrupt raised without a signal is deferred the same
+        # way. Then it is raised as is.
+        deferred: list[BaseException] = []
+        with signals_held():
+            try:
+                ran = self._end("COMMIT", deferred)
+                if ran is None:
+                    raise StorageClosedError("Transaction was closed while committing")
+            except Exception as e:
+                # The connection went back to the pool rolled back: treat as aborted.
+                self._aborted = True
+                self._storage._untrack_transaction(self)
+                logger.error("Transaction commit failed")
+                if deferred:
+                    raise deferred[0] from e  # the interrupt, with the failure as its cause
+                if isinstance(e, StorageClosedError):
+                    raise  # the storage's close ended it first: say so, as every backend does
+                if is_busy_error(e):
+                    raise StorageLockTimeoutError(f"Timed out committing transaction: {e}") from e
+                raise StorageTransactionError(f"Failed to commit transaction: {e}") from e
+            if not ran:  # the interrupt came before the COMMIT: rolled back, as an abort
+                self._aborted = True
+                self._storage._untrack_transaction(self)
+                raise deferred[0]
 
-        logger.debug("Transaction committed")
+            logger.debug("Transaction committed")
 
-        self._committed = True
-        self._storage._notify_batch(self._modified_keys)
-        self._storage._untrack_transaction(self)
+            self._committed = True
+            try:
+                self._storage._notify_batch(self._modified_keys)
+            finally:
+                self._storage._untrack_transaction(self)
+            if deferred:
+                raise deferred[0]
 
     def abort(self) -> None:
         """Abort transaction and discard all changes."""
@@ -109,19 +136,20 @@ class SQLiteTransaction(
         # Only the call that takes the connection ends the transaction. If a
         # racing commit took it, this abort rolled nothing back and the
         # transaction keeps the commit's outcome.
-        rolled_back = True
-        try:
-            rolled_back = self._end("ROLLBACK")
-            if rolled_back:
-                logger.debug("Transaction aborted")
-        except Exception as e:
-            # The connection went back to the pool, which rolls it back.
-            logger.error("Transaction abort failed")
-            raise StorageTransactionAbortedError(f"Failed to abort transaction: {e}") from e
-        finally:
-            if rolled_back:
-                self._aborted = True
-            self._storage._untrack_transaction(self)
+        rolled_back: bool | None = True
+        with signals_held():
+            try:
+                rolled_back = self._end("ROLLBACK")
+                if rolled_back:
+                    logger.debug("Transaction aborted")
+            except Exception as e:
+                # The connection went back to the pool, which rolls it back.
+                logger.error("Transaction abort failed")
+                raise StorageTransactionAbortedError(f"Failed to abort transaction: {e}") from e
+            finally:
+                if rolled_back:
+                    self._aborted = True
+                self._storage._untrack_transaction(self)
 
     def __del__(self) -> None:
         """Last resort: end a transaction dropped without commit or abort.

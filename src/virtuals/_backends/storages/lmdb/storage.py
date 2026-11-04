@@ -27,7 +27,7 @@ from virtuals.tkv.storage import (
     WriteBatchProtocol,
 )
 
-from .._write_slot import LOOP_THREAD_WAIT_CAP, WriterLock, WriteSlot
+from .._write_slot import LOOP_THREAD_WAIT_CAP, WriterLock, WriteSlot, signals_held
 from ._writer import WriterGate, WriterThread
 from .context import WRITER_BACKOFF_STEPS, replay_pending, yield_to_writer
 from .snapshot import LMDBSnapshot
@@ -214,10 +214,14 @@ class LMDBStorage:
     (after ``busy_timeout``, or ``LOOP_THREAD_WAIT_CAP`` on an event loop
     thread) when that thread is stuck behind a writer outside virtuals;
     the transaction stays pending and may be retried or aborted. A
-    signal or ``KeyboardInterrupt`` that lands in such a wait, or in a
-    commit's, leaves nothing behind: an interrupted begin is aborted on
-    the writer thread once it lands, and a commit already in flight runs
-    to its end and is then marked and notified as committed. Snapshots
+    signal or ``KeyboardInterrupt`` that lands in such a wait aborts the
+    begin on the writer thread once it lands; one that lands in a
+    commit's wait never changes the commit's outcome or how it is
+    reported: the commit is waited out, the transaction ends committed
+    (closed, notified, slot and gate given back) and the interrupt is
+    then raised as it is, so a caller never sees a failure for a commit
+    that happened. An interrupt before the commit started aborts as
+    usual. Snapshots
     never touch the slot or the gate, so a waiting writer never delays a
     reader; the one exception is a writer starved of the GIL by reader
     threads spinning on short calls, which readers answer with brief
@@ -230,8 +234,10 @@ class LMDBStorage:
     ``begin_transaction(write_slot=...)``. Threads compete for the slot's
     lock and take it the instant it is free, so a thread writing in a
     loop barges ahead of other threads; a coroutine is handed the slot at
-    a release instead and lands after at most one transaction of the
-    holder. A second writer from the task or thread that already holds
+    a release instead, and threads and coroutines take turns at each
+    release, so a queued coroutine waits at most one thread transaction
+    per coroutine ahead of it. A second writer from the task or thread
+    that already holds
     the slot raises ``StorageNestedTransactionError``; a sync begin while
     another task on the same loop holds it raises
     ``StorageLockTimeoutError`` at once. A sync begin or batch write from
@@ -842,41 +848,46 @@ class LMDBStorage:
         self._check_fork()
         self._require_not_forked()
 
-        deadline = time.monotonic() + self._busy_timeout
-        lock, give_back_slot = self._writer.take_slot(self, write_slot, self._busy_timeout)
-        lmdb_txn: Any = None
-        try:
-            if write_slot is None:
-                self._acquire_gate(deadline)
-            with self._env_lock:
-                if write_slot is not None:
-                    lmdb_txn, write_slot._lmdb_txn = write_slot._lmdb_txn, None  # type: ignore[attr-defined]
-                    self._reserved_slots.discard(write_slot)  # type: ignore[arg-type]
-                    if lmdb_txn is None:
-                        raise StorageClosedError(
-                            "Write slot was reserved on a storage that has since closed"
-                        )
-                if not self._opened:
-                    raise StorageClosedError("Storage is not open")  # close() ends the txn
-                transaction = LMDBTransaction(self, lmdb_txn, lock)  # pending unless reserved
-                self._active_transactions.add(transaction)
-                return transaction
-        except BaseException as e:
+        # Signals are held from the take of the slot to the transaction
+        # that owns it (its finalizer gives everything back from then
+        # on); the waits inside (slot, gate, begin) let them through and
+        # undo themselves when interrupted.
+        with signals_held():
+            deadline = time.monotonic() + self._busy_timeout
+            lock, give_back_slot = self._writer.take_slot(self, write_slot, self._busy_timeout)
+            lmdb_txn: Any = None
             try:
-                if lmdb_txn is not None:
-                    try:
-                        self._end_write(lmdb_txn, commit=False)
-                    except Exception as abort_error:
-                        logger.error(f"Abort after a failed begin failed: {abort_error}")
-            finally:  # a second interrupt, in the abort's wait, still gives both back
                 if write_slot is None:
-                    self._release_gate()
-                give_back_slot()
-            if isinstance(e, (StorageClosedError, StorageLockTimeoutError)):
+                    self._acquire_gate(deadline)
+                with self._env_lock:
+                    if write_slot is not None:
+                        lmdb_txn, write_slot._lmdb_txn = write_slot._lmdb_txn, None  # type: ignore[attr-defined]
+                        self._reserved_slots.discard(write_slot)  # type: ignore[arg-type]
+                        if lmdb_txn is None:
+                            raise StorageClosedError(
+                                "Write slot was reserved on a storage that has since closed"
+                            )
+                    if not self._opened:
+                        raise StorageClosedError("Storage is not open")  # close() ends the txn
+                    transaction = LMDBTransaction(self, lmdb_txn, lock)  # pending unless reserved
+                    self._active_transactions.add(transaction)
+                    return transaction
+            except BaseException as e:
+                try:
+                    if lmdb_txn is not None:
+                        try:
+                            self._end_write(lmdb_txn, commit=False)
+                        except Exception as abort_error:
+                            logger.error(f"Abort after a failed begin failed: {abort_error}")
+                finally:
+                    if write_slot is None:
+                        self._release_gate()
+                    give_back_slot()
+                if isinstance(e, (StorageClosedError, StorageLockTimeoutError)):
+                    raise
+                if isinstance(e, Exception):
+                    raise StorageError(f"Failed to begin transaction: {e}") from e
                 raise
-            if isinstance(e, Exception):
-                raise StorageError(f"Failed to begin transaction: {e}") from e
-            raise
 
     async def areserve_write_slot(self) -> WriteSlot:
         """Wait for the writer slot without blocking the event loop.
@@ -960,13 +971,22 @@ class LMDBStorage:
         stamp = self._writer_thread._stamp_soft()  # flock releases the GIL: see yield_to_writer
         try:
             self._gate.acquire(timeout)
+            self._gate_held = True
         except StorageLockTimeoutError:
             if not on_loop:
                 raise
             raise self._writer.loop_cap_timeout("the write lock held by another process") from None
+        except BaseException:
+            # An interrupt (a signal handler raising) between the acquire
+            # and the flag would leave the gate held and unflagged, so
+            # never released: give it back whatever the state. The slot
+            # is held, so nobody else in this process can own the gate,
+            # and an unlock of a lock not held is a no-op.
+            self._gate_held = False
+            self._gate.release()
+            raise
         finally:
             self._writer_thread._unstamp_soft(stamp)
-        self._gate_held = True
 
     def _hop(self, run: Callable[[float], Any]) -> Any:  # noqa: ANN401
         """Run a begin hop with its bound: ``busy_timeout``, capped on a loop thread.
@@ -1000,14 +1020,15 @@ class LMDBStorage:
         ``write``). Give both back with ``_release_write_slot(lock)``.
         """
         self._require_not_forked()
-        deadline = time.monotonic() + self._busy_timeout
-        lock = self._writer.acquire(self._busy_timeout)
-        try:
-            self._acquire_gate(deadline)
-        except BaseException:
-            self._writer.release(lock)
-            raise
-        return lock
+        with signals_held():  # the caller holds on until the lock is kept
+            deadline = time.monotonic() + self._busy_timeout
+            lock = self._writer.acquire(self._busy_timeout)
+            try:
+                self._acquire_gate(deadline)
+            except BaseException:
+                self._writer.release(lock)
+                raise
+            return lock
 
     def _begin_pending(self, pending: Pending) -> tuple[Any, set[bytes]]:
         """Begin a pending transaction's LMDB txn and replay its writes on this thread.
@@ -1035,19 +1056,16 @@ class LMDBStorage:
                     continue
                 raise StorageOperationError(f"Failed to apply pending writes: {e}") from e
 
-    def _commit_pending(
-        self, pending: Pending, settle: Callable[[set[bytes]], None] | None = None
-    ) -> set[bytes]:
+    def _commit_pending(self, pending: Pending, deferred: list[BaseException]) -> Any:  # noqa: ANN401
         """Begin, replay and commit on the writer thread in one job.
 
         The caller holds the slot and the gate. The begin is bounded like
         any other; once it has landed the commit runs to the end. Returns
-        the keys whose delete found nothing. A caller interrupted while
-        the commit is in flight (a signal) gets the interrupt, and
-        ``settle`` takes the keys once the commit lands, on the writer
-        thread: the context's bookkeeping, so the commit that happened is
-        marked and notified. Interrupted before the begin landed, nothing
-        is committed and ``settle`` never runs.
+        the keys whose delete found nothing, or ``NOT_RUN`` if an
+        interrupt arrived before the begin landed (nothing is committed;
+        the interrupt is in ``deferred``). An interrupt after that is
+        deferred and the commit is waited out: its outcome is what the
+        caller reports, then the interrupt (see ``WriterThread.run``).
         """
         return self._hop(
             lambda timeout: self._writer_thread.run_staged(
@@ -1055,7 +1073,7 @@ class LMDBStorage:
                 lambda lmdb_txn: self._apply_and_commit(lmdb_txn, pending),
                 timeout=timeout,
                 abandoned=self._abort_abandoned,
-                then_abandoned=settle,
+                deferred=deferred,
             )
         )
 
@@ -1081,16 +1099,6 @@ class LMDBStorage:
             self._end_live(lmdb_txn, True)
             return missing
 
-    def _drain_writer(self) -> None:
-        """Wait for every job queued on the writer thread so far (a no-op queued behind them).
-
-        A stopped thread has drained its jobs already.
-        """
-        try:
-            self._writer_thread.run(lambda: None)
-        except StorageClosedError:
-            pass
-
     def _abort_abandoned(self, lmdb_txn: Any) -> None:  # noqa: ANN401
         """End a begin whose requester gave up (runs on the writer thread).
 
@@ -1105,35 +1113,44 @@ class LMDBStorage:
         lmdb_txn: Any,  # noqa: ANN401
         *,
         commit: bool,
-        settle: Callable[[Any], None] | None = None,
+        deferred: list[BaseException] | None = None,
     ) -> None:
         """Commit or abort an LMDB write transaction on the writer thread.
 
         Called under the context's call lock from any thread. The gate and
         the slot are given back by the context's ``_mark_closed`` after.
-        The end runs to its end whatever the caller does; a caller
-        interrupted while waiting (a signal) gets the interrupt, and
-        ``settle`` runs once the end has landed, on the writer thread (a
-        commit's bookkeeping; an abort needs none).
+        The end runs to its end whatever the caller does. With
+        ``deferred`` (a commit) an interrupt while waiting is deferred and
+        the commit waited out, so the caller reports the outcome first
+        and the interrupt after (see ``WriterThread.run``); an abort
+        needs no such care, its requester's cleanup runs either way.
         """
-        self._writer_thread.run(lambda: self._end_live(lmdb_txn, commit), abandoned=settle)
+        self._writer_thread.run(lambda: self._end_live(lmdb_txn, commit), deferred=deferred)
 
     def _release_gate(self) -> None:
-        if self._gate_held:
-            self._gate_held = False
-            if self._gate is not None:
-                stamp = self._writer_thread._stamp_soft()
-                try:
-                    self._gate.release()
-                finally:
-                    self._writer_thread._unstamp_soft(stamp)
+        with signals_held():
+            if self._gate_held:
+                self._gate_held = False
+                if self._gate is not None:
+                    stamp = self._writer_thread._stamp_soft()  # flock releases the GIL
+                    try:
+                        self._gate.release()
+                    finally:
+                        self._writer_thread._unstamp_soft(stamp)
 
     def _release_write_slot(self, lock: Any = None) -> None:  # noqa: ANN401
-        """Release the cross-process gate, then the in-process writer slot."""
-        if lock is not None and lock is not self._writer.lock:
-            return  # a fork reset the slot since; the gate was reopened too
-        self._release_gate()
-        self._writer.release(lock)
+        """Release the cross-process gate, then the in-process writer slot.
+
+        Signals are held across both: a slot nobody holds and nobody
+        releases wedges every writer in this process until close().
+        """
+        with signals_held():
+            if lock is not None and lock is not self._writer.lock:
+                return  # a fork reset the slot since; the gate was reopened too
+            try:
+                self._release_gate()
+            finally:
+                self._writer.release(lock)
 
     def _release_reserved(self, slot: LMDBWriteSlot, *, finalizing: bool = False) -> None:
         """Give back a reserved slot no transaction took: abort its begun txn first.
@@ -1142,22 +1159,23 @@ class LMDBStorage:
         skipped when the writer thread is gone or the interpreter is
         exiting; the slot and the gate are given back at once.
         """
-        with self._env_lock:
-            lmdb_txn, slot._lmdb_txn = slot._lmdb_txn, None
-            self._reserved_slots.discard(slot)
-        try:
-            if lmdb_txn is not None:
-                try:
-                    if finalizing:
-                        self._end_write_from_finalizer(lmdb_txn)
-                    else:
-                        self._end_write(lmdb_txn, commit=False)
-                except StorageClosedError:
-                    pass  # close() got there first and ended it
-                except Exception as e:
-                    logger.error(f"Abort of a reserved transaction failed: {e}")
-        finally:  # an interrupt in the abort's wait never keeps the slot
-            self._release_write_slot(slot._lock)
+        with signals_held():
+            with self._env_lock:
+                lmdb_txn, slot._lmdb_txn = slot._lmdb_txn, None
+                self._reserved_slots.discard(slot)
+            try:
+                if lmdb_txn is not None:
+                    try:
+                        if finalizing:
+                            self._end_write_from_finalizer(lmdb_txn)
+                        else:
+                            self._end_write(lmdb_txn, commit=False)
+                    except StorageClosedError:
+                        pass  # close() got there first and ended it
+                    except Exception as e:
+                        logger.error(f"Abort of a reserved transaction failed: {e}")
+            finally:
+                self._release_write_slot(slot._lock)
 
     def _end_write_from_finalizer(self, lmdb_txn: Any) -> bool:  # noqa: ANN401
         """Queue the abort of a dropped write txn on the writer thread; False if skipped.

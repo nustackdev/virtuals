@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import gc
+import os
 import threading
 import time
 
@@ -717,3 +719,35 @@ def areserve_timeout_meeting_a_release_is_a_lock_timeout(storage) -> None:
 
     asyncio.run(main())
     _write_fast(storage)
+
+
+class Interrupt(BaseException):
+    """Raised by a signal handler on the main thread: what Ctrl-C does, minus pytest's handling."""
+
+
+@contextlib.contextmanager
+def interrupt_after(delay: float):
+    """Deliver SIGUSR1 to this process after ``delay``; its handler raises ``Interrupt``.
+
+    The handler runs on the main thread, inside whatever wait it is in
+    (a future's lock acquire is interruptible), or once a section that
+    holds signals ends. SIGUSR1, so pytest-timeout's SIGALRM is left alone.
+    """
+    import signal
+
+    def handler(*_args) -> None:
+        raise Interrupt
+
+    previous = signal.signal(signal.SIGUSR1, handler)
+    # A handler installed between two sections is wrapped at the next check,
+    # which the storage runs at most every 0.1s: make this one now.
+    from virtuals._backends.storages import _write_slot
+
+    _write_slot._signal_state.checked = 0.0
+    timer = threading.Timer(delay, os.kill, (os.getpid(), signal.SIGUSR1))
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        signal.signal(signal.SIGUSR1, previous)

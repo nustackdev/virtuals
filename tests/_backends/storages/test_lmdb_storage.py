@@ -2012,7 +2012,7 @@ def test_interrupted_commit_leaves_no_stamp(tmp_path: Path) -> None:
         for i in range(20000):
             tx.put(("k", i), os.urandom(2000))
         signal.setitimer(signal.ITIMER_REAL, 0.003)
-        with pytest.raises(Exception, match=r"InterruptedCommitError|Failed to commit"):
+        with pytest.raises(InterruptedCommitError):  # as is, after the commit landed
             tx.commit()
         signal.setitimer(signal.ITIMER_REAL, 0)
         deadline = time.monotonic() + 20
@@ -2081,30 +2081,8 @@ def test_areserve_timeout_meeting_a_release_is_a_lock_timeout(storage: LMDBStora
 # =========================================================================
 
 
-class _Interrupt(BaseException):
-    """Raised by a signal handler on the main thread: what Ctrl-C does, minus pytest's handling."""
-
-
-@contextlib.contextmanager
-def _interrupt_after(delay: float):
-    """Deliver SIGUSR1 to this process after ``delay``; its handler raises ``_Interrupt``.
-
-    The handler runs on the main thread, inside whatever wait it is in
-    (a future's lock acquire is interruptible). SIGUSR1, so pytest-timeout's
-    SIGALRM is left alone.
-    """
-
-    def handler(*_args) -> None:
-        raise _Interrupt
-
-    previous = signal.signal(signal.SIGUSR1, handler)
-    timer = threading.Timer(delay, os.kill, (os.getpid(), signal.SIGUSR1))
-    timer.start()
-    try:
-        yield
-    finally:
-        timer.cancel()
-        signal.signal(signal.SIGUSR1, previous)
+_Interrupt = cases.Interrupt
+_interrupt_after = cases.interrupt_after
 
 
 def _gate_is_free(root: str) -> bool:
@@ -2147,7 +2125,7 @@ def test_interrupted_begin_hop_leaves_no_live_write(ctx, tmp_path: Path) -> None
             tx.get(("k",))
         tx.abort()  # pending: touches nothing
         assert not st._writer.lock.locked()
-        st._drain_writer()  # the begin lands and is aborted ahead of this
+        st._writer_thread.run(lambda: None)  # the begin lands and is aborted ahead of this
         assert not st._live_writes
         with (
             st.transaction() as tx
@@ -2246,7 +2224,7 @@ def test_interrupted_staged_commit_before_its_begin_commits_nothing(tmp_path: Pa
             with _interrupt_after(0.05):
                 tx.commit()
         assert tx._aborted and not tx._committed
-        st._drain_writer()
+        st._writer_thread.run(lambda: None)  # the begin lands and is aborted ahead of this
         assert not st._live_writes
         assert recorder.seen == []
         with st.snapshot() as snap:
@@ -2443,3 +2421,118 @@ def test_gate_does_not_outlive_a_dead_parent_through_a_forked_child(ctx, tmp_pat
         peer.join(10)
         if peer.is_alive():
             peer.kill()
+
+
+# =========================================================================
+# Round 3 review: bookkeeping windows (S1), a second interrupt (S2), settle then raise (S3)
+# =========================================================================
+
+
+def _kill_self_then(original):
+    """Wrap ``original`` so the call first delivers SIGUSR1 to this process: a signal inside the call."""
+    import signal
+
+    def wrapped(*args, **kwargs):
+        os.kill(os.getpid(), signal.SIGUSR1)
+        time.sleep(0.002)  # the handler runs at the next bytecode, or at the section's end
+        return original(*args, **kwargs)
+
+    return wrapped
+
+
+@pytest.mark.timeout(30)
+def test_signal_in_the_slot_release_runs_after_it(storage: LMDBStorage, monkeypatch) -> None:
+    """A signal that lands between the gate release and the slot release is handled after both.
+
+    Before, the handler raised in between and the slot stayed held by
+    nobody: the next write here failed as nested, every other writer timed out.
+    """
+    from virtuals._backends.storages.lmdb._writer import WriterGate
+
+    monkeypatch.setattr(WriterGate, "release", _kill_self_then(WriterGate.release))
+    with _interrupt_after(60), pytest.raises(_Interrupt), storage.transaction() as tx:
+        tx.put(("k",), b"1")
+    assert tx._committed and not tx._aborted
+    assert not storage._writer.lock.locked()
+    assert not storage._gate_held
+    monkeypatch.undo()
+    with storage.transaction() as tx:  # before: StorageNestedTransactionError
+        tx.put(("k",), b"2")
+
+
+@pytest.mark.timeout(30)
+def test_signal_in_the_gate_attach_runs_after_it(holder, tmp_path: Path, monkeypatch) -> None:
+    """A signal inside the gate's wait setup is handled once the wait is queued and marked.
+
+    Before, the handler raised with the wait marked in flight and nothing
+    queued, so every later begin joined a phantom wait and timed out.
+    """
+    from virtuals._backends.storages.lmdb import _writer
+
+    st = _open(str(tmp_path), busy_timeout=5.0)
+    try:
+        monkeypatch.setattr(_writer.os, "dup", _kill_self_then(os.dup))
+        with _interrupt_after(60), pytest.raises(_Interrupt):
+            st.begin_transaction()  # waits for the gate behind the holder
+        monkeypatch.undo()
+        assert not st._writer.lock.locked()
+        holder.join(10)
+        deadline = time.monotonic() + 5
+        while st._gate._waiting and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert not st._gate._waiting  # before: a phantom wait, never served
+        with st.transaction() as tx:  # before: StorageLockTimeoutError after busy_timeout
+            tx.put(("k",), b"1")
+    finally:
+        st.close()
+
+
+@pytest.mark.timeout(30)
+def test_signal_in_the_slot_registration_runs_after_it(storage: LMDBStorage, monkeypatch) -> None:
+    """A signal inside the slot's bookkeeping is handled once a transaction owns the slot.
+
+    The interrupt then surfaces out of ``begin_transaction`` with the
+    transaction unreachable, whose finalizer gives the slot and the gate
+    back. Before, the handler raised with the slot owned and no lock
+    object anywhere: nested errors for good.
+    """
+    from virtuals._backends.storages._write_slot import WriterLock
+
+    monkeypatch.setattr(WriterLock, "_held_by", _kill_self_then(WriterLock._held_by))
+    with _interrupt_after(60), pytest.raises(_Interrupt):
+        storage.begin_transaction()
+    monkeypatch.undo()
+    gc.collect()
+    assert not storage._writer.lock.locked()
+    with storage.transaction() as tx:  # before: StorageNestedTransactionError
+        tx.put(("k",), b"1")
+
+
+@pytest.mark.timeout(60)
+def test_two_interrupts_during_a_commit_settle_it_once(tmp_path: Path) -> None:
+    """Ctrl-C twice while a commit is in flight: committed, notified once, the interrupt raised once."""
+    import signal
+
+    st = _open(str(tmp_path), busy_timeout=5.0, map_size=1 << 30, sync=True)
+    recorder = _Recorder()
+    st._publisher = recorder
+    keys = {("k", i) for i in range(30000)}
+    try:
+        with pytest.raises(_Interrupt), st.transaction() as tx:
+            tx.get(("k", 0))
+            for key in keys:
+                tx.put(key, os.urandom(2000))
+            second = threading.Timer(0.05, os.kill, (os.getpid(), signal.SIGUSR1))
+            with _interrupt_after(0.02):
+                second.start()
+                try:
+                    tx.commit()
+                finally:
+                    second.cancel()
+        assert tx._committed and not tx._aborted and tx.is_closed
+        assert not st._writer.lock.locked() and not st._gate_held
+        assert recorder.seen == [keys]
+        with st.transaction() as tx:  # before: the second interrupt left the slot and gate held
+            tx.put(("after",), b"1")
+    finally:
+        st.close()

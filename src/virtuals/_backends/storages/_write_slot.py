@@ -23,6 +23,17 @@ and a grant held by a loop that closed after the handoff is taken back at
 the next acquire. A loop that is stopped but never closed keeps the grant:
 nothing can tell it apart from a loop that is about to run again.
 
+Interrupts: a signal handler that raises (Ctrl-C) runs between any two
+bytecodes of the main thread, so a lock taken or given back and the
+bookkeeping that records it are never one step in Python. ``signals_held``
+defers the handlers across such a section (microseconds), so the handler
+runs once it is consistent; ``signals_released`` lets them run again for a
+wait inside it, which undoes itself when interrupted. The storages hold
+signals from taking the slot to tracking the context that owns it, and
+across every release, commit and abort; the result of a blocking wait is
+recorded in the same C call that waited (``_acquire_into``), so no handler
+can run between the two.
+
 Lifecycle: a storage's ``close()`` calls ``WriterLock.close()``, which
 replaces the slot. Nothing reserved or taken before survives into a
 reopen: a waiter wakes with ``StorageClosedError``, a ``WriteSlot`` from
@@ -35,9 +46,12 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import signal
 import threading
+import time
 import weakref
 from collections import deque
+from itertools import starmap
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from virtuals.tkv.storage import (
@@ -52,7 +66,161 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-__all__ = ["LOOP_THREAD_WAIT_CAP", "WriteSlot", "WriterLock"]
+__all__ = ["LOOP_THREAD_WAIT_CAP", "WriteSlot", "WriterLock", "signals_held", "signals_released"]
+
+
+# The signals a Python handler is usually installed for: these are deferred
+# across a critical section. Synchronous faults (SIGSEGV, SIGFPE) are not.
+_HELD_SIGNALS = tuple(
+    getattr(signal, name)
+    for name in (
+        "SIGINT",
+        "SIGTERM",
+        "SIGHUP",
+        "SIGQUIT",
+        "SIGUSR1",
+        "SIGUSR2",
+        "SIGALRM",
+        "SIGVTALRM",
+        "SIGPROF",
+        "SIGCHLD",
+        "SIGWINCH",
+        "SIGPIPE",
+        "SIGXCPU",
+        "SIGXFSZ",
+    )
+    if hasattr(signal, name)
+)
+
+
+class _SignalState(threading.local):
+    """Per thread: the held sections in progress and the signals deferred by them."""
+
+    def __init__(self) -> None:
+        self.depth = 0  # nested ``signals_held`` sections on this thread
+        self.released = 0  # nested ``signals_released`` sections inside them
+        self.checked = 0.0  # when the installed handlers were last looked at
+        self.deferred: list[tuple[int, object]] = []  # delivered while held, in order
+
+
+_signal_state = _SignalState()
+_MAIN_THREAD = threading.main_thread().ident
+# How long a handler the application installs may go unwrapped: the check
+# costs a lookup per signal, so it runs at most this often.
+_WRAP_CHECK_EVERY = 0.1
+
+
+class _Dispatch:
+    """The handler installed for a held signal: defers inside a held section, else calls the real one.
+
+    One per real handler, so ``previous = signal.signal(sig, mine)`` and
+    ``signal.signal(sig, previous)`` keep their meaning: the wrapper
+    stands for the handler it holds. ``signal.getsignal`` returns the
+    wrapper, which is the one visible difference.
+    """
+
+    __slots__ = ("real",)
+
+    def __init__(self, real: object) -> None:
+        self.real = real
+
+    def __call__(self, signum: int, frame: object) -> None:
+        state = _signal_state  # handlers run on the main thread: its state
+        if state.depth and not state.released:
+            state.deferred.append((signum, frame))
+            return
+        self.real(signum, frame)  # type: ignore[operator]
+
+
+def _wrap_handlers() -> None:
+    """Install ``_Dispatch`` for every held signal with a Python handler. Main thread only.
+
+    A handler the application installed since the last check is wrapped
+    at the next one, at most ``_WRAP_CHECK_EVERY`` later.
+    """
+    for signum in _HELD_SIGNALS:
+        handler = signal.getsignal(signum)
+        if callable(handler) and not isinstance(handler, _Dispatch):
+            signal.signal(signum, _Dispatch(handler))
+
+
+def _run_deferred() -> None:
+    """Run the handlers deferred while the section was held, in order. Main thread only.
+
+    One usually raises (KeyboardInterrupt); the rest stay recorded and
+    run at the next release, or as the next section ends.
+    """
+    deferred = _signal_state.deferred
+    while deferred:
+        signum, frame = deferred.pop(0)
+        handler = signal.getsignal(signum)
+        if isinstance(handler, _Dispatch):
+            handler = handler.real
+        if callable(handler):
+            handler(signum, frame)
+
+
+class signals_held:  # noqa: N801 (a context manager, read as a verb phrase)
+    """Defer Python signal handlers across a critical section, on the main thread.
+
+    A handler that raises (what Ctrl-C does) runs between any two
+    bytecodes of the main thread, whichever thread the kernel delivered
+    the signal to; inside the section it would leave a lock held by
+    nobody. Held, the signal is recorded and its handler runs as the
+    outermost section ends, with every lock accounted for. Sections nest.
+    On other threads handlers never run, so nothing is done there.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self) -> None:
+        state = _signal_state
+        if state.depth == 0 and threading.get_ident() == _MAIN_THREAD:
+            now = time.monotonic()
+            if now - state.checked > _WRAP_CHECK_EVERY:
+                state.checked = now
+                _wrap_handlers()
+        state.depth += 1
+
+    def __exit__(self, *_exc: object) -> None:
+        state = _signal_state
+        state.depth -= 1
+        if state.depth == 0 and state.deferred:
+            _run_deferred()  # a deferred handler runs right here
+
+
+class signals_released:  # noqa: N801
+    """Let signal handlers run again for a wait inside a ``signals_held`` section.
+
+    The wait must undo itself when a handler raises out of it. A signal
+    already deferred runs on entry, before the wait starts; the section
+    is held again whichever way the wait ends.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self) -> None:
+        state = _signal_state
+        state.released += 1
+        if state.depth and state.deferred:
+            try:
+                _run_deferred()
+            except BaseException:  # a deferred handler raised: the section goes on held
+                state.released -= 1
+                raise
+
+    def __exit__(self, *_exc: object) -> None:
+        _signal_state.released -= 1
+
+
+def _acquire_into(lock: threading.Lock, timeout: float, got: list) -> None:
+    """``got.append(lock.acquire(True, timeout))`` as one C call.
+
+    A handler cannot run between the acquire and the record (both happen
+    inside ``list.extend``), so an interrupt out of this either left the
+    lock alone or is reported after ``got`` says it is held.
+    """
+    got.extend(starmap(lock.acquire, ((True, timeout),)))
 
 
 # The most a sync ``acquire`` on an event loop thread blocks for a slot a
@@ -249,7 +417,7 @@ class WriterLock:
         coroutine, wakes with ``StorageClosedError`` at once instead of
         after ``busy_timeout``.
         """
-        with self._guard:
+        with signals_held(), self._guard:
             old, self._lock = self._lock, threading.Lock()
             had_owner = self._owner is not None
             self._owner = None
@@ -407,7 +575,7 @@ class WriterLock:
 
     def _pass_on(self, waiter: _Waiter) -> None:
         """A coroutine granted the slot will not use it (cancelled, torn down): hand it on."""
-        with self._guard:
+        with signals_held(), self._guard:
             if waiter.state != "granted":
                 return  # closed: the old lock was released by close()
             waiter.state = "abandoned"
@@ -419,16 +587,17 @@ class WriterLock:
     def _granted(self, me: _Owner, waiter: _Waiter) -> threading.Lock:
         """Finish an ``areserve`` whose waiter is ``granted`` (or was closed meanwhile)."""
         hold = _Hold(self)
-        with self._guard:
-            lock = waiter.lock
-            if waiter.state != "granted" or lock is None or lock is not self._lock:
-                raise StorageClosedError(_CLOSED_WHILE_WAITING)
-            if self._pending is waiter:
-                self._pending = None
-            self._owner = me
-            self._hold = hold
-        _mark_held(hold)
-        return lock
+        with signals_held():
+            with self._guard:
+                lock = waiter.lock
+                if waiter.state != "granted" or lock is None or lock is not self._lock:
+                    raise StorageClosedError(_CLOSED_WHILE_WAITING)
+                if self._pending is waiter:
+                    self._pending = None
+                self._owner = me
+                self._hold = hold
+            _mark_held(hold)
+            return lock
 
     def acquire(self, timeout: float) -> threading.Lock:
         """Block for the slot, up to ``timeout`` seconds.
@@ -466,35 +635,47 @@ class WriterLock:
         on_loop = asyncio._get_running_loop() is not None
         if on_loop:
             timeout = min(timeout, LOOP_THREAD_WAIT_CAP)
-        lock = self._lock
-        if lock.acquire(blocking=False):  # the uncontended path costs no bookkeeping
-            waited = False
-        else:
-            with self._guard:
-                self._reclaim_dead_pending()
-                lock = self._lock
-                self._sync_waiting += 1
-            waited = True
-            try:
-                got = lock.acquire(timeout=max(timeout, 0))
-            except BaseException:
-                got = False
-                raise
-            finally:
-                if not got:
-                    # Timed out, or an exception out of the wait (a signal
-                    # handler raising): this thread is gone, so a lock
-                    # unlocked for it must go to the queue instead.
+        # Signals are held from the take to the record of who holds it
+        # (and on through the caller, which holds them until the lock is
+        # kept somewhere a release will find it); only the wait lets them
+        # through, and records its result in the same call that waited.
+        with signals_held():
+            lock = self._lock
+            if lock.acquire(blocking=False):  # the uncontended path costs no bookkeeping
+                waited = False
+            else:
+                with self._guard:
+                    self._reclaim_dead_pending()
+                    lock = self._lock
+                    self._sync_waiting += 1
+                waited = True
+                got: list[bool] = []
+                try:
+                    with signals_released():
+                        _acquire_into(lock, max(timeout, 0), got)
+                except BaseException:
+                    # A signal handler raising: this thread is gone. The
+                    # lock it may have just taken (recorded in ``got``)
+                    # goes to whoever is next, and one unlocked for it
+                    # must go to the queue instead.
                     with self._guard:
+                        self._sync_waiting -= 1
+                        if got and got[0]:
+                            self._release_locked()
+                        else:
+                            self._reclaim_dead_pending()
+                            self._rescue_queue()
+                    raise
+                if not got[0]:
+                    with self._guard:  # timed out: as above
                         self._sync_waiting -= 1
                         self._reclaim_dead_pending()
                         self._rescue_queue()
-            if not got:
-                raise self._timed_out(timeout, on_loop=on_loop)
-        if not self._held_by(me, lock, waited=waited):
-            lock.release()
-            raise StorageClosedError(_CLOSED_WHILE_WAITING)
-        return lock
+                    raise self._timed_out(timeout, on_loop=on_loop)
+            if not self._held_by(me, lock, waited=waited):
+                lock.release()
+                raise StorageClosedError(_CLOSED_WHILE_WAITING)
+            return lock
 
     async def areserve(self, timeout: float) -> threading.Lock:
         """Wait for the slot without blocking the event loop, behind the coroutines already queued.
@@ -513,7 +694,7 @@ class WriterLock:
         if self._is_nested(me):
             raise self._nested()
         loop = asyncio.get_running_loop()
-        with self._guard:
+        with signals_held(), self._guard:
             self._reclaim_dead_pending()
             # Behind queued coroutines, and behind threads blocked in the
             # lock: a free lock they are counted on is theirs to take.
@@ -554,7 +735,7 @@ class WriterLock:
                 released when it is no longer the current lock (a close
                 or a fork replaced the slot since).
         """
-        with self._guard:
+        with signals_held(), self._guard:
             if lock is not None and lock is not self._lock:
                 return
             if not self._lock.locked():
@@ -588,18 +769,19 @@ class WriterLock:
             records nothing on the fresh slot.
         """
         if write_slot is not None:
-            with self._guard:
-                write_slot._take(storage)
-                lock = write_slot._lock
-                previous = self._owner
-                me = _caller()
-                self._owner = me
-                hold = self._hold
-            if me[1] is not None and hold is not None:
-                _mark_held(hold)
+            with signals_held():
+                with self._guard:
+                    write_slot._take(storage)
+                    lock = write_slot._lock
+                    previous = self._owner
+                    me = _caller()
+                    self._owner = me
+                    hold = self._hold
+                if me[1] is not None and hold is not None:
+                    _mark_held(hold)
 
             def give_back() -> None:
-                with self._guard:
+                with signals_held(), self._guard:
                     if lock is self._lock:
                         self._owner = previous
                         write_slot._give_back()

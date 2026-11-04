@@ -16,6 +16,8 @@ from virtuals.tkv.storage import (
 )
 from virtuals.tkv.types import EMPTY, Empty
 
+from .._write_slot import signals_held
+
 
 if TYPE_CHECKING:
     from virtuals.tkv.types import Key, Value
@@ -115,7 +117,7 @@ class ContextBase:
             raise StorageClosedError("Context handle is invalid")
         return self._conn
 
-    def _end(self, sql: str) -> bool:
+    def _end(self, sql: str, deferred: list[BaseException] | None = None) -> bool | None:
         """Run COMMIT or ROLLBACK, then give back the connection and writer slot.
 
         The connection and slot are released even when the statement fails,
@@ -125,28 +127,56 @@ class ContextBase:
         connection and the slot, so each is given back once; the other
         waits on the context lock and finds nothing to end.
 
+        With ``deferred`` (a commit) an interrupt (a signal handler
+        raising, ``KeyboardInterrupt``) out of the statement never
+        changes its outcome or how it is reported: the interrupt is
+        appended to ``deferred`` and the outcome read from the
+        connection, so the caller reports it first and raises the
+        interrupt after. The statement itself is one call into SQLite
+        that no handler runs inside, so the interrupt lands before it
+        (nothing ran: the pool rolls the connection back) or after it.
+
         Returns:
-            True if this call ran ``sql``; False if there was no connection
-            (none taken yet, or a racing call took it).
+            True if this call ran ``sql``; False if an interrupt came
+            first and was deferred; None if there was no connection (none
+            taken yet, or a racing call took it).
         """
         with self._lock:
-            return self._end_locked(sql)
+            return self._end_locked(sql, deferred)
 
-    def _end_locked(self, sql: str) -> bool:
-        """``_end`` for a caller that already holds the context lock."""
+    def _end_locked(self, sql: str, deferred: list[BaseException] | None = None) -> bool | None:
+        """``_end`` for a caller that already holds the context lock.
+
+        The connection and the slot are given back whatever lands in
+        between (an interrupt in the cleanup): each step is in its own
+        ``finally``.
+        """
         conn, self._conn = self._conn, None
         holds, self._holds_write_lock = self._holds_write_lock, False
         writer_lock, self._writer_lock = self._writer_lock, None
+        ran: bool | None = None
         try:
             if conn is not None:
-                conn.execute(sql)
+                try:
+                    conn.execute(sql)
+                except sqlite3.Error:
+                    raise  # the statement's own failure
+                except BaseException as e:
+                    if deferred is None:
+                        raise
+                    deferred.append(e)
+                    ran = not conn.in_transaction  # over: the statement ran before the interrupt
+                else:
+                    ran = True
         finally:
             self._closed = True
-            if conn is not None:
-                self._storage._release_connection(conn)
-            if holds:
-                self._storage._release_write_slot(writer_lock)
-        return conn is not None
+            try:
+                if conn is not None:
+                    self._storage._release_connection(conn)
+            finally:
+                if holds:
+                    self._storage._release_write_slot(writer_lock)
+        return ran
 
     def _finalize(self) -> None:
         """End a context that was dropped without being ended.
@@ -159,21 +189,24 @@ class ContextBase:
         a collection may run on a thread that holds it. A connection
         inherited across a fork is parked, never closed.
         """
-        with self._lock:
+        with (
+            signals_held(),
+            self._lock,
+        ):  # a handler raising in a finalizer is swallowed: never half done
             conn, self._conn = self._conn, None
             holds, self._holds_write_lock = self._holds_write_lock, False
             writer_lock, self._writer_lock = self._writer_lock, None
             self._closed = True
-        if conn is not None:
-            if os.getpid() != self._storage._pid:
-                self._storage._park_inherited([conn])
-            else:
-                try:
-                    conn.close()
-                except Exception:  # noqa: S110 (interpreter shutdown)
-                    pass
-        if holds:
-            self._storage._release_write_slot(writer_lock)
+            if conn is not None:
+                if os.getpid() != self._storage._pid:
+                    self._storage._park_inherited([conn])
+                else:
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: S110 (interpreter shutdown)
+                        pass
+            if holds:
+                self._storage._release_write_slot(writer_lock)
 
     def _forget(self) -> None:
         """Mark the context ended without touching its connection.
