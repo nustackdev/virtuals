@@ -1112,6 +1112,100 @@ def test_get_returns_the_default_only_for_an_absent_key(root, view_cls, monkeypa
         view.get(_key(view_cls, 1))
 
 
+@pytest.mark.parametrize("view_cls", ACCESS_VIEWS)
+def test_get_on_a_closed_storage_raises(storage, view_cls):
+    """The real path: a read that fails below the view is not an absent key."""
+    from virtuals.tkv.storage.exceptions import StorageClosedError
+
+    key = _key(view_cls, 1)
+    with storage.transaction() as tx:
+        Navigator(storage).root(tx).open_child("d", view_cls)[key] = 1
+    snap = storage.snapshot().__enter__()  # left open on purpose: close() ends it
+    view = Navigator(storage).root(snap).open_child("d", view_cls)
+    storage.close()
+    with pytest.raises(StorageClosedError):
+        view.get(key)
+
+
+def test_access_views_cover_every_dict_view():
+    """A view with ``get`` exported from ``_views`` is in ACCESS_VIEWS, or this fails."""
+    from virtuals import _views
+
+    found = {
+        cls
+        for name in _views.__all__
+        if not name.endswith("Base")
+        and isinstance(cls := getattr(_views, name), type)
+        and hasattr(cls, "get")
+    }
+    assert found == set(ACCESS_VIEWS)
+
+
+# ============================================================================
+# KEY DOMAIN: a key the view cannot hold is absent on reads, rejected on writes
+# ============================================================================
+
+FOREIGN_KEYS = (None, 1.5, b"a", ("a",), [1])
+"""Keys no dict view holds: not str or int (the last one is not even hashable)."""
+
+KH57_FOREIGN_KEYS = (*FOREIGN_KEYS, "k", -1, 1 << 57)
+"""Kh57 holds non-negative ints under 57 bits only."""
+
+
+@pytest.mark.parametrize("view_cls", ACCESS_VIEWS)
+def test_a_key_the_view_cannot_hold_is_absent_on_reads_and_rejected_on_writes(root, view_cls):
+    """Dict holds no key of a type it was never given: KeyError, the default, False.
+
+    A write under such a key raises TypeError (ValueError for an int outside
+    the Kh57 domain) and leaves the view as it was.
+    """
+    view = root.open_child("d", view_cls)
+    key = _key(view_cls, 1)
+    view[key] = 1
+    foreign = KH57_FOREIGN_KEYS if view_cls in (EagerKh57View, LazyKh57View) else FOREIGN_KEYS
+    for bad in foreign:
+        with pytest.raises(KeyError):
+            view[bad]
+        assert view.get(bad) is EMPTY
+        assert view.get(bad, "dflt") == "dflt"
+        assert bad not in view
+        with pytest.raises((TypeError, ValueError)):
+            view[bad] = 2
+        if view_cls in SILENT_DELETE_VIEWS:
+            del view[bad]
+        else:
+            with pytest.raises(KeyError):
+                del view[bad]
+        if hasattr(view, "pop"):
+            with pytest.raises(KeyError):
+                view.pop(bad)
+            assert view.pop(bad, "dflt") == "dflt"
+    assert list(view) == [key]
+    assert _read(view, key) == 1
+
+
+@pytest.mark.parametrize("view_cls", (EagerKh57View, LazyKh57View))
+def test_kh57_reads_follow_python_int_key_semantics(root, view_cls):
+    """``1.0 == 1`` and ``True == 1`` name key 1; ``1.5`` names nothing. Writes take ints only."""
+    view = root.open_child("k", view_cls)
+    view[1] = "one"
+    for alias in (1.0, True):
+        assert alias in view
+        assert view[alias] == "one"
+        assert view.get(alias) == "one"
+    assert 1.5 not in view
+    assert view.get(1.5) is EMPTY
+    with pytest.raises(KeyError):
+        view[1.5]
+    with pytest.raises(TypeError):
+        view[1.0] = "x"
+    view[True] = "uno"
+    assert view[1] == "uno"
+    del view[1.0]
+    assert 1 not in view
+    assert len(view) == 0
+
+
 # ============================================================================
 # EXISTENCE: a raising or no-op write never creates the view (contract 6, r3 F3 to F7)
 # ============================================================================
