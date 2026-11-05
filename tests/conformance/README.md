@@ -77,7 +77,7 @@ Races are forced, not hoped for. In lost update a pause sits between each read a
 | `test_s5_subscribe_ready_on_return` | 5 | the very next commit after subscribe() returns is delivered, no window |
 | `test_s5_watch_covers_the_subtree` | 5 | a prefix watch gets the row and everything under it, not a sibling whose name only starts the same |
 | `test_s5_untyped_child_watch_covers_the_child_subtree` | 5 | the watch a dict view builds for an untyped child fires on a write deep inside the compound value stored there, not on a sibling (once per dict view kind) |
-| `test_s5_resync_on_reconnect` | 5 | writes made while the observer is cut off are recovered by one keyless wake (redis transport only) |
+| `test_s5_delivery_resumes_after_reconnect` | 5 | writes made while the observer is cut off are not delivered; keyed delivery resumes once it is re-registered (redis transport only) |
 | `test_s6_raw_put_rejects_empty` | 6 | `txn.put` and `batch.put` raise `ValueError` on `EMPTY` and store nothing; the transaction stays usable |
 | `test_s7_storage_delete_is_point_delete` | 7 | `txn.delete` of one key handles one key inside the backend at 10 and 1000 siblings |
 | `test_s7_storage_delete_time_flat` | 7 | median `txn.delete` time grows under 10x from 100 to 10k siblings |
@@ -98,6 +98,6 @@ Out of scope: multi-store transactions (one Transaction over several storages, c
 
 Strict xfails: an unexpected pass fails the run, so delete the row in the commit that fixes it. `known_failures.py` is the source of truth and is empty as of this commit: every case passes on every backend. A row names the case, the backend (or one parametrization of it), and an owner.
 
-Section 5 runs every case on both transports (in-memory, redis). The resync case is skipped on the in-memory transport, which has no connection to lose. The multi-process cases skip on rocksdb and mem, which declare a single-process model.
+Section 5 runs every case on both transports (in-memory, redis). The reconnect case is skipped on the in-memory transport, which has no connection to lose. The multi-process cases skip on rocksdb and mem, which declare a single-process model.
 
 On rocksdb and mem the second writer in the never-waits case does not block, and the case still checks only the snapshot. On backends without a writer slot the `slot` and `plain` section 4 variants run the same path.

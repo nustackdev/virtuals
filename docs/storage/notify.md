@@ -21,9 +21,11 @@ Writes are published after they commit. Observers wake subscribers whose filter 
 
 **At least once.** A redis chunk whose reply is lost is sent again, so a receiver may see a key twice.
 
-**Resync on reconnect.** Pub/sub cannot replay writes made while an observer was disconnected. When the redis connection drops, each filter loses its readiness until it is subscribed and registered again. Writes committed in that window are not delivered. Once a filter is re-registered, every local subscription on it gets one keyless wake: the receiver is called with `None`. That means re-read state. Level flows recover exactly. Event flows must treat `None` as a re-read or skip it.
+**Every wake names a key.** A receiver is always called with the key that changed, never with a placeholder that means "you may have missed something".
 
-**Drops become resync wakes.** The publisher never drops silently. A failing send is retried with backoff for `publish_retry_seconds` (default 5s). Meanwhile the queue fills and `notify()` blocks (backpressure) for up to `notify_timeout` (default 1s on redis, unbounded on the in-memory transport), then drops the rest of its keys. Every drop is logged at ERROR, counted in `dropped_keys`, raised once by the next `flush()`, and followed by a resync wake to every subscriber on the prefix the next time the worker can publish. A drop costs readers one re-read, never a missed state. A commit while the publisher is disconnected is a drop too: the storage logs it, the keys are counted and raised once by the next `flush()`, and the first connection that sends again carries the resync wake.
+**Best effort across a reconnect.** Pub/sub cannot replay writes made while an observer was disconnected. When the redis connection drops, each filter loses its readiness until it is subscribed and registered again. Writes committed in that window are not delivered and are gone. Once a filter is re-registered, delivery resumes with the next commit. A reader that re-reads state on its own schedule catches up then; one that reacts to each key misses the window.
+
+**Drops are counted, not delivered.** The publisher never drops silently. A failing send is retried with backoff for `publish_retry_seconds` (default 5s). Meanwhile the queue fills and `notify()` blocks (backpressure) for up to `notify_timeout` (default 1s on redis, unbounded on the in-memory transport), then drops the rest of its keys. Every drop is logged at ERROR, counted in `dropped_keys` and raised once by the next `flush()`. Dropped keys never reach a subscriber. A commit while the publisher is disconnected is a drop too: the storage logs it, and the keys are counted and raised once by the next `flush()`.
 
 **Subscriptions on an absent container work.** A view whose container does not exist yet builds the same filter as an existing one. The first write under it fires the watch. Taking the watch writes nothing.
 
@@ -37,7 +39,7 @@ Writes are published after they commit. Observers wake subscribers whose filter 
 | `subscribe_timeout` | redis observer | 2s | how long `subscribe()` waits for the server to confirm and register |
 | `queue_maxsize` | publisher | 100000 keys | queue capacity before backpressure |
 
-A stalled server bounds `subscribe()` at about the subscribe timeout plus twice the socket timeout. A slow receiver never stalls a `subscribe()` from another thread: the listener parks inbound keys in an overflow buffer and keeps serving commands, and while a subscribe awaits its confirmation it reads the socket whatever the backlog, so the confirmation is never behind it. Past the overflow cap with no subscribe pending it stops reading the socket; with one pending the overflow is unbounded, and the real cap is valkey's client output buffer limit, past which the client is disconnected, reconnects and resyncs.
+A stalled server bounds `subscribe()` at about the subscribe timeout plus twice the socket timeout. A slow receiver never stalls a `subscribe()` from another thread: the listener parks inbound keys in an overflow buffer and keeps serving commands, and while a subscribe awaits its confirmation it reads the socket whatever the backlog, so the confirmation is never behind it. Past the overflow cap with no subscribe pending it stops reading the socket; with one pending the overflow is unbounded, and the real cap is valkey's client output buffer limit, past which the client is disconnected and reconnects (writes in between are not delivered).
 
 ## Lifecycle
 

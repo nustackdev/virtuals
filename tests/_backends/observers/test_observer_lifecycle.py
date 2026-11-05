@@ -313,17 +313,14 @@ def test_in_process_publisher_blocks_by_default_and_never_drops():
         pub.disconnect()
 
 
-def test_in_process_publisher_with_a_timeout_wakes_every_observer_after_a_drop():
+def test_in_process_publisher_with_a_timeout_drops_instead_of_blocking():
     tr = InMemoryTransport()
     pub = InMemoryPublisher(tr, queue_maxsize=2, notify_timeout=0.2)
     obs = InMemoryObserver(tr, dispatch_queue_maxsize=2)
-    other = InMemoryObserver(tr)
     pub.connect()
     obs.connect()
-    other.connect()
     gate = threading.Event()
     got: list = []
-    other_got: list = []
     try:
 
         def slow(k):
@@ -331,22 +328,17 @@ def test_in_process_publisher_with_a_timeout_wakes_every_observer_after_a_drop()
             got.append(k)
 
         obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("k",)))).bind(slow)
-        other.subscribe(SubscriptionOptions(filter=PrefixFilter(("x",)))).bind(other_got.append)
         t0 = time.monotonic()
         pub.notify([("k", i) for i in range(40)])
         assert time.monotonic() - t0 < 1.0
         assert pub.dropped_keys > 0
         gate.set()
-        # once the transport moves again, every observer on it gets a keyless wake
-        assert _wait_until(lambda: got.count(None) == 1 and other_got == [None], 5), (
-            got,
-            other_got,
-        )
         with pytest.raises(Exception, match="dropped"):
             pub.flush(2)
+        obs.flush(2)
+        assert len(got) == 40 - pub.dropped_keys
     finally:
         gate.set()
-        other.disconnect()
         obs.disconnect()
         pub.disconnect()
 
@@ -429,44 +421,6 @@ def test_worker_takes_at_most_one_batch_off_the_queue_per_round():
 
 
 # =============================================================================
-# r2 N3: resync wakes coalesce per filter hash until delivered
-# =============================================================================
-
-
-def test_resync_wakes_asked_for_while_one_is_pending_collapse_into_it():
-    """Three publishers dropping in one stall ask three times; each subscription
-    re-reads once. After that wake is delivered the next request wakes again."""
-    tr, pub, obs = _pair()
-    hold = threading.Event()
-    a: list = []
-    b: list = []
-    try:
-
-        def slow(key):
-            hold.wait(10)
-            a.append(key)
-
-        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("a",)))).bind(slow)
-        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("b",)))).bind(b.append)
-        pub.notify([("a", 0)])
-        pub.flush(5)
-        assert _wait_until(lambda: obs._dispatch_queue.qsize() == 0)  # worker inside slow()
-        for _ in range(3):
-            tr.resync()  # what each dropping publisher does
-        hold.set()
-        obs.flush(5)
-        time.sleep(0.1)
-        assert a == [("a", 0), None] and b == [None], (a, b)
-        tr.resync()
-        obs.flush(5)
-        assert a == [("a", 0), None, None] and b == [None, None], (a, b)
-    finally:
-        hold.set()
-        obs.disconnect()
-        pub.disconnect()
-
-
-# =============================================================================
 # r2 N4: flush(timeout) returns at the timeout on a full queue
 # =============================================================================
 
@@ -490,40 +444,6 @@ def test_flush_honours_its_timeout_on_a_full_dispatch_queue():
         t0 = time.monotonic()
         obs.flush(timeout=0.3)
         assert time.monotonic() - t0 < 1.0, "flush waited for room instead of its timeout"
-    finally:
-        hold.set()
-        obs.disconnect()
-        pub.disconnect()
-
-
-# =============================================================================
-# review B1: a resync wake that finds no subscription releases its hash
-# =============================================================================
-
-
-def test_resync_delivered_to_an_empty_registry_does_not_block_the_next_one():
-    """Every subscription closes before a pending wake is delivered; a later
-    subscription on the same filter still gets a keyless wake on the next request."""
-    tr, pub, obs = _pair()
-    hold = threading.Event()
-    try:
-        blk = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("x",))))
-        blk.bind(lambda k: hold.wait(10))
-        pub.notify([("x", 0)])
-        pub.flush(5)
-        assert _wait_until(lambda: obs._dispatch_queue.qsize() == 0)  # worker inside blk
-        s1 = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("a",))))
-        tr.resync()  # wakes queued for hash(a) and hash(x)
-        s1.close()
-        blk.close()  # registry empty before the batch is delivered
-        hold.set()
-        obs.flush(5)
-        assert _wait_until(lambda: not obs._resync_queued), obs._resync_queued
-        got: list = []
-        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(("a",)))).bind(got.append)
-        tr.resync()
-        obs.flush(5)
-        assert _wait_until(lambda: got == [None]), got
     finally:
         hold.set()
         obs.disconnect()

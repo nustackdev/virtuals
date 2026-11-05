@@ -59,7 +59,7 @@ Swap `InMemoryStorage` for `SQLiteStorage`, `LMDBStorage` or `RocksDBStorage` an
 - **Many structures, one store.** Dict, list, set, frozenset, tuple, bytearray, insertion-ordered dict with paging, fractional-indexed ordered collection with O(1) insert and move, int-keyed map with range sampling. Mix them freely under one root.
 - **Real transactions.** Serializable, read your own writes, atomic commit, abort on exception. Snapshots bind at open and are never torn.
 - **Concurrency that holds up.** One writer at a time, queued across threads, coroutines and processes. Coroutines wait without blocking the loop. Contention surfaces as two retryable errors, never as backend noise.
-- **Watch anything.** Subscribe to a view, a child, its children or a pattern of descendants. Wakes arrive after commit, in-process or across processes over Redis or Valkey, with resync on reconnect and no silent drops.
+- **Watch anything.** Subscribe to a view, a child, its children or a pattern of descendants. Wakes arrive after commit, in-process or across processes over Redis or Valkey. Delivery is best effort and drops are never silent.
 - **Extensible both ways.** Write a new view and it runs on every backend. Write a new backend, run the shipped compliance suites, and every view works on it.
 
 ## Eager and lazy
@@ -139,7 +139,7 @@ observer.disconnect()
 live.close()
 ```
 
-Swap the in-memory pair for the Redis publisher and observer and the same watch fires in every process. Receivers re-read state on wake, so repeats and resync wakes are harmless.
+Swap the in-memory pair for the Redis publisher and observer and the same watch fires in every process. Receivers re-read state on wake, so repeats are harmless.
 
 ## Backends
 

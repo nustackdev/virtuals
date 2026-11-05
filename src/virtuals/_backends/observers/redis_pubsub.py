@@ -21,12 +21,10 @@ subscribe() in that window waits for the re-registration (or raises on
 timeout) instead of returning early. Writes committed while the connection
 is down, or before the re-registration lands, are NOT delivered (a restarted
 server lost the index; a dropped connection misses the PUBLISH). The observer
-logs a WARNING when this starts and an INFO per re-registered hash. Once a
-hash is re-registered, every local subscription on it gets one keyless resync
-wake (its receivers are called with None), so a level flow re-reads and
-recovers the writes it missed. Event flows must treat None as a re-read or
-skip it. A publisher that had to drop keys sends the same keyless wake to
-every hash on the prefix (an empty-keys payload) once it can publish again.
+logs a WARNING when this starts and an INFO per re-registered hash. Delivery
+is best effort: what was written in the window is gone, and notifications
+flow again once the hash is re-registered. Level flows recover on their own
+re-check; event flows miss those changes.
 
 Backlog. The listener never blocks on the dispatch queue. When the queue is
 full it parks inbound keys in its own overflow buffer (bounded by the same
@@ -40,10 +38,7 @@ a SUBSCRIBE awaits its confirmation: then it reads whatever the backlog, so
 the confirmation is never behind it and a subscribe() never times out on a
 slow receiver. While one is pending the overflow is unbounded; the real cap
 is valkey's client output buffer limit, past which valkey disconnects the
-client, which degrades to a reconnect and a resync wake. A keyless wake
-(reconnect or a publisher's drop) is parked at most once per hash until
-delivered, so W publishers dropping in one stall cost one re-read per
-subscription, not W.
+client, which degrades to a reconnect (and the reconnect window above).
 
 Timeouts. Both connections have a socket and connect timeout and at most one
 transparent redis-py retry, so a stalled server bounds `nu1_reg` (and with it
@@ -64,8 +59,8 @@ messages whose `iid` matches.
 
 Wire format:
 - Channel: `{prefix}:notif:{filter_hash}`.
-- msgpack payload: `{"iid": pub_id, "keys": [[...], ...]}`. Empty `keys`
-  is a keyless resync wake for the hash.
+- msgpack payload: `{"iid": pub_id, "keys": [[...], ...]}`. A payload
+  without keys is ignored.
 - Routing index: `{prefix}:nx1:*` (owned by the Lua library).
 Mixing with observers/publishers from before server-side routing on one
 prefix is unsupported.
@@ -88,7 +83,7 @@ from virtuals._backends.notify.router import NotifyLua
 from virtuals.tkv.filter import Filter, canonicalize, filter_hash
 from virtuals.tkv.observer import ObserverSubscriptionError
 
-from ._base import DEFAULT_DISPATCH_QUEUE_MAXSIZE, ObserverBase, _Resync, _TaggedKey
+from ._base import DEFAULT_DISPATCH_QUEUE_MAXSIZE, ObserverBase, _TaggedKey
 
 
 try:
@@ -351,7 +346,7 @@ class RedisObserver(ObserverBase):
         self._pending: dict[bytes, deque[list[_Ack]]] = {}
         self._watched_conn: Any = None
         # Inbound items the dispatch queue had no room for (listener-owned).
-        self._overflow: deque[_TaggedKey | _Resync] = deque()
+        self._overflow: deque[_TaggedKey] = deque()
 
         self._obs_stop_event = threading.Event()
         self._listener_thread: threading.Thread | None = None
@@ -712,8 +707,7 @@ class RedisObserver(ObserverBase):
         if reset:
             logger.warning(
                 "Redis observer pubsub connection %s: %d subscribed filter hash(es) not "
-                "routed until re-registered; writes in this window are not delivered, "
-                "subscribers get a keyless resync wake once re-registered",
+                "routed until re-registered; writes in this window are not delivered",
                 why,
                 reset,
             )
@@ -733,12 +727,6 @@ class RedisObserver(ObserverBase):
                     ack = None
             elif action == "unsub":
                 self._pubsub.unsubscribe(channel)
-            elif action == "resync":
-                # Behind every key parked so far, so the wake follows them.
-                item = self._resync_item(channel)
-                if item is not None:
-                    self._overflow.append(item)
-                    self._drain_overflow()
         except Exception as e:
             logger.warning("Listener cmd %s(%s) failed: %s", action, channel, e)
             if ack is not None:
@@ -853,7 +841,7 @@ class RedisObserver(ObserverBase):
         # callback queue room. In that state the overflow can absorb what
         # the server buffered for this client, so the real bound is valkey's
         # pubsub output buffer limit; past it valkey disconnects the client,
-        # which degrades to a reconnect and a resync wake.
+        # which degrades to a reconnect.
         room = len(self._overflow) < self._dispatch_queue_maxsize or pending
 
         # 3. Take one message if redis-py has one and there is room for it,
@@ -900,18 +888,11 @@ class RedisObserver(ObserverBase):
         # multiple registered filters (arriving on multiple notif channels),
         # and drops the router's over-delivery (hints are a superset).
         raw_keys = payload.get("keys")
-        if raw_keys:
-            self._overflow.extend(_TaggedKey(tuple(k), filter_hash_str) for k in raw_keys)
-        elif raw_keys == []:
-            # A publisher that dropped keys asks every hash to re-read. One
-            # wake per hash is pending at a time, whatever the publisher count.
-            item = self._resync_item(filter_hash_str)
-            if item is None:
-                return
-            self._overflow.append(item)
-        else:
-            logger.warning("Payload without keys on %s ignored", msg.get("channel"))
+        if not raw_keys:
+            if raw_keys != []:
+                logger.warning("Payload without keys on %s ignored", msg.get("channel"))
             return
+        self._overflow.extend(_TaggedKey(tuple(k), filter_hash_str) for k in raw_keys)
         self._drain_overflow()
 
     # -- Maintenance thread ---------------------------------------------------
@@ -929,10 +910,6 @@ class RedisObserver(ObserverBase):
             return False
         logger.info("Re-registered filter hash %s after reconnect", h)
         self._mark_ready(h, gen)
-        # Routed again: wake each local sub once so it re-reads whatever was
-        # written while the hash was not routed. Through the listener, so
-        # the wake queues behind keys it read before the reconnect.
-        self._dispatch_pubsub_cmd("resync", h, wait=False)
         return True
 
     def _mark_ready(self, h: str, gen: int) -> None:

@@ -36,7 +36,7 @@ A failure prints the shrunk sequence of steps that reproduces it. Each run also 
 |---|---|---|
 | `conformance/` | the kv contract as executable cases, one run per backend. Transactions, snapshots, errors, process model, notifications, cost. See its [README](conformance/README.md) | sqlite, lmdb, rocksdb, mem; notify on the in-memory and redis transports |
 | `_backends/storages/` | per backend behaviour below the contract: locks, threads, fork, close races, map growth, secondaries. `_write_slot_cases.py` is the shared writer slot suite each backend runs | one file per backend |
-| `_backends/publishers/`, `_backends/observers/`, `_backends/notify/` | publisher queue, retry, drops and resync; observer readiness, reconnect, backlog; the redis routing function | in-memory and redis |
+| `_backends/publishers/`, `_backends/observers/`, `_backends/notify/` | publisher queue, retry and drops; observer readiness, reconnect, backlog; the redis routing function | in-memory and redis |
 | `_backends/test_notify_*.py` | notify end to end: gap after subscribe, backpressure, reconnect | in-memory and redis |
 | `views/` | every view against storage: behaviour on every backend, op counts on the seeking backends (sqlite, lmdb, rocksdb). `test_dict_views_hardening.py` pins the contract rules for dict views: EMPTY, existence, kind change, cost | all four |
 | `functional/` | container and view behaviour through the public API, watches on subtrees and absent containers | mem |

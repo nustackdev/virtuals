@@ -1,8 +1,8 @@
 """Publisher under stalls, drops, failed connects and worker lifecycle.
 
 Each test pins one finding of the notify or lifecycle audit: a stalled
-transport never holds a writer in notify() for long (N2), drops reach
-readers as a resync wake (N4), one worker ever (F4), a failed connect
+transport never holds a writer in notify() for long (N2), drops are
+counted and surfaced, one worker ever (F4), a failed connect
 leaks nothing (N7), a dropped publisher is collected (F8), a dead server
 bounds the drain at disconnect.
 """
@@ -44,7 +44,6 @@ class _Gated(PublisherBase):
         self.fail = fail
         self.delay = delay
         self.sent: list = []
-        self.resyncs = 0
 
     def _publish_batch(self, batch) -> None:
         if self.delay:
@@ -54,11 +53,6 @@ class _Gated(PublisherBase):
         if self.fail:
             raise ConnectionError("down")
         self.sent.extend(batch)
-
-    def _send_resync(self) -> None:
-        if self.fail:
-            raise ConnectionError("down")
-        self.resyncs += 1
 
 
 # =============================================================================
@@ -81,8 +75,6 @@ def test_notify_on_a_stalled_transport_returns_within_its_timeout_and_surfaces()
         with pytest.raises(PublisherOperationError, match="dropped"):
             p.flush(timeout=2)
         assert sorted(p.sent) == [("k", i) for i in range(10 - p.dropped_keys)]
-        # the drop was followed by a resync wake once sends worked again
-        assert _wait_until(lambda: p.resyncs == 1, 2)
     finally:
         p.gate.set()
         p.disconnect()
@@ -97,29 +89,6 @@ def test_notify_timeout_is_per_call_not_per_key():
         assert time.monotonic() - t0 < 0.6
     finally:
         p.gate.set()
-        p.disconnect()
-
-
-# =============================================================================
-# N4: drops are followed by one resync wake once the transport is back
-# =============================================================================
-
-
-def test_resync_wake_goes_out_on_idle_once_the_transport_recovers():
-    """No further writes after the drop: the idle poll sends the wake."""
-    p = _Gated(fail=True, delay=0.01, publish_retry_seconds=0.1)
-    p.connect()
-    try:
-        p.notify(("k", 1))
-        with pytest.raises(PublisherOperationError):
-            p.flush(timeout=2)
-        assert p.dropped_keys == 1
-        assert p.resyncs == 0
-        p.fail = False
-        assert _wait_until(lambda: p.resyncs == 1, 3)
-        time.sleep(0.3)
-        assert p.resyncs == 1  # once per drop episode, not per poll
-    finally:
         p.disconnect()
 
 
@@ -219,7 +188,7 @@ def test_dropped_publisher_is_collected_and_its_worker_exits():
 
 
 # =============================================================================
-# Redis: stalled server, resync reaches an observer, failed connect, drop
+# Redis: stalled server, failed connect, drop
 # =============================================================================
 
 
@@ -234,9 +203,9 @@ def own_valkey(tmp_path):
 
 
 @pytest.mark.redis
-def test_stalled_server_bounds_notify_and_wakes_subscribers_after(own_valkey):
+def test_stalled_server_bounds_notify_and_delivery_resumes_after(own_valkey):
     """SIGSTOP valkey: writers return within notify_timeout, drops are counted,
-    and once the server is back every subscriber gets one keyless wake."""
+    and once the server is back keyed delivery goes on."""
     pytest.importorskip("redis")
     from virtuals._backends.observers.redis_pubsub import RedisObserver
     from virtuals._backends.publishers.redis_pubsub import RedisPublisher
@@ -275,83 +244,15 @@ def test_stalled_server_bounds_notify_and_wakes_subscribers_after(own_valkey):
             os.kill(pid, signal.SIGCONT)
         with pytest.raises(PublisherOperationError):
             pub.flush(timeout=5)
-        # one keyless wake per subscription on the prefix, b included
-        assert _wait_until(lambda: got_a.count(None) == 1 and got_b.count(None) == 1, 5), (
-            got_a,
-            got_b,
-        )
-        time.sleep(0.3)
-        assert got_a.count(None) == 1 and got_b.count(None) == 1
         # keyed delivery goes on
         pub.notify(("b", 1))
         pub.flush(2)
-        assert _wait_until(lambda: got_b[-1] == ("b", 1))
+        assert _wait_until(lambda: got_b == [("b", 1)]), got_b
     finally:
         try:
             os.kill(pid, signal.SIGCONT)
         except OSError:
             pass
-        pub.disconnect()
-        obs.disconnect()
-
-
-@pytest.mark.redis
-def test_publisher_only_loss_is_recovered_by_a_level_reader(own_valkey, monkeypatch):
-    """The observer stays connected; only the publisher cannot send for a while.
-
-    Writes made then are dropped after the retry window. No further write
-    follows, so only the publisher's resync wake can bring the level reader
-    to the final state.
-    """
-    pytest.importorskip("redis")
-    from virtuals._backends.observers.redis_pubsub import RedisObserver
-    from virtuals._backends.publishers.redis_pubsub import RedisPublisher
-
-    truth: dict = {}
-    view: dict = {}
-    wakes: list = []
-
-    def on_wake(key):
-        wakes.append(key)
-        view.clear()
-        view.update(truth)
-
-    pub = RedisPublisher(redis_url=own_valkey.url, channel_prefix="r", publish_retry_seconds=0.2)
-    pub.connect()
-    obs = RedisObserver(redis_url=own_valkey.url, channel_prefix="r")
-    obs.connect()
-    real = pub._lua.call
-    down = threading.Event()
-
-    def call(conn, name, args):
-        if down.is_set():
-            raise ConnectionError("publisher link down")
-        return real(conn, name, args)
-
-    monkeypatch.setattr(pub._lua, "call", call)
-    try:
-        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("lv",)))).bind(on_wake)
-        for i in range(20):
-            truth[("lv", i % 3)] = i
-            pub.notify(("lv", i % 3))
-        pub.flush(2)
-        assert _wait_until(lambda: view == truth)
-
-        down.set()
-        for i in range(20, 40):
-            truth[("lv", i % 3)] = i
-            pub.notify(("lv", i % 3))
-        with pytest.raises(PublisherOperationError):
-            pub.flush(timeout=3)
-        assert pub.dropped_keys == 20
-        assert view != truth
-        n_keyed = sum(1 for k in wakes if k is not None)
-
-        down.clear()  # link back, nothing else is written
-        assert _wait_until(lambda: view == truth, 5), (view, truth)
-        assert wakes.count(None) == 1
-        assert sum(1 for k in wakes if k is not None) == n_keyed
-    finally:
         pub.disconnect()
         obs.disconnect()
 
@@ -393,38 +294,6 @@ def test_failed_connect_and_drop_leave_no_client(own_valkey):
 
 
 # =============================================================================
-# review M3: a drop recorded while the wake is in flight keeps its own wake
-# =============================================================================
-
-
-def test_drop_recorded_during_a_resync_send_gets_its_own_wake():
-    p = _Gated(fail=True, delay=0.01, publish_retry_seconds=0.1)
-    p.connect()
-    real = p._send_resync
-    once = [True]
-
-    def racing():
-        real()
-        if once[0]:  # a writer's notify() times out while the wake is on the wire
-            once[0] = False
-            p._record_drop(1, PublisherOperationError("late drop"))
-
-    p._send_resync = racing
-    try:
-        p.notify(("k", 1))
-        with pytest.raises(PublisherOperationError):
-            p.flush(timeout=2)
-        p.fail = False
-        assert _wait_until(lambda: p.resyncs == 1, 3)
-        assert p._resync_pending, "the late drop was cleared with the first wake"
-        assert _wait_until(lambda: p.resyncs == 2, 3)
-        time.sleep(0.3)
-        assert p.resyncs == 2
-    finally:
-        p.disconnect()
-
-
-# =============================================================================
 # review m2: a stall costs the first commit the timeout, later ones nothing
 # =============================================================================
 
@@ -457,20 +326,6 @@ def test_stalled_queue_drops_later_calls_at_once_until_the_worker_sends():
     finally:
         p.gate.set()
         p.disconnect()
-
-
-# =============================================================================
-# review m6: a drop just before disconnect still wakes
-# =============================================================================
-
-
-def test_drop_right_before_disconnect_sends_the_wake_in_the_drain():
-    p = _Gated(delay=0.01, queue_maxsize=1, notify_timeout=0.1)
-    p.connect()
-    p.gate.set()
-    p._record_drop(1, PublisherOperationError("late drop"))
-    p.disconnect()
-    assert p.resyncs == 1
 
 
 # =============================================================================
@@ -508,10 +363,9 @@ def test_stalled_fast_path_does_not_survive_a_reconnect():
 # =============================================================================
 
 
-def test_notify_while_disconnected_counts_the_drop_and_wakes_after_reconnect():
+def test_notify_while_disconnected_counts_the_drop():
     """notify() between disconnect() and connect() still raises, and the keys
-    it could not queue are a drop: counted, raised once by flush(), and
-    followed by a resync wake as soon as the new worker can send."""
+    it could not queue are a drop: counted and raised once by flush()."""
     p = _Gated()
     p.gate.set()
     p.connect()
@@ -521,10 +375,8 @@ def test_notify_while_disconnected_counts_the_drop_and_wakes_after_reconnect():
     with pytest.raises(PublisherConnectionError, match="not connected"):
         p.notify([("b",), ("c",)])
     assert p.dropped_keys == 3
-    assert p._resync_pending
     p.connect()
     try:
-        assert _wait_until(lambda: p.resyncs == 1, 5), "no resync wake after reconnect"
         with pytest.raises(PublisherOperationError, match="not connected"):
             p.flush(2)
         p.flush(2)  # raised once, then clean
@@ -534,12 +386,10 @@ def test_notify_while_disconnected_counts_the_drop_and_wakes_after_reconnect():
 
 
 @pytest.mark.redis
-def test_commit_while_publisher_disconnected_resyncs_the_reader_after_reconnect(
-    own_valkey, tmp_path
-):
+def test_commit_while_publisher_disconnected_is_a_counted_drop(own_valkey, tmp_path):
     """The storage keeps committing while its publisher is disconnected (the
-    failed notify is logged, the commit stands). The level reader gets one
-    keyless wake once the publisher is back, so it re-reads what it missed."""
+    failed notify is logged, the commit stands). The key is a counted drop
+    and never reaches the reader."""
     pytest.importorskip("redis")
     from virtuals._backends.observers.redis_pubsub import RedisObserver
     from virtuals._backends.publishers.redis_pubsub import RedisPublisher
@@ -562,13 +412,13 @@ def test_commit_while_publisher_disconnected_resyncs_the_reader_after_reconnect(
 
         pub.disconnect()
         with storage.begin_transaction() as tx:
-            tx.put(("k", 2), b"b")  # committed; the wake cannot be sent
+            tx.put(("k", 2), b"b")  # committed; the key cannot be sent
         assert pub.dropped_keys == 1
         pub.connect()
-        assert _wait_until(lambda: None in got, 5), got
         with pytest.raises(PublisherOperationError, match="not connected"):
             pub.flush(2)
         pub.flush(2)
+        assert got == [("k", 1)]
         with storage.snapshot() as snap:
             assert snap.get(("k", 2)) == b"b"
     finally:

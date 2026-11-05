@@ -54,7 +54,7 @@ DEFAULT_QUEUE_MAXSIZE: int = 100_000
 DEFAULT_PUBLISH_RETRY_SECONDS: float = 5.0
 
 # Longest notify() blocks a writer on a full queue before dropping the rest
-# of its keys (counted, surfaced, followed by a resync wake).
+# of its keys (counted and surfaced, never delivered).
 DEFAULT_NOTIFY_TIMEOUT_SECONDS: float = 1.0
 
 # Retry backoff: first delay, doubling, capped.
@@ -68,7 +68,7 @@ _STOP_MARKER: object = object()
 # drain up to it.
 _STOP_JOIN_SECONDS: float = 5.0
 
-# Idle poll of the worker; also how often a pending resync is retried at most.
+# Idle poll of the worker.
 _IDLE_POLL_SECONDS: float = 0.1
 
 
@@ -94,11 +94,8 @@ def _worker(ref: weakref.ref[PublisherBase], q: queue.Queue[Any], stop: threadin
         except queue.Empty:
             if stop.is_set():
                 return
-            owner = ref()
-            if owner is None:
+            if ref() is None:
                 return
-            owner._try_resync()
-            del owner
             continue
 
         # Drain what's queued right now into a single batch. Sentinels
@@ -106,10 +103,7 @@ def _worker(ref: weakref.ref[PublisherBase], q: queue.Queue[Any], stop: threadin
         batch: list[Key] = []
         while True:
             if item is _STOP_MARKER:
-                if _publish(ref, batch, stop):
-                    owner = ref()
-                    if owner is not None and not owner._drain_failed:
-                        owner._try_resync(force=True)  # a drop just before stop still wakes
+                _publish(ref, batch, stop)
                 return
             if isinstance(item, threading.Event):
                 alive = _publish(ref, batch, stop)
@@ -154,10 +148,8 @@ class PublisherBase:
     `publish_retry_seconds`; meanwhile the worker does not drain, the queue
     fills and notify() blocks (backpressure) for up to `notify_timeout`,
     then drops the rest of its keys. Every drop is logged at ERROR, counted
-    in `dropped_keys`, raised once by the next flush(), and followed by a
-    resync wake: the next time the worker can publish, it asks every
-    subscriber on the prefix to re-read (`_send_resync`, transport
-    specific), so a level flow recovers what the drop lost.
+    in `dropped_keys` and raised once by the next flush(). Delivery is best
+    effort: dropped keys never reach a subscriber.
 
     disconnect() drains: the worker publishes every key queued before it
     (one attempt per chunk, no retry window; after the first failed chunk
@@ -191,13 +183,9 @@ class PublisherBase:
         self.dropped_keys: int = 0
         self._last_error: BaseException | None = None
         self._error_lock = threading.Lock()
-        # Set by any drop; cleared once a resync wake went out (worker only).
-        self._resync_pending: bool = False
-        self._next_resync_at: float = 0.0
-        self._resync_backoff: float = _RETRY_BACKOFF_START
         # Set by a notify() drop, cleared by the worker's next successful
         # send: while set, writers drop at once instead of each waiting out
-        # `notify_timeout` (the loss is covered by the resync wake anyway).
+        # `notify_timeout` (the transport is stalled, so the wait buys nothing).
         self._stalled: bool = False
         # Set once a chunk failed after stop: the rest of the drain is dropped.
         self._drain_failed: bool = False
@@ -232,7 +220,7 @@ class PublisherBase:
             q = self._queue = queue.Queue(maxsize=self._queue_maxsize)
             self._drain_failed = False
             # Per connection: a fresh queue has room, so writers wait for it
-            # again. `_resync_pending` survives, the wake is still owed.
+            # again.
             self._stalled = False
 
             self._on_connect()
@@ -327,8 +315,8 @@ class PublisherBase:
         Fire-and-forget: caller just enqueues; the worker handles batching
         and transport send. Blocks on a full queue for at most
         `notify_timeout` in total, then drops the keys it could not queue
-        (logged, counted, surfaced by flush() and by a resync wake): a
-        committing writer is never held by a stalled transport. Once a call
+        (logged, counted, surfaced by flush()): a committing writer is
+        never held by a stalled transport. Once a call
         has dropped, later calls on the still-full queue drop at once until
         the worker sends again, so a stall costs the first commit the
         timeout and the rest nothing. With `notify_timeout=None` the call
@@ -337,8 +325,7 @@ class PublisherBase:
         Accepts a single key (tuple) or a batch of keys (set, list, etc.).
 
         While not connected the keys cannot be sent: they are counted as a
-        drop (logged, surfaced by the next flush(), followed by a resync
-        wake once a connection sends again) and `PublisherConnectionError`
+        drop (logged, surfaced by the next flush()) and `PublisherConnectionError`
         is raised. A commit that lands between disconnect() and connect()
         is therefore never lost silently.
         """
@@ -405,13 +392,11 @@ class PublisherBase:
                     done.wait(timeout=max(0.0, deadline - time.monotonic()))
         self._raise_last_error()
 
-    def _record_drop(self, n: int, err: BaseException, *, resync: bool = True) -> None:
-        """Count a drop and surface it. `resync=False` for keys no subscriber could match."""
+    def _record_drop(self, n: int, err: BaseException) -> None:
+        """Count a drop and surface it."""
         with self._error_lock:
             self.dropped_keys += n
             self._last_error = err
-        if resync:
-            self._resync_pending = True
 
     def _raise_last_error(self) -> None:
         with self._error_lock:
@@ -439,7 +424,7 @@ class PublisherBase:
             prepared, n = self._prepare_chunk(chunk)
         except Exception as e:
             logger.error("Publish failed, dropping %d keys: %s", len(chunk), e)
-            self._record_drop(len(chunk), e, resync=False)  # not encodable: unroutable anyway
+            self._record_drop(len(chunk), e)
             return
         if not n:
             return
@@ -467,37 +452,7 @@ class PublisherBase:
                 delay = min(delay * 2, _RETRY_BACKOFF_CAP)
                 continue
             self._stalled = False  # writers may wait for room again
-            if self._resync_pending:
-                self._try_resync()
             return
-
-    def _try_resync(self, *, force: bool = False) -> None:
-        """Send the pending resync wake if due. Worker only.
-
-        Called after every successful send and on every idle poll, so the
-        wake goes out as soon as the transport is back even with nothing
-        else to publish. Failures back off up to the retry cap (`force`
-        ignores the backoff: the last attempt before the worker exits).
-
-        The flag is cleared before the send and set back on failure: a drop
-        recorded while the wake is in flight keeps its own wake, since that
-        drop's commit may have landed after this wake was published.
-        """
-        if not self._resync_pending:
-            return
-        if not force and time.monotonic() < self._next_resync_at:
-            return
-        self._resync_pending = False
-        try:
-            self._send_resync()
-        except Exception as e:
-            logger.warning("Publisher resync wake failed, retrying: %s", e)
-            self._resync_pending = True
-            self._next_resync_at = time.monotonic() + self._resync_backoff
-            self._resync_backoff = min(self._resync_backoff * 2, _RETRY_BACKOFF_CAP)
-            return
-        self._resync_backoff = _RETRY_BACKOFF_START
-        logger.info("Publisher sent a resync wake after dropping keys")
 
     # -- Subclass hooks -------------------------------------------------------
 
@@ -524,15 +479,6 @@ class PublisherBase:
     def _send_chunk(self, prepared: Any) -> None:  # noqa: ANN401 -- subclass-defined
         """Send one prepared chunk; retried on error. Default: `_publish_batch`."""
         self._publish_batch(prepared)
-
-    def _send_resync(self) -> None:
-        """Ask every subscriber on this transport to re-read, after a drop.
-
-        Default: nothing (the drop stays counted and surfaced by flush()).
-        Transports that can reach their subscribers implement it; it is
-        retried until it succeeds.
-        """
-        return None
 
     def _publish_batch(self, batch: list[Key]) -> None:
         """Send a batch of keys onto the transport. Subclass responsibility."""

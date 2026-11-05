@@ -22,14 +22,12 @@ only for as long as that one callback. The worker holds the observer only
 weakly between batches, so an observer dropped without disconnect() is
 collected and its worker exits. An explicit disconnect() drops the wakes
 still queued and closes every subscription (none survives it), so a reader
-that reconnects subscribes again and re-reads; "resync on reconnect" in
-the contract is about a transport reconnect inside a live observer.
+that reconnects subscribes again and re-reads.
 
 Memory. A batch is at most `DISPATCH_BATCH_MAX` keys, so what one observer
 holds is bounded by its dispatch queue, the batch in hand, and whatever the
 transport parks on its own side (the Redis listener's overflow, at most one
-more queue). A keyless resync wake is queued at most once per filter hash
-until it is delivered, however many publishers or reconnects ask for one.
+more queue).
 """
 
 from __future__ import annotations
@@ -60,33 +58,11 @@ if TYPE_CHECKING:
     from virtuals.tkv.types import Key
 
 
-def _hash_of(sub: Subscription) -> str:
-    """``sub.filter_hash``, or a process-local stand-in for a filter without ``to_dict()``.
-
-    Such a filter cannot be subscribed on redis (its hash is sent at
-    subscribe), but on the in-memory transport it delivers keys, so its
-    resync wake is keyed by the subscription itself. The stand-in never
-    reaches a transport, and one subscription that cannot be hashed never
-    costs the others their wake.
-    """
-    try:
-        return sub.filter_hash
-    except Exception:  # no to_dict(), or one that does not serialise
-        return f"local:{id(sub):x}"
-
-
 @dataclass(frozen=True, slots=True)
 class _TaggedKey:
     """A key tagged with a filter hash for hash-scoped delivery."""
 
     key: Any  # tkv.Key at runtime; kept loose to avoid a circular import
-    filter_hash: str
-
-
-@dataclass(frozen=True, slots=True)
-class _Resync:
-    """A keyless resync wake for every local subscription on one filter hash."""
-
     filter_hash: str
 
 
@@ -203,10 +179,6 @@ class ObserverBase:
         self._stop_event = threading.Event()
         self._dispatch_thread: threading.Thread | None = None
         self._worker_finalizer: weakref.finalize | None = None
-        # Filter hashes with a keyless resync wake queued (or parked by the
-        # transport) and not yet delivered: one wake per hash at a time.
-        self._resync_queued: set[str] = set()
-        self._resync_lock = threading.Lock()
 
     def _ensure_connected(self) -> None:
         if not self._connected:
@@ -231,8 +203,6 @@ class ObserverBase:
             self._registry = SubscriptionRegistry()
             stop = self._stop_event = threading.Event()
             q = self._dispatch_queue = queue.Queue(maxsize=self._dispatch_queue_maxsize)
-            with self._resync_lock:
-                self._resync_queued = set()
 
             self._on_connect()
 
@@ -381,48 +351,6 @@ class ObserverBase:
             if not self._enqueue(k if filter_hash is None else _TaggedKey(k, filter_hash)):
                 return
 
-    def _dispatch_resync(self, filter_hash: str) -> None:
-        """Queue one keyless resync wake for every local sub on `filter_hash`.
-
-        A transport calls this when it may have missed changes for that hash
-        (after a reconnect, once the hash is routed again). Each matching
-        subscription's receivers get `None` in place of a key, meaning
-        "re-read the state you watch". Queued behind keys already received,
-        so the wake follows them.
-        """
-        if self._connected:
-            item = self._resync_item(filter_hash)
-            if item is not None:
-                self._enqueue(item)
-
-    def _dispatch_resync_all(self) -> None:
-        """Queue one keyless resync wake per filter hash with a local subscription.
-
-        A transport calls this when a publisher on it dropped keys: nobody
-        knows which filters they matched, so every subscription re-reads.
-        """
-        registry = self._registry
-        if not self._connected or registry is None:
-            return
-        for h in {_hash_of(s) for s in registry.subscriptions()}:
-            item = self._resync_item(h)
-            if item is not None:
-                self._enqueue(item)
-
-    def _resync_item(self, filter_hash: str) -> _Resync | None:
-        """A resync wake to queue for `filter_hash`, or None while one is pending.
-
-        One keyless wake per hash is enough until it is delivered: it
-        re-reads state as of its delivery, which is later than every drop
-        or reconnect that asked for one in the meantime. So W publishers
-        dropping in one stall cost each subscription one re-read, not W.
-        """
-        with self._resync_lock:
-            if filter_hash in self._resync_queued:
-                return None
-            self._resync_queued.add(filter_hash)
-        return _Resync(filter_hash)
-
     def _enqueue_nowait(self, item: object) -> bool:
         """Put `item` on the dispatch queue if there is room. False when full."""
         try:
@@ -470,30 +398,16 @@ class ObserverBase:
             return
         done.wait(timeout=max(0.0, deadline - time.monotonic()))
 
-    def _deliver_batch(self, batch: list[Key | _TaggedKey | _Resync]) -> None:
+    def _deliver_batch(self, batch: list[Key | _TaggedKey]) -> None:
         if not batch:
             return
-        # Every resync wake in hand is consumed here, delivered or not, so
-        # its hash is released first: a later subscription on the same
-        # filter gets its own wake. Released before any receiver runs, so a
-        # drop recorded from now on queues a new wake.
-        with self._resync_lock:
-            for item in batch:
-                if isinstance(item, _Resync):
-                    self._resync_queued.discard(item.filter_hash)
         registry = self._registry
         if registry is None:
             return
         if len(registry) == 0:
             return
-        notifications: list[tuple[Key | None, list[Subscription]]] = []
+        notifications: list[tuple[Key, list[Subscription]]] = []
         for item in batch:
-            if isinstance(item, _Resync):
-                h = item.filter_hash
-                woken = [s for s in registry.subscriptions() if _hash_of(s) == h]
-                if woken:
-                    notifications.append((None, woken))
-                continue
             if isinstance(item, _TaggedKey):
                 key = item.key
                 h = item.filter_hash

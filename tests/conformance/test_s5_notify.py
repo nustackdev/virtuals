@@ -307,12 +307,14 @@ def test_s5_untyped_child_watch_covers_the_child_subtree(notifying_storage, pair
 
 
 # =============================================================================
-# 5.5 resync on reconnect
+# 5.5 delivery resumes after a reconnect
 # =============================================================================
 
 
-def test_s5_resync_on_reconnect(notifying_storage, pair):
-    """Writes made while the observer is cut off are recovered by one keyless wake."""
+def test_s5_delivery_resumes_after_reconnect(notifying_storage, pair):
+    """Writes made while the observer is cut off are not delivered; once it is
+    re-registered keyed delivery resumes and a level reader catches up on its
+    next wake."""
     if pair.kind == "mem":
         pytest.skip("the in-process transport has no connection to lose")
     from virtuals.tkv.storage import StorageScanOptions
@@ -348,7 +350,6 @@ def test_s5_resync_on_reconnect(notifying_storage, pair):
     truth[("lv", "barrier")] = 1
     assert _wait_until(lambda: wakes and wakes[-1] == ("lv", "barrier")), wakes
     assert view == truth
-    n_keyed = sum(1 for k in wakes if k is not None)
 
     pair.cut_off_observer()
     for i in range(30, 60):
@@ -358,10 +359,13 @@ def test_s5_resync_on_reconnect(notifying_storage, pair):
     assert view != truth
     pair.reconnect_observer()
 
-    assert _wait_until(lambda: wakes.count(None) == 1, 10.0), wakes
-    assert _wait_until(lambda: view == truth, 10.0), (view, truth)
-    assert sum(1 for k in wakes if k is not None) == n_keyed, "a keyed wake after the gap"
-    # keyed delivery resumes
-    write(60)
-    assert _wait_until(lambda: wakes[-1] == ("lv", 60 % 7) and view == truth), wakes
-    assert wakes.count(None) == 1
+    # keyed delivery resumes once the filter is re-registered
+    deadline = time.monotonic() + 10.0
+    i = 60
+    while True:
+        write(i)
+        key = ("lv", i % 7)
+        if _wait_until(lambda key=key: wakes[-1] == key and view == truth, 0.2):
+            break
+        assert time.monotonic() < deadline, (wakes, view, truth)
+        i += 1

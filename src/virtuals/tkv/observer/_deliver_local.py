@@ -25,13 +25,12 @@ __all__ = [
 
 
 def deliver_local(
-    notifications: list[tuple[Key | None, list[Subscription]]],
+    notifications: list[tuple[Key, list[Subscription]]],
 ) -> None:
     """Deliver notifications to local subscribers.
 
     Args:
-        notifications: Matched (key, subscriptions) pairs. A None key is a
-            keyless resync wake.
+        notifications: Matched (key, subscriptions) pairs.
     """
     for key, subs in notifications:
         for sub in subs:

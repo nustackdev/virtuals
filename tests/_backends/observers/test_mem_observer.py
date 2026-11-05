@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 import re
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-
-import pytest
 
 from virtuals._backends.observers.mem import InMemoryObserver
 from virtuals._backends.publishers.mem import InMemoryPublisher
 from virtuals.tkv.filter import Filter, PrefixFilter
 from virtuals.tkv.observer import SubscriptionOptions
-from virtuals.tkv.publisher import PublisherConnectionError, PublisherOperationError
 from virtuals.tkv.transport import InMemoryTransport
 
 
@@ -105,27 +101,6 @@ def test_last_sub_close_leaves_observer_listener_registered():
     assert t._listeners == []
 
 
-def test_resync_wakes_each_sub_on_the_hash_once_after_queued_keys():
-    """A keyless resync wake reaches every sub on that filter hash, behind earlier keys."""
-    t = InMemoryTransport()
-    with InMemoryObserver(t) as obs:
-        a: list = []
-        a2: list = []
-        b: list = []
-        sa = obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("a",))))
-        sa.bind(a.append)
-        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("a",)))).bind(a2.append)
-        obs.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("b",)))).bind(b.append)
-
-        obs._dispatch_incoming([("a", 1)], filter_hash=sa.filter_hash)
-        obs._dispatch_resync(sa.filter_hash)
-        obs.flush(timeout=1.0)
-
-        assert a == [("a", 1), None]
-        assert a2 == [("a", 1), None]
-        assert b == []
-
-
 # =============================================================================
 # CUSTOM FILTERS WITHOUT to_dict()
 # =============================================================================
@@ -147,15 +122,10 @@ class _RegexFilter(Filter):
         return isinstance(other, _RegexFilter) and other.pattern == self.pattern
 
 
-def test_custom_filter_without_to_dict_costs_nobody_their_resync_wake():
-    """One subscription that cannot be hashed never blocks the wake of the others.
-
-    The custom subscription gets a keyless wake of its own, keyed by the
-    subscription (process-local, never sent across a transport). A publisher
-    that dropped keys sends its wake once and does not retry for ever.
-    """
+def test_custom_filter_without_to_dict_delivers_keys():
+    """A subscription that cannot be hashed still gets its keys on the in-memory transport."""
     t = InMemoryTransport()
-    with InMemoryObserver(t) as a, InMemoryObserver(t) as b:
+    with InMemoryPublisher(t) as pub, InMemoryObserver(t) as a, InMemoryObserver(t) as b:
         custom: list = []
         prefix_a: list = []
         prefix_b: list = []
@@ -163,32 +133,11 @@ def test_custom_filter_without_to_dict_costs_nobody_their_resync_wake():
         a.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("p",)))).bind(prefix_a.append)
         b.subscribe(SubscriptionOptions(filter=PrefixFilter(prefix=("p",)))).bind(prefix_b.append)
 
-        t.resync()  # what a publisher sends after dropping keys
+        pub.notify(("c", 1))
+        pub.notify(("p", 2))
+        pub.flush(timeout=1.0)
         a.flush(timeout=1.0)
         b.flush(timeout=1.0)
-        assert prefix_a == [None]
-        assert prefix_b == [None]
-        assert custom == [None]
-
-        # the publisher's own path: a drop, then the wake goes out once
-        pub = InMemoryPublisher(t)
-        with pytest.raises(PublisherConnectionError):
-            pub.notify(("p", 1))  # not connected: a counted drop
-        pub.connect()
-        try:
-            with pytest.raises(PublisherOperationError):
-                pub.flush(timeout=1.0)
-            deadline = time.monotonic() + 3.0
-            while pub._resync_pending and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert not pub._resync_pending
-            pub.notify(("c", 1))
-            pub.notify(("p", 2))
-            pub.flush(timeout=1.0)
-        finally:
-            pub.disconnect()
-        a.flush(timeout=1.0)
-        b.flush(timeout=1.0)
-        assert prefix_a == [None, None, ("p", 2)]
-        assert prefix_b == [None, None, ("p", 2)]
-        assert custom == [None, None, ("c", 1)]
+        assert prefix_a == [("p", 2)]
+        assert prefix_b == [("p", 2)]
+        assert custom == [("c", 1)]

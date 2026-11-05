@@ -42,15 +42,6 @@ def _weak_listener(ref: weakref.ref[InMemoryObserver]) -> Callable[[list[Key]], 
     return listener
 
 
-def _weak_resync(ref: weakref.ref[InMemoryObserver]) -> Callable[[], None]:
-    def on_resync() -> None:
-        obs = ref()
-        if obs is not None:
-            obs._dispatch_resync_all()
-
-    return on_resync
-
-
 class InMemoryObserver(ObserverBase):
     """Observer that receives batches from a shared InMemoryTransport."""
 
@@ -63,16 +54,12 @@ class InMemoryObserver(ObserverBase):
         super().__init__(dispatch_queue_maxsize=dispatch_queue_maxsize)
         self._transport = transport
         self._listener: Callable[[list[Key]], None] | None = None
-        self._on_resync: Callable[[], None] | None = None
 
     def _on_connect(self) -> None:
-        ref = weakref.ref(self)
-        self._listener = _weak_listener(ref)
-        self._on_resync = _weak_resync(ref)
-        self._transport.register(self._listener, self._on_resync)
+        self._listener = _weak_listener(weakref.ref(self))
+        self._transport.register(self._listener)
 
     def _on_disconnect(self) -> None:
         if self._listener is not None:
-            self._transport.unregister(self._listener, self._on_resync)
+            self._transport.unregister(self._listener)
             self._listener = None
-            self._on_resync = None
