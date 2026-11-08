@@ -19,15 +19,20 @@ stored structure is a plain ``RingView``); writes need a capacity and raise
 TypeError without one. Shrinking the capacity drops the extra entries on
 the next append.
 
-Cost. ``append`` reads the newest row (one seek), writes one row, and
-reads the oldest rows up to the first it keeps (one seek, two rows in a
-full ring), deleting the ones that fall out: a constant number of keys.
-``extend`` does the same once for the whole batch. No stored length, no
-key shared with any other container.
+Cost. ``append`` checks the ring's marker (one get), reads the newest
+row (one seek), writes one row, and reads the oldest rows up to the first
+it keeps (one seek, two rows in a full ring), deleting the ones that fall
+out: a constant number of keys. ``extend`` does the same once for the
+whole batch. An append to an empty ring also reads the restart mark (one
+get). No stored length, no key shared with any other container.
 
 Cursor. A sequence number marks a position for good: ``entries(after=seq)``
 resumes after it even once it has dropped out, so a reader can follow a
-ring by its last seen sequence number.
+ring by its last seen sequence number. ``clear`` and ``store`` keep the
+numbering going: emptying a ring that held entries writes the next
+sequence number to the ring's ``__next__`` metadata, and the next append
+to the empty ring starts there. Numbering restarts at 0 only for a ring
+that is deleted and written again.
 
 Concurrency. Two writers appending at once read the same newest row and
 pick the same sequence number. sqlite and lmdb serialize writers, so the
@@ -58,6 +63,10 @@ if TYPE_CHECKING:
 
 
 __all__ = ["RingView"]
+
+
+_NEXT = "__next__"
+"""Metadata key: the sequence number the next append to an emptied ring takes."""
 
 
 class RingView(ObservableBase, ViewBase):
@@ -142,6 +151,19 @@ class RingView(ObservableBase, ViewBase):
         for _seq, entry in self._rows(reverse=True):
             yield entry
 
+    def __contains__(self, value: object) -> bool:
+        """True if an entry equals ``value``. One scan, O(capacity)."""
+        return any(entry == value for entry in self)
+
+    def index(self, value: object, start: int = 0, stop: int | None = None) -> int:
+        """Position of the first entry equal to ``value``, as ``list.index``. One scan, O(capacity)."""
+        kept = list(self)
+        return kept.index(value, start) if stop is None else kept.index(value, start, stop)
+
+    def count(self, value: object) -> int:
+        """Entries equal to ``value``. One scan, O(capacity)."""
+        return sum(1 for entry in self if entry == value)
+
     def entries(
         self, *, after: int | None = None, limit: int | None = None
     ) -> Generator[tuple[int, Value], None, None]:
@@ -161,46 +183,60 @@ class RingView(ObservableBase, ViewBase):
 
     def append(self, entry: Value) -> int:
         """Add ``entry`` as the newest; drop the oldest past capacity. Returns its seq."""
-        return cast("int", self._push([entry]))
+        return cast("int", self._push(self._checked([entry])))
 
     def extend(self, entries: Iterable[Value]) -> None:
         """Append every entry in order. Writes nothing for an empty iterable."""
-        self._push(entries)
+        self._push(self._checked(entries))
 
     def store(self, entries: Iterable[Value], *, replace: bool = True) -> None:
         """Replace the contents with ``entries`` (the last ``capacity`` of them).
 
-        Sequence numbers restart from 0. Cost: O(entries kept before and after).
-        ``replace=False`` skips clearing, for a ring known to be new (its
-        parent just created it); on a ring holding entries it appends.
+        Numbering goes on past the entries replaced, so a reader's cursor
+        stays good. Cost: O(entries kept before and after). ``replace=False``
+        skips clearing, for a ring known to be new (its parent just created
+        it); on a ring holding entries it appends.
         """
-        self._require_capacity()
-        batch = self._reject_empty_in(list(entries))
+        batch = self._checked(entries)
         self.ensure_created()
         if replace:
-            self.container.clear_children(validate=False)
-        self._push(cast("list[Value]", batch))
+            self._empty()
+        self._push(batch, created=True)
 
     def clear(self) -> None:
-        """Drop every entry. Sequence numbers restart from 0."""
+        """Drop every entry. The next append numbers on from the newest dropped."""
         if not self.container.exists():
             return  # clear of nothing is not a write: the view stays absent
+        self._empty()
+
+    def _empty(self) -> None:
+        """Drop every entry, keeping the next sequence number in ``__next__``. One seek, O(entries)."""
+        newest = self._edge_seq(newest=True)
+        if newest is None:
+            return  # already empty: its mark, if any, still holds
+        self.container.put_metadata(_NEXT, newest + 1)
         self.container.clear_children(validate=False)
 
-    def _push(self, entries: Iterable[Value]) -> int | None:
-        """Write ``entries`` after the newest, then drop what falls past capacity.
+    def _checked(self, entries: Iterable[Value]) -> list[Value]:
+        """``entries`` as a list, refused whole if one is EMPTY. TypeError first on a read-only ring."""
+        self._require_capacity()
+        return cast("list[Value]", self._reject_empty_in(list(entries)))
+
+    def _push(self, batch: list[Value], *, created: bool = False) -> int | None:
+        """Write a checked ``batch`` after the newest, then drop what falls past capacity.
 
         An oversized batch still numbers every entry, but writes only the
-        last ``capacity`` of them. Returns the newest seq, None if nothing
-        was given.
+        last ``capacity`` of them. An empty ring numbers on from its
+        ``__next__`` mark. ``created``: the caller just ran ``ensure_created``.
+        Returns the newest seq, None if nothing was given.
         """
         capacity = self._require_capacity()
-        batch = cast("list[Value]", self._reject_empty_in(list(entries)))
         if not batch:
             return None
-        self.ensure_created()
+        if not created:
+            self.ensure_created()
         newest = self._edge_seq(newest=True)
-        first = 0 if newest is None else newest + 1
+        first = self._next_on_empty() if newest is None else newest + 1
         last = first + len(batch) - 1
         for seq in range(max(first, last - capacity + 1), last + 1):
             self.container.put_child_primitive(
@@ -208,6 +244,10 @@ class RingView(ObservableBase, ViewBase):
             )
         self._trim(last - capacity)
         return last
+
+    def _next_on_empty(self) -> int:
+        """The sequence number an empty ring's next append takes: its mark, or 0. One get."""
+        return cast("int", self.container.get_metadata(_NEXT, 0))
 
     def _trim(self, through: int) -> None:
         """Delete every row with a sequence number up to ``through``. Reads to the first kept."""

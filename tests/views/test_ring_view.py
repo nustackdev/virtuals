@@ -92,6 +92,19 @@ def test_read_by_position(ring_factory):
         ring["0"]
 
 
+def test_sequence_lookups(ring_factory):
+    ring = ring_factory(capacity=4, data=["a", "b", "a", "c", "a"])  # the first "a" dropped
+
+    assert isinstance(ring, Sequence)
+    assert "c" in ring
+    assert "z" not in ring
+    assert ring.index("a") == 1
+    assert ring.index("a", 2) == 3
+    assert ring.count("a") == 2
+    with pytest.raises(ValueError):
+        ring.index("a", 0, 1)
+
+
 def test_empty_ring(ring_factory):
     ring = ring_factory()
     assert len(ring) == 0
@@ -123,18 +136,39 @@ def test_extend_oversized_batch_keeps_the_last(ring_factory):
     assert list(ring) == ["d", "e", "f"]
 
 
-def test_store_replaces_and_restarts_numbering(ring_factory):
+def test_store_replaces_and_numbers_on(ring_factory):
     ring = ring_factory(capacity=3, data=["a", "b", "c", "d"])
     ring.store(["x", "y"])
 
-    assert list(ring.entries()) == [(0, "x"), (1, "y")]
+    assert list(ring.entries()) == [(4, "x"), (5, "y")]
+    assert list(ring.entries(after=3)) == [(4, "x"), (5, "y")]
 
 
-def test_clear_then_append_restarts(ring_factory):
+def test_clear_then_append_numbers_on(ring_factory):
     ring = ring_factory(capacity=3, data=["a", "b"])
     ring.clear()
     assert len(ring) == 0
-    assert ring.append("c") == 0
+    ring.clear()  # an empty ring keeps its mark
+    assert ring.append("c") == 2
+    assert list(ring.entries(after=1)) == [(2, "c")]
+
+
+def test_store_of_nothing_then_append_numbers_on(ring_factory):
+    ring = ring_factory(capacity=3, data=["a", "b"])
+    ring.store([])
+    assert list(ring) == []
+    ring.store(["c"])
+    assert list(ring.entries()) == [(2, "c")]
+
+
+def test_a_deleted_ring_written_again_starts_at_zero(root_view):
+    parent = root_view.open_child("runs", EagerDictView)
+    parent.ensure_created()
+    parent.set_child_container_as("out", ["a", "b"], RingView.of(3))
+    parent.open_child("out", RingView.of(3)).clear()
+    del parent["out"]
+    parent.set_child_container_as("out", ["x"], RingView.of(3))
+    assert list(parent.open_child("out", RingView).entries()) == [(0, "x")]
 
 
 def test_smaller_capacity_drops_extra_on_next_append(ring_factory, root_view):
