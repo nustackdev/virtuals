@@ -500,13 +500,15 @@ def test_keys_after_with_limit_is_exact(fdict):
     assert list(view.keys(after="g", limit=3)) == []
     assert list(view.keys(after="f", limit=3)) == ["g"]
     with pytest.raises(KeyError):
-        list(view.keys(after="zz"))
+        view.keys(after="zz")  # raised at the call, before any read
+    with pytest.raises(KeyError):
+        view.keys_reverse(before="zz")
 
 
 def test_keys_after_a_cursor_of_the_wrong_type_raises_type_error(fdict):
     view = fdict("lst", {"a": 1})
     with pytest.raises(TypeError):
-        list(view.keys(after=1.5))
+        view.keys(after=1.5)
 
 
 def test_keys_reverse_before_with_limit_is_exact(fdict):

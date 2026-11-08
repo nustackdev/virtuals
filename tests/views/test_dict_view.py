@@ -343,4 +343,6 @@ def test_dict_paging_limit_zero_and_bad_cursor(dict_factory):
 
     assert list(d.keys(limit=0)) == []
     with pytest.raises(TypeError):
-        list(d.keys(after=1.5))
+        d.keys(after=1.5)  # raised at the call, before any read
+    with pytest.raises(TypeError):
+        d.keys_reverse(before=1.5)

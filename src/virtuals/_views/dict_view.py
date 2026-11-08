@@ -155,9 +155,10 @@ class DictViewBase(
     def _keys_page(
         self, *, cursor: str | int | None, limit: int | None, reverse: bool
     ) -> Generator[str | int, None, None]:
+        """One page of keys. A bad cursor raises at the call, not on the first read."""
         if cursor is not None and not is_view_key(cursor):
             raise TypeError(f"view keys must be str or int, got {type(cursor).__name__}")
-        yield from self.container.iter_child_keys(
+        return self.container.iter_child_keys(
             validate=False, strict=True, reverse=reverse, cursor=cursor, limit=limit
         )
 

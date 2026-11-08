@@ -437,7 +437,10 @@ class LogIndexedDictViewBase(
 
         Args:
             after: An item id held by the view. KeyError if it holds no
-                data. Cost: about three gets to find its log slot.
+                data. Cost: about three gets to find its log slot; an id
+                whose reverse ``__log__/`` row is missing or stale (data
+                logged before that index, or by a writer that skips it)
+                falls back to a ``__keys__/`` scan, O(n).
             limit: Cap on the number of keys yielded.
 
         Cost: O(limit) rows from one seek into ``__keys__/``.
@@ -455,8 +458,10 @@ class LogIndexedDictViewBase(
         """Keys newest first, logged before the item ``before``, at most ``limit``.
 
         From the newest when ``before`` is None. ``before`` is an item id,
-        KeyError if it holds no data. Cost: O(limit) rows from one reverse
-        seek, so a tail-N read stays cheap on any size of log.
+        KeyError if it holds no data, resolved as in ``keys(after=)`` (the
+        same O(n) fallback for a missing or stale ``__log__/`` row). Cost:
+        O(limit) rows from one reverse seek, so a tail-N read stays cheap on
+        any size of log.
         """
         return self._keys_page(cursor=before, limit=limit, reverse=True)
 

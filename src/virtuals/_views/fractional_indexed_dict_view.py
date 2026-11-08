@@ -578,6 +578,7 @@ class FractionalIndexedDictViewBase(
     def _keys_scan(
         self, *, after: Address | None, limit: int | None, reverse: bool
     ) -> Generator[Address, None, None]:
+        """One page of ids. The cursor id resolves to its position eagerly, so a bad one raises here."""
         if after is not None and not is_view_key(after):
             raise TypeError(f"view keys must be str or int, got {type(after).__name__}")
         if after is None:
@@ -585,8 +586,7 @@ class FractionalIndexedDictViewBase(
         else:
             cursor = self._require_position(after)
             rows = self._scan_order(start=cursor, reverse=reverse, limit=limit, skip=(cursor,))
-        for _okey, address in rows:
-            yield address
+        return (address for _okey, address in rows)
 
     def first(self) -> Address | None:
         """First id, or None when empty. One seek."""
