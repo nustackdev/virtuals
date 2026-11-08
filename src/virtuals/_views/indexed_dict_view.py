@@ -33,6 +33,8 @@ from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType
+from virtuals.tkv.filter import PrefixFilter, WildcardFilter
+from virtuals.tkv.observer import SubscriptionOptions
 from virtuals.types import EMPTY, Empty
 from virtuals.view import (
     ChildNavigationBase,
@@ -40,6 +42,7 @@ from virtuals.view import (
     ChildNestedSetBase,
     ChildObservableBase,
     ChildPrimitiveSetBase,
+    DescendantsObservableBase,
     LazyChildReadBase,
     ObservableBase,
     PrimitiveOpsBase,
@@ -76,6 +79,7 @@ _DATA = "__data__"
 class IndexedDictViewBase(
     ObservableBase,
     ChildObservableBase[str | int],
+    DescendantsObservableBase,
     ChildNavigationBase[str | int],
     ChildNestedGetBase,
     ChildNestedSetBase,
@@ -154,6 +158,30 @@ class IndexedDictViewBase(
             protocol=FlatListView.PROTOCOL,
             validate=False,
         )
+
+    # -- Observability overrides -------------------------------------------
+    # Children live under `__data__/`, so the base filters at
+    # `(container.site, ...)` would match only the two layout markers.
+    # Rebased like the other indexed views. `__keys__/` is bookkeeping (a
+    # delete rewrites all of it) and is never watched.
+
+    def on_change(self) -> SubscriptionOptions:
+        """Any data write under ``__data__/``. Key-list rewrites do not fire."""
+        return SubscriptionOptions(PrefixFilter(prefix=(*self.container.site, _DATA)))
+
+    def on_child_change(self, address: str | int) -> SubscriptionOptions:
+        """Any write at or under ``__data__/<address>``."""
+        normalized = self.normalize_address(address)
+        return SubscriptionOptions(PrefixFilter(prefix=(*self.container.site, _DATA, normalized)))
+
+    def on_children_change(self) -> SubscriptionOptions:
+        """A direct child added, deleted or set as a primitive (``__data__/*``)."""
+        return SubscriptionOptions(WildcardFilter(pattern=(*self.container.site, _DATA, "*")))
+
+    def on_descendants_change(self, address: object, *addresses: object) -> SubscriptionOptions:
+        """Wildcard match under ``__data__/``, patterned relative to the dict."""
+        pattern = (address, *addresses)
+        return SubscriptionOptions(WildcardFilter(pattern=(*self.container.site, _DATA, *pattern)))
 
     # -- Membership & keys (same for both facets) ---------------------------
 

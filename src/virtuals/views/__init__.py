@@ -26,6 +26,7 @@ from virtuals._views import (
     LightDictView,
     ListViewBase,
     LogIndexedDictViewBase,
+    RingView,
     SetView,
     TupleView,
 )
@@ -68,6 +69,7 @@ __all__ = (
     "ListViewBase",
     "LogIndexedDictView",
     "LogIndexedDictViewBase",
+    "RingView",
     "SetView",
     "TupleView",
 )

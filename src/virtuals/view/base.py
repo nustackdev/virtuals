@@ -407,6 +407,7 @@ def _view_for_structure(registry: ViewRegistry, structure: ContainerStructure) -
             _views.FlatListView,
             _views.FrozenSetView,
             _views.LightDictView,
+            _views.RingView,
             _views.SetView,
             _views.TupleView,
         )

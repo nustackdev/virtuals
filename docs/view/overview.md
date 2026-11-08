@@ -240,7 +240,7 @@ The same on every view and every backend. Pinned by `tests/views/test_dict_views
 - `update` applies its keys in order. A kind change on one key raises there and leaves the keys before it written and the rest unwritten; abort the transaction, or delete the key first.
 - `LazyListView`, `LazyDictView` and `LightDictView` have no `pop`: read, then `del`, or use the eager view. `FlatListView` has no `pop`, `remove`, `insert` or `del` at all: it appends, sets, extends and clears.
 - Existence is one read: `view.container.exists()`. Opening a chain of children touches no storage.
-- `len()` on DictView, FlatDictView, LightDictView, LogIndexedDictView and FractionalIndexedDictView counts live rows (O(children)); Kh57View, IndexedDictView, ListView and SetView read a stored count. `bool()` is one storage op on every view. Paging with `keys(after=, limit=)` on the log and fractional views returns exactly `limit` keys when they exist.
+- `len()` on DictView, FlatDictView, LightDictView, LogIndexedDictView and FractionalIndexedDictView counts live rows (O(children)); Kh57View, IndexedDictView, ListView and SetView read a stored count. `bool()` is one storage op on every view. Paging with `keys(after=, limit=)` and `keys_reverse(before=, limit=)` on the dict, log and fractional views returns exactly `limit` keys when they exist. `RingView.len()` is two seeks: its sequence numbers are dense.
 - `IndexedDictView` delete and `ListView` insert or delete in the middle are O(n). Use `FractionalIndexedDictView` for ordered collections.
 
 ## How It Uses Layer 2

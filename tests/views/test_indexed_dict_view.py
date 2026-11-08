@@ -418,3 +418,47 @@ def test_lazy_indexed_reversed_items_matches_slice(indexed_dict_factory):
     dct = indexed_dict_factory("dct", {"a": 1, "b": 2, "c": 3}).lazy
     fwd = list(dct.items())
     assert list(reversed(dct.items())) == fwd[::-1]
+
+
+# ============================================================================
+# WATCHES: rebased under __data__/, like the other indexed views
+# ============================================================================
+
+
+def test_indexed_dict_watches_fire_on_data_writes():
+    from tests.support.observed import Hooks, observed_storage
+
+    with observed_storage() as observed:
+        h = Hooks(*observed, view_cls=EagerIndexedDictView)
+        h.write(lambda v: v.store({"a": 1, "b": 2, "c": {"n": 0}}))
+        h.watch_view(
+            change=lambda v: v.on_change(),
+            child_b=lambda v: v.on_child_change("b"),
+            children=lambda v: v.on_children_change(),
+            desc=lambda v: v.on_descendants_change("*", "n"),
+        )
+
+        # Re-set of b: its child watch and the children watch fire.
+        hits = h.run(lambda v: v.__setitem__("b", 20))
+        assert len(hits["child_b"]) == 1
+        assert len(hits["children"]) == 1
+        assert len(hits["change"]) == 1
+        assert hits["desc"] == []
+
+        # A new key: the children watch fires on the data row only, never
+        # on the key list.
+        hits = h.run(lambda v: v.__setitem__("d", 4))
+        assert hits["child_b"] == []
+        assert len(hits["children"]) == 1
+        assert all("__keys__" not in k for k in hits["change"])
+
+        # A nested write under c matches the descendants pattern.
+        hits = h.run(lambda v: v.__setitem__("c", {"n": 1}))
+        assert any(k[-2:] == ("c", "n") for k in hits["desc"])
+        assert hits["child_b"] == []
+
+        # Delete of b: fires b's watch, and rewriting the key list stays quiet.
+        hits = h.run(lambda v: v.__delitem__("b"))
+        assert len(hits["child_b"]) == 1
+        assert len(hits["children"]) == 1
+        assert all("__data__" in k for k in hits["change"])

@@ -21,6 +21,7 @@ from .log_indexed_dict_view import (
     LazyLogIndexedDictView,
     LogIndexedDictViewBase,
 )
+from .ring_view import RingView
 from .set_view import SetView
 from .tuple_view import TupleView
 
@@ -49,6 +50,7 @@ __all__ = (
     "LightDictView",
     "ListViewBase",
     "LogIndexedDictViewBase",
+    "RingView",
     "SetView",
     "TupleView",
 )

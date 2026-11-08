@@ -102,7 +102,7 @@ with storage.transaction() as tx:
     assert board.next_after("ship") == "design"
 ```
 
-`LogIndexedDictView` keeps insertion order and pages with `keys(after=, limit=)`. `Kh57View` maps sparse ints and samples uniformly from a key range.
+`DictView` pages in key order with `keys(after=, limit=)` and `keys_reverse(before=, limit=)`. `LogIndexedDictView` keeps insertion order and pages the same way by an item's id. `RingView.of(n)` is a capped log: it keeps the newest `n` entries and drops the oldest. `Kh57View` maps sparse ints and samples uniformly from a key range.
 
 ## Watching changes
 
