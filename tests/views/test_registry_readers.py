@@ -45,3 +45,20 @@ def test_a_reader_claims_its_structure_but_never_a_type():
     assert registry.get_view_for_type(dict) is EagerDictView
     with pytest.raises(ViewRegistryError, match="already registered"):
         registry.register_reader(EagerFractionalIndexedDictView)
+
+
+def test_every_built_in_view_reads_back_through_any_navigator():
+    from virtuals import _views
+    from virtuals.codecs import NoOpCodec
+    from virtuals.navigator import Navigator
+    from virtuals.storages.mem import InMemoryStorage
+
+    exported = {
+        getattr(_views, name).STRUCTURE
+        for name in _views.__all__
+        if getattr(getattr(_views, name), "STRUCTURE", None) is not None
+    }
+    assert {view.STRUCTURE for view in _views.BUILTIN_VIEWS} == exported
+    registry = Navigator(InMemoryStorage(codec=NoOpCodec()), views=(EagerDictView,)).registry
+    for view in _views.BUILTIN_VIEWS:
+        assert registry.is_structure_registered(view.STRUCTURE), view

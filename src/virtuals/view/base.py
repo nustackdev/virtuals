@@ -393,25 +393,9 @@ def _view_for_structure(registry: ViewRegistry, structure: ContainerStructure) -
     try:
         return registry.get_view_for_structure(structure)
     except ViewRegistryError:
-        from virtuals import _views
+        from virtuals._views import BUILTIN_VIEWS
 
-        builtins = (
-            _views.ByteArrayView,
-            _views.EagerDictView,
-            _views.EagerFractionalIndexedDictView,
-            _views.EagerIndexedDictView,
-            _views.EagerKh57View,
-            _views.EagerListView,
-            _views.EagerLogIndexedDictView,
-            _views.FlatDictView,
-            _views.FlatListView,
-            _views.FrozenSetView,
-            _views.LightDictView,
-            _views.RingView,
-            _views.SetView,
-            _views.TupleView,
-        )
-        for view_class in builtins:
+        for view_class in BUILTIN_VIEWS:
             if view_class.STRUCTURE == structure:
                 return view_class  # type: ignore[return-value]
         return None

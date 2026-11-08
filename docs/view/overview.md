@@ -282,23 +282,24 @@ storage.put(("tasks", 0), "Task 1")
 
 ```python
 from virtuals.view import ViewRegistry
-from virtuals.view.views import DictView, ListView
+from virtuals.views import EagerDictView, EagerFractionalIndexedDictView, EagerListView
 
 registry = ViewRegistry()
 
-# Register built-in views
-registry.register_view(
-    DictView,
-)
-# structure_id=1,
-# container_type=dict,
+# A writer: its structure ID reads back to it, and it writes its Python type.
+registry.register(EagerDictView)  # structure 1, dict
+registry.register(EagerListView)  # structure 2, list
 
-registry.register_view(
-    ListView,
-)
-# structure_id=2,
-# container_type=list,
+# A reader: its structure ID reads back to it, but it never writes a type
+# (an ordered dict is a dict too, and dict is already EagerDictView's).
+registry.register_reader(EagerFractionalIndexedDictView)
 ```
+
+A `Navigator` builds its registry this way: the views it is given (or the
+standard ones) as writers, then every other built-in view as a reader. So
+a container stored with any built-in view (an ordered dict, a log dict, a
+ring) reads back by its structure, eg when its parent is extracted,
+whichever views write the Python types.
 
 ### Registry Lookup
 
@@ -311,7 +312,7 @@ view_class = registry.get_view_for_structure(1)  # Returns: DictView
 **Writing:** Python Type → View
 
 ```python
-view_class = registry.get_view_for_container_type(dict)  # Returns: DictView
+view_class = registry.get_view_for_type(dict)  # Returns: EagerDictView
 ```
 
 ## Context Management
