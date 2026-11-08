@@ -1,5 +1,10 @@
 """Functional tests for DictView."""
 
+import pytest
+
+from virtuals._views import EagerDictView
+from virtuals.container import ContainerNotFoundError
+
 
 def test_dict_factory_creates_empty_view(dict_factory):
     """Verify dict_factory creates an empty DictView."""
@@ -266,3 +271,76 @@ def test_dict_extract_full(dict_factory):
 
     assert extracted == {"alice": 1, "bob": 2, "charlie": 3}
     assert isinstance(extracted, dict)
+
+
+# ============================================================================
+# CURSOR PAGING
+# ============================================================================
+
+
+def test_dict_keys_after_pages_in_key_order(dict_factory):
+    """keys(after=, limit=) walks key order a page at a time, ints before strs."""
+    d = dict_factory("d", {"b": 2, "a": 1, "d": {"x": {"y": 1}}, "c": 3, 10: 0, 2: 0})
+
+    assert list(d.keys(limit=3)) == [2, 10, "a"]
+    assert list(d.keys(after="a", limit=2)) == ["b", "c"]
+    assert list(d.keys(after="c", limit=2)) == ["d"]
+    assert list(d.keys(after="d", limit=2)) == []
+    assert list(d.keys(after=2)) == [10, "a", "b", "c", "d"]
+
+
+def test_dict_keys_reverse_pages_newest_key_first(dict_factory):
+    d = dict_factory("d", {"a": 1, "b": {"x": 1}, "c": 3, 5: 0})
+
+    assert list(d.keys_reverse()) == ["c", "b", "a", 5]
+    assert list(d.keys_reverse(limit=2)) == ["c", "b"]
+    assert list(d.keys_reverse(before="b", limit=5)) == ["a", 5]
+    assert list(d.keys_reverse(before=5)) == []
+
+
+def test_dict_cursor_need_not_exist(dict_factory):
+    """A cursor is a position in key order: a deleted or never-set key resumes fine."""
+    d = dict_factory("d", {"a": 1, "c": 3, "e": 5})
+
+    assert list(d.keys(after="b")) == ["c", "e"]
+    assert list(d.keys_reverse(before="d")) == ["c", "a"]
+    del d["c"]
+    assert list(d.keys(after="c")) == ["e"]
+
+
+def test_dict_cursor_skips_subtree_of_compound_cursor(dict_factory):
+    """The cursor's own subtree sorts after it; paging never yields its fields."""
+    d = dict_factory("d", {"a": {"x": 1, "y": {"z": 2}}, "b": 1})
+
+    assert list(d.keys(after="a")) == ["b"]
+    assert list(d.keys_reverse(before="b")) == ["a"]
+
+
+def test_dict_keys_no_args_stays_a_keys_view(dict_factory):
+    d = dict_factory("d", {"a": 1, "b": 2})
+
+    keys = d.keys()
+    assert len(keys) == 2
+    assert "a" in keys
+    assert keys | {"z"} == {"a", "b", "z"}
+
+
+def test_dict_paging_on_empty_and_absent(root_view):
+    absent = root_view.open_child("nope", EagerDictView)
+    with pytest.raises(ContainerNotFoundError):
+        list(absent.keys(after="a"))
+    with pytest.raises(ContainerNotFoundError):
+        list(absent.keys_reverse(limit=1))
+
+    absent.ensure_created()
+    assert list(absent.keys(after="a")) == []
+    assert list(absent.keys(limit=5)) == []
+    assert list(absent.keys_reverse(before="a")) == []
+
+
+def test_dict_paging_limit_zero_and_bad_cursor(dict_factory):
+    d = dict_factory("d", {"a": 1})
+
+    assert list(d.keys(limit=0)) == []
+    with pytest.raises(TypeError):
+        list(d.keys(after=1.5))

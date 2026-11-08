@@ -120,13 +120,46 @@ class DictViewBase(
         """Iterate over keys."""
         yield from self.container.iter_child_keys(validate=False, strict=True)
 
-    def keys(self) -> KeysView[str | int]:
-        """Get all keys as a set-like view.
+    def keys(
+        self, *, after: str | int | None = None, limit: int | None = None
+    ) -> KeysView[str | int] | Generator[str | int, None, None]:
+        """Keys in key order (ints first, then strs bytewise).
 
-        Returns a proper KeysView supporting len, contains, and set
-        operations (union, intersection, difference, etc.).
+        With no arguments: a set-like KeysView supporting len, contains and
+        set operations. With ``after`` or ``limit``: a generator, a page of
+        the keys strictly after ``after`` (from the start when None), at
+        most ``limit`` of them.
+
+        ``after`` is a position in key order, not a row: it does not have
+        to exist, so a page resumes after a key that was deleted since.
+        Cost: one seek plus O(limit) rows, whatever the dict's size.
+
+        Raises:
+            ContainerNotFoundError: On a never-written view, when nothing
+                is read (as iteration does).
         """
-        return KeysView(self)  # type: ignore[arg-type]
+        if after is None and limit is None:
+            return KeysView(self)  # type: ignore[arg-type]
+        return self._keys_page(cursor=after, limit=limit, reverse=False)
+
+    def keys_reverse(
+        self, *, before: str | int | None = None, limit: int | None = None
+    ) -> Generator[str | int, None, None]:
+        """Keys in reverse key order, strictly before ``before``, at most ``limit``.
+
+        From the end when ``before`` is None. Like ``keys(after=)``, the
+        cursor does not have to exist. Cost: one seek plus O(limit) rows.
+        """
+        return self._keys_page(cursor=before, limit=limit, reverse=True)
+
+    def _keys_page(
+        self, *, cursor: str | int | None, limit: int | None, reverse: bool
+    ) -> Generator[str | int, None, None]:
+        if cursor is not None and not is_view_key(cursor):
+            raise TypeError(f"view keys must be str or int, got {type(cursor).__name__}")
+        yield from self.container.iter_child_keys(
+            validate=False, strict=True, reverse=reverse, cursor=cursor, limit=limit
+        )
 
     # =========================================================================
     # MUTATIONS (same for both facets)

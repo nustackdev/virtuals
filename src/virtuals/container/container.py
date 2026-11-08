@@ -270,15 +270,20 @@ class Container:
         reverse: bool = False,
         strict: bool = False,
         owner: site_.Site | None = None,
+        cursor: site_.SiteSegment | None = None,
+        limit: int | None = None,
     ) -> Generator[site_.SiteSegment, None, None]:
         """Iterate over direct child keys.
 
         Args:
             validate: If True, validate this is a container (default False)
-            reverse: If True, yield in reverse insertion order (default False)
+            reverse: If True, yield in reverse key order (default False)
             strict: If True, raise ``ContainerNotFoundError`` when this
                 container was never written (checked only on an empty result)
             owner: Site to name in that error (default this container's site)
+            cursor: Start strictly past this key (above it forward, below
+                it reverse). It does not have to exist.
+            limit: Cap on the number of keys yielded.
 
         Yields:
             Child keys
@@ -289,7 +294,14 @@ class Container:
             StorageInterfaceError: If context doesn't support reads
         """
         yield from container_ops.iter_child_keys(
-            self.site, self.ctx, validate=validate, reverse=reverse, strict=strict, owner=owner
+            self.site,
+            self.ctx,
+            validate=validate,
+            reverse=reverse,
+            strict=strict,
+            owner=owner,
+            cursor=cursor,
+            limit=limit,
         )
 
     def iter_children(
@@ -299,15 +311,19 @@ class Container:
         reverse: bool = False,
         strict: bool = False,
         owner: site_.Site | None = None,
+        cursor: site_.SiteSegment | None = None,
+        limit: int | None = None,
     ) -> Generator[tuple[site_.SiteSegment, NodeInfo], None, None]:
         """Iterate over direct children with their info.
 
         Args:
             validate: If True, validate this is a container (default False)
-            reverse: If True, yield in reverse insertion order (default False)
+            reverse: If True, yield in reverse key order (default False)
             strict: If True, raise ``ContainerNotFoundError`` when this
                 container was never written (checked only on an empty result)
             owner: Site to name in that error (default this container's site)
+            cursor: Start strictly past this key (it does not have to exist)
+            limit: Cap on the number of children yielded
 
         Yields:
             Tuples of (child_key, NodeInfo)
@@ -318,7 +334,14 @@ class Container:
             StorageInterfaceError: If context doesn't support reads
         """
         yield from container_ops.iter_children(
-            self.site, self.ctx, validate=validate, reverse=reverse, strict=strict, owner=owner
+            self.site,
+            self.ctx,
+            validate=validate,
+            reverse=reverse,
+            strict=strict,
+            owner=owner,
+            cursor=cursor,
+            limit=limit,
         )
 
     def count_children(

@@ -20,6 +20,20 @@ stored head, tail or length: ``first``/``last`` are one seek each and
 
 Placement is relative (``before=``/``after=`` an id), never by index.
 
+Cursors. ``keys(after=id, limit=)`` and ``keys_reverse(before=id, limit=)``
+page by id. ``next_key_after(okey)`` steps by order key, the cursor a
+stream follows: it still marks a place after its id is gone.
+
+End mark. A key placed at the end is drawn above the last row, with a
+random tail, so with the last row gone it could land below that row's old
+key, behind a cursor still sitting there. So when the last row's order
+key leaves (a delete, a move away from the end, ``clear``, ``respace``)
+it is kept in ``__end__``, one primitive beside the three sub-containers,
+and a key placed at the end is drawn above it too. Only that case writes
+the mark, so appends never contend on it; an append reads it (one get).
+On backends that do not track reads (rocksdb, mem) an append racing the
+delete of the last row can still draw below the mark it writes.
+
 Key length. Inserting again and again at one gap grows the key about one
 char per four inserts, and LMDB rejects storage keys above 511 bytes
 (the encoded site plus the order key). So a fresh key longer than
@@ -142,6 +156,7 @@ __all__ = [
 _DATA = "__data__"
 _ORDER = "__order__"
 _POS = "__pos__"
+_END = "__end__"
 
 Address = str | int
 
@@ -318,8 +333,11 @@ class FractionalIndexedDictViewBase(
         overwritten by ``_index``); on a hit a new tail is drawn. If the
         key passes ``MAX_KEY_LENGTH`` the rows around the gap are respaced
         first (``_respace_around``) and the key comes from the respaced
-        window.
+        window. A key at the end (``nxt`` None) is also drawn above the end
+        mark, one more get.
         """
+        if nxt is None:
+            prev = self._past_end(prev)
         oc = self._order_container()
         for _ in range(self.ALLOT_ATTEMPTS):
             okey = generate_suffixed_key_between(prev, nxt, suffix_length=self.SUFFIX_LENGTH)
@@ -382,6 +400,33 @@ class FractionalIndexedDictViewBase(
             self._index(address, next(fresh))
         return gap_key
 
+    def _end_mark(self) -> str | None:
+        """The highest order key the last row has held since it left, None if none. One get."""
+        mark = self.container.get_child_primitive_unsafe(_END)
+        return None if is_empty(mark) else cast("str", mark)
+
+    def _past_end(self, prev: str | None) -> str | None:
+        """The bound a key placed at the end must pass: ``prev`` or the end mark, the higher."""
+        mark = self._end_mark()
+        if mark is None or (prev is not None and prev >= mark):
+            return prev
+        return mark
+
+    def _raise_end(self, okey: str) -> None:
+        """Keep ``okey`` as the end mark unless the mark is already higher. One get, one put."""
+        mark = self._end_mark()
+        if mark is None or okey > mark:
+            self.container.put_child_primitive(_END, okey, validate=False, validate_parent=False)
+
+    def _retire(self, okey: str) -> None:
+        """``okey``'s order row is gone: if it was the last row, raise the end mark to it.
+
+        One seek to tell whether a row is left above it; only the last row
+        writes the mark.
+        """
+        if self._neighbour(okey, before=False) is None:
+            self._raise_end(okey)
+
     def _index(self, address: Address, okey: str) -> None:
         """Record ``address`` at ``okey``: one ``__pos__`` put, one ``__order__`` put."""
         self._pos_container().put_child_primitive(
@@ -400,6 +445,7 @@ class FractionalIndexedDictViewBase(
     def _relocate(self, address: Address, okey: str, prev: str | None, nxt: str | None) -> str:
         """Move ``address`` from ``okey`` to a fresh key between ``prev`` and ``nxt``."""
         self._order_container().delete_child_primitive_unsafe(okey)
+        self._retire(okey)
         return self._place(address, prev, nxt)
 
     def _write_value(self, address: Address, value: object) -> None:
@@ -459,6 +505,7 @@ class FractionalIndexedDictViewBase(
         oc = self._order_container()
         for okey, _address in rows:
             oc.delete_child_primitive_unsafe(okey)
+        self._raise_end(rows[-1][0])
         keys = generate_n_suffixed_keys_between(
             None, None, len(rows), suffix_length=self.SUFFIX_LENGTH
         )
@@ -531,6 +578,8 @@ class FractionalIndexedDictViewBase(
     def _keys_scan(
         self, *, after: Address | None, limit: int | None, reverse: bool
     ) -> Generator[Address, None, None]:
+        if after is not None and not is_view_key(after):
+            raise TypeError(f"view keys must be str or int, got {type(after).__name__}")
         if after is None:
             rows = self._scan_order(reverse=reverse, limit=limit)
         else:
@@ -558,6 +607,31 @@ class FractionalIndexedDictViewBase(
         """Id directly before ``address``, or None at the start."""
         row = self._neighbour(self._require_position(address), before=True)
         return None if row is None else row[1]
+
+    def next_key_after(self, cursor: str | None = None) -> tuple[str, Address] | None:
+        """The next ``(order key, id)`` past the order key ``cursor``, or None at the end.
+
+        The cursor protocol a stream follows, as on ``LogIndexedDictView``:
+        one seek per call, from the first row when ``cursor`` is None. The
+        cursor is an order key, not an id, so it still marks a place after
+        its id is deleted or moved.
+
+        A stream over a list that only grows at the end sees every id once,
+        also when the id under its cursor is deleted or moved away: a key
+        placed at the end is drawn above the end mark, which keeps the last
+        row's key when that row leaves. Placement in the middle does not
+        keep that promise: an id placed or moved before the cursor is not
+        seen, one moved past it is seen again, and a window respace near the
+        cursor rewrites the order keys around it, so some ids there may be
+        seen twice or missed.
+        """
+        if cursor is None:
+            rows = self._scan_order(limit=1)
+        else:
+            rows = self._scan_order(start=cursor, limit=1, skip=(cursor,))
+        for row in rows:
+            return row
+        return None
 
     def position(self, address: Address) -> str:
         """Order key of ``address``. Opaque, stable until the id moves."""
@@ -730,6 +804,7 @@ class FractionalIndexedDictViewBase(
         else:
             self._order_container().delete_child_primitive_unsafe(cast("str", okey))
             self._pos_container().delete_child_primitive_unsafe(address)
+            self._retire(cast("str", okey))
         dc.delete_child(address)
 
     def pop(self, address: Address, default: object | Empty = EMPTY) -> object | Empty:
@@ -746,9 +821,12 @@ class FractionalIndexedDictViewBase(
         if not self.container.exists():
             return  # clear of nothing is not a write: the view stays absent
         self.ensure_created()
+        last = self._edge(last=True, strict=False)
         self._data_container().clear_children(validate=False)
         self._order_container().clear_children(validate=False)
         self._pos_container().clear_children(validate=False)
+        if last is not None:
+            self._raise_end(last[0])
 
     def update(self, other: PyMapping[Address, object] | None = None, **kwargs: object) -> None:
         self._reject_empty_in(other or {})

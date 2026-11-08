@@ -503,6 +503,12 @@ def test_keys_after_with_limit_is_exact(fdict):
         list(view.keys(after="zz"))
 
 
+def test_keys_after_a_cursor_of_the_wrong_type_raises_type_error(fdict):
+    view = fdict("lst", {"a": 1})
+    with pytest.raises(TypeError):
+        list(view.keys(after=1.5))
+
+
 def test_keys_reverse_before_with_limit_is_exact(fdict):
     view = fdict("lst", {k: i for i, k in enumerate("abcdefg")})
     assert list(view.keys_reverse(before="f", limit=3)) == ["e", "d", "c"]
@@ -510,6 +516,100 @@ def test_keys_reverse_before_with_limit_is_exact(fdict):
     assert list(view.keys_reverse(limit=2)) == ["g", "f"]
     assert list(view.keys_reverse(before="a", limit=3)) == []
     assert list(view.keys_reverse(before="b", limit=3)) == ["a"]
+
+
+def _follow(view, cursor=None):
+    """Every (order key, id) past ``cursor``, one ``next_key_after`` call each."""
+    rows = []
+    while (row := view.next_key_after(cursor)) is not None:
+        rows.append(row)
+        cursor = row[0]
+    return rows
+
+
+def test_next_key_after_steps_by_order_key(fdict):
+    view = fdict("lst", {"a": 1, "b": 2, "c": 3})
+    rows = _follow(view)
+    assert [address for _, address in rows] == ["a", "b", "c"]
+    assert rows == list(view.positions())
+    assert view.next_key_after(rows[-1][0]) is None
+
+
+def test_next_key_after_resumes_past_a_deleted_id(fdict):
+    view = fdict("lst", {"a": 1, "b": 2, "c": 3})
+    cursor = view.position("b")
+    del view["b"]
+    view["d"] = 4
+    assert [address for _, address in _follow(view, cursor)] == ["c", "d"]
+
+
+@pytest.mark.parametrize("rounds", [40])
+def test_next_key_after_sees_an_append_past_a_deleted_last_id(fdict, rounds):
+    # The new key is drawn with a random tail; without the end mark it lands
+    # below the deleted last key about half the time.
+    view = fdict("lst", {"a": 1})
+    for i in range(rounds):
+        cursor = view.position(view.last())
+        del view[view.last()]
+        view[f"n{i}"] = i
+        assert [address for _, address in _follow(view, cursor)] == [f"n{i}"]
+
+
+def test_next_key_after_sees_an_append_to_a_view_emptied_under_the_cursor(fdict):
+    for i in range(40):
+        view = fdict(f"lst{i}", {"a": 1})
+        cursor = view.position("a")
+        del view["a"]
+        view["b"] = 2
+        assert [address for _, address in _follow(view, cursor)] == ["b"]
+
+
+def test_next_key_after_sees_an_append_past_a_last_id_moved_away(fdict):
+    for i in range(40):
+        view = fdict(f"lst{i}", {"a": 1, "b": 2})
+        cursor = view.position("b")
+        view.move_first("b")
+        view["c"] = 3
+        assert [address for _, address in _follow(view, cursor)] == ["c"]
+
+
+def test_next_key_after_sees_an_append_after_clear(fdict):
+    for i in range(20):
+        view = fdict(f"lst{i}", {"a": 1, "b": 2})
+        cursor = view.position("b")
+        view.clear()
+        view["c"] = 3
+        assert [address for _, address in _follow(view, cursor)] == ["c"]
+
+
+def test_end_mark_is_not_an_id(fdict):
+    view = fdict("lst", {"a": 1, "b": 2})
+    del view["b"]
+    view["c"] = 3
+    assert list(view) == ["a", "c"]
+    assert len(view) == 2
+    assert view.extract() == {"a": 1, "c": 3}
+
+
+def test_a_middle_delete_writes_no_end_mark(fdict):
+    view = fdict("lst", {"a": 1, "b": 2, "c": 3})
+    del view["b"]
+    assert view._end_mark() is None
+    del view["c"]
+    assert view._end_mark() is not None
+
+
+def test_next_key_after_on_an_empty_view_is_none(fdict):
+    view = fdict("lst", {"a": 1})
+    del view["a"]
+    assert view.next_key_after(None) is None
+
+
+def test_next_key_after_on_a_never_written_view_raises(broot):
+    view = broot.open_child("absent", EagerFractionalIndexedDictView)
+    with pytest.raises(ContainerNotFoundError):
+        view.next_key_after(None)
+    assert not view.container.exists()
 
 
 def test_keys_returns_keysview_without_args(fdict):
@@ -1429,9 +1529,13 @@ def test_key_touches_are_constant_in_n(backend, tmp_path):
         at_1000 = _measure(large, 1000)
     finally:
         large.close()
+    # An op that takes an order row away seeks once more, to tell whether
+    # the row was the last one (the end mark).
+    retiring = {"move_before", "move_after", "move_first", "move_last", "delete"}
     for name in at_10:
         assert at_10[name] == at_1000[name], (name, at_10[name], at_1000[name])
-        assert at_10[name].get("scan", 0) <= 1, (name, at_10[name])
+        max_scans = 2 if name in retiring else 1
+        assert at_10[name].get("scan", 0) <= max_scans, (name, at_10[name])
         assert at_10[name].get("scan_row", 0) <= 5, (name, at_10[name])
         assert sum(at_10[name].values()) <= 30, (name, at_10[name])
     print(f"\n{backend} key touches per op (n=10 == n=1000):")

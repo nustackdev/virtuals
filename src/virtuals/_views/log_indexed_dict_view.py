@@ -29,7 +29,12 @@ scan on delete; ``rebuild_bookkeeping()`` fills the index.
 Ordered enumeration via ``__keys__/`` prefix scan (lexicographic =
 chronological). Direct lookup via ``__data__.[key]`` (skips ``__keys__``).
 
-Cursor-friendly: ``keys(after=cursor)`` seeks into ``__keys__/`` log.
+Cursors. ``keys(after=id, limit=)`` and ``keys_reverse(before=id, limit=)``
+page by an item's own id: the reverse index gives its log key in one get,
+then one seek into ``__keys__/``. An id that is gone raises KeyError, like
+``FractionalIndexedDictView``: its log slot went with it. Streams that must
+resume past deleted rows hold the log key instead
+(``keys_with_log_keys(after=)``, ``next_key_after``).
 """
 
 from __future__ import annotations
@@ -126,7 +131,7 @@ class LogIndexedDictViewBase(
     for nested data with controlled granularity. No ``__len__`` metadata.
 
     Multi-writer safe: each writer generates unique log keys independently.
-    Cursor-friendly: ``keys(after=cursor)`` for seek-based iteration.
+    Pages by item id: ``keys(after=id, limit=)``, ``keys_reverse(before=id, limit=)``.
     """
 
     STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(15)
@@ -200,6 +205,33 @@ class LogIndexedDictViewBase(
     def _log_key_or_empty(self, actual_key: str | int) -> str | Empty:
         """Log key of ``actual_key`` from the reverse index, EMPTY if unrecorded. One get."""
         return cast("str | Empty", self._log_container().get_child_primitive_unsafe(actual_key))
+
+    def _find_log_key(self, actual_key: str | int) -> str | Empty:
+        """Log key of a key that holds data, EMPTY if the log never recorded it.
+
+        One reverse-index get, one get to confirm the log row still names
+        this key. A missing reverse row (data logged before ``__log__/``
+        existed) or a stale one (a writer that does not maintain the index
+        deleted and re-set the key) falls back to a log scan.
+        """
+        log_key = self._log_key_or_empty(actual_key)
+        if not is_empty(log_key):
+            held = self._keys_container().get_child_primitive_unsafe(cast("str", log_key))
+            if not is_empty(held) and held == actual_key:
+                return log_key
+        for candidate, logged in self._scan_log_keys():
+            if logged == actual_key:
+                return candidate
+        return EMPTY
+
+    def _require_log_key(self, actual_key: str | int) -> str:
+        """Log key of ``actual_key`` as a cursor. KeyError if the id holds no data."""
+        if actual_key not in self:
+            raise KeyError(actual_key)
+        log_key = self._find_log_key(actual_key)
+        if is_empty(log_key):
+            raise KeyError(actual_key)
+        return cast("str", log_key)
 
     # -- Bookkeeping -------------------------------------------------------
 
@@ -394,62 +426,66 @@ class LogIndexedDictViewBase(
     def keys(
         self,
         *,
-        after: str | None = None,
+        after: str | int | None = None,
         limit: int | None = None,
     ) -> KeysView[str | int] | Generator[str | int, None, None]:
-        """Get keys in insertion order.
+        """Keys in insertion order.
+
+        With no arguments: a set-like KeysView. With ``after`` or ``limit``:
+        a generator, a page of the keys logged after the item ``after``
+        (from the oldest when None), at most ``limit`` of them.
 
         Args:
-            after: If provided, start iteration past this log-key cursor.
-            limit: Optional cap on the number of keys yielded.
-                Requires ``after`` or triggers a generator (KeysView has
-                no natural cap).
+            after: An item id held by the view. KeyError if it holds no
+                data. Cost: about three gets to find its log slot.
+            limit: Cap on the number of keys yielded.
+
+        Cost: O(limit) rows from one seek into ``__keys__/``.
         """
-        if after is not None or limit is not None:
-            return self._keys_scan(after=after, limit=limit)
-        return KeysView(self)  # type: ignore[arg-type]
+        if after is None and limit is None:
+            return KeysView(self)  # type: ignore[arg-type]
+        return self._keys_page(cursor=after, limit=limit, reverse=False)
 
     def keys_reverse(
         self,
         *,
-        before: str | None = None,
+        before: str | int | None = None,
         limit: int | None = None,
     ) -> Generator[str | int, None, None]:
-        """Yield actual keys in reverse insertion order (newest first).
+        """Keys newest first, logged before the item ``before``, at most ``limit``.
 
-        Args:
-            before: If provided, start just below this log-key cursor
-                (older-than semantics).
-            limit: Optional cap on the number of keys yielded.
-
-        Cost: O(limit) via a reverse rocksdb range scan over ``__keys__/``,
-        so ``keys_reverse(limit=n)`` is safe against arbitrarily large
-        streams -- the natural fit for tail-N reads on this view.
+        From the newest when ``before`` is None. ``before`` is an item id,
+        KeyError if it holds no data. Cost: O(limit) rows from one reverse
+        seek, so a tail-N read stays cheap on any size of log.
         """
-        for _log_key, actual_key in self._scan_log_keys(
-            reverse=True,
-            before=before,
-            limit=limit,
-        ):
-            yield actual_key
+        return self._keys_page(cursor=before, limit=limit, reverse=True)
 
-    def _keys_scan(
-        self,
-        *,
-        after: str | None,
-        limit: int | None,
+    def _keys_page(
+        self, *, cursor: str | int | None, limit: int | None, reverse: bool
     ) -> Generator[str | int, None, None]:
-        """Yield actual keys with forward cursor + optional cap."""
-        for _log_key, actual_key in self._scan_log_keys(after=after, limit=limit):
+        """One page of actual keys. The cursor id resolves to its log key eagerly."""
+        if cursor is not None and not is_view_key(cursor):
+            raise TypeError(f"view keys must be str or int, got {type(cursor).__name__}")
+        log_key = None if cursor is None else self._require_log_key(cursor)
+        return self._iter_page(log_key, limit=limit, reverse=reverse)
+
+    def _iter_page(
+        self, log_key: str | None, *, limit: int | None, reverse: bool
+    ) -> Generator[str | int, None, None]:
+        if reverse:
+            rows = self._scan_log_keys(reverse=True, before=log_key, limit=limit)
+        else:
+            rows = self._scan_log_keys(after=log_key, limit=limit)
+        for _log_key, actual_key in rows:
             yield actual_key
 
     def keys_with_log_keys(
         self, *, after: str | None = None
     ) -> Generator[tuple[str, str | int], None, None]:
-        """Yield (log_key, actual_key) pairs for cursor tracking.
+        """Yield (log_key, actual_key) pairs, past the log key ``after``.
 
-        This is the primary method for Stream consumers that need to
-        advance a cursor.
+        The log-key cursor: unlike an item id, a log key still marks a
+        position after its item is deleted, so a stream resumes past it.
         """
         yield from self._scan_log_keys(after=after)
 
@@ -498,21 +534,9 @@ class LogIndexedDictViewBase(
         if not is_view_key(address) or not dc.exists_child(address):
             raise KeyError(address)
         dc.delete_child(address)
-        # Drop the log entry: one reverse-index get, one get to confirm the
-        # log row still names this key, then two point deletes. A missing
-        # reverse row (data logged before ``__log__/`` existed) or a stale
-        # one (a writer that does not maintain the index deleted and re-set
-        # the key) falls back to a log scan, as before the index.
-        log_key = self._log_key_or_empty(address)
-        if not is_empty(log_key):
-            held = self._keys_container().get_child_primitive_unsafe(cast("str", log_key))
-            if is_empty(held) or held != address:
-                log_key = EMPTY
-        if is_empty(log_key):
-            for candidate, actual_key in self._scan_log_keys():
-                if actual_key == address:
-                    log_key = candidate
-                    break
+        # Drop the log entry: found in two gets (a scan only for data
+        # logged before the reverse index), then two point deletes.
+        log_key = self._find_log_key(address)
         if not is_empty(log_key):
             self._keys_container().delete_child_primitive_unsafe(cast("str", log_key))
             self._log_container().delete_child_primitive_unsafe(address)

@@ -173,17 +173,14 @@ def test_keys_with_log_keys_after_cursor(log_dict_factory):
     assert remaining[0][1] == "c"
 
 
-def test_keys_after_returns_generator(log_dict_factory):
+def test_keys_after_item_id(log_dict_factory):
     dct = log_dict_factory("dct")
     dct["a"] = 1
     dct["b"] = 2
     dct["c"] = 3
 
-    entries = list(dct.keys_with_log_keys())
-    cursor = entries[0][0]
-
-    result = list(dct.keys(after=cursor))
-    assert result == ["b", "c"]
+    assert list(dct.keys(after="a")) == ["b", "c"]
+    assert list(dct.keys(after="c")) == []
 
 
 def test_cursor_after_last_returns_empty(log_dict_factory):
@@ -545,34 +542,60 @@ def _cursor_of(dct, key):
 
 def test_keys_after_with_limit_is_exact(log_dict_factory):
     dct = log_dict_factory("dct", {f"k{i}": i for i in range(6)})
-    cursor = _cursor_of(dct, "k1")
-    assert list(dct.keys(after=cursor, limit=3)) == ["k2", "k3", "k4"]
-    assert list(dct.keys(after=cursor, limit=1)) == ["k2"]
-    assert list(dct.keys(after=cursor, limit=10)) == ["k2", "k3", "k4", "k5"]
+    assert list(dct.keys(after="k1", limit=3)) == ["k2", "k3", "k4"]
+    assert list(dct.keys(after="k1", limit=1)) == ["k2"]
+    assert list(dct.keys(after="k1", limit=10)) == ["k2", "k3", "k4", "k5"]
     assert list(dct.keys(limit=3)) == ["k0", "k1", "k2"]
 
 
 def test_keys_reverse_before_with_limit_is_exact(log_dict_factory):
     dct = log_dict_factory("dct", {f"k{i}": i for i in range(6)})
-    cursor = _cursor_of(dct, "k4")
-    assert list(dct.keys_reverse(before=cursor, limit=2)) == ["k3", "k2"]
-    assert list(dct.keys_reverse(before=cursor, limit=1)) == ["k3"]
-    assert list(dct.keys_reverse(before=cursor, limit=10)) == ["k3", "k2", "k1", "k0"]
+    assert list(dct.keys_reverse(before="k4", limit=2)) == ["k3", "k2"]
+    assert list(dct.keys_reverse(before="k4", limit=1)) == ["k3"]
+    assert list(dct.keys_reverse(before="k4", limit=10)) == ["k3", "k2", "k1", "k0"]
     assert list(dct.keys_reverse(limit=2)) == ["k5", "k4"]
+    assert list(dct.keys_reverse(before="k0")) == []
 
 
-def test_keys_after_deleted_cursor_with_limit_is_exact(log_dict_factory):
-    """A cursor whose row was deleted still pages the same count."""
+def test_page_cursor_follows_log_order_not_key_order(log_dict_factory):
+    """Pages run in write order; a re-set keeps its slot."""
+    dct = log_dict_factory("dct")
+    for k in ["zebra", "alpha", "mango", "beta"]:
+        dct[k] = 1
+    dct["zebra"] = 2
+    assert list(dct.keys(after="zebra", limit=2)) == ["alpha", "mango"]
+    assert list(dct.keys_reverse(before="mango")) == ["alpha", "zebra"]
+
+
+def test_keys_after_missing_id_raises(log_dict_factory):
+    """A gone id has no log slot left: KeyError, as on the fractional view."""
+    dct = log_dict_factory("dct", {f"k{i}": i for i in range(3)})
+    del dct["k1"]
+    with pytest.raises(KeyError):
+        list(dct.keys(after="k1"))
+    with pytest.raises(KeyError):
+        list(dct.keys_reverse(before="nope", limit=1))
+    with pytest.raises(TypeError):
+        dct.keys(after=1.5)
+
+
+def test_keys_after_id_without_reverse_row_falls_back_to_scan(log_dict_factory):
+    """Data logged before ``__log__/`` existed still pages by id."""
+    dct = log_dict_factory("dct", {f"k{i}": i for i in range(4)})
+    dct._log_container().delete_child_primitive_unsafe("k1")
+    assert list(dct.keys(after="k1", limit=2)) == ["k2", "k3"]
+
+
+def test_log_key_cursor_survives_deleted_row(log_dict_factory):
+    """A log-key cursor still pages the same count after its row is deleted."""
     dct = log_dict_factory("dct", {f"k{i}": i for i in range(6)})
     fwd = _cursor_of(dct, "k1")
-    rev = _cursor_of(dct, "k4")
     del dct["k1"]
     del dct["k4"]
-    assert list(dct.keys(after=fwd, limit=3)) == ["k2", "k3", "k5"]
-    assert list(dct.keys_reverse(before=rev, limit=2)) == ["k3", "k2"]
     assert list(dct.keys_with_log_keys(after=fwd)) == [
         (lk, ak) for lk, ak in dct.keys_with_log_keys() if ak in ("k2", "k3", "k5")
     ]
+    assert dct.next_key_after(fwd)[1] == "k2"
 
 
 def test_next_key_after_cursor_with_limit_one(log_dict_factory):
@@ -750,29 +773,20 @@ def test_set_new_cost_is_constant_in_n(costed):
 
 
 def test_keys_after_limit_scan_is_bounded(costed):
-    """Paging reads limit + 1 rows (the cursor row), never the whole log."""
-    from tests.support.counting import measure
+    """Paging by id: a few gets for the cursor, then limit + 1 rows, never the whole log."""
+    from tests.support.counting import POINT_OPS, measure
 
     storage, counts = costed
     _fill_log(storage, 1000)
-    with storage.transaction() as tx:
-        from virtuals.navigator import Navigator
-
-        d = Navigator(storage).root(tx).open_child("d", EagerLogIndexedDictView)
-        cursor = _cursor_of(d, "k10")
-    cost = measure(
-        storage,
-        counts,
-        lambda root: list(
-            root.open_child("d", EagerLogIndexedDictView).keys(after=cursor, limit=5)
-        ),
-    )
-    assert cost["scan_rows"] <= 7, cost
-    cost = measure(
-        storage,
-        counts,
-        lambda root: list(
-            root.open_child("d", EagerLogIndexedDictView).keys_reverse(before=cursor, limit=5)
-        ),
-    )
-    assert cost["scan_rows"] <= 7, cost
+    for page in (
+        lambda d: list(d.keys(after="k10", limit=5)),
+        lambda d: list(d.keys_reverse(before="k10", limit=5)),
+    ):
+        cost = measure(
+            storage,
+            counts,
+            lambda root, page=page: page(root.open_child("d", EagerLogIndexedDictView)),
+        )
+        assert cost["scan"] == 1, cost
+        assert cost["scan_rows"] <= 7, cost
+        assert sum(cost[name] for name in POINT_OPS) <= 4, cost
