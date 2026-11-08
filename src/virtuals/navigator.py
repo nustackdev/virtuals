@@ -51,6 +51,31 @@ def _default_views() -> tuple[type[View], ...]:
     return (ByteArrayView, EagerDictView, FrozenSetView, EagerListView, SetView, TupleView)
 
 
+def _readers() -> tuple[type[View], ...]:
+    """Every other built-in view, registered to read its structure back, never to write a type."""
+    from virtuals._views import (
+        EagerFractionalIndexedDictView,
+        EagerIndexedDictView,
+        EagerKh57View,
+        EagerLogIndexedDictView,
+        FlatDictView,
+        FlatListView,
+        LightDictView,
+        RingView,
+    )
+
+    return (
+        EagerFractionalIndexedDictView,
+        EagerIndexedDictView,
+        EagerKh57View,
+        EagerLogIndexedDictView,
+        FlatDictView,
+        FlatListView,
+        LightDictView,
+        RingView,
+    )
+
+
 class Navigator(Generic[ViewT]):
     """High-level entrypoint for virtuals storage.
 
@@ -187,8 +212,16 @@ class Navigator(Generic[ViewT]):
         return self._root_view_cls(container, self._registry)
 
     def _build_registry(self, views: tuple[type[View], ...] | None = None) -> ViewRegistry:
-        """Build registry from provided views or defaults."""
+        """Build registry from provided views or defaults, plus every built-in view as a reader.
+
+        The registered views decide which view writes a Python type. Every
+        other built-in structure is still read back (eg an ordered dict held
+        by an extracted parent), whichever views were given.
+        """
         registry = ViewRegistry()
         for view in views or _default_views():
             registry.register(view)
+        for view in _readers():
+            if not registry.is_structure_registered(view.get_structure()):
+                registry.register_reader(view)
         return registry

@@ -127,6 +127,31 @@ class ViewRegistry:
             },
         )
 
+    def register_reader(self, view_class: type[View]) -> None:
+        """Register a view class for reading only: its structure ID maps to it, its type does not.
+
+        For views whose container type another view already writes (an
+        ordered or log dict is a ``dict`` too): a container stored with one
+        of them is still read back by structure, eg when its parent is
+        extracted.
+
+        Args:
+            view_class: View class to read its structure with
+        Raises:
+            ViewRegistryError: If its structure ID is already registered
+        """
+        structure_id: ContainerStructure = view_class.get_structure()
+        if structure_id in self._structure_to_view:
+            existing = self._structure_to_view[structure_id]
+            raise ViewRegistryError(
+                f"Structure ID {structure_id} already registered to {existing.__name__}"
+            )
+        self._structure_to_view[structure_id] = view_class
+
+    def is_structure_registered(self, structure_id: ContainerStructure) -> bool:
+        """Whether a view reads ``structure_id``."""
+        return structure_id in self._structure_to_view
+
     def get_view_for_structure(self, structure_id: ContainerStructure) -> type[View]:
         """Get view class for structure ID (reading).
 
