@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, ClassVar
 
 from virtuals._views._member_key import member_key
-from virtuals.collections import SetBase
+from virtuals.collections import FrozenSetMethods
 from virtuals.container import ContainerProtocol, ContainerStructure, ContainerTypeError
 from virtuals.types import is_empty
 from virtuals.view import (
@@ -38,13 +38,14 @@ class FrozenSetView(
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
-    SetBase[object],
+    FrozenSetMethods[object],
 ):
     """Frozenset-like view over container (immutable set).
 
-    A read-only ``Set``: ``in``, ``len``, iteration, comparisons, the
-    ``& | - ^`` operators (returning a plain frozenset), ``isdisjoint``,
-    plus ``issubset`` and ``issuperset`` as on ``frozenset``.
+    Every ``frozenset`` method with the same semantics; new values
+    (operators, ``union``, ``copy``, ...) come back as a plain frozenset.
+    Not hashable, unlike ``frozenset``: the stored members can be replaced
+    under the view, so a hash would not hold for the view's lifetime.
 
     Type Parameters:
         V: Type of values (default: Value)
@@ -111,28 +112,6 @@ class FrozenSetView(
             stored_value = self.container.get_child_primitive(key)
             if not is_empty(stored_value):
                 yield stored_value
-
-    def issubset(self, other: Iterable[object]) -> bool:
-        """Check if all elements are in other.
-
-        Args:
-            other: Set to compare with
-
-        Returns:
-            True if subset
-        """
-        return all(value in other for value in self)
-
-    def issuperset(self, other: Iterable[object]) -> bool:
-        """Check if all elements of other are in this set.
-
-        Args:
-            other: Set to compare with
-
-        Returns:
-            True if superset
-        """
-        return all(value in self for value in other)
 
     def extract(self) -> frozenset[object]:
         """Extract all values as frozenset.

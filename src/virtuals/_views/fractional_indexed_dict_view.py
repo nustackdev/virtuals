@@ -106,7 +106,7 @@ import contextlib
 from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from virtuals.collections import ReactiveMappingBase
+from virtuals.collections import DictMethods, ReactiveMappingBase
 from virtuals.container import (
     Container,
     ContainerProtocol,
@@ -182,6 +182,7 @@ class FractionalIndexedDictViewBase(
     UnsafePrimitiveOpsBase,
     ViewBase,
     ReactiveMappingBase[Address, object],
+    DictMethods[Address, object],
 ):
     """Ordered dict view with fractional index order keys.
 

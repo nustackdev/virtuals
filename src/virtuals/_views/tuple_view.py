@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar, TypeVar
 
-from virtuals.collections import SequenceBase
+from virtuals.collections import TupleMethods
 from virtuals.container import (
     Container,
     ContainerNotFoundError,
@@ -53,12 +53,15 @@ class TupleView(
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
-    SequenceBase[object],
+    TupleMethods[object],
 ):
     """Tuple-like view over container (immutable sequence).
 
     A read-only ``Sequence`` using integer keys: ``[i]`` and slices,
-    ``len``, ``in``, iteration, ``reversed``, ``index`` and ``count``.
+    ``len``, ``in``, iteration, ``reversed``, ``index`` and ``count``,
+    plus ``+``, ``*`` and ordering as on ``tuple``. Not hashable, unlike
+    ``tuple``: the stored items can be replaced under the view, so a hash
+    would not hold for the view's lifetime.
 
     Type Parameters:
         V: Type of values (default: Value)
@@ -127,17 +130,6 @@ class TupleView(
     # =========================================================================
     # VIEW INTERFACE
     # =========================================================================
-
-    def __eq__(self, other: object) -> bool:
-        """Equal to a tuple, or a tuple view, holding equal items in order, as ``tuple ==``.
-
-        Not hashable: the stored tuple can be replaced under the view.
-        """
-        if not isinstance(other, tuple | TupleView):
-            return NotImplemented
-        return tuple(self) == tuple(other)
-
-    __hash__ = None  # type: ignore[assignment]
 
     def extract(self) -> tuple[object, ...]:
         """Extract all items as tuple.

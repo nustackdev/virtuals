@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from virtuals.collections import ReactiveMappingBase
+from virtuals.collections import DictMethods, ReactiveMappingBase
 from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType
 from virtuals.tkv.filter import PrefixFilter, WildcardFilter
 from virtuals.tkv.observer import SubscriptionOptions
@@ -92,6 +92,7 @@ class IndexedDictViewBase(
     UnsafePrimitiveOpsBase,
     ViewBase,
     ReactiveMappingBase[str | int, object],
+    DictMethods[str | int, object],
 ):
     """Dict view base with hierarchical internal layout for O(1) key access.
 

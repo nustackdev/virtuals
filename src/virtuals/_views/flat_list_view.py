@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from virtuals.collections import MutableSequenceBase
+from virtuals.collections import ListMethods
 from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import Empty, Value
 from virtuals.view import (
@@ -23,7 +23,7 @@ from virtuals.view import (
     ViewBase,
 )
 
-from ._index import refuse_slice, require_int_index
+from ._index import require_int_index
 
 
 if TYPE_CHECKING:
@@ -40,7 +40,7 @@ class FlatListView(
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
-    MutableSequenceBase[Value],
+    ListMethods[Value],
 ):
     """Primitives-only list with O(1) append and length tracking.
 
@@ -118,19 +118,27 @@ class FlatListView(
         self.container.put_child_primitive(index, value)
         self._set_length(index + 1)
 
-    def __setitem__(self, address: int, value: Value) -> None:
-        """Set primitive value at existing index. A slice raises TypeError."""
-        refuse_slice(address, "assignment")
+    def __setitem__(self, address: int | slice, value: Value) -> None:
+        """Set the value at an existing index, or the items of a slice as ``list`` does.
+
+        A slice write reads the items whole and stores the result back.
+        """
+        if isinstance(address, slice):
+            self._set_slice(address, value)  # type: ignore[arg-type]
+            return
         normalized = self.normalize_address(address)
         self._reject_empty_in(value)
         self.container.put_child_primitive(normalized, value)
 
-    def __delitem__(self, address: int) -> None:
+    def __delitem__(self, address: int | slice) -> None:
         """Delete the item at ``address``, shifting later items down. O(n - address) rows.
 
-        A slice raises TypeError.
+        A slice is deleted as ``list`` does: the items are read whole and
+        the rest stored back.
         """
-        refuse_slice(address, "deletion")
+        if isinstance(address, slice):
+            self._del_slice(address)
+            return
         normalized = self.normalize_address(address)  # IndexError before any write
         length = self._len()
         for i in range(normalized + 1, length):
@@ -207,15 +215,13 @@ class FlatListView(
         for _k, v in self.container.iter_children(validate=False, strict=True, reverse=True):
             yield cast("Value", v.primitive_value)
 
-    def __eq__(self, other: object) -> bool:
-        """Equal to a list, or a list view, holding equal items in order, as ``list ==``."""
-        from .list_view import ListViewBase
+    def _plain_values(self) -> list[Value]:
+        """Every value, in order, in one scan."""
+        return list(self)
 
-        if not isinstance(other, list | FlatListView | ListViewBase):
-            return NotImplemented
-        return list(self) == list(other)
-
-    __hash__ = None  # type: ignore[assignment]
+    def _replace_all(self, values: list[Value]) -> None:
+        """Store ``values`` as the items: one bulk store."""
+        self.store(values)
 
     def extract_range(self, start: int, stop: int) -> list[Value]:
         """Extract a range of items by index.  O(stop-start) individual reads."""

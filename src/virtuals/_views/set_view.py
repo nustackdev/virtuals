@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, ClassVar
 
 from virtuals._views._member_key import member_key
-from virtuals.collections import ReactiveSetBase
+from virtuals.collections import ReactiveSetBase, SetMethods
 from virtuals.container import ContainerProtocol, ContainerStructure, ContainerTypeError
 from virtuals.types import is_empty
 from virtuals.view import (
@@ -46,13 +46,13 @@ class SetView(
     UnsafePrimitiveOpsBase,
     ViewBase,
     ReactiveSetBase[object],
+    SetMethods[object],
 ):
     """Set-like view over container.
 
-    A ``MutableSet`` using values as keys: ``add``, ``discard``,
-    ``remove``, ``pop``, ``clear``, ``in``, ``len``, iteration, comparisons,
-    the ``& | - ^`` operators (returning a plain set) and their in-place
-    forms, ``isdisjoint``, plus ``issubset`` and ``issuperset`` as on ``set``.
+    A ``set`` in full, using values as keys: every ``set`` method with the
+    same semantics. New values (operators, ``union``, ``copy``, ...) come
+    back as a plain set.
 
     Implementation:
     - Keys are a hash of the member's canonical pickle (see ``_member_key``)
@@ -195,28 +195,6 @@ class SetView(
         self.container.clear_children()
         # Reset length metadata
         self._set_length(0)
-
-    def issubset(self, other: Iterable[object]) -> bool:
-        """Check if all elements are in other.
-
-        Args:
-            other: Set to compare with
-
-        Returns:
-            True if subset
-        """
-        return all(value in other for value in self)
-
-    def issuperset(self, other: Iterable[object]) -> bool:
-        """Check if all elements of other are in this set.
-
-        Args:
-            other: Set to compare with
-
-        Returns:
-            True if superset
-        """
-        return all(value in self for value in other)
 
     # =========================================================================
     # VIEW INTERFACE

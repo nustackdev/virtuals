@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from virtuals.collections import MutableMappingBase
+from virtuals.collections import DictMethods
 from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import Empty, Value
 from virtuals.view import (
@@ -42,7 +42,7 @@ class FlatDictView(
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
-    MutableMappingBase[str | int, Value],
+    DictMethods[str | int, Value],
 ):
     """Flat dict view with no nested containers.
 

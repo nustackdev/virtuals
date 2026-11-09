@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from virtuals.collections import ReactiveSequenceBase
+from virtuals.collections import ByteArrayMethods, ReactiveSequenceBase
 from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import is_empty
 from virtuals.view import (
@@ -17,7 +17,7 @@ from virtuals.view import (
     ViewBase,
 )
 
-from ._index import refuse_slice, require_int_index
+from ._index import require_int_index
 
 
 if TYPE_CHECKING:
@@ -42,11 +42,13 @@ class ByteArrayView(
     UnsafePrimitiveOpsBase,
     ViewBase,
     ReactiveSequenceBase[int],
+    ByteArrayMethods,
 ):
     """ByteArray-like view over container.
 
     Stores bytes as individual integer children for efficient access.
-    Provides bytearray interface with indexing and mutation.
+    Every ``bytearray`` method with the same semantics, except the buffer
+    protocol and ``fromhex`` (see ``ByteArrayMethods``).
 
     Example:
         >>> data = ByteArrayView(container, registry)
@@ -109,29 +111,36 @@ class ByteArrayView(
             raise IndexNotFoundError("bytearray index out of range")
         return cast("int", value)
 
-    def __setitem__(self, address: int, value: int) -> None:
-        """Set byte at index.
+    def __setitem__(self, address: int | slice, value: int) -> None:
+        """Set byte at index, or the bytes of a slice as ``bytearray`` does.
+
+        A slice write reads the bytes whole and stores the result back.
 
         Args:
-            address: Index (supports negative)
-            value: Byte value (0-255)
+            address: Index (supports negative) or slice
+            value: Byte value (0-255), or bytes for a slice
 
         Raises:
             IndexError: If index out of bounds
             ValueError: If value not in range 0-255
         """
-        refuse_slice(address, "assignment", "bytearray")
+        if isinstance(address, slice):
+            self._set_slice(address, value)  # type: ignore[arg-type]
+            return
         _check_byte(value)
         normalized = self.normalize_address(address)  # IndexError before any write
         self.ensure_created()
         self.container.put_child_primitive(normalized, value)
 
-    def __delitem__(self, address: int) -> None:
+    def __delitem__(self, address: int | slice) -> None:
         """Delete byte at index and shift remaining bytes down.
 
-        O(n) in the number of bytes after ``address``. A slice raises TypeError.
+        O(n) in the number of bytes after ``address``. A slice is deleted
+        as ``bytearray`` does: the bytes are read whole and the rest stored back.
         """
-        refuse_slice(address, "deletion", "bytearray")
+        if isinstance(address, slice):
+            self._del_slice(address)
+            return
         normalized = self.normalize_address(address)  # IndexError before any write
         self.ensure_created()
         length = self._len()
@@ -209,13 +218,13 @@ class ByteArrayView(
         """
         return value in bytes(self)
 
-    def index(self, value: object, start: int = 0, stop: int | None = None) -> int:
+    def index(self, value: object, start: int | None = None, stop: int | None = None) -> int:
         """Position of the first byte (or run of bytes) equal to ``value``, as ``bytearray.index``."""
         return bytes(self).index(value, start, stop)  # type: ignore[arg-type]
 
-    def count(self, value: object) -> int:
+    def count(self, value: object, start: int | None = None, stop: int | None = None) -> int:
         """Occurrences of a byte (or non-overlapping runs of bytes), as ``bytearray.count``."""
-        return bytes(self).count(value)  # type: ignore[arg-type]
+        return bytes(self).count(value, start, stop)  # type: ignore[arg-type]
 
     def remove(self, value: int) -> None:
         """Remove the first byte equal to ``value``. On an absent bytearray, as on an empty one."""
@@ -232,13 +241,9 @@ class ByteArrayView(
         self.container.clear_children()
         self._set_length(0)
 
-    def __eq__(self, other: object) -> bool:
-        """Equal to bytes, a bytearray or a bytearray view with the same bytes, as ``bytearray ==``."""
-        if not isinstance(other, bytes | bytearray | ByteArrayView):
-            return NotImplemented
-        return bytes(self) == bytes(other)
-
-    __hash__ = None  # type: ignore[assignment]
+    def _replace_all(self, values: bytearray) -> None:  # type: ignore[override]
+        """Store ``values`` as the bytes: one bulk store."""
+        self.store(values)
 
     def extract(self) -> bytearray:
         """Extract all bytes as bytearray.

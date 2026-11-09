@@ -45,7 +45,7 @@ import uuid
 from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from virtuals.collections import ReactiveMappingBase
+from virtuals.collections import DictMethods, ReactiveMappingBase
 from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType
 from virtuals.tkv.filter import LengthFilter, PrefixFilter, WildcardFilter
 from virtuals.tkv.observer import SubscriptionOptions
@@ -129,6 +129,7 @@ class LogIndexedDictViewBase(
     UnsafePrimitiveOpsBase,
     ViewBase,
     ReactiveMappingBase[str | int, object],
+    DictMethods[str | int, object],
 ):
     """Dict view with append-only log key index for multi-writer safety.
 

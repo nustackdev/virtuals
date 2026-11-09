@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
 
-from virtuals.collections import ReactiveSequenceBase
+from virtuals.collections import ListMethods, ReactiveSequenceBase
 from virtuals.container import (
     ContainerNotFoundError,
     ContainerProtocol,
@@ -33,7 +33,7 @@ from virtuals.view import (
     ViewBase,
 )
 
-from ._index import refuse_slice, require_int_index
+from ._index import require_int_index
 
 
 if TYPE_CHECKING:
@@ -81,6 +81,7 @@ class ListViewBase(
     UnsafePrimitiveOpsBase,
     ViewBase,
     ReactiveSequenceBase[object],
+    ListMethods[object],
 ):
     """List-like view base — shared by eager and lazy facets.
 
@@ -143,9 +144,14 @@ class ListViewBase(
     # MUTATIONS (same for both facets)
     # =========================================================================
 
-    def __setitem__(self, address: int, value: object) -> None:
-        """Set item at index. A slice raises TypeError: no slice assignment on a list view."""
-        refuse_slice(address, "assignment")
+    def __setitem__(self, address: int | slice, value: object) -> None:
+        """Set the item at an index, or the items of a slice as ``list`` does.
+
+        A slice write reads the items whole and stores the result back.
+        """
+        if isinstance(address, slice):
+            self._set_slice(address, value)  # type: ignore[arg-type]
+            return
         normalized = self.normalize_address(address)
         self._set_child_value(normalized, value)
 
@@ -168,14 +174,17 @@ class ListViewBase(
         self.ensure_created()
         self._populate_child_container(normalized, value, view_class=view_class)
 
-    def __delitem__(self, address: int) -> None:
+    def __delitem__(self, address: int | slice) -> None:
         """Delete item at index and shift remaining items.
 
         O(n) in the number of storage entries under the shifted tail. For
         large lists of container children where middle-position deletes are
-        common, prefer a dict keyed by id. A slice raises TypeError.
+        common, prefer a dict keyed by id. A slice is deleted as ``list``
+        does: the items are read whole and the rest stored back.
         """
-        refuse_slice(address, "deletion")
+        if isinstance(address, slice):
+            self._del_slice(address)
+            return
         normalized = self.normalize_address(address)  # IndexError before any write
         self.ensure_created()
         length = self._len()
@@ -259,7 +268,7 @@ class ListViewBase(
         """
         if self._len() < 2:
             return
-        self.store(list(reversed(list(self.eager))))  # type: ignore[attr-defined]
+        self._replace_all(self._plain_values()[::-1])
 
     def pop(self, index: int = -1) -> object:
         """Remove and return the item at ``index``, read as a plain value, as ``list.pop``."""
@@ -267,25 +276,18 @@ class ListViewBase(
             raise IndexError("pop from empty list")
         return super().pop(index)
 
-    # -- List-only (``list`` has them, ``MutableSequence`` does not) ---------
+    def _plain_values(self) -> list[object]:
+        """Every item as plain data, read through the eager facet in one scan."""
+        return list(self.eager)  # type: ignore[call-overload]
 
-    def __add__(self, other: Iterable[object]) -> list[object]:
-        """Concatenate with another iterable, returning a plain list."""
-        return list(self) + list(other)
+    def _replace_all(self, values: list[object]) -> None:
+        """Store ``values`` as the items: one bulk store.
 
-    def __radd__(self, other: Iterable[object]) -> list[object]:
-        """Support ``other + list_view``."""
-        return list(other) + list(self)
-
-    def __eq__(self, other: object) -> bool:
-        """Equal to a list, or a list view, holding equal items in order, as ``list ==``."""
-        from .flat_list_view import FlatListView
-
-        if not isinstance(other, list | ListViewBase | FlatListView):
-            return NotImplemented
-        return list(self) == list(other)
-
-    __hash__ = None  # type: ignore[assignment]
+        A view among them (``lazy[:] = lazy`` hands in this list's own
+        children) is read to data first, before the store clears what it
+        stands at.
+        """
+        self.store([v.eager.extract() if isinstance(v, ViewBase) else v for v in values])  # type: ignore[attr-defined]
 
     def store(self, value: Iterable[object], *, replace: bool = True) -> None:
         """Store list contents.

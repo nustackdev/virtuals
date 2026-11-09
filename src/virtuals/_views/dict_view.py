@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar
 
-from virtuals.collections import ReactiveMappingBase
+from virtuals.collections import DictMethods, ReactiveMappingBase
 from virtuals.container import (
     ContainerNotFoundError,
     ContainerProtocol,
@@ -88,6 +88,7 @@ class DictViewBase(
     UnsafePrimitiveOpsBase,
     ViewBase,
     ReactiveMappingBase[str | int, object],
+    DictMethods[str | int, object],
 ):
     """Dict-like view base — shared by eager and lazy facets.
 
