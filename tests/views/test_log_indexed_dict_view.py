@@ -557,6 +557,16 @@ def test_keys_reverse_before_with_limit_is_exact(log_dict_factory):
     assert list(dct.keys_reverse(before="k0")) == []
 
 
+def test_first_and_last_are_the_oldest_and_newest(log_dict_factory):
+    dct = log_dict_factory("dct", {"b": 1, "a": 2, "c": 3})
+    assert (dct.first(), dct.last()) == ("b", "c")
+    del dct["c"]
+    assert dct.last() == "a"
+    del dct["b"]
+    del dct["a"]
+    assert (dct.first(), dct.last()) == (None, None)
+
+
 def test_page_cursor_follows_log_order_not_key_order(log_dict_factory):
     """Pages run in write order; a re-set keeps its slot."""
     dct = log_dict_factory("dct")

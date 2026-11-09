@@ -484,6 +484,18 @@ class LogIndexedDictViewBase(
         for _log_key, actual_key in rows:
             yield actual_key
 
+    def first(self) -> str | int | None:
+        """Oldest key, or None when empty. One seek."""
+        for _log_key, actual_key in self._scan_log_keys(limit=1):
+            return actual_key
+        return None
+
+    def last(self) -> str | int | None:
+        """Newest key, or None when empty. One reverse seek."""
+        for _log_key, actual_key in self._scan_log_keys(reverse=True, limit=1):
+            return actual_key
+        return None
+
     def keys_with_log_keys(
         self, *, after: str | None = None
     ) -> Generator[tuple[str, str | int], None, None]:
