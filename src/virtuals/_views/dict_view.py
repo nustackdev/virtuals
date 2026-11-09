@@ -171,14 +171,14 @@ class DictViewBase(
         self._set_child_value(address, value)
 
     def __delitem__(self, address: str | int) -> None:
-        """Delete key (and its subtree). Silent if the key is missing.
+        """Delete key (and its subtree). KeyError if the key is missing, like a dict.
 
-        A delete never materializes the view: on an absent view it is a
-        no-op after one existence read, so nothing is written and no
-        parent bookkeeping fires.
+        A delete never materializes the view: on an absent view it raises
+        after one existence read, so nothing is written and no parent
+        bookkeeping fires.
         """
-        if not is_view_key(address) or not self.container.exists():
-            return
+        if not is_view_key(address) or not self.container.exists_child(address):
+            raise KeyError(address)
         self.container.delete_child(address)
 
     def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:

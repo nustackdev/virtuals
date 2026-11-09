@@ -93,15 +93,13 @@ class LightDictView(
         self.container.put_child_primitive(key, value)
 
     def __delitem__(self, key: str | int) -> None:
-        """Delete key.
+        """Delete key. KeyError if the key is missing, like a dict; an absent view stays absent.
 
         Args:
             key: Key to delete
-
-        Silent if the key is missing; an absent view stays absent.
         """
-        if not is_view_key(key) or not self.container.exists():
-            return
+        if not is_view_key(key) or not self.container.exists_child(key):
+            raise KeyError(key)
         self.container.delete_child(key)
 
     def __contains__(self, key: str | int) -> bool:

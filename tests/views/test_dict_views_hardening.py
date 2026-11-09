@@ -58,9 +58,6 @@ FLAT_VIEWS = (FlatDictView, LightDictView, EagerKh57View)
 
 DICT_VIEWS = (*NESTED_VIEWS, *FLAT_VIEWS)
 
-SILENT_DELETE_VIEWS = (EagerDictView, LazyDictView, FlatDictView, LightDictView)
-"""Views whose delete of a missing key is a no-op; the others raise KeyError."""
-
 
 def _key(view_cls, i):
     """A key of the type the view takes (Kh57 takes ints only)."""
@@ -110,11 +107,8 @@ def costed(request, tmp_path, monkeypatch):
 def test_delete_on_absent_view_does_not_create_it(root, view_cls):
     view = root.open_child("absent", view_cls)
     key = _key(view_cls, 1)
-    if view_cls in SILENT_DELETE_VIEWS:
+    with pytest.raises(KeyError):
         del view[key]
-    else:
-        with pytest.raises(KeyError):
-            del view[key]
     _assert_absent(view)
     assert _lacks(view, key)
 
@@ -124,19 +118,26 @@ def test_delete_on_absent_nested_view_leaves_the_chain_absent(root, view_cls):
     """``del a.b["k"]`` on an absent chain stamps neither ``a`` nor ``b``."""
     outer = root.open_child("a", EagerDictView)
     inner = outer.open_child("b", view_cls)
-    del inner["k"]
+    with pytest.raises(KeyError):
+        del inner["k"]
     assert not inner.container.exists()
     assert not outer.container.exists()
     assert _lacks(root, "a")
 
 
-@pytest.mark.parametrize("view_cls", SILENT_DELETE_VIEWS)
-def test_delete_missing_key_on_existing_view_is_silent(root, view_cls):
+@pytest.mark.parametrize("view_cls", (EagerDictView, LazyDictView, FlatDictView, LightDictView))
+def test_delete_missing_key_on_existing_view_raises_and_keeps_the_rest(root, view_cls):
     view = root.open_child("d", view_cls)
     view["a"] = 1
-    del view["zz"]
+    with pytest.raises(KeyError):
+        del view["zz"]
     assert list(view) == ["a"]
     assert len(view) == 1
+
+
+def _delete_missing(root, view_cls):
+    with pytest.raises(KeyError):
+        del root.open_child("d", view_cls)["zz"]
 
 
 @pytest.mark.parametrize("view_cls", (EagerDictView, FlatDictView))
@@ -146,9 +147,7 @@ def test_delete_missing_key_cost_is_constant_and_writes_nothing(costed, view_cls
         if present:
             with storage.transaction() as tx:
                 Navigator(storage).root(tx).open_child("d", view_cls).store({"a": 1})
-        cost = measure(
-            storage, counts, lambda root: root.open_child("d", view_cls).__delitem__("zz")
-        )
+        cost = measure(storage, counts, lambda root: _delete_missing(root, view_cls))
         assert cost["put"] == 0 and cost["delete"] == 0, (present, cost)
         assert cost["scan"] == 0, (present, cost)
         assert cost["get"] + cost["exists"] <= 3, (present, cost)
@@ -1169,11 +1168,8 @@ def test_a_key_the_view_cannot_hold_is_absent_on_reads_and_rejected_on_writes(ro
         assert _lacks(view, bad)
         with pytest.raises((TypeError, ValueError)):
             view[bad] = 2
-        if view_cls in SILENT_DELETE_VIEWS:
+        with pytest.raises(KeyError):
             del view[bad]
-        else:
-            with pytest.raises(KeyError):
-                del view[bad]
         if hasattr(view, "pop"):
             with pytest.raises(KeyError):
                 view.pop(bad)

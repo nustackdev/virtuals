@@ -434,8 +434,11 @@ class ViewsMachine(RuleBasedStateMachine):
     @rule(k=ids_st)
     def dict_del(self, k):
         self.count("dict_del")
-        del self.d[k]  # silent when absent
-        self.m_dict.pop(k, None)
+        if k in self.m_dict:
+            del self.d[k]
+            del self.m_dict[k]
+        else:
+            expect(KeyError, lambda: self.d.__delitem__(k), "dict del of absent key")
         self.check_all()
 
     @rule(k=ids_st)

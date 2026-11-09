@@ -236,11 +236,8 @@ def test_mapping_removals_on_absent_act_as_on_empty(root, view_cls):
         with pytest.raises(KeyError):
             view.pop(key)
         assert view.pop(key, "dflt") == "dflt"
-    if view_cls in (EagerDictView, LazyDictView, FlatDictView, LightDictView):
-        del view[key]  # these views delete a missing key silently
-    else:
-        with pytest.raises(KeyError):
-            del view[key]
+    with pytest.raises(KeyError):
+        del view[key]
     view.clear()
     assert not view.container.exists()
 
