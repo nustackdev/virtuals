@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Set as SetABC
 from typing import TYPE_CHECKING, ClassVar
 
 from virtuals._views._member_key import member_key
+from virtuals.collections import FrozenSetMethods
 from virtuals.container import ContainerProtocol, ContainerStructure, ContainerTypeError
 from virtuals.types import is_empty
 from virtuals.view import (
@@ -19,7 +19,6 @@ from virtuals.view import (
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable
-    from collections.abc import Set as PySet
 
     from virtuals.collections import (
         Containable,
@@ -39,11 +38,14 @@ class FrozenSetView(
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    FrozenSetMethods[object],
 ):
     """Frozenset-like view over container (immutable set).
 
-    Provides read-only set interface:
-    - __contains__, __len__, __iter__
+    Every ``frozenset`` method with the same semantics; new values
+    (operators, ``union``, ``copy``, ...) come back as a plain frozenset.
+    Not hashable, unlike ``frozenset``: the stored members can be replaced
+    under the view, so a hash would not hold for the view's lifetime.
 
     Type Parameters:
         V: Type of values (default: Value)
@@ -59,6 +61,11 @@ class FrozenSetView(
     STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(5)
     PROTOCOL: ClassVar[ContainerProtocol] = ContainerProtocol.SET
     CONTAINER_CLS: ClassVar[type] = frozenset
+
+    @classmethod
+    def _from_iterable(cls, it: Iterable[object]) -> frozenset[object]:
+        """Operators return a plain frozenset, as ``frozenset`` operators do."""
+        return frozenset(it)
 
     def _make_key(self, value: object) -> key_.KeySegment:
         """Convert value to storage key.
@@ -91,6 +98,7 @@ class FrozenSetView(
         Returns:
             True if value in set
         """
+        hash(obj)  # TypeError for an unhashable value, as a Python set raises
         key = self._make_key(obj)
         return self.container.exists_child(key, strict=True)
 
@@ -104,63 +112,6 @@ class FrozenSetView(
             stored_value = self.container.get_child_primitive(key)
             if not is_empty(stored_value):
                 yield stored_value
-
-    def isdisjoint(self, other: PySet[object]) -> bool:
-        """Check if no elements in common with other.
-
-        Args:
-            other: Set to compare with
-
-        Returns:
-            True if no common elements
-        """
-        return not any(value in self for value in other)
-
-    def issubset(self, other: PySet[object]) -> bool:
-        """Check if all elements are in other.
-
-        Args:
-            other: Set to compare with
-
-        Returns:
-            True if subset
-        """
-        return all(value in other for value in self)
-
-    def issuperset(self, other: PySet[object]) -> bool:
-        """Check if all elements of other are in this set.
-
-        Args:
-            other: Set to compare with
-
-        Returns:
-            True if superset
-        """
-        return all(value in self for value in other)
-
-    def __or__(self, other: object) -> frozenset[object]:
-        """Set union: self | other."""
-        return frozenset(self) | frozenset(other)
-
-    def __and__(self, other: object) -> frozenset[object]:
-        """Set intersection: self & other."""
-        return frozenset(self) & frozenset(other)
-
-    def __sub__(self, other: object) -> frozenset[object]:
-        """Set difference: self - other."""
-        return frozenset(self) - frozenset(other)
-
-    def __xor__(self, other: object) -> frozenset[object]:
-        """Set symmetric difference: self ^ other."""
-        return frozenset(self) ^ frozenset(other)
-
-    def __le__(self, other: object) -> bool:
-        """Test if subset: self <= other."""
-        return self.issubset(other)
-
-    def __ge__(self, other: object) -> bool:
-        """Test if superset: self >= other."""
-        return self.issuperset(other)
 
     def extract(self) -> frozenset[object]:
         """Extract all values as frozenset.
@@ -197,9 +148,6 @@ class FrozenSetView(
                 self.container.delete_child(key)
                 self._decrement_length()
                 self._put_child_primitive(key, item)
-
-
-SetABC.register(FrozenSetView)
 
 
 if TYPE_CHECKING:

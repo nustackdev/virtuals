@@ -42,11 +42,13 @@ from virtuals._views import (
     LazyListView,
     LazyLogIndexedDictView,
     LightDictView,
+    RingView,
     SetView,
     TupleView,
 )
 from virtuals.container import ContainerNotFoundError
 from virtuals.navigator import Navigator
+from virtuals.view import Faceted
 
 
 MAPPINGS = (
@@ -94,8 +96,13 @@ def _fill(view):
         view.append(7)
 
 
+def _eager(view):
+    """The view's eager facet, or the view itself when it has no facets."""
+    return view.eager if isinstance(view, Faceted) else view
+
+
 def _extract(view):
-    return (view.eager if hasattr(view, "eager") else view).extract()
+    return _eager(view).extract()
 
 
 @pytest.fixture(params=BACKENDS)
@@ -113,6 +120,48 @@ def root(storage):
         root = Navigator(storage).root(tx)
         root.ensure_created()
         yield root
+
+
+# ============================================================================
+# PRESENCE AND FACETS, DECLARED ON EVERY VIEW
+# ============================================================================
+
+
+@pytest.mark.parametrize("view_cls", [*ALL_VIEWS, RingView.of(3)])
+def test_exists_is_false_until_written(root, view_cls):
+    view = root.open_child("absent", view_cls)
+    assert view.exists() is False
+    view.ensure_created()
+    assert view.exists() is True
+
+
+FACETED = {
+    EagerDictView,
+    LazyDictView,
+    EagerListView,
+    LazyListView,
+    EagerIndexedDictView,
+    LazyIndexedDictView,
+    EagerLogIndexedDictView,
+    LazyLogIndexedDictView,
+    EagerFractionalIndexedDictView,
+    LazyFractionalIndexedDictView,
+    EagerKh57View,
+    LazyKh57View,
+}
+
+
+@pytest.mark.parametrize("view_cls", [*ALL_VIEWS, RingView.of(3)])
+def test_only_faceted_views_declare_facets(root, view_cls):
+    view = root.open_child("v", view_cls)
+    if view_cls in FACETED:
+        assert issubclass(view_cls, Faceted)
+        for facet in (view.eager, view.lazy):
+            assert facet.container == view.container
+    else:
+        assert not issubclass(view_cls, Faceted)
+        assert not hasattr(view, "eager")
+        assert not hasattr(view, "lazy")
 
 
 # ============================================================================
@@ -179,14 +228,15 @@ def test_internal_layout_views_name_their_own_site(root):
             assert info.value.site == ("/", "absent")
 
 
-def test_ordered_view_edges_raise_on_absent_and_are_none_on_empty(root):
+def test_ordered_view_edges_raise_on_absent_and_on_empty(root):
     view = root.open_child("absent", EagerFractionalIndexedDictView)
     for read in (lambda v: v.first(), lambda v: v.last(), bool):
         with pytest.raises(ContainerNotFoundError):
             read(view)
     view.ensure_created()
-    assert view.first() is None
-    assert view.last() is None
+    for read in (lambda v: v.first(), lambda v: v.last()):
+        with pytest.raises(IndexError):
+            read(view)
     assert not view
 
 
@@ -209,7 +259,7 @@ def test_adding_mutation_creates_the_container(root, view_cls):
 def test_list_removals_on_absent_act_as_on_empty(root, view_cls):
     view = root.open_child("absent", view_cls)
     with pytest.raises(IndexError):
-        view.eager.pop() if hasattr(view, "eager") else view.pop()
+        _eager(view).pop()
     with pytest.raises(ValueError):
         view.remove(7)
     with pytest.raises(IndexError):
@@ -230,17 +280,14 @@ def test_set_removals_on_absent_act_as_on_empty(root):
 @pytest.mark.parametrize("view_cls", MAPPINGS)
 def test_mapping_removals_on_absent_act_as_on_empty(root, view_cls):
     view = root.open_child("absent", view_cls)
-    view = view.eager if hasattr(view, "eager") else view
+    view = _eager(view)
     key = _key(view_cls)
     if hasattr(view, "pop"):
         with pytest.raises(KeyError):
             view.pop(key)
         assert view.pop(key, "dflt") == "dflt"
-    if view_cls in (EagerDictView, LazyDictView, FlatDictView, LightDictView):
-        del view[key]  # these views delete a missing key silently
-    else:
-        with pytest.raises(KeyError):
-            del view[key]
+    with pytest.raises(KeyError):
+        del view[key]
     view.clear()
     assert not view.container.exists()
 

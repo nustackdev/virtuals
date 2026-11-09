@@ -20,6 +20,20 @@ stored head, tail or length: ``first``/``last`` are one seek each and
 
 Placement is relative (``before=``/``after=`` an id), never by index.
 
+Cursors. ``keys(after=id, limit=)`` and ``reversed_keys(before=id, limit=)``
+page by id. ``next_key_after(okey)`` steps by order key, the cursor a
+stream follows: it still marks a place after its id is gone.
+
+End mark. A key placed at the end is drawn above the last row, with a
+random tail, so with the last row gone it could land below that row's old
+key, behind a cursor still sitting there. So when the last row's order
+key leaves (a delete, a move away from the end, ``clear``, ``respace``)
+it is kept in ``__end__``, one primitive beside the three sub-containers,
+and a key placed at the end is drawn above it too. Only that case writes
+the mark, so appends never contend on it; an append reads it (one get).
+On backends that do not track reads (rocksdb, mem) an append racing the
+delete of the last row can still draw below the mark it writes.
+
 Key length. Inserting again and again at one gap grows the key about one
 char per four inserts, and LMDB rejects storage keys above 511 bytes
 (the encoded site plus the order key). So a fresh key longer than
@@ -89,9 +103,10 @@ second writer sees the first row and never collides.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
+from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from virtuals.collections import DictMethods, ReactiveMappingBase
 from virtuals.container import (
     Container,
     ContainerProtocol,
@@ -111,6 +126,8 @@ from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
     DescendantsObservableBase,
+    Faceted,
+    KeyNotFoundError,
     LazyChildReadBase,
     ObservableBase,
     PrimitiveOpsBase,
@@ -119,6 +136,7 @@ from virtuals.view import (
     is_view_key,
 )
 
+from ._keys_view import ReversibleKeysView
 from .fractional_index import (
     DEFAULT_SUFFIX_LENGTH,
     generate_n_suffixed_keys_between,
@@ -142,6 +160,7 @@ __all__ = [
 _DATA = "__data__"
 _ORDER = "__order__"
 _POS = "__pos__"
+_END = "__end__"
 
 Address = str | int
 
@@ -162,7 +181,10 @@ class FractionalIndexedDictViewBase(
     LazyChildReadBase,
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
+    Faceted,
     ViewBase,
+    ReactiveMappingBase[Address, object],
+    DictMethods[Address, object],
 ):
     """Ordered dict view with fractional index order keys.
 
@@ -228,7 +250,7 @@ class FractionalIndexedDictViewBase(
     def _require_position(self, address: Address) -> str:
         okey = self._position_or_empty(address)
         if is_empty(okey):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         return cast("str", okey)
 
     def _scan_order(
@@ -318,8 +340,11 @@ class FractionalIndexedDictViewBase(
         overwritten by ``_index``); on a hit a new tail is drawn. If the
         key passes ``MAX_KEY_LENGTH`` the rows around the gap are respaced
         first (``_respace_around``) and the key comes from the respaced
-        window.
+        window. A key at the end (``nxt`` None) is also drawn above the end
+        mark, one more get.
         """
+        if nxt is None:
+            prev = self._past_end(prev)
         oc = self._order_container()
         for _ in range(self.ALLOT_ATTEMPTS):
             okey = generate_suffixed_key_between(prev, nxt, suffix_length=self.SUFFIX_LENGTH)
@@ -382,6 +407,33 @@ class FractionalIndexedDictViewBase(
             self._index(address, next(fresh))
         return gap_key
 
+    def _end_mark(self) -> str | None:
+        """The highest order key the last row has held since it left, None if none. One get."""
+        mark = self.container.get_child_primitive_unsafe(_END)
+        return None if is_empty(mark) else cast("str", mark)
+
+    def _past_end(self, prev: str | None) -> str | None:
+        """The bound a key placed at the end must pass: ``prev`` or the end mark, the higher."""
+        mark = self._end_mark()
+        if mark is None or (prev is not None and prev >= mark):
+            return prev
+        return mark
+
+    def _raise_end(self, okey: str) -> None:
+        """Keep ``okey`` as the end mark unless the mark is already higher. One get, one put."""
+        mark = self._end_mark()
+        if mark is None or okey > mark:
+            self.container.put_child_primitive(_END, okey, validate=False, validate_parent=False)
+
+    def _retire(self, okey: str) -> None:
+        """``okey``'s order row is gone: if it was the last row, raise the end mark to it.
+
+        One seek to tell whether a row is left above it; only the last row
+        writes the mark.
+        """
+        if self._neighbour(okey, before=False) is None:
+            self._raise_end(okey)
+
     def _index(self, address: Address, okey: str) -> None:
         """Record ``address`` at ``okey``: one ``__pos__`` put, one ``__order__`` put."""
         self._pos_container().put_child_primitive(
@@ -400,6 +452,7 @@ class FractionalIndexedDictViewBase(
     def _relocate(self, address: Address, okey: str, prev: str | None, nxt: str | None) -> str:
         """Move ``address`` from ``okey`` to a fresh key between ``prev`` and ``nxt``."""
         self._order_container().delete_child_primitive_unsafe(okey)
+        self._retire(okey)
         return self._place(address, prev, nxt)
 
     def _write_value(self, address: Address, value: object) -> None:
@@ -459,6 +512,7 @@ class FractionalIndexedDictViewBase(
         oc = self._order_container()
         for okey, _address in rows:
             oc.delete_child_primitive_unsafe(okey)
+        self._raise_end(rows[-1][0])
         keys = generate_n_suffixed_keys_between(
             None, None, len(rows), suffix_length=self.SUFFIX_LENGTH
         )
@@ -519,10 +573,10 @@ class FractionalIndexedDictViewBase(
     ) -> KeysView[Address] | Generator[Address, None, None]:
         """Ids in order. ``after`` starts just past that id, ``limit`` caps the count."""
         if after is None and limit is None:
-            return KeysView(self)  # type: ignore[arg-type]
+            return ReversibleKeysView(self)
         return self._keys_scan(after=after, limit=limit, reverse=False)
 
-    def keys_reverse(
+    def reversed_keys(
         self, *, before: Address | None = None, limit: int | None = None
     ) -> Generator[Address, None, None]:
         """Ids in reverse order. ``before`` starts just below that id."""
@@ -531,23 +585,29 @@ class FractionalIndexedDictViewBase(
     def _keys_scan(
         self, *, after: Address | None, limit: int | None, reverse: bool
     ) -> Generator[Address, None, None]:
+        """One page of ids. The cursor id resolves to its position eagerly, so a bad one raises here."""
+        if after is not None and not is_view_key(after):
+            raise TypeError(f"view keys must be str or int, got {type(after).__name__}")
         if after is None:
             rows = self._scan_order(reverse=reverse, limit=limit)
         else:
             cursor = self._require_position(after)
             rows = self._scan_order(start=cursor, reverse=reverse, limit=limit, skip=(cursor,))
-        for _okey, address in rows:
-            yield address
+        return (address for _okey, address in rows)
 
-    def first(self) -> Address | None:
-        """First id, or None when empty. One seek."""
+    def first(self) -> Address:
+        """First id. One seek. IndexError when empty, as ``seq[0]``."""
         row = self._edge(last=False)
-        return None if row is None else row[1]
+        if row is None:
+            raise IndexError("first() of an empty collection")
+        return row[1]
 
-    def last(self) -> Address | None:
-        """Last id, or None when empty. One seek."""
+    def last(self) -> Address:
+        """Last id. One seek. IndexError when empty, as ``seq[-1]``."""
         row = self._edge(last=True)
-        return None if row is None else row[1]
+        if row is None:
+            raise IndexError("last() of an empty collection")
+        return row[1]
 
     def next_after(self, address: Address) -> Address | None:
         """Id directly after ``address``, or None at the end."""
@@ -559,6 +619,31 @@ class FractionalIndexedDictViewBase(
         row = self._neighbour(self._require_position(address), before=True)
         return None if row is None else row[1]
 
+    def next_key_after(self, cursor: str | None = None) -> tuple[str, Address] | None:
+        """The next ``(order key, id)`` past the order key ``cursor``, or None at the end.
+
+        The cursor protocol a stream follows, as on ``LogIndexedDictView``:
+        one seek per call, from the first row when ``cursor`` is None. The
+        cursor is an order key, not an id, so it still marks a place after
+        its id is deleted or moved.
+
+        A stream over a list that only grows at the end sees every id once,
+        also when the id under its cursor is deleted or moved away: a key
+        placed at the end is drawn above the end mark, which keeps the last
+        row's key when that row leaves. Placement in the middle does not
+        keep that promise: an id placed or moved before the cursor is not
+        seen, one moved past it is seen again, and a window respace near the
+        cursor rewrites the order keys around it, so some ids there may be
+        seen twice or missed.
+        """
+        if cursor is None:
+            rows = self._scan_order(limit=1)
+        else:
+            rows = self._scan_order(start=cursor, limit=1, skip=(cursor,))
+        for row in rows:
+            return row
+        return None
+
     def position(self, address: Address) -> str:
         """Order key of ``address``. Opaque, stable until the id moves."""
         return self._require_position(address)
@@ -566,13 +651,6 @@ class FractionalIndexedDictViewBase(
     def positions(self, *, reverse: bool = False) -> Generator[tuple[str, Address], None, None]:
         """``(order key, id)`` rows in order."""
         return self._scan_order(reverse=reverse)
-
-    def get(self, address: Address, default: object | Empty = EMPTY) -> object | Empty:
-        """Value at ``address``, or ``default`` (EMPTY) when the id is absent."""
-        try:
-            return self[address]  # type: ignore[index]
-        except KeyError:
-            return default
 
     # -- Mutations ---------------------------------------------------------
 
@@ -721,42 +799,34 @@ class FractionalIndexedDictViewBase(
     def __delitem__(self, address: Address) -> None:
         # No ensure_created: a delete must not materialize the view.
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc = self._data_container()
         okey = self._position_or_empty(address)
         if is_empty(okey):
             if not dc.exists_child(address):
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
         else:
             self._order_container().delete_child_primitive_unsafe(cast("str", okey))
             self._pos_container().delete_child_primitive_unsafe(address)
+            self._retire(cast("str", okey))
         dc.delete_child(address)
-
-    def pop(self, address: Address, default: object | Empty = EMPTY) -> object | Empty:
-        try:
-            value = self[address]  # type: ignore[index]
-        except KeyError:
-            if is_empty(default):
-                raise
-            return default
-        del self[address]
-        return value
 
     def clear(self) -> None:
         if not self.container.exists():
             return  # clear of nothing is not a write: the view stays absent
         self.ensure_created()
+        last = self._edge(last=True, strict=False)
         self._data_container().clear_children(validate=False)
         self._order_container().clear_children(validate=False)
         self._pos_container().clear_children(validate=False)
+        if last is not None:
+            self._raise_end(last[0])
 
-    def update(self, other: PyMapping[Address, object] | None = None, **kwargs: object) -> None:
-        self._reject_empty_in(other or {})
-        self._reject_empty_in(kwargs)
-        if other:
-            for key, value in other.items():
-                self[key] = value
-        for key, value in kwargs.items():
+    def update(self, other: object = (), /, **kwargs: object) -> None:
+        """Update as ``dict.update``. The whole batch is checked for EMPTY before the first write."""
+        items = self._update_items(other, kwargs)
+        self._reject_empty_in(items)
+        for key, value in items.items():
             self[key] = value
 
     def store(
@@ -785,11 +855,11 @@ class FractionalIndexedDictViewBase(
         from virtuals.container import node_ops
 
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc = self._data_container()
         node_info = node_ops.get_node_info((*dc.site, address), dc.ctx)
         if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         return node_info, node_info.node_type == NodeType.CONTAINER
 
     def _child_view(self, address: Address, node_info: object) -> View:
@@ -808,7 +878,7 @@ class FractionalIndexedDictViewBase(
         node_info, is_container = self._read_child(address)
         if not is_container:
             if is_empty(node_info.primitive_value):  # type: ignore[attr-defined]
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value  # type: ignore[attr-defined]
         return self._child_result(address, node_info)
 
@@ -878,7 +948,7 @@ class LazyFractionalIndexedDictView(FractionalIndexedDictViewBase):
     """Lazy facet: container children read as child Views."""
 
     def _child_result(self, address: Address, node_info: object) -> object:
-        return self._child_view(address, node_info)
+        return self._child_view(address, node_info).lazy
 
     @property
     def eager(self) -> EagerFractionalIndexedDictView:
@@ -922,6 +992,3 @@ class _FractionalItemsView(ItemsView):
 
     def __reversed__(self) -> Generator[tuple[Address, object], None, None]:
         yield from self._mapping._iter_items(reverse=not self._reverse)
-
-
-MutableMapping.register(FractionalIndexedDictViewBase)

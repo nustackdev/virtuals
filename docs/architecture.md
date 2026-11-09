@@ -149,6 +149,7 @@ Views that support nested containers have eager/lazy facets (see `docs/collectio
 | `EagerLogIndexedDictView` / `LazyLogIndexedDictView` | Dict in insertion order, pageable | yes |
 | `EagerFractionalIndexedDictView` / `LazyFractionalIndexedDictView` | Ordered collection keyed by id, O(1) insert and move | yes |
 | `EagerKh57View` / `LazyKh57View` | Dict keyed by kh57-encoded ints | yes |
+| `RingView.of(n)` | Capped log of whole entries, oldest dropped past `n` | no |
 | `TupleView` | Immutable ordered sequence | no |
 | `ByteArrayView` | Binary data | no |
 

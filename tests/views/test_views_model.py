@@ -302,7 +302,7 @@ class ViewsMachine(RuleBasedStateMachine):
             if k in model:
                 assert same(got, model[k]), (k, got, model[k])
             else:
-                assert is_empty(got), (k, got)  # get of an absent key is EMPTY, never None
+                assert got is None, (k, got)  # get of an absent key is None, as on a dict
         got_items = dict(v.items())
         assert list(got_items) == list(model) or set(got_items) == set(model)
         assert all(same(got_items[k], model[k]) for k in model), (got_items, model)
@@ -327,7 +327,7 @@ class ViewsMachine(RuleBasedStateMachine):
                 assert same(v[k], model[k]), (k, v[k], model[k])
                 assert same(v.get(k), model[k])
             else:
-                assert is_empty(v.get(k)), (k, v.get(k))  # get of an absent key is EMPTY
+                assert v.get(k) is None, (k, v.get(k))  # get of an absent key is None, as on a dict
                 expect(KeyError, lambda k=k: v[k], "getitem of an absent key")
         rows = rows_under(ctx, ("/", "l"))
         keys_rows = {k[3]: val for k, val in rows.items() if len(k) == 4 and k[2] == "__keys__"}
@@ -349,8 +349,12 @@ class ViewsMachine(RuleBasedStateMachine):
         assert list(v.keys()) == ids
         assert [k for k, _ in v.items()] == ids
         assert same_seq([x for _, x in v.items()], [vals[i] for i in ids])
-        assert v.first() == (ids[0] if ids else None)
-        assert v.last() == (ids[-1] if ids else None)
+        if ids:
+            assert (v.first(), v.last()) == (ids[0], ids[-1])
+        else:
+            for edge in (v.first, v.last):
+                with pytest.raises(IndexError):
+                    edge()
         for k in IDS:
             assert (k in v) == (k in vals), k
             if k in vals:
@@ -360,7 +364,7 @@ class ViewsMachine(RuleBasedStateMachine):
                 assert v.next_after(k) == (ids[i + 1] if i + 1 < len(ids) else None)
                 assert v.prev_before(k) == (ids[i - 1] if i > 0 else None)
             else:
-                assert is_empty(v.get(k)), (k, v.get(k))  # get of an absent key is EMPTY
+                assert v.get(k) is None, (k, v.get(k))  # get of an absent key is None, as on a dict
                 expect(KeyError, lambda k=k: v[k], "getitem of an absent id")
         pos = list(v.positions())
         okeys = [o for o, _ in pos]
@@ -434,8 +438,11 @@ class ViewsMachine(RuleBasedStateMachine):
     @rule(k=ids_st)
     def dict_del(self, k):
         self.count("dict_del")
-        del self.d[k]  # silent when absent
-        self.m_dict.pop(k, None)
+        if k in self.m_dict:
+            del self.d[k]
+            del self.m_dict[k]
+        else:
+            expect(KeyError, lambda: self.d.__delitem__(k), "dict del of absent key")
         self.check_all()
 
     @rule(k=ids_st)

@@ -12,15 +12,21 @@ SizedBase                   abstract __len__
         │
         ├─ MappingBase[K, V]
         │   └─ MutableMappingBase[K, V]
-        │       └─ ReactiveMappingBase[K, V]
+        │       ├─ ReactiveMappingBase[K, V]
+        │       └─ DictMethods[K, V]              dict
         │
         ├─ SequenceBase[V]
+        │   ├─ TupleMethods[V]                    tuple
         │   └─ MutableSequenceBase[V]
-        │       └─ ReactiveSequenceBase[V]
+        │       ├─ ReactiveSequenceBase[V]
+        │       ├─ ListMethods[V]                 list
+        │       └─ ByteArrayMethods               bytearray
         │
         └─ SetBase[V]
+            ├─ FrozenSetMethods[V]                frozenset
             └─ MutableSetBase[V]
-                └─ ReactiveSetBase[V]
+                ├─ ReactiveSetBase[V]
+                └─ SetMethods[V]                  set (+ FrozenSetMethods)
 ```
 
 Each collection type follows a three-tier pattern:
@@ -29,50 +35,86 @@ Each collection type follows a three-tier pattern:
 - **Mutable base** — adds mutation abstracts, derives convenience methods
 - **Reactive base** — adds observation abstracts (`on_change`, `on_child_change`, etc.)
 
+Beside them, one `*Methods` class per built-in adds what that built-in has beyond its ABC. A view that mixes one in is that built-in in full.
+
 ## How It Works
 
 ### Minimal abstracts, maximum defaults
 
-Like Python's `collections.abc.MutableMapping`, each base requires only a few abstract methods and derives everything else:
+Each base is its `collections.abc` class: the same abstract core, the same mixin methods with the same semantics, and it is registered with that ABC, so `isinstance(view, MutableMapping)` holds for every view built on it. Built-in-only methods (`list +`, `dict |`, `set.union`, `copy`, `sort`) are not on the ABC bases: they sit on the `*Methods` classes below.
 
-**MappingBase** — implement `__getitem__`, `__iter__`, `__len__`:
+**MappingBase** (`Mapping`): implement `__getitem__`, `__iter__`, `__len__`:
 ```python
 # You get for free:
 __contains__    # try __getitem__, catch KeyError
-keys()          # yield from __iter__
-values()        # yield self[key] for each key
-items()         # yield (key, self[key]) for each key
-get()           # __getitem__ with default fallback
+keys()          # KeysView over the mapping
+values()        # ValuesView
+items()         # ItemsView
+get()           # __getitem__, default None as dict.get
+__eq__          # equal to any mapping with the same items; not hashable
 ```
 
-**MutableMappingBase** — additionally implement `__setitem__`, `__delitem__`:
+**MutableMappingBase** (`MutableMapping`): additionally implement `__setitem__`, `__delitem__`:
 ```python
 # You get for free:
-pop()           # __getitem__ + __delitem__
-update()        # __setitem__ in a loop
+pop()           # with an optional default, else KeyError
+popitem()       # the last pair in order (dict.popitem); the first without __reversed__
+setdefault()    # the value, or store the default and read it back
+update()        # a mapping, an object with keys(), or pairs, then kwargs
 clear()         # __delitem__ in a loop
 ```
 
-**SequenceBase** — implement `__getitem__`, `__len__`:
+**SequenceBase** (`Sequence`): implement `__getitem__`, `__len__`:
 ```python
 # You get for free:
 __iter__        # yield self[i] for i in range(len)
 __reversed__    # same, reversed
 __contains__    # linear scan
-index()         # linear search
+index()         # linear search, with start and stop
 count()         # linear count
 ```
 
-**SetBase** — all three from CollectionBase remain abstract:
+**MutableSequenceBase** (`MutableSequence`): additionally implement `__setitem__`, `__delitem__`, `insert`:
 ```python
 # You get for free:
-isdisjoint()    # any(value in self for value in other)
-issubset()      # all(value in other_set for value in self)
-issuperset()    # all(value in self for value in other)
-__le__, __ge__  # subset/superset operators
-__or__, __and__,
-__sub__, __xor__ # set algebra operators
+append(), extend(), pop(), remove(), reverse(), clear(), __iadd__
 ```
+
+**SetBase** (`Set`): all three from CollectionBase remain abstract:
+```python
+# You get for free:
+__le__, __lt__, __eq__, __ge__, __gt__   # comparisons; not hashable
+__and__, __or__, __sub__, __xor__        # and their reflected forms, a plain set back
+isdisjoint()
+```
+
+**MutableSetBase** (`MutableSet`): additionally implement `add`, `discard`:
+```python
+# You get for free:
+remove(), pop(), clear(), __ior__, __iand__, __isub__, __ixor__
+```
+
+### Built-in methods
+
+A view that models a built-in acts exactly like it: every method, same results, same errors. One that cannot implement a built-in's whole API sits at its ABC instead (Kh57View at `MutableMapping`, RingView at `Sequence`). Methods that return a new value return a plain built-in (`copy()` is a `dict`, `view + [1]` is a `list`), holding the items as the facet reads them, a shallow copy as on the built-in.
+
+**DictMethods** (`dict`): `copy()`, `|` and its reflected form (a dict or dict view, as `dict | dict`), `|=` (anything `update` takes); requires `__reversed__`.
+
+**ListMethods** (`list`): `copy()`, `sort(key=, reverse=)`, `+` (lists only), `*`, `*=`, ordering against lists, and slice writes through `_set_slice` / `_del_slice`.
+
+**TupleMethods** (`tuple`): `+` (tuples only), `*`, ordering against tuples.
+
+**FrozenSetMethods** (`frozenset`): `copy()`, `union`, `intersection`, `difference`, `symmetric_difference`, `issubset`, `issuperset` over any iterables; `& | - ^` take sets only, as on `frozenset`, and a reflected one gives the left operand's type.
+
+**SetMethods** (`set`): the above plus `update`, `intersection_update`, `difference_update`, `symmetric_difference_update`; `|= &= -= ^=` take sets only.
+
+**ByteArrayMethods** (`bytearray`): `copy()`, `+`, `*`, `%`, ordering against bytes-likes, slice writes, and every bytes method (`find`, `split`, `upper`, `decode`, `hex`, ...).
+
+`sort`, `reverse` and the slice writes read the items whole and store the result back (`_plain_values`, `_replace_all`): O(n) rows.
+
+Not provided, because a view cannot do them honestly: `hash()` of a tuple or frozenset view (the stored value can be replaced under it), `dict.fromkeys` and `bytearray.fromhex` (constructors; a view needs a place in storage), and the buffer protocol on a bytearray view (`memoryview(view)`; `bytes(view)` gives a copy).
+
+`pop`, `popitem` and `reverse` read items through `_plain_value`, a plain read by default. A `Faceted` view overrides it to read through its eager facet, so a lazy view hands back data, not a view of a removed child.
 
 ## Protocols vs Bases
 
@@ -130,10 +172,22 @@ Collections provide the **abstract shape**. Views provide the **concrete impleme
 ```text
 Collections (abstract)          Views (concrete)
 ─────────────────────           ────────────────
-ReactiveMappingBase   ←───────  DictViewBase → EagerDictView / LazyDictView
-ReactiveSequenceBase  ←───────  ListViewBase → EagerListView / LazyListView
-ReactiveSetBase       ←───────  SetView
+ReactiveMappingBase   ←───────  Kh57ViewBase (→ Eager / Lazy facet)
+  + DictMethods       ←───────  DictViewBase, IndexedDictViewBase, FractionalIndexedDictViewBase,
+                                LogIndexedDictViewBase (each → Eager / Lazy facet)
+DictMethods           ←───────  FlatDictView, LightDictView
+ReactiveSequenceBase
+  + ListMethods       ←───────  ListViewBase (→ Eager / Lazy)
+  + ByteArrayMethods  ←───────  ByteArrayView
+ListMethods           ←───────  FlatListView
+TupleMethods          ←───────  TupleView
+SequenceBase          ←───────  RingView (+ append / extend / clear)
+ReactiveSetBase
+  + SetMethods        ←───────  SetView
+FrozenSetMethods      ←───────  FrozenSetView
 ```
+
+A view lists its collection base right after `ViewBase`, so the view's own methods and the `virtuals.view` mixins win over the base defaults. Where a layout cannot do what the built-in does, it raises: a kh57 view is not reversible (`reversed()` raises TypeError, as on a plain `Mapping`), a ring has no write at a position. `tests/views/test_abc_conformance.py` runs every ABC method on every built-in view and facet against the built-in; `tests/views/test_builtin_conformance.py` does the same for the rest of each built-in's API.
 
 Views that support nested containers have two **facets** — eager (reads return Python values) and lazy (reads return child Views). Both share a common base with mutations, keys, and lifecycle. See [Eager vs Lazy Access](eager-lazy.md) for details.
 

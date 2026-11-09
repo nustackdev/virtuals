@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, ClassVar, TypeVar
 from kh57 import kh57
 from kh57 import sample as kh57_sample
 
+from virtuals.collections import ReactiveMappingBase
 from virtuals.container import (
     Container,
     ContainerProtocol,
@@ -47,14 +48,15 @@ from virtuals.container import (
 )
 from virtuals.tkv.filter import LengthFilter, PrefixFilter
 from virtuals.tkv.storage import StorageScanOptions
-from virtuals.types import EMPTY, Empty
 from virtuals.view import (
     ChildNavigationBase,
     ChildNestedGetBase,
     ChildNestedSetBase,
     ChildObservableBase,
     ChildPrimitiveSetBase,
+    Faceted,
     KeyedChildrenCountBase,
+    KeyNotFoundError,
     LazyChildReadBase,
     ObservableBase,
     PrimitiveOpsBase,
@@ -171,7 +173,9 @@ class Kh57ViewBase(
     LazyChildReadBase,
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
+    Faceted,
     ViewBase,
+    ReactiveMappingBase[int, object],
 ):
     """Sparse int-keyed map with kh57-encoded layout for range sampling.
 
@@ -224,7 +228,7 @@ class Kh57ViewBase(
         if isinstance(address, float) and address.is_integer():
             address = int(address)
         if not isinstance(address, int) or address < 0 or address >> _LEVEL_BITS:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         return address
 
     # -- Internal encoded-key ops -----------------------------------------
@@ -335,13 +339,13 @@ class Kh57ViewBase(
         return child_view.extract()
 
     def _view_container_value(self, encoded: int, info: NodeInfo) -> object:
-        """Lazy reader: return a child View for a container child."""
+        """Lazy reader: return the lazy child View for a container child."""
         child_site = (*self.container.site, encoded)
         child_container = Container(ctx=self.container.ctx, site=child_site)
         if info.structure is None:
             raise ValueError(f"Child container at {encoded} has no structure ID")
         view_class = self.registry.get_view_for_structure(info.structure)
-        return view_class(container=child_container, registry=self.registry, parent=self)
+        return view_class(container=child_container, registry=self.registry, parent=self).lazy
 
     # -- Membership -------------------------------------------------------
 
@@ -363,7 +367,7 @@ class Kh57ViewBase(
         """Delete item at original int key `address`."""
         encoded = kh57(self._read_key(address))
         if not self.container.exists_child(encoded):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         self.container.delete_child(encoded)
         self._decrement_length()
 
@@ -375,19 +379,12 @@ class Kh57ViewBase(
         self.container.clear_children(validate=False)
         self._set_length(0)
 
-    def update(
-        self,
-        other: PyMapping[int, object] | None = None,
-        **kwargs: object,
-    ) -> None:
-        """Update from mapping or kwargs — int keys only."""
-        self._reject_empty_in(other or {})
-        self._reject_empty_in(kwargs)
-        if other:
-            for key, value in other.items():
-                self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value  # type: ignore[assignment,index]
+    def update(self, other: object = (), /, **kwargs: object) -> None:
+        """Update as ``dict.update``. The whole batch is checked for EMPTY before the first write."""
+        items = self._update_items(other, kwargs)
+        self._reject_empty_in(items)
+        for key, value in items.items():
+            self[key] = value
 
     def store(self, value: PyMapping[int, object], *, replace: bool = True) -> None:
         """Bulk-load mapping contents under kh57-encoded segments."""
@@ -483,26 +480,30 @@ class Kh57ViewBase(
         """``rows``, raising on a never-written view when there are none."""
         return scan_or_absent(rows, self.container.site, self.container.ctx)
 
-    def get(self, address: int, default: object | Empty = EMPTY) -> object | Empty:
-        """Return item at `address` or `default` if absent."""
-        try:
-            return self[address]  # type: ignore[index]
-        except KeyError:
-            return default
-
     # -- Mapping surface --------------------------------------------------
 
     def keys(self) -> KeysView:
-        """Return an iterable of int keys in original int order."""
+        """Set-like view of the int keys, in original int order."""
         return KeysView(self)
 
     def values(self) -> ValuesView:
-        """Return an iterable of values in original-key order."""
-        return ValuesView(self)
+        """Values in original-key order: one merged scan."""
+        return _Kh57ValuesView(self)
 
     def items(self) -> ItemsView:
-        """Return an iterable of (int_key, value) pairs in original-key order."""
-        return ItemsView(self)
+        """Set-like view of ``(int_key, value)`` pairs in original-key order: one merged scan."""
+        return _Kh57ItemsView(self)
+
+    def _iter_items(self) -> Generator[tuple[int, object], None, None]:
+        """``(int_key, value)`` in original int order, values read through this facet."""
+        level_iters = [
+            self._iter_level_items(level, 0, 1 << _LEVEL_BITS) for level in range(_LEVELS)
+        ]
+        for key, info in self._or_absent(heapq.merge(*level_iters, key=lambda kv: kv[0])):
+            if info.node_type == NodeType.PRIMITIVE:
+                yield key, info.primitive_value
+            else:
+                yield key, self._read_container_value(kh57(key), info)
 
     # -- Navigation -------------------------------------------------------
 
@@ -537,47 +538,18 @@ class EagerKh57View(Kh57ViewBase):
         child_site = (*self.container.site, encoded)
         info = node_ops.get_node_info(child_site, self.container.ctx)
         if not info.exists or info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         if info.node_type == NodeType.PRIMITIVE:
             from virtuals.types import is_empty
 
             if is_empty(info.primitive_value):
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return info.primitive_value
         return self._extract_container_value(encoded, info)
-
-    def items(self) -> Generator[tuple[int, object], None, None]:
-        """Yield (int_key, value) pairs in original int order."""
-        level_iters = [
-            self._iter_level_items(level, 0, 1 << _LEVEL_BITS) for level in range(_LEVELS)
-        ]
-        for key, info in self._or_absent(heapq.merge(*level_iters, key=lambda kv: kv[0])):
-            if info.node_type == NodeType.PRIMITIVE:
-                yield key, info.primitive_value
-            else:
-                yield key, self._extract_container_value(kh57(key), info)
-
-    def values(self) -> Generator[object, None, None]:
-        """Yield values in original int-key order."""
-        for _k, v in self.items():
-            yield v
 
     def extract(self) -> dict[int, object]:
         """Materialize as a plain dict keyed by original int keys."""
         return dict(self.items())
-
-    def pop(self, address: int, default: object | Empty = EMPTY) -> object | Empty:
-        """Remove item at ``address`` and return its extracted value."""
-        from virtuals.types import is_empty
-
-        try:
-            value = self[address]
-            del self[address]
-            return value
-        except KeyError:
-            if is_empty(default):
-                raise
-            return default
 
     # -- Facet navigation ------------------------------------------------
 
@@ -613,27 +585,20 @@ class LazyKh57View(Kh57ViewBase):
         child_site = (*self.container.site, encoded)
         info = node_ops.get_node_info(child_site, self.container.ctx)
         if not info.exists or info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         if info.node_type == NodeType.PRIMITIVE:
             from virtuals.types import is_empty
 
             if is_empty(info.primitive_value):
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return info.primitive_value
         return self._view_container_value(encoded, info)
 
-    def items(self) -> Generator[tuple[int, object], None, None]:
-        """Yield (int_key, value_or_view) pairs in original int order."""
-        level_iters = [
-            self._iter_level_items(level, 0, 1 << _LEVEL_BITS) for level in range(_LEVELS)
-        ]
-        for key, info in self._or_absent(heapq.merge(*level_iters, key=lambda kv: kv[0])):
-            if info.node_type == NodeType.PRIMITIVE:
-                yield key, info.primitive_value
-            else:
-                yield key, self._view_container_value(kh57(key), info)
-
     # -- Facet navigation ------------------------------------------------
+
+    def extract(self) -> dict[int, object]:
+        """The whole subtree as plain Python values, read through the eager facet."""
+        return self.eager.extract()
 
     @property
     def eager(self) -> EagerKh57View:
@@ -644,3 +609,27 @@ class LazyKh57View(Kh57ViewBase):
     def lazy(self) -> LazyKh57View:
         """Identity — already lazy."""
         return self
+
+
+# =============================================================================
+# VIEW CLASSES: ValuesView / ItemsView over one merged scan
+# =============================================================================
+
+
+class _Kh57ValuesView(ValuesView):
+    """ValuesView reading values in the same merged scan as the keys."""
+
+    _mapping: Kh57ViewBase
+
+    def __iter__(self) -> Generator[object, None, None]:  # type: ignore[override]
+        for _key, value in self._mapping._iter_items():
+            yield value
+
+
+class _Kh57ItemsView(ItemsView):
+    """ItemsView reading pairs in one merged scan."""
+
+    _mapping: Kh57ViewBase
+
+    def __iter__(self) -> Generator[tuple[int, object], None, None]:  # type: ignore[override]
+        yield from self._mapping._iter_items()

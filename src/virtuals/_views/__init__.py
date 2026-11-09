@@ -21,8 +21,28 @@ from .log_indexed_dict_view import (
     LazyLogIndexedDictView,
     LogIndexedDictViewBase,
 )
+from .ring_view import RingView
 from .set_view import SetView
 from .tuple_view import TupleView
+
+
+BUILTIN_VIEWS = (
+    ByteArrayView,
+    EagerDictView,
+    EagerFractionalIndexedDictView,
+    EagerIndexedDictView,
+    EagerKh57View,
+    EagerListView,
+    EagerLogIndexedDictView,
+    FlatDictView,
+    FlatListView,
+    FrozenSetView,
+    LightDictView,
+    RingView,
+    SetView,
+    TupleView,
+)
+"""Every built-in view, one per stored structure: what a stored container is read back with."""
 
 
 __all__ = (
@@ -49,6 +69,7 @@ __all__ = (
     "LightDictView",
     "ListViewBase",
     "LogIndexedDictViewBase",
+    "RingView",
     "SetView",
     "TupleView",
 )

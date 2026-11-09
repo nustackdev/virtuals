@@ -2,23 +2,26 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator, MutableSequence
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from virtuals.collections import ByteArrayMethods, ReactiveSequenceBase
 from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import is_empty
 from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
+    IndexNotFoundError,
     MetadataBasedChildrenCountBase,
     ObservableBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
 )
 
+from ._index import require_int_index
+
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Iterable
 
     from virtuals.collections import (
         Assignable,
@@ -38,11 +41,14 @@ class ByteArrayView(
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    ReactiveSequenceBase[int],
+    ByteArrayMethods,
 ):
     """ByteArray-like view over container.
 
     Stores bytes as individual integer children for efficient access.
-    Provides bytearray interface with indexing and mutation.
+    Every ``bytearray`` method with the same semantics, except the buffer
+    protocol and ``fromhex`` (see ``ByteArrayMethods``).
 
     Example:
         >>> data = ByteArrayView(container, registry)
@@ -71,20 +77,22 @@ class ByteArrayView(
             Normalized positive index
 
         Raises:
+            TypeError: If ``address`` is not an int, as ``bytearray`` does
             IndexError: If index out of bounds (also on an absent bytearray)
         """
+        require_int_index(address, "bytearray")
         length = self._len()
 
         if address < 0:
             address = length + address
 
         if address < 0 or address >= length:
-            raise IndexError("bytearray address (index) out of range")
+            raise IndexNotFoundError("bytearray address (index) out of range")
 
         return address
 
-    def __getitem__(self, address: int) -> int:
-        """Get byte at index.
+    def __getitem__(self, address: int | slice) -> int | bytearray:
+        """Get byte at index; a slice gives a plain bytearray, as ``bytearray`` does.
 
         Args:
             address: Index (supports negative)
@@ -95,56 +103,44 @@ class ByteArrayView(
         Raises:
             IndexError: If index out of bounds
         """
+        if isinstance(address, slice):
+            return bytearray(self[i] for i in range(*address.indices(len(self))))
         normalized = self.normalize_address(address)
         value = self.container.get_child_primitive(normalized)
         if is_empty(value):
-            raise IndexError("bytearray index out of range")
+            raise IndexNotFoundError("bytearray index out of range")
         return cast("int", value)
 
-    def __setitem__(self, address: int, value: int) -> None:
-        """Set byte at index.
+    def __setitem__(self, address: int | slice, value: int) -> None:
+        """Set byte at index, or the bytes of a slice as ``bytearray`` does.
+
+        A slice write reads the bytes whole and stores the result back.
 
         Args:
-            address: Index (supports negative)
-            value: Byte value (0-255)
+            address: Index (supports negative) or slice
+            value: Byte value (0-255), or bytes for a slice
 
         Raises:
             IndexError: If index out of bounds
             ValueError: If value not in range 0-255
         """
-        if not isinstance(value, int) or not 0 <= value <= 255:
-            raise ValueError("byte must be in range(0, 256)")
-
+        if isinstance(address, slice):
+            self._set_slice(address, value)  # type: ignore[arg-type]
+            return
+        _check_byte(value)
         normalized = self.normalize_address(address)  # IndexError before any write
         self.ensure_created()
         self.container.put_child_primitive(normalized, value)
 
-    def __iter__(self) -> Generator[int, None, None]:
-        """Iterate over bytes.
-
-        Yields:
-            Byte values (0-255)
-        """
-        for i in range(len(self)):
-            yield self[i]
-
-    def __contains__(self, value: object) -> bool:
-        """Check if byte value exists."""
-        for byte in self:
-            if byte == value:
-                return True
-        return False
-
-    def __reversed__(self) -> Generator[int, None, None]:
-        """Iterate over bytes in reverse."""
-        for i in range(len(self) - 1, -1, -1):
-            yield self[i]
-
-    def __delitem__(self, address: int) -> None:
+    def __delitem__(self, address: int | slice) -> None:
         """Delete byte at index and shift remaining bytes down.
 
-        O(n) in the number of bytes after ``address``.
+        O(n) in the number of bytes after ``address``. A slice is deleted
+        as ``bytearray`` does: the bytes are read whole and the rest stored back.
         """
+        if isinstance(address, slice):
+            self._del_slice(address)
+            return
         normalized = self.normalize_address(address)  # IndexError before any write
         self.ensure_created()
         length = self._len()
@@ -167,8 +163,7 @@ class ByteArrayView(
         Raises:
             ValueError: If value not in range 0-255
         """
-        if not isinstance(value, int) or not 0 <= value <= 255:
-            raise ValueError("byte must be in range(0, 256)")
+        _check_byte(value)
 
         self.ensure_created()
         index = self._len()
@@ -180,8 +175,8 @@ class ByteArrayView(
 
         O(n) in the number of bytes after ``index``.
         """
-        if not isinstance(value, int) or not 0 <= value <= 255:
-            raise ValueError("byte must be in range(0, 256)")
+        require_int_index(index, "bytearray")
+        _check_byte(value)
 
         self.ensure_created()
         length = self._len()
@@ -208,34 +203,35 @@ class ByteArrayView(
         return value
 
     def extend(self, values: Iterable[int]) -> None:
-        """Extend with bytes from iterable."""
-        for value in values:
+        """Extend with bytes from iterable. Every byte is checked before the first write."""
+        batch = list(values)
+        for value in batch:
+            _check_byte(value)
+        for value in batch:
             self.append(value)
 
+    def __contains__(self, value: object) -> bool:
+        """``value in view`` as on a bytearray: a byte, or a bytes-like run of bytes.
+
+        Raises TypeError for anything else and ValueError for an int past
+        range(0, 256), as ``bytearray`` does.
+        """
+        return value in bytes(self)
+
+    def index(self, value: object, start: int | None = None, stop: int | None = None) -> int:
+        """Position of the first byte (or run of bytes) equal to ``value``, as ``bytearray.index``."""
+        return bytes(self).index(value, start, stop)  # type: ignore[arg-type]
+
+    def count(self, value: object, start: int | None = None, stop: int | None = None) -> int:
+        """Occurrences of a byte (or non-overlapping runs of bytes), as ``bytearray.count``."""
+        return bytes(self).count(value, start, stop)  # type: ignore[arg-type]
+
     def remove(self, value: int) -> None:
-        """Remove first occurrence of byte value. On an absent bytearray, as on an empty one."""
+        """Remove the first byte equal to ``value``. On an absent bytearray, as on an empty one."""
+        _check_byte(value)
         if self._len() == 0:
             raise ValueError(f"{value!r} is not in bytearray")
-        for i, byte in enumerate(self):
-            if byte == value:
-                del self[i]
-                return
-        raise ValueError(f"{value!r} is not in bytearray")
-
-    def index(self, value: int) -> int:
-        """Find index of first occurrence of byte value.
-
-        Raises:
-            ValueError: If value not found
-        """
-        for i, byte in enumerate(self):
-            if byte == value:
-                return i
-        raise ValueError(f"{value!r} is not in bytearray")
-
-    def count(self, value: int) -> int:
-        """Count occurrences of byte value."""
-        return sum(1 for byte in self if byte == value)
+        super().remove(value)
 
     def clear(self) -> None:
         """Remove all bytes."""
@@ -244,6 +240,10 @@ class ByteArrayView(
         self.ensure_created()
         self.container.clear_children()
         self._set_length(0)
+
+    def _replace_all(self, values: bytearray) -> None:  # type: ignore[override]
+        """Store ``values`` as the bytes: one bulk store."""
+        self.store(values)
 
     def extract(self) -> bytearray:
         """Extract all bytes as bytearray.
@@ -272,7 +272,12 @@ class ByteArrayView(
         self._set_length(count)
 
 
-MutableSequence.register(ByteArrayView)
+def _check_byte(value: object) -> None:
+    """Refuse what ``bytearray`` refuses: TypeError for a non-int, ValueError past range(0, 256)."""
+    if not isinstance(value, int):
+        raise TypeError(f"'{type(value).__name__}' object cannot be interpreted as an integer")
+    if not 0 <= value <= 255:
+        raise ValueError("byte must be in range(0, 256)")
 
 
 if TYPE_CHECKING:

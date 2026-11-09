@@ -202,9 +202,9 @@ has_python = "python" in tags  # True
 tags.remove("python")
 tags.discard("java")  # Silent if missing
 
-# Set algebra
-union = tags.union(other)
-intersection = tags.intersection(other)
+# Set algebra (plain sets back)
+union = tags | other
+intersection = tags & other
 
 # Extract entire set
 all_tags = tags.extract()  # {"python", "rust"}
@@ -238,9 +238,11 @@ The same on every view and every backend. Pinned by `tests/views/test_dict_views
 - Writes create. Setting into an absent view creates it. A delete of a missing key creates nothing: DictView, FlatDictView and LightDictView are silent, the index views and Kh57View raise `KeyError`. Nor does any write that raises or changes nothing: an out-of-range `del` or set on a list or bytearray, `remove` or `discard` of a non-member, `extend([])`, `update({})`, `clear()`.
 - A set member is an opaque hashable value. A tuple or frozenset is stored as one row and reads back as is; a list, dict or set raises `TypeError` before any write, as a Python set would, and so does a member that does not pickle. A frozenset member is keyed by its sorted contents, so equal sets match from any process.
 - `update` applies its keys in order. A kind change on one key raises there and leaves the keys before it written and the rest unwritten; abort the transaction, or delete the key first.
-- `LazyListView`, `LazyDictView` and `LightDictView` have no `pop`: read, then `del`, or use the eager view. `FlatListView` has no `pop`, `remove`, `insert` or `del` at all: it appends, sets, extends and clears.
+- Every view is the `collections.abc` type it stands for, with all its methods, on both facets: `pop`, `popitem`, `setdefault`, `update`, `reverse`, `+=`, `|=` and the rest work as on the built-in. A lazy `pop` or `popitem` hands back the value, not a view of the removed child. What a layout cannot do raises: `reversed()` on a Kh57View (no order to reverse), a write at a position on a RingView. `tests/views/test_abc_conformance.py` pins all of it against the built-ins.
+- A view that models a built-in is that built-in in full: dict views (plain, fractional, log, indexed, flat, light) have `copy`, `|`, `|=`; list views `copy`, `sort`, `+`, `*`, ordering and slice writes; the set views `union`, `issubset`, `update` and the rest; the tuple and bytearray views likewise. New values come back as plain built-ins. Not provided: `hash()` of a tuple or frozenset view, `fromkeys`, `fromhex`, and the buffer protocol on a bytearray view. `tests/views/test_builtin_conformance.py` pins it.
+- `get(key)` of an absent key returns `None`, as `dict.get` does.
 - Existence is one read: `view.container.exists()`. Opening a chain of children touches no storage.
-- `len()` on DictView, FlatDictView, LightDictView, LogIndexedDictView and FractionalIndexedDictView counts live rows (O(children)); Kh57View, IndexedDictView, ListView and SetView read a stored count. `bool()` is one storage op on every view. Paging with `keys(after=, limit=)` on the log and fractional views returns exactly `limit` keys when they exist.
+- `len()` on DictView, FlatDictView, LightDictView, LogIndexedDictView and FractionalIndexedDictView counts live rows (O(children)); Kh57View, IndexedDictView, ListView and SetView read a stored count. `bool()` is one storage op on every view. Paging with `keys(after=, limit=)` and `reversed_keys(before=, limit=)` on the dict (plain, flat, light), log, fractional and indexed views returns exactly `limit` keys when they exist. `RingView.len()` is two seeks: its sequence numbers are dense.
 - `IndexedDictView` delete and `ListView` insert or delete in the middle are O(n). Use `FractionalIndexedDictView` for ordered collections.
 
 ## How It Uses Layer 2
@@ -282,23 +284,24 @@ storage.put(("tasks", 0), "Task 1")
 
 ```python
 from virtuals.view import ViewRegistry
-from virtuals.view.views import DictView, ListView
+from virtuals.views import EagerDictView, EagerFractionalIndexedDictView, EagerListView
 
 registry = ViewRegistry()
 
-# Register built-in views
-registry.register_view(
-    DictView,
-)
-# structure_id=1,
-# container_type=dict,
+# A writer: its structure ID reads back to it, and it writes its Python type.
+registry.register(EagerDictView)  # structure 1, dict
+registry.register(EagerListView)  # structure 2, list
 
-registry.register_view(
-    ListView,
-)
-# structure_id=2,
-# container_type=list,
+# A reader: its structure ID reads back to it, but it never writes a type
+# (an ordered dict is a dict too, and dict is already EagerDictView's).
+registry.register_reader(EagerFractionalIndexedDictView)
 ```
+
+A `Navigator` builds its registry this way: the views it is given (or the
+standard ones) as writers, then every other built-in view as a reader. So
+a container stored with any built-in view (an ordered dict, a log dict, a
+ring) reads back by its structure, eg when its parent is extracted,
+whichever views write the Python types.
 
 ### Registry Lookup
 
@@ -311,7 +314,7 @@ view_class = registry.get_view_for_structure(1)  # Returns: DictView
 **Writing:** Python Type → View
 
 ```python
-view_class = registry.get_view_for_container_type(dict)  # Returns: DictView
+view_class = registry.get_view_for_type(dict)  # Returns: EagerDictView
 ```
 
 ## Context Management

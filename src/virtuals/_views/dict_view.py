@@ -12,16 +12,16 @@ Provides three classes following the eager/lazy facet pattern:
 
 from __future__ import annotations
 
-from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
+from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar
 
+from virtuals.collections import DictMethods, ReactiveMappingBase
 from virtuals.container import (
     ContainerNotFoundError,
     ContainerProtocol,
     ContainerStructure,
     NodeType,
 )
-from virtuals.types import EMPTY, Empty, is_empty
 from virtuals.view import (
     ChildNavigationBase,
     ChildNestedGetBase,
@@ -29,6 +29,8 @@ from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
     DescendantsObservableBase,
+    Faceted,
+    KeyNotFoundError,
     LazyChildReadBase,
     LiveChildrenCountBase,
     ObservableBase,
@@ -38,9 +40,11 @@ from virtuals.view import (
     is_view_key,
 )
 
+from ._keys_view import ReversibleKeysView
+
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Generator
     from collections.abc import Mapping as PyMapping
 
     from virtuals.collections import (
@@ -57,6 +61,7 @@ if TYPE_CHECKING:
         Sizeable,
         Subscriptable,
     )
+    from virtuals.types import Empty
 
 __all__ = [
     "DictViewBase",
@@ -82,7 +87,10 @@ class DictViewBase(
     LazyChildReadBase,
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
+    Faceted,
     ViewBase,
+    ReactiveMappingBase[str | int, object],
+    DictMethods[str | int, object],
 ):
     """Dict-like view base — shared by eager and lazy facets.
 
@@ -120,13 +128,51 @@ class DictViewBase(
         """Iterate over keys."""
         yield from self.container.iter_child_keys(validate=False, strict=True)
 
-    def keys(self) -> KeysView[str | int]:
-        """Get all keys as a set-like view.
+    def __reversed__(self) -> Generator[str | int, None, None]:
+        """Keys last first: one reverse scan."""
+        return self.reversed_keys()
 
-        Returns a proper KeysView supporting len, contains, and set
-        operations (union, intersection, difference, etc.).
+    def keys(
+        self, *, after: str | int | None = None, limit: int | None = None
+    ) -> KeysView[str | int] | Generator[str | int, None, None]:
+        """Keys in key order (ints first, then strs bytewise).
+
+        With no arguments: a set-like KeysView supporting len, contains and
+        set operations. With ``after`` or ``limit``: a generator, a page of
+        the keys strictly after ``after`` (from the start when None), at
+        most ``limit`` of them.
+
+        ``after`` is a position in key order, not a row: it does not have
+        to exist, so a page resumes after a key that was deleted since.
+        Cost: one seek plus O(limit) rows, whatever the dict's size.
+
+        Raises:
+            ContainerNotFoundError: On a never-written view, when nothing
+                is read (as iteration does).
         """
-        return KeysView(self)  # type: ignore[arg-type]
+        if after is None and limit is None:
+            return ReversibleKeysView(self)
+        return self._keys_page(cursor=after, limit=limit, reverse=False)
+
+    def reversed_keys(
+        self, *, before: str | int | None = None, limit: int | None = None
+    ) -> Generator[str | int, None, None]:
+        """Keys in reverse key order, strictly before ``before``, at most ``limit``.
+
+        From the end when ``before`` is None. Like ``keys(after=)``, the
+        cursor does not have to exist. Cost: one seek plus O(limit) rows.
+        """
+        return self._keys_page(cursor=before, limit=limit, reverse=True)
+
+    def _keys_page(
+        self, *, cursor: str | int | None, limit: int | None, reverse: bool
+    ) -> Generator[str | int, None, None]:
+        """One page of keys. A bad cursor raises at the call, not on the first read."""
+        if cursor is not None and not is_view_key(cursor):
+            raise TypeError(f"view keys must be str or int, got {type(cursor).__name__}")
+        return self.container.iter_child_keys(
+            validate=False, strict=True, reverse=reverse, cursor=cursor, limit=limit
+        )
 
     # =========================================================================
     # MUTATIONS (same for both facets)
@@ -137,22 +183,15 @@ class DictViewBase(
         self._set_child_value(address, value)
 
     def __delitem__(self, address: str | int) -> None:
-        """Delete key (and its subtree). Silent if the key is missing.
+        """Delete key (and its subtree). KeyError if the key is missing, like a dict.
 
-        A delete never materializes the view: on an absent view it is a
-        no-op after one existence read, so nothing is written and no
-        parent bookkeeping fires.
+        A delete never materializes the view: on an absent view it raises
+        after one existence read, so nothing is written and no parent
+        bookkeeping fires.
         """
-        if not is_view_key(address) or not self.container.exists():
-            return
+        if not is_view_key(address) or not self.container.exists_child(address):
+            raise KeyNotFoundError(address)
         self.container.delete_child(address)
-
-    def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        """Value at ``address``, or ``default`` (EMPTY) when the key is absent."""
-        try:
-            return self[address]
-        except KeyError:
-            return default
 
     def clear(self) -> None:
         """Remove all items."""
@@ -161,15 +200,12 @@ class DictViewBase(
         self.ensure_created()
         self.container.clear_children(validate=True)
 
-    def update(self, other: PyMapping[str | int, object] | None = None, **kwargs: object) -> None:
-        """Update from dict or kwargs."""
-        self._reject_empty_in(other or {})
-        self._reject_empty_in(kwargs)
-        if other:
-            for key, value in other.items():
-                self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value  # type: ignore[assignment]
+    def update(self, other: object = (), /, **kwargs: object) -> None:
+        """Update as ``dict.update``. The whole batch is checked for EMPTY before the first write."""
+        items = self._update_items(other, kwargs)
+        self._reject_empty_in(items)
+        for key, value in items.items():
+            self[key] = value
 
     def store(self, value: PyMapping[str | int, object], *, replace: bool = True) -> None:
         """Store dict contents."""
@@ -229,11 +265,11 @@ class EagerDictView(DictViewBase):
     def __getitem__(self, address: str | int) -> object | Empty:
         """Get value for key — returns extracted Python value."""
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         try:
             return self._get_child_value(address)
         except ContainerNotFoundError as e:
-            raise KeyError(address) from e
+            raise KeyNotFoundError(address) from e
 
     def values(self) -> ValuesView[object]:
         """Get all values as a collection view.
@@ -284,17 +320,6 @@ class EagerDictView(DictViewBase):
             elif v.node_type == NodeType.CONTAINER:
                 yield k, self._get_child_value(k, node_info=v)
 
-    def pop(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        """Remove and return value."""
-        try:
-            value = self[address]
-            del self[address]
-            return value
-        except KeyError:
-            if is_empty(default):
-                raise
-            return default
-
     def extract(self) -> dict[str | int, object]:
         """Extract all items as dict."""
         return dict(self.items())
@@ -312,56 +337,6 @@ class EagerDictView(DictViewBase):
     def eager(self) -> EagerDictView:
         """Identity — already eager."""
         return self
-
-    # =========================================================================
-    # FUNCTIONAL OPERATIONS
-    # =========================================================================
-
-    def map_values(self, fn: Callable[[object], object]) -> dict[str | int, object]:
-        """Apply function to each value, keeping keys unchanged."""
-        return {k: fn(v) for k, v in self.items()}
-
-    def map_items(
-        self, fn: Callable[[str | int, object], tuple[str | int, object]]
-    ) -> dict[str | int, object]:
-        """Apply function to each (key, value) pair."""
-        return dict(fn(k, v) for k, v in self.items())
-
-    def filter(self, fn: Callable[[str | int, object], bool]) -> dict[str | int, object]:
-        """Filter items by predicate."""
-        return {k: v for k, v in self.items() if fn(k, v)}
-
-    def reduce(self, fn: Callable[[object, str | int, object], object], initial: object) -> object:
-        """Reduce dict to single value."""
-        result = initial
-        for k, v in self.items():
-            result = fn(result, k, v)
-        return result
-
-    # =========================================================================
-    # SEARCH OPERATIONS
-    # =========================================================================
-
-    def find(self, fn: Callable[[object], bool]) -> object:
-        """Find first value matching predicate."""
-        for v in self.values():
-            if fn(v):
-                return v
-        raise ValueError("No matching value found")
-
-    def find_key(self, fn: Callable[[object], bool]) -> str | int:
-        """Find first key whose value matches predicate."""
-        for k, v in self.items():
-            if fn(v):
-                return k
-        raise ValueError("No matching value found")
-
-    def find_item(self, fn: Callable[[str | int, object], bool]) -> tuple[str | int, object]:
-        """Find first item (key, value) matching predicate."""
-        for k, v in self.items():
-            if fn(k, v):
-                return k, v
-        raise ValueError("No matching item found")
 
 
 # =============================================================================
@@ -382,11 +357,11 @@ class LazyDictView(DictViewBase):
     def __getitem__(self, address: str | int) -> object:
         """Get child — returns View for containers, value for primitives."""
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         try:
             return self._get_child_view_or_value(address)
         except ContainerNotFoundError as e:
-            raise KeyError(address) from e
+            raise KeyNotFoundError(address) from e
 
     def values(self) -> ValuesView[object]:
         """Get all children as a collection view.
@@ -437,6 +412,10 @@ class LazyDictView(DictViewBase):
     # =========================================================================
     # FACET NAVIGATION
     # =========================================================================
+
+    def extract(self) -> dict[str | int, object]:
+        """The whole subtree as plain Python values, read through the eager facet."""
+        return self.eager.extract()
 
     @property
     def eager(self) -> EagerDictView:
@@ -536,9 +515,6 @@ class _LazyReversedItemsView(ItemsView):
 
     def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
         yield from self._mapping._iter_items_reverse()
-
-
-MutableMapping.register(EagerDictView)
 
 
 if TYPE_CHECKING:

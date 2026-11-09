@@ -4,7 +4,7 @@ import random
 
 import pytest
 
-from virtuals._views import EagerDictView, EagerKh57View, LazyKh57View
+from virtuals._views import EagerKh57View, LazyDictView, LazyKh57View
 
 
 def _rng(seed: int) -> random.Random:
@@ -209,7 +209,7 @@ def test_kh57_lazy_returns_child_views(kh57_factory):
     got = lazy[1]
     # lazy returns a View for container children
     assert not isinstance(got, dict)
-    assert isinstance(got, EagerDictView)
+    assert isinstance(got, LazyDictView)  # lazy all the way down
     assert got.extract() == {"x": 1}
 
 

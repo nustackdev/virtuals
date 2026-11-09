@@ -29,17 +29,23 @@ Provides three classes following the eager/lazy facet pattern:
 
 from __future__ import annotations
 
-from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
+from collections.abc import ItemsView, KeysView, ValuesView
+from itertools import islice
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from virtuals.collections import DictMethods, ReactiveMappingBase
 from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType
-from virtuals.types import EMPTY, Empty
+from virtuals.tkv.filter import PrefixFilter, WildcardFilter
+from virtuals.tkv.observer import SubscriptionOptions
 from virtuals.view import (
     ChildNavigationBase,
     ChildNestedGetBase,
     ChildNestedSetBase,
     ChildObservableBase,
     ChildPrimitiveSetBase,
+    DescendantsObservableBase,
+    Faceted,
+    KeyNotFoundError,
     LazyChildReadBase,
     ObservableBase,
     PrimitiveOpsBase,
@@ -48,6 +54,7 @@ from virtuals.view import (
     is_view_key,
 )
 
+from ._keys_view import ReversibleKeysView
 from .flat_list_view import FlatListView
 
 
@@ -55,6 +62,7 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from collections.abc import Mapping as PyMapping
 
+    from virtuals.types import Empty
     from virtuals.view import View
 
 
@@ -76,6 +84,7 @@ _DATA = "__data__"
 class IndexedDictViewBase(
     ObservableBase,
     ChildObservableBase[str | int],
+    DescendantsObservableBase,
     ChildNavigationBase[str | int],
     ChildNestedGetBase,
     ChildNestedSetBase,
@@ -83,7 +92,10 @@ class IndexedDictViewBase(
     LazyChildReadBase,
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
+    Faceted,
     ViewBase,
+    ReactiveMappingBase[str | int, object],
+    DictMethods[str | int, object],
 ):
     """Dict view base with hierarchical internal layout for O(1) key access.
 
@@ -155,6 +167,30 @@ class IndexedDictViewBase(
             validate=False,
         )
 
+    # -- Observability overrides -------------------------------------------
+    # Children live under `__data__/`, so the base filters at
+    # `(container.site, ...)` would match only the two layout markers.
+    # Rebased like the other indexed views. `__keys__/` is bookkeeping (a
+    # delete rewrites all of it) and is never watched.
+
+    def on_change(self) -> SubscriptionOptions:
+        """Any data write under ``__data__/``. Key-list rewrites do not fire."""
+        return SubscriptionOptions(PrefixFilter(prefix=(*self.container.site, _DATA)))
+
+    def on_child_change(self, address: str | int) -> SubscriptionOptions:
+        """Any write at or under ``__data__/<address>``."""
+        normalized = self.normalize_address(address)
+        return SubscriptionOptions(PrefixFilter(prefix=(*self.container.site, _DATA, normalized)))
+
+    def on_children_change(self) -> SubscriptionOptions:
+        """A direct child added, deleted or set as a primitive (``__data__/*``)."""
+        return SubscriptionOptions(WildcardFilter(pattern=(*self.container.site, _DATA, "*")))
+
+    def on_descendants_change(self, address: object, *addresses: object) -> SubscriptionOptions:
+        """Wildcard match under ``__data__/``, patterned relative to the dict."""
+        pattern = (address, *addresses)
+        return SubscriptionOptions(WildcardFilter(pattern=(*self.container.site, _DATA, *pattern)))
+
     # -- Membership & keys (same for both facets) ---------------------------
 
     def __len__(self) -> int:
@@ -177,9 +213,55 @@ class IndexedDictViewBase(
         """Get key at index — single O(1) read from __keys__ FlatListView."""
         return self._keys_view()[idx]
 
-    def keys(self) -> KeysView[str | int]:
-        """Get all keys as a set-like view."""
-        return KeysView(self)  # type: ignore[arg-type]
+    def keys(
+        self, *, after: str | int | None = None, limit: int | None = None
+    ) -> KeysView[str | int] | Generator[str | int, None, None]:
+        """Keys in insertion order.
+
+        With no arguments: a set-like KeysView. With ``after`` or ``limit``:
+        a generator, a page of the keys recorded after the key ``after``
+        (from the first when None), at most ``limit`` of them.
+
+        ``after`` is a key the view holds, KeyError otherwise, as on the log
+        and fractional views. Cost: the key list has no reverse index, so
+        finding ``after`` scans ``__keys__/`` up to it, O(n); with no
+        cursor a page reads O(limit) rows.
+        """
+        if after is None and limit is None:
+            return ReversibleKeysView(self)
+        return self._keys_page(cursor=after, limit=limit, reverse=False)
+
+    def reversed_keys(
+        self, *, before: str | int | None = None, limit: int | None = None
+    ) -> Generator[str | int, None, None]:
+        """Keys last first, recorded before the key ``before``, at most ``limit``.
+
+        From the last when ``before`` is None. ``before`` is a key the view
+        holds, KeyError otherwise; found by the same O(n) scan as
+        ``keys(after=)``.
+        """
+        return self._keys_page(cursor=before, limit=limit, reverse=True)
+
+    def _keys_page(
+        self, *, cursor: str | int | None, limit: int | None, reverse: bool
+    ) -> Generator[str | int, None, None]:
+        """One page of keys. A bad or missing cursor raises at the call, not on the first read."""
+        if cursor is not None:
+            if not is_view_key(cursor):
+                raise TypeError(f"view keys must be str or int, got {type(cursor).__name__}")
+            if cursor not in self:
+                raise KeyNotFoundError(cursor)
+        return self._iter_page(cursor, limit=limit, reverse=reverse)
+
+    def _iter_page(
+        self, cursor: str | int | None, *, limit: int | None, reverse: bool
+    ) -> Generator[str | int, None, None]:
+        keys = self._iter_ordered_keys(reverse=reverse)
+        if cursor is not None:
+            for key in keys:
+                if key == cursor:
+                    break
+        yield from islice(keys, limit)
 
     # -- Bookkeeping ---------------------------------------------------------
 
@@ -206,13 +288,6 @@ class IndexedDictViewBase(
                 seen.add(key)  # type: ignore[arg-type]
         keys.extend(key for key in data_keys if key not in seen)  # type: ignore[misc]
         kv.store(keys)
-
-    def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        """Value at ``address``, or ``default`` (EMPTY) when the key is absent."""
-        try:
-            return self[address]
-        except KeyError:
-            return default
 
     # -- Mutations (same for both facets) -----------------------------------
 
@@ -244,11 +319,11 @@ class IndexedDictViewBase(
         # No ensure_created here: deletes must not materialize the view as
         # a side effect. If the underlying __data__/ container doesn't
         # exist yet, exists_child returns False against raw storage and we
-        # raise KeyError -- matching Python dict semantics and letting ref
-        # callers no-op via their KeyError/IndexError catch.
+        # raise KeyNotFoundError -- a KeyError, matching Python dict
+        # semantics.
         dc = self._data_container()
         if not is_view_key(address) or not dc.exists_child(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc.delete_child(address)
         # Rebuild key index
         kv = self._keys_view()
@@ -262,14 +337,12 @@ class IndexedDictViewBase(
         self._data_container().clear_children(validate=False)
         self._keys_view().clear()
 
-    def update(self, other: PyMapping[str | int, object] | None = None, **kwargs: object) -> None:
-        self._reject_empty_in(other or {})
-        self._reject_empty_in(kwargs)
-        if other:
-            for key, value in other.items():
-                self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value  # type: ignore[assignment]
+    def update(self, other: object = (), /, **kwargs: object) -> None:
+        """Update as ``dict.update``. The whole batch is checked for EMPTY before the first write."""
+        items = self._update_items(other, kwargs)
+        self._reject_empty_in(items)
+        for key, value in items.items():
+            self[key] = value
 
     def store(self, value: PyMapping[str | int, object], *, replace: bool = True) -> None:
         value = self._reject_empty_in(value)  # type: ignore[assignment]
@@ -300,14 +373,14 @@ class IndexedDictViewBase(
             (node_info, is_container) — the raw node info and whether it's a container
         """
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc = self._data_container()
         child_site = (*dc.site, address)
         from virtuals.container import node_ops
 
         node_info = node_ops.get_node_info(child_site, dc.ctx)
         if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         return node_info, node_info.node_type == NodeType.CONTAINER
 
     def _extract_data_child(self, address: str | int, node_info: object) -> object:
@@ -326,14 +399,14 @@ class IndexedDictViewBase(
         return child_view.extract()
 
     def _view_data_child(self, address: str | int, node_info: object) -> object:
-        """Return a View for a container child from __data__ (no extraction)."""
+        """Return the lazy View of a container child from __data__ (no extraction)."""
         dc = self._data_container()
         child_site = (*dc.site, address)
         child_container = Container(ctx=dc.ctx, site=child_site)
         if node_info.structure is None:  # type: ignore[union-attr]
             raise ValueError(f"Child container '{address}' has no structure ID")
         view_class = self.registry.get_view_for_structure(node_info.structure)  # type: ignore[union-attr]
-        return view_class(container=child_container, registry=self.registry, parent=self)
+        return view_class(container=child_container, registry=self.registry, parent=self).lazy
 
     # -- Ordered key iteration --------------------------------------------
     #
@@ -376,7 +449,7 @@ class EagerIndexedDictView(IndexedDictViewBase):
             from virtuals.types import is_empty
 
             if is_empty(node_info.primitive_value):  # type: ignore[union-attr]
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value  # type: ignore[union-attr]
         return self._extract_data_child(address, node_info)
 
@@ -436,18 +509,6 @@ class EagerIndexedDictView(IndexedDictViewBase):
         """Iterate keys in reverse insertion order."""
         yield from self._iter_ordered_keys(reverse=True)
 
-    def pop(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        try:
-            value = self[address]
-            del self[address]
-            return value
-        except KeyError:
-            from virtuals.types import is_empty
-
-            if is_empty(default):
-                raise
-            return default
-
     def extract(self) -> dict[str | int, object]:
         return {k: self[k] for k in self}
 
@@ -483,7 +544,7 @@ class LazyIndexedDictView(IndexedDictViewBase):
             from virtuals.types import is_empty
 
             if is_empty(node_info.primitive_value):  # type: ignore[union-attr]
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value  # type: ignore[union-attr]
         return self._view_data_child(address, node_info)
 
@@ -542,6 +603,10 @@ class LazyIndexedDictView(IndexedDictViewBase):
         yield from self._iter_ordered_keys(reverse=True)
 
     # -- Facet navigation --------------------------------------------------
+
+    def extract(self) -> dict[str | int, object]:
+        """The whole subtree as plain Python values, read through the eager facet."""
+        return self.eager.extract()
 
     @property
     def eager(self) -> EagerIndexedDictView:
@@ -643,6 +708,3 @@ class _LazyIndexedReversedItemsView(ItemsView):
 
     def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
         yield from self._mapping._iter_items_reverse()
-
-
-MutableMapping.register(EagerIndexedDictView)

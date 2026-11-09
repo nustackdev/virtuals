@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from itertools import islice
 
+import pytest
+
+from virtuals import _views
 from virtuals._views import EagerDictView, EagerListView, LazyDictView, LazyListView
 from virtuals.view import ViewBase
 
@@ -265,3 +268,69 @@ class TestLazyListView:
         eager_again = lst.lazy.eager
         assert isinstance(eager_again, EagerListView)
         assert list(eager_again) == [1, 2, 3]
+
+
+# =============================================================================
+# FACETS HOLD ALL THE WAY DOWN
+# =============================================================================
+
+_LAZY_PARENTS = [
+    "EagerDictView",
+    "EagerIndexedDictView",
+    "EagerFractionalIndexedDictView",
+    "EagerLogIndexedDictView",
+    "EagerListView",
+]
+
+
+def _nested(view_name: str) -> tuple[object, object]:
+    """The data to store in a parent of ``view_name``, and the address of its compound child."""
+    if view_name == "EagerListView":
+        return [{"inner": {"x": 1}}], 0
+    return {"a": {"inner": {"x": 1}}}, "a"
+
+
+@pytest.mark.parametrize("view_name", _LAZY_PARENTS)
+def test_lazy_child_is_lazy_two_levels_down(root_view: EagerDictView, view_name: str) -> None:
+    """A lazy read hands out the child's lazy facet, so its reads are Views too."""
+    data, address = _nested(view_name)
+    parent = root_view.open_child("p", getattr(_views, view_name))
+    parent.store(data)
+
+    child = parent.lazy[address]
+    assert isinstance(child, ViewBase)
+    assert child.lazy is child
+    grandchild = child["inner"]
+    assert isinstance(grandchild, ViewBase)
+    assert grandchild.lazy is grandchild
+    assert grandchild["x"] == 1
+
+
+@pytest.mark.parametrize("view_name", _LAZY_PARENTS)
+def test_lazy_values_and_items_are_lazy(root_view: EagerDictView, view_name: str) -> None:
+    data, _address = _nested(view_name)
+    parent = root_view.open_child("p", getattr(_views, view_name))
+    parent.store(data)
+
+    lazy = parent.lazy
+    values = list(lazy) if view_name == "EagerListView" else list(lazy.values())
+    assert all(isinstance(v, ViewBase) and v.lazy is v for v in values)
+    assert all(isinstance(v["inner"], ViewBase) for v in values)
+
+
+@pytest.mark.parametrize("view_name", _LAZY_PARENTS)
+def test_eager_child_is_plain_data(root_view: EagerDictView, view_name: str) -> None:
+    data, address = _nested(view_name)
+    parent = root_view.open_child("p", getattr(_views, view_name))
+    parent.store(data)
+
+    assert parent.eager[address] == {"inner": {"x": 1}}
+
+
+def test_lazy_kh57_child_is_lazy(root_view: EagerDictView) -> None:
+    parent = root_view.open_child("p", _views.EagerKh57View)
+    parent.store({7: {"inner": {"x": 1}}})
+
+    child = parent.lazy[7]
+    assert child.lazy is child
+    assert isinstance(child["inner"], ViewBase)

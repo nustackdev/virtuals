@@ -8,9 +8,9 @@ Provides three classes following the eager/lazy facet pattern:
 
 from __future__ import annotations
 
-from collections.abc import MutableSequence
 from typing import TYPE_CHECKING, ClassVar
 
+from virtuals.collections import ListMethods, ReactiveSequenceBase
 from virtuals.container import (
     ContainerNotFoundError,
     ContainerProtocol,
@@ -25,6 +25,9 @@ from virtuals.view import (
     ChildNestedSetBase,
     ChildObservableBase,
     ChildPrimitiveSetBase,
+    DescendantsObservableBase,
+    Faceted,
+    IndexNotFoundError,
     LazyChildReadBase,
     MetadataBasedChildrenCountBase,
     ObservableBase,
@@ -32,9 +35,11 @@ from virtuals.view import (
     ViewBase,
 )
 
+from ._index import require_int_index
+
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable
+    from collections.abc import Generator, Iterable
     from collections.abc import Sequence as PySequence
 
     from virtuals.collections import (
@@ -69,6 +74,7 @@ __all__ = [
 class ListViewBase(
     ObservableBase,
     ChildObservableBase[int],
+    DescendantsObservableBase,
     MetadataBasedChildrenCountBase,
     ChildNavigationBase[int],
     ChildNestedGetBase,
@@ -76,7 +82,10 @@ class ListViewBase(
     ChildPrimitiveSetBase,
     LazyChildReadBase,
     UnsafePrimitiveOpsBase,
+    Faceted,
     ViewBase,
+    ReactiveSequenceBase[object],
+    ListMethods[object],
 ):
     """List-like view base — shared by eager and lazy facets.
 
@@ -106,14 +115,19 @@ class ListViewBase(
 
         Uses the stored length with no existence check: an index on an
         absent list is out of range, like on an empty one.
+
+        Raises:
+            TypeError: If ``address`` is not an int, as ``list`` does.
+            IndexError: If ``address`` is out of range.
         """
+        require_int_index(address)
         length = self._len()
 
         if address < 0:
             address = length + address
 
         if address < 0 or address >= length:
-            raise IndexError("list index out of range")
+            raise IndexNotFoundError("list index out of range")
 
         return address
 
@@ -131,22 +145,17 @@ class ListViewBase(
         return SubscriptionOptions(filter=PrefixFilter(prefix=(*self.container.site, address)))
 
     # =========================================================================
-    # MEMBERSHIP (same for both facets)
-    # =========================================================================
-
-    def __contains__(self, obj: object) -> bool:
-        """Check if value exists in list."""
-        for item in self:
-            if item == obj:
-                return True
-        return False
-
-    # =========================================================================
     # MUTATIONS (same for both facets)
     # =========================================================================
 
-    def __setitem__(self, address: int, value: object) -> None:
-        """Set item at index."""
+    def __setitem__(self, address: int | slice, value: object) -> None:
+        """Set the item at an index, or the items of a slice as ``list`` does.
+
+        A slice write reads the items whole and stores the result back.
+        """
+        if isinstance(address, slice):
+            self._set_slice(address, value)  # type: ignore[arg-type]
+            return
         normalized = self.normalize_address(address)
         self._set_child_value(normalized, value)
 
@@ -169,13 +178,17 @@ class ListViewBase(
         self.ensure_created()
         self._populate_child_container(normalized, value, view_class=view_class)
 
-    def __delitem__(self, address: int) -> None:
+    def __delitem__(self, address: int | slice) -> None:
         """Delete item at index and shift remaining items.
 
         O(n) in the number of storage entries under the shifted tail. For
         large lists of container children where middle-position deletes are
-        common, prefer a dict keyed by id.
+        common, prefer a dict keyed by id. A slice is deleted as ``list``
+        does: the items are read whole and the rest stored back.
         """
+        if isinstance(address, slice):
+            self._del_slice(address)
+            return
         normalized = self.normalize_address(address)  # IndexError before any write
         self.ensure_created()
         length = self._len()
@@ -201,6 +214,7 @@ class ListViewBase(
 
     def insert(self, address: int, value: object) -> None:
         """Insert value at index, shifting later items."""
+        require_int_index(address)
         self._reject_empty(address, value)
         self.ensure_created()
         length = self._len()
@@ -249,6 +263,35 @@ class ListViewBase(
                 del self[i]
                 return
         raise ValueError(f"{value!r} is not in list")
+
+    def reverse(self) -> None:
+        """Reverse in place, as ``list.reverse``: the items are read whole and stored back reversed.
+
+        Not by swaps: a swap would write a compound item over a primitive
+        one, which a list view refuses (an item keeps its kind).
+        """
+        if self._len() < 2:
+            return
+        self._replace_all(self._plain_values()[::-1])
+
+    def pop(self, index: int = -1) -> object:
+        """Remove and return the item at ``index``, read as a plain value, as ``list.pop``."""
+        if self._len() == 0:
+            raise IndexError("pop from empty list")
+        return super().pop(index)
+
+    def _plain_values(self) -> list[object]:
+        """Every item as plain data, read through the eager facet in one scan."""
+        return list(self.eager)  # type: ignore[call-overload]
+
+    def _replace_all(self, values: list[object]) -> None:
+        """Store ``values`` as the items: one bulk store.
+
+        A view among them (``lazy[:] = lazy`` hands in this list's own
+        children) is read to data first, before the store clears what it
+        stands at.
+        """
+        self.store([v.eager.extract() if isinstance(v, ViewBase) else v for v in values])  # type: ignore[attr-defined]
 
     def store(self, value: Iterable[object], *, replace: bool = True) -> None:
         """Store list contents.
@@ -299,7 +342,7 @@ class EagerListView(ListViewBase):
         try:
             return self._get_child_value(normalized)
         except ContainerNotFoundError as e:
-            raise IndexError("list index out of bounds") from e
+            raise IndexNotFoundError("list index out of bounds") from e
 
     def __iter__(self) -> Generator[Value, None, None]:
         """Iterate over items — yields extracted Python values."""
@@ -308,28 +351,6 @@ class EagerListView(ListViewBase):
                 yield v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
                 yield self[int(k)]
-
-    def __reversed__(self) -> Generator[object, None, None]:
-        """Iterate in reverse order."""
-        for i in range(len(self) - 1, -1, -1):
-            yield self[i]
-
-    def __add__(self, other: Iterable[object]) -> list[object]:
-        """Concatenate with another iterable, returning a plain list."""
-        return list(self) + list(other)
-
-    def __radd__(self, other: Iterable[object]) -> list[object]:
-        """Support ``other + list_view``."""
-        return list(other) + list(self)
-
-    def pop(self, address: int = -1) -> object | Empty:
-        """Remove and return item at index."""
-        if self._len() == 0:
-            raise IndexError("pop from empty list")
-
-        value = self[address]
-        del self[address]
-        return value
 
     def extract(self) -> Iterable[object]:
         """Extract all items as list."""
@@ -348,54 +369,6 @@ class EagerListView(ListViewBase):
     def eager(self) -> EagerListView:
         """Identity — already eager."""
         return self
-
-    # =========================================================================
-    # FUNCTIONAL OPERATIONS
-    # =========================================================================
-
-    def map(self, fn: Callable[[object], object]) -> list[object]:
-        """Apply function to each element."""
-        return [fn(item) for item in self]
-
-    def filter(self, fn: Callable[[object], bool]) -> list[object]:
-        """Filter elements by predicate."""
-        return [item for item in self if fn(item)]
-
-    def reduce(self, fn: Callable[[object, object], object], initial: object) -> object:
-        """Reduce list to single value."""
-        result = initial
-        for item in self:
-            result = fn(result, item)
-        return result
-
-    # =========================================================================
-    # SEARCH OPERATIONS
-    # =========================================================================
-
-    def index(self, value: object) -> int:
-        """Find index of first occurrence of value."""
-        for i, item in enumerate(self):
-            if item == value:
-                return i
-        raise ValueError(f"{value!r} is not in list")
-
-    def count(self, value: object) -> int:
-        """Count occurrences of value."""
-        return sum(1 for item in self if item == value)
-
-    def find(self, fn: Callable[[object], bool]) -> object:
-        """Find first element matching predicate."""
-        for item in self:
-            if fn(item):
-                return item
-        raise ValueError("No matching element found")
-
-    def find_index(self, fn: Callable[[object], bool]) -> int:
-        """Find index of first element matching predicate."""
-        for i, item in enumerate(self):
-            if fn(item):
-                return i
-        raise ValueError("No matching element found")
 
 
 # =============================================================================
@@ -425,7 +398,7 @@ class LazyListView(ListViewBase):
         try:
             return self._get_child_view_or_value(normalized)
         except ContainerNotFoundError as e:
-            raise IndexError("list index out of bounds") from e
+            raise IndexNotFoundError("list index out of bounds") from e
 
     def __iter__(self) -> Generator[object, None, None]:
         """Iterate — yields Views for containers, values for primitives."""
@@ -435,14 +408,13 @@ class LazyListView(ListViewBase):
             elif v.node_type == NodeType.CONTAINER:
                 yield self._get_child_view_or_value(int(k), node_info=v)
 
-    def __reversed__(self) -> Generator[object, None, None]:
-        """Iterate in reverse order."""
-        for i in range(len(self) - 1, -1, -1):
-            yield self[i]
-
     # =========================================================================
     # FACET NAVIGATION
     # =========================================================================
+
+    def extract(self) -> list[object]:
+        """The whole subtree as plain Python values, read through the eager facet."""
+        return self.eager.extract()
 
     @property
     def eager(self) -> EagerListView:
@@ -453,9 +425,6 @@ class LazyListView(ListViewBase):
     def lazy(self) -> LazyListView:
         """Identity — already lazy."""
         return self
-
-
-MutableSequence.register(EagerListView)
 
 
 if TYPE_CHECKING:

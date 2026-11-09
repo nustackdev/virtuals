@@ -2,20 +2,33 @@
 
 Ultra-lightweight dict view with no:
 - Length tracking
-- Observable support
 - Nested views support (primitives only)
 - Functional operations
 - Child navigation
+
+Observable like ``DictView``: the whole view, one key, the keys, a pattern.
 """
 
 from __future__ import annotations
 
-from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
+from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from virtuals.collections import DictMethods, ReactiveMappingBase
 from virtuals.container import ContainerProtocol, ContainerStructure
-from virtuals.types import EMPTY, Empty, Value
-from virtuals.view import ChildPrimitiveSetBase, UnsafePrimitiveOpsBase, ViewBase, is_view_key
+from virtuals.types import Empty, Value
+from virtuals.view import (
+    ChildObservableBase,
+    ChildPrimitiveSetBase,
+    DescendantsObservableBase,
+    KeyNotFoundError,
+    ObservableBase,
+    UnsafePrimitiveOpsBase,
+    ViewBase,
+    is_view_key,
+)
+
+from ._keys_view import ReversibleKeysView
 
 
 if TYPE_CHECKING:
@@ -29,14 +42,19 @@ __all__ = [
 
 
 class LightDictView(
+    ObservableBase,
+    ChildObservableBase[str | int],
+    DescendantsObservableBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    ReactiveMappingBase[str | int, Value],
+    DictMethods[str | int, Value],
 ):
     """Ultra-lightweight dict view for maximum performance.
 
     Stores only primitive values (int, float, str, bool, bytes, None).
-    No nested containers, no observables, no length tracking.
+    No nested containers, no length tracking.
 
     Use when:
     - You need maximum set/get performance
@@ -75,10 +93,10 @@ class LightDictView(
             KeyError: If key not found, or a key the view cannot hold
         """
         if not is_view_key(key):
-            raise KeyError(key)
+            raise KeyNotFoundError(key)
         value = self.container.get_child_primitive(key)
         if isinstance(value, Empty):
-            raise KeyError(key)
+            raise KeyNotFoundError(key)
         return value
 
     def __setitem__(self, key: str | int, value: Value) -> None:
@@ -93,15 +111,13 @@ class LightDictView(
         self.container.put_child_primitive(key, value)
 
     def __delitem__(self, key: str | int) -> None:
-        """Delete key.
+        """Delete key. KeyError if the key is missing, like a dict; an absent view stays absent.
 
         Args:
             key: Key to delete
-
-        Silent if the key is missing; an absent view stays absent.
         """
-        if not is_view_key(key) or not self.container.exists():
-            return
+        if not is_view_key(key) or not self.container.exists_child(key):
+            raise KeyNotFoundError(key)
         self.container.delete_child(key)
 
     def __contains__(self, key: str | int) -> bool:
@@ -120,16 +136,39 @@ class LightDictView(
         """Iterate over keys."""
         yield from self.container.iter_child_keys(validate=False, strict=True)
 
-    def get(self, key: str | int, default: Value | Empty = EMPTY) -> Value | Empty:
-        """Get value with default fallback."""
-        try:
-            return self[key]
-        except KeyError:
-            return default
+    def __reversed__(self) -> Generator[str | int, None, None]:
+        """Keys last first: one reverse scan."""
+        yield from self.container.iter_child_keys(validate=False, strict=True, reverse=True)
 
-    def keys(self) -> KeysView[str | int]:
-        """Get all keys as a set-like view."""
-        return KeysView(self)  # type: ignore[arg-type]
+    def keys(
+        self, *, after: str | int | None = None, limit: int | None = None
+    ) -> KeysView[str | int] | Generator[str | int, None, None]:
+        """Keys in key order, or one page of them, as ``DictView.keys``.
+
+        With no arguments: a set-like KeysView. With ``after`` or ``limit``:
+        a generator over the keys strictly after ``after`` (a position in
+        key order, it need not exist), at most ``limit`` of them. Cost: one
+        seek plus O(limit) rows.
+        """
+        if after is None and limit is None:
+            return ReversibleKeysView(self)
+        return self._keys_page(cursor=after, limit=limit, reverse=False)
+
+    def reversed_keys(
+        self, *, before: str | int | None = None, limit: int | None = None
+    ) -> Generator[str | int, None, None]:
+        """Keys in reverse key order, strictly before ``before``, at most ``limit``."""
+        return self._keys_page(cursor=before, limit=limit, reverse=True)
+
+    def _keys_page(
+        self, *, cursor: str | int | None, limit: int | None, reverse: bool
+    ) -> Generator[str | int, None, None]:
+        """One page of keys. A bad cursor raises at the call, not on the first read."""
+        if cursor is not None and not is_view_key(cursor):
+            raise TypeError(f"view keys must be str or int, got {type(cursor).__name__}")
+        return self.container.iter_child_keys(
+            validate=False, strict=True, reverse=reverse, cursor=cursor, limit=limit
+        )
 
     def values(self) -> ValuesView[Value]:
         """Get all values as a collection view."""
@@ -146,15 +185,12 @@ class LightDictView(
         self.ensure_created()
         self.container.clear_children(validate=False)
 
-    def update(self, other: PyMapping[str | int, Value] | None = None, **kwargs: Value) -> None:
-        """Update from dict or kwargs."""
-        self._reject_empty_in(other or {})
-        self._reject_empty_in(kwargs)
-        if other:
-            for key, value in other.items():
-                self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value  # type: ignore[index]
+    def update(self, other: object = (), /, **kwargs: Value) -> None:
+        """Update as ``dict.update``. The whole batch is checked for EMPTY before the first write."""
+        items = self._update_items(other, kwargs)
+        self._reject_empty_in(items)
+        for key, value in items.items():
+            self[key] = value
 
     def extract(self) -> dict[str | int, Value]:
         """Extract all items as dict."""
@@ -184,6 +220,12 @@ class _LightValuesView(ValuesView):
         for _k, v in self._mapping.container.iter_children(validate=False, strict=True):
             yield cast("Value", v.primitive_value)
 
+    def __reversed__(self) -> Generator[Value, None, None]:
+        for _k, v in self._mapping.container.iter_children(
+            validate=False, strict=True, reverse=True
+        ):
+            yield cast("Value", v.primitive_value)
+
 
 class _LightItemsView(ItemsView):
     """Efficient ItemsView for LightDictView — single-pass iteration."""
@@ -194,5 +236,8 @@ class _LightItemsView(ItemsView):
         for k, v in self._mapping.container.iter_children(validate=False, strict=True):
             yield k, cast("Value", v.primitive_value)
 
-
-MutableMapping.register(LightDictView)
+    def __reversed__(self) -> Generator[tuple[str | int, Value], None, None]:
+        for k, v in self._mapping.container.iter_children(
+            validate=False, strict=True, reverse=True
+        ):
+            yield k, cast("Value", v.primitive_value)

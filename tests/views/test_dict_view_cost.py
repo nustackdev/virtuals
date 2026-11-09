@@ -317,3 +317,37 @@ def test_kh57_scan_cost_scales_with_children_not_descendants(storage, counts, vi
     assert costs[50] == costs[500], costs
     # one row per child, one peek into each subtree before the seek, one row per level
     assert costs[500]["scan_rows"] <= 2 * children + KH57_LEVELS + 2, costs
+
+
+# =============================================================================
+# CURSOR PAGING: O(limit), NOT O(dict)
+# =============================================================================
+
+
+@pytest.mark.parametrize("direction", ["forward", "reverse"])
+def test_dict_page_cost_tracks_limit_not_size(storage, counts, direction):
+    """A page of 3 after a cursor reads the same rows on 10 and 1000 compound keys."""
+
+    def page(root: EagerDictView) -> list:
+        d = root.open_child("d", EagerDictView)
+        if direction == "forward":
+            return list(d.keys(after="k5", limit=3))
+        return list(d.reversed_keys(before="k5", limit=3))
+
+    costs = {}
+    pages = {}
+    for n in SIZES:
+        _fill(storage, EagerDictView, n, _compound(5))
+        costs[n] = _measure(storage, counts, page)
+        with storage.snapshot() as snap:
+            pages[n] = page(Navigator(storage).root(snap))
+
+    assert costs[SIZES[0]] == costs[SIZES[-1]], costs
+    assert costs[SIZES[0]]["scan"] == 1, costs
+    # cursor row, its subtree peek, then each child plus one peek into it
+    assert costs[SIZES[0]]["scan_rows"] <= 2 * 3 + 3, costs
+    for n in SIZES:
+        ordered = sorted(f"k{i}" for i in range(n))
+        at = ordered.index("k5")
+        want = ordered[at + 1 : at + 4] if direction == "forward" else ordered[at - 3 : at][::-1]
+        assert pages[n] == want, (n, pages[n])

@@ -42,6 +42,7 @@ from virtuals._views import (
 from virtuals.container import ContainerNotFoundError, ContainerTypeError
 from virtuals.navigator import Navigator
 from virtuals.types import EMPTY
+from virtuals.view import Faceted
 
 
 NESTED_VIEWS = (
@@ -57,9 +58,6 @@ FLAT_VIEWS = (FlatDictView, LightDictView, EagerKh57View)
 """Dict views whose values are primitives only."""
 
 DICT_VIEWS = (*NESTED_VIEWS, *FLAT_VIEWS)
-
-SILENT_DELETE_VIEWS = (EagerDictView, LazyDictView, FlatDictView, LightDictView)
-"""Views whose delete of a missing key is a no-op; the others raise KeyError."""
 
 
 def _key(view_cls, i):
@@ -110,11 +108,8 @@ def costed(request, tmp_path, monkeypatch):
 def test_delete_on_absent_view_does_not_create_it(root, view_cls):
     view = root.open_child("absent", view_cls)
     key = _key(view_cls, 1)
-    if view_cls in SILENT_DELETE_VIEWS:
+    with pytest.raises(KeyError):
         del view[key]
-    else:
-        with pytest.raises(KeyError):
-            del view[key]
     _assert_absent(view)
     assert _lacks(view, key)
 
@@ -124,19 +119,26 @@ def test_delete_on_absent_nested_view_leaves_the_chain_absent(root, view_cls):
     """``del a.b["k"]`` on an absent chain stamps neither ``a`` nor ``b``."""
     outer = root.open_child("a", EagerDictView)
     inner = outer.open_child("b", view_cls)
-    del inner["k"]
+    with pytest.raises(KeyError):
+        del inner["k"]
     assert not inner.container.exists()
     assert not outer.container.exists()
     assert _lacks(root, "a")
 
 
-@pytest.mark.parametrize("view_cls", SILENT_DELETE_VIEWS)
-def test_delete_missing_key_on_existing_view_is_silent(root, view_cls):
+@pytest.mark.parametrize("view_cls", (EagerDictView, LazyDictView, FlatDictView, LightDictView))
+def test_delete_missing_key_on_existing_view_raises_and_keeps_the_rest(root, view_cls):
     view = root.open_child("d", view_cls)
     view["a"] = 1
-    del view["zz"]
+    with pytest.raises(KeyError):
+        del view["zz"]
     assert list(view) == ["a"]
     assert len(view) == 1
+
+
+def _delete_missing(root, view_cls):
+    with pytest.raises(KeyError):
+        del root.open_child("d", view_cls)["zz"]
 
 
 @pytest.mark.parametrize("view_cls", (EagerDictView, FlatDictView))
@@ -146,9 +148,7 @@ def test_delete_missing_key_cost_is_constant_and_writes_nothing(costed, view_cls
         if present:
             with storage.transaction() as tx:
                 Navigator(storage).root(tx).open_child("d", view_cls).store({"a": 1})
-        cost = measure(
-            storage, counts, lambda root: root.open_child("d", view_cls).__delitem__("zz")
-        )
+        cost = measure(storage, counts, lambda root: _delete_missing(root, view_cls))
         assert cost["put"] == 0 and cost["delete"] == 0, (present, cost)
         assert cost["scan"] == 0, (present, cost)
         assert cost["get"] + cost["exists"] <= 3, (present, cost)
@@ -847,7 +847,7 @@ def test_fractional_nested_empty_insert_leaves_no_trace(root):
     assert _lacks(view, "x")
     assert len(view) == 2
     assert list(view) == ["a", "b"]
-    assert view.get("x") is EMPTY
+    assert view.get("x") is None
     assert not view._data_container().exists_child("x")
     assert list(view.items()) == [("a", 1), ("b", 2)]
     with pytest.raises(ValueError, match="EMPTY"):
@@ -940,7 +940,7 @@ def test_changing_a_keys_kind_raises_and_keeps_the_old_value(root, view_cls):
     with pytest.raises(ContainerTypeError):
         view.set_child_container_as("p", {"z": 2}, EagerDictView)
     assert _rows_under(view) == rows
-    eager = getattr(view, "eager", view)
+    eager = view.eager
     assert eager.extract() == {"p": 1, "c": {"z": 1}}
     assert set(view) == {"p", "c"}
     del view["p"]
@@ -1020,7 +1020,7 @@ def test_none_is_a_stored_value(storage, view_cls):
         assert k in view
         assert view[k] is None
         assert view.get(k, "dflt") is None
-        assert getattr(view, "eager", view).extract() == {k: None}
+        assert (view.eager if isinstance(view, Faceted) else view).extract() == {k: None}
 
 
 def test_none_is_a_stored_list_item(storage):
@@ -1037,7 +1037,7 @@ def test_none_is_a_stored_list_item(storage):
 
 
 # ============================================================================
-# ACCESS: every dict-like view mimics dict, with EMPTY as the absent default
+# ACCESS: every dict-like view mimics dict
 # ============================================================================
 
 ACCESS_VIEWS = (
@@ -1050,21 +1050,35 @@ ACCESS_VIEWS = (
 """Every dict-like view and facet. A new dict view belongs here."""
 
 
+@pytest.mark.parametrize(
+    "view_cls", [v for v in ACCESS_VIEWS if v not in (EagerKh57View, LazyKh57View)]
+)
+def test_reversed_reads_keys_values_and_items_last_first(root, view_cls):
+    """Every ordered dict view reverses like a dict: itself, its keys, values and items."""
+    view = root.open_child("d", view_cls)
+    view.store({"k2": 2, "k1": 1, "k3": 3})
+    keys = list(view)
+    assert list(reversed(view)) == keys[::-1]
+    assert list(reversed(view.keys())) == keys[::-1]
+    assert list(reversed(view.values())) == list(view.values())[::-1]
+    assert list(reversed(view.items())) == list(view.items())[::-1]
+
+
 @pytest.mark.parametrize("view_cls", ACCESS_VIEWS)
-def test_access_mimics_dict_with_empty_as_the_absent_default(storage, view_cls):
+def test_access_mimics_dict(storage, view_cls):
     """The three access rules, on an absent view, in a transaction and in a snapshot.
 
     ``view[key]`` on an absent key raises KeyError. ``view.get(key)`` returns
-    EMPTY, never None, and ``view.get(key, default)`` returns the given
-    default. None is a stored value, never a marker for absent. ``pop``
-    follows ``get``. A read never creates the view.
+    None, as ``dict.get`` does, and ``view.get(key, default)`` returns the
+    given default. None is also a value a view stores: ``in`` tells the two
+    apart. ``pop`` follows ``get``. A read never creates the view.
     """
     key, absent = _key(view_cls, 1), _key(view_cls, 2)
 
     def check_absent_key(view):
         with pytest.raises(KeyError):
             view[absent]
-        assert view.get(absent) is EMPTY
+        assert view.get(absent) is None
         assert view.get(absent, "dflt") == "dflt"
         assert view.get(absent, None) is None
         assert _lacks(view, absent)
@@ -1164,16 +1178,13 @@ def test_a_key_the_view_cannot_hold_is_absent_on_reads_and_rejected_on_writes(ro
     for bad in foreign:
         with pytest.raises(KeyError):
             view[bad]
-        assert view.get(bad) is EMPTY
+        assert view.get(bad) is None
         assert view.get(bad, "dflt") == "dflt"
         assert _lacks(view, bad)
         with pytest.raises((TypeError, ValueError)):
             view[bad] = 2
-        if view_cls in SILENT_DELETE_VIEWS:
+        with pytest.raises(KeyError):
             del view[bad]
-        else:
-            with pytest.raises(KeyError):
-                del view[bad]
         if hasattr(view, "pop"):
             with pytest.raises(KeyError):
                 view.pop(bad)
@@ -1192,7 +1203,7 @@ def test_kh57_reads_follow_python_int_key_semantics(root, view_cls):
         assert view[alias] == "one"
         assert view.get(alias) == "one"
     assert _lacks(view, 1.5)
-    assert view.get(1.5) is EMPTY
+    assert view.get(1.5) is None
     with pytest.raises(KeyError):
         view[1.5]
     with pytest.raises(TypeError):

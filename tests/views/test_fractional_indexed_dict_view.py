@@ -19,6 +19,7 @@ import pytest
 from virtuals._views import (
     EagerDictView,
     EagerFractionalIndexedDictView,
+    LazyDictView,
     LazyFractionalIndexedDictView,
 )
 from virtuals._views.fractional_index import validate_order_key
@@ -34,7 +35,6 @@ from virtuals.storages.rocksdb import RocksDBStorage
 from virtuals.storages.sqlite import SQLiteStorage
 from virtuals.tkv.storage import StorageLockTimeoutError, StorageTransactionConflictError
 from virtuals.tkv.transport import InMemoryTransport
-from virtuals.types import is_empty
 
 
 BACKENDS = ("mem", "sqlite", "lmdb", "rocksdb")
@@ -130,10 +130,11 @@ def test_empty(fdict):
     view = fdict()
     assert len(view) == 0
     assert list(view) == []
-    assert view.first() is None
-    assert view.last() is None
+    for edge in (view.first, view.last):
+        with pytest.raises(IndexError):
+            edge()
     assert "a" not in view
-    assert is_empty(view.get("a"))
+    assert view.get("a") is None
     assert view.get("a", "dflt") == "dflt"
 
 
@@ -210,10 +211,10 @@ def test_set_primitive_blob(fdict):
     assert view["b"] == [1, 2]
 
 
-def test_get_missing_returns_empty(fdict):
-    """Dict access with EMPTY as the absent default: get of a missing id is EMPTY, never None."""
+def test_get_missing_returns_none(fdict):
+    """Dict access: get of a missing id is None, as ``dict.get``."""
     view = fdict("lst", {"a": 1})
-    assert is_empty(view.get("zz"))
+    assert view.get("zz") is None
     assert view.get("a") == 1
 
 
@@ -500,16 +501,118 @@ def test_keys_after_with_limit_is_exact(fdict):
     assert list(view.keys(after="g", limit=3)) == []
     assert list(view.keys(after="f", limit=3)) == ["g"]
     with pytest.raises(KeyError):
-        list(view.keys(after="zz"))
+        view.keys(after="zz")  # raised at the call, before any read
+    with pytest.raises(KeyError):
+        view.reversed_keys(before="zz")
 
 
-def test_keys_reverse_before_with_limit_is_exact(fdict):
+def test_keys_after_a_cursor_of_the_wrong_type_raises_type_error(fdict):
+    view = fdict("lst", {"a": 1})
+    with pytest.raises(TypeError):
+        view.keys(after=1.5)
+
+
+def test_reversed_keys_before_with_limit_is_exact(fdict):
     view = fdict("lst", {k: i for i, k in enumerate("abcdefg")})
-    assert list(view.keys_reverse(before="f", limit=3)) == ["e", "d", "c"]
-    assert list(view.keys_reverse(before="f")) == ["e", "d", "c", "b", "a"]
-    assert list(view.keys_reverse(limit=2)) == ["g", "f"]
-    assert list(view.keys_reverse(before="a", limit=3)) == []
-    assert list(view.keys_reverse(before="b", limit=3)) == ["a"]
+    assert list(view.reversed_keys(before="f", limit=3)) == ["e", "d", "c"]
+    assert list(view.reversed_keys(before="f")) == ["e", "d", "c", "b", "a"]
+    assert list(view.reversed_keys(limit=2)) == ["g", "f"]
+    assert list(view.reversed_keys(before="a", limit=3)) == []
+    assert list(view.reversed_keys(before="b", limit=3)) == ["a"]
+
+
+def _follow(view, cursor=None):
+    """Every (order key, id) past ``cursor``, one ``next_key_after`` call each."""
+    rows = []
+    while (row := view.next_key_after(cursor)) is not None:
+        rows.append(row)
+        cursor = row[0]
+    return rows
+
+
+def test_next_key_after_steps_by_order_key(fdict):
+    view = fdict("lst", {"a": 1, "b": 2, "c": 3})
+    rows = _follow(view)
+    assert [address for _, address in rows] == ["a", "b", "c"]
+    assert rows == list(view.positions())
+    assert view.next_key_after(rows[-1][0]) is None
+
+
+def test_next_key_after_resumes_past_a_deleted_id(fdict):
+    view = fdict("lst", {"a": 1, "b": 2, "c": 3})
+    cursor = view.position("b")
+    del view["b"]
+    view["d"] = 4
+    assert [address for _, address in _follow(view, cursor)] == ["c", "d"]
+
+
+@pytest.mark.parametrize("rounds", [40])
+def test_next_key_after_sees_an_append_past_a_deleted_last_id(fdict, rounds):
+    # The new key is drawn with a random tail; without the end mark it lands
+    # below the deleted last key about half the time.
+    view = fdict("lst", {"a": 1})
+    for i in range(rounds):
+        cursor = view.position(view.last())
+        del view[view.last()]
+        view[f"n{i}"] = i
+        assert [address for _, address in _follow(view, cursor)] == [f"n{i}"]
+
+
+def test_next_key_after_sees_an_append_to_a_view_emptied_under_the_cursor(fdict):
+    for i in range(40):
+        view = fdict(f"lst{i}", {"a": 1})
+        cursor = view.position("a")
+        del view["a"]
+        view["b"] = 2
+        assert [address for _, address in _follow(view, cursor)] == ["b"]
+
+
+def test_next_key_after_sees_an_append_past_a_last_id_moved_away(fdict):
+    for i in range(40):
+        view = fdict(f"lst{i}", {"a": 1, "b": 2})
+        cursor = view.position("b")
+        view.move_first("b")
+        view["c"] = 3
+        assert [address for _, address in _follow(view, cursor)] == ["c"]
+
+
+def test_next_key_after_sees_an_append_after_clear(fdict):
+    for i in range(20):
+        view = fdict(f"lst{i}", {"a": 1, "b": 2})
+        cursor = view.position("b")
+        view.clear()
+        view["c"] = 3
+        assert [address for _, address in _follow(view, cursor)] == ["c"]
+
+
+def test_end_mark_is_not_an_id(fdict):
+    view = fdict("lst", {"a": 1, "b": 2})
+    del view["b"]
+    view["c"] = 3
+    assert list(view) == ["a", "c"]
+    assert len(view) == 2
+    assert view.extract() == {"a": 1, "c": 3}
+
+
+def test_a_middle_delete_writes_no_end_mark(fdict):
+    view = fdict("lst", {"a": 1, "b": 2, "c": 3})
+    del view["b"]
+    assert view._end_mark() is None
+    del view["c"]
+    assert view._end_mark() is not None
+
+
+def test_next_key_after_on_an_empty_view_is_none(fdict):
+    view = fdict("lst", {"a": 1})
+    del view["a"]
+    assert view.next_key_after(None) is None
+
+
+def test_next_key_after_on_a_never_written_view_raises(broot):
+    view = broot.open_child("absent", EagerFractionalIndexedDictView)
+    with pytest.raises(ContainerNotFoundError):
+        view.next_key_after(None)
+    assert not view.container.exists()
 
 
 def test_keys_returns_keysview_without_args(fdict):
@@ -550,11 +653,11 @@ def test_lazy_facet_returns_views(fdict):
     lazy = view.lazy
     assert isinstance(lazy, LazyFractionalIndexedDictView)
     child = lazy["a"]
-    assert isinstance(child, EagerDictView)
+    assert isinstance(child, LazyDictView)  # lazy all the way down
     assert child["n"] == 1
     assert lazy["b"] == 2
     assert list(lazy) == ["a", "b"]
-    assert [type(v).__name__ for v in lazy.values()] == ["EagerDictView", "int"]
+    assert [type(v).__name__ for v in lazy.values()] == ["LazyDictView", "int"]
     assert lazy.extract() == {"a": {"n": 1}, "b": 2}
     assert isinstance(lazy.eager, EagerFractionalIndexedDictView)
     assert lazy.eager.extract() == {"a": {"n": 1}, "b": 2}
@@ -873,7 +976,7 @@ def test_failed_value_write_leaves_no_trace(broot):
     assert list(view) == ["a", "b"]
     assert list(view.items()) == [("a", 1), ("b", 2)]
     assert view.extract() == {"a": 1, "b": 2}
-    assert is_empty(view.get("x"))
+    assert view.get("x") is None
     with pytest.raises(KeyError):
         view["x"]
     with pytest.raises(KeyError):
@@ -1384,7 +1487,7 @@ def _ops(n):
         "next_after": lambda v: v.next_after(_mid(n)),
         "prev_before": lambda v: v.prev_before(_mid(n)),
         "keys_after_limit3": lambda v: list(v.keys(after=_mid(n), limit=3)),
-        "keys_reverse_limit3": lambda v: list(v.keys_reverse(before=_mid(n), limit=3)),
+        "reversed_keys_limit3": lambda v: list(v.reversed_keys(before=_mid(n), limit=3)),
         "set_existing": lambda v: v.__setitem__(_mid(n), -1),
         "set_new": lambda v: v.__setitem__("set_new", -1),
         "append": lambda v: v.append("app", -1),
@@ -1429,9 +1532,13 @@ def test_key_touches_are_constant_in_n(backend, tmp_path):
         at_1000 = _measure(large, 1000)
     finally:
         large.close()
+    # An op that takes an order row away seeks once more, to tell whether
+    # the row was the last one (the end mark).
+    retiring = {"move_before", "move_after", "move_first", "move_last", "delete"}
     for name in at_10:
         assert at_10[name] == at_1000[name], (name, at_10[name], at_1000[name])
-        assert at_10[name].get("scan", 0) <= 1, (name, at_10[name])
+        max_scans = 2 if name in retiring else 1
+        assert at_10[name].get("scan", 0) <= max_scans, (name, at_10[name])
         assert at_10[name].get("scan_row", 0) <= 5, (name, at_10[name])
         assert sum(at_10[name].values()) <= 30, (name, at_10[name])
     print(f"\n{backend} key touches per op (n=10 == n=1000):")
@@ -1577,7 +1684,7 @@ def test_failed_compound_write_leaves_no_data(broot):
     assert "x" not in view
     assert len(view) == 2
     assert list(view) == ["a", "b"]
-    assert is_empty(view.get("x"))
+    assert view.get("x") is None
     assert not view._data_container().exists_child("x")
     assert list(view.items()) == [("a", 1), ("b", 2)]
     _assert_consistent(view)
@@ -1596,6 +1703,6 @@ def test_failed_compound_write_over_stale_data_leaves_no_data(broot):
     with pytest.raises(RuntimeError, match="boom"):
         view.append("x", {"new": 1, "boom": 2})
     assert "x" not in view
-    assert is_empty(view.get("x"))
+    assert view.get("x") is None
     assert not view._data_container().exists_child("x")
     _assert_consistent(view)

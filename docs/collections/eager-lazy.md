@@ -14,6 +14,8 @@ DictViewBase                  shared: mutations, keys, lifecycle
 
 Cross-navigation is a first-class operation. Switching facets creates a lightweight view over the same container — no data copied, no state carried over.
 
+A view with both facets inherits `Faceted` (from `virtuals.view`): dict, list, indexed, fractional indexed, log indexed and kh57 views. The rest (set, frozenset, tuple, bytearray, ring, flat and light views) hand out plain values only and have no `eager` or `lazy` attribute, so `issubclass(view_class, Faceted)` decides from the class alone whether to switch.
+
 ## How It Works
 
 ```python
@@ -45,17 +47,18 @@ users.lazy["score"]         # → 42 (not a View)
 
 ## Not a Mode
 
-`.lazy` is a **facet**, not a configuration. Child views returned from lazy access are eager by default:
+`.lazy` is a **facet**, not a configuration. A child view returned from lazy access is lazy too, all the way down; the eager facet hands out plain data at every level:
 
 ```python
 for user_view in islice(users.lazy.values(), 3):
-    # user_view is an EagerDictView — defaults to eager
-    user_view["name"]           # → "Alice" (value)
-    user_view.lazy["name"]      # → "Alice" (also value — it's a primitive)
-    user_view.extract()         # → {"name": "Alice", "role": "admin", "score": 95}
+    # user_view is a LazyDictView: its compound children read as Views too
+    user_view["name"]           # → "Alice" (value — it's a primitive)
+    user_view["tags"]           # → LazyListView
+    user_view.eager["tags"]     # → ["admin"] (value)
+    user_view.extract()         # → {"name": "Alice", "tags": ["admin"], "score": 95}
 ```
 
-Each navigation step, you choose eager or lazy independently. No hidden state.
+Switch facets at any step with `.eager` / `.lazy`. No hidden state.
 
 ## What Differs Between Facets
 
@@ -126,7 +129,7 @@ Only views that support **nested containers** need the eager/lazy split:
 
 ```text
 DictViewBase                    shared mutations, keys, contains, len, lifecycle
-├── EagerDictView               eager reads, extract(), functional ops
+├── EagerDictView               eager reads, extract()
 └── LazyDictView                lazy reads, facet cross-navigation
 ```
 

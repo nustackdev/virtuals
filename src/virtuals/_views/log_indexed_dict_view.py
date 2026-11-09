@@ -29,7 +29,12 @@ scan on delete; ``rebuild_bookkeeping()`` fills the index.
 Ordered enumeration via ``__keys__/`` prefix scan (lexicographic =
 chronological). Direct lookup via ``__data__.[key]`` (skips ``__keys__``).
 
-Cursor-friendly: ``keys(after=cursor)`` seeks into ``__keys__/`` log.
+Cursors. ``keys(after=id, limit=)`` and ``reversed_keys(before=id, limit=)``
+page by an item's own id: the reverse index gives its log key in one get,
+then one seek into ``__keys__/``. An id that is gone raises KeyError, like
+``FractionalIndexedDictView``: its log slot went with it. Streams that must
+resume past deleted rows hold the log key instead
+(``keys_with_log_keys(after=)``, ``next_key_after``).
 """
 
 from __future__ import annotations
@@ -37,9 +42,10 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
+from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from virtuals.collections import DictMethods, ReactiveMappingBase
 from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType
 from virtuals.tkv.filter import LengthFilter, PrefixFilter, WildcardFilter
 from virtuals.tkv.observer import SubscriptionOptions
@@ -52,6 +58,8 @@ from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
     DescendantsObservableBase,
+    Faceted,
+    KeyNotFoundError,
     LazyChildReadBase,
     ObservableBase,
     PrimitiveOpsBase,
@@ -59,6 +67,8 @@ from virtuals.view import (
     ViewBase,
     is_view_key,
 )
+
+from ._keys_view import ReversibleKeysView
 
 
 if TYPE_CHECKING:
@@ -118,7 +128,10 @@ class LogIndexedDictViewBase(
     LazyChildReadBase,
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
+    Faceted,
     ViewBase,
+    ReactiveMappingBase[str | int, object],
+    DictMethods[str | int, object],
 ):
     """Dict view with append-only log key index for multi-writer safety.
 
@@ -126,7 +139,7 @@ class LogIndexedDictViewBase(
     for nested data with controlled granularity. No ``__len__`` metadata.
 
     Multi-writer safe: each writer generates unique log keys independently.
-    Cursor-friendly: ``keys(after=cursor)`` for seek-based iteration.
+    Pages by item id: ``keys(after=id, limit=)``, ``reversed_keys(before=id, limit=)``.
     """
 
     STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(15)
@@ -200,6 +213,33 @@ class LogIndexedDictViewBase(
     def _log_key_or_empty(self, actual_key: str | int) -> str | Empty:
         """Log key of ``actual_key`` from the reverse index, EMPTY if unrecorded. One get."""
         return cast("str | Empty", self._log_container().get_child_primitive_unsafe(actual_key))
+
+    def _find_log_key(self, actual_key: str | int) -> str | Empty:
+        """Log key of a key that holds data, EMPTY if the log never recorded it.
+
+        One reverse-index get, one get to confirm the log row still names
+        this key. A missing reverse row (data logged before ``__log__/``
+        existed) or a stale one (a writer that does not maintain the index
+        deleted and re-set the key) falls back to a log scan.
+        """
+        log_key = self._log_key_or_empty(actual_key)
+        if not is_empty(log_key):
+            held = self._keys_container().get_child_primitive_unsafe(cast("str", log_key))
+            if not is_empty(held) and held == actual_key:
+                return log_key
+        for candidate, logged in self._scan_log_keys():
+            if logged == actual_key:
+                return candidate
+        return EMPTY
+
+    def _require_log_key(self, actual_key: str | int) -> str:
+        """Log key of ``actual_key`` as a cursor. KeyError if the id holds no data."""
+        if actual_key not in self:
+            raise KeyNotFoundError(actual_key)
+        log_key = self._find_log_key(actual_key)
+        if is_empty(log_key):
+            raise KeyNotFoundError(actual_key)
+        return cast("str", log_key)
 
     # -- Bookkeeping -------------------------------------------------------
 
@@ -394,62 +434,83 @@ class LogIndexedDictViewBase(
     def keys(
         self,
         *,
-        after: str | None = None,
+        after: str | int | None = None,
         limit: int | None = None,
     ) -> KeysView[str | int] | Generator[str | int, None, None]:
-        """Get keys in insertion order.
+        """Keys in insertion order.
+
+        With no arguments: a set-like KeysView. With ``after`` or ``limit``:
+        a generator, a page of the keys logged after the item ``after``
+        (from the oldest when None), at most ``limit`` of them.
 
         Args:
-            after: If provided, start iteration past this log-key cursor.
-            limit: Optional cap on the number of keys yielded.
-                Requires ``after`` or triggers a generator (KeysView has
-                no natural cap).
-        """
-        if after is not None or limit is not None:
-            return self._keys_scan(after=after, limit=limit)
-        return KeysView(self)  # type: ignore[arg-type]
+            after: An item id held by the view. KeyError if it holds no
+                data. Cost: about three gets to find its log slot; an id
+                whose reverse ``__log__/`` row is missing or stale (data
+                logged before that index, or by a writer that skips it)
+                falls back to a ``__keys__/`` scan, O(n).
+            limit: Cap on the number of keys yielded.
 
-    def keys_reverse(
+        Cost: O(limit) rows from one seek into ``__keys__/``.
+        """
+        if after is None and limit is None:
+            return ReversibleKeysView(self)
+        return self._keys_page(cursor=after, limit=limit, reverse=False)
+
+    def reversed_keys(
         self,
         *,
-        before: str | None = None,
+        before: str | int | None = None,
         limit: int | None = None,
     ) -> Generator[str | int, None, None]:
-        """Yield actual keys in reverse insertion order (newest first).
+        """Keys newest first, logged before the item ``before``, at most ``limit``.
 
-        Args:
-            before: If provided, start just below this log-key cursor
-                (older-than semantics).
-            limit: Optional cap on the number of keys yielded.
-
-        Cost: O(limit) via a reverse rocksdb range scan over ``__keys__/``,
-        so ``keys_reverse(limit=n)`` is safe against arbitrarily large
-        streams -- the natural fit for tail-N reads on this view.
+        From the newest when ``before`` is None. ``before`` is an item id,
+        KeyError if it holds no data, resolved as in ``keys(after=)`` (the
+        same O(n) fallback for a missing or stale ``__log__/`` row). Cost:
+        O(limit) rows from one reverse seek, so a tail-N read stays cheap on
+        any size of log.
         """
-        for _log_key, actual_key in self._scan_log_keys(
-            reverse=True,
-            before=before,
-            limit=limit,
-        ):
+        return self._keys_page(cursor=before, limit=limit, reverse=True)
+
+    def _keys_page(
+        self, *, cursor: str | int | None, limit: int | None, reverse: bool
+    ) -> Generator[str | int, None, None]:
+        """One page of actual keys. The cursor id resolves to its log key eagerly."""
+        if cursor is not None and not is_view_key(cursor):
+            raise TypeError(f"view keys must be str or int, got {type(cursor).__name__}")
+        log_key = None if cursor is None else self._require_log_key(cursor)
+        return self._iter_page(log_key, limit=limit, reverse=reverse)
+
+    def _iter_page(
+        self, log_key: str | None, *, limit: int | None, reverse: bool
+    ) -> Generator[str | int, None, None]:
+        if reverse:
+            rows = self._scan_log_keys(reverse=True, before=log_key, limit=limit)
+        else:
+            rows = self._scan_log_keys(after=log_key, limit=limit)
+        for _log_key, actual_key in rows:
             yield actual_key
 
-    def _keys_scan(
-        self,
-        *,
-        after: str | None,
-        limit: int | None,
-    ) -> Generator[str | int, None, None]:
-        """Yield actual keys with forward cursor + optional cap."""
-        for _log_key, actual_key in self._scan_log_keys(after=after, limit=limit):
-            yield actual_key
+    def first(self) -> str | int:
+        """Oldest key. One seek. IndexError when empty, as ``seq[0]``."""
+        for _log_key, actual_key in self._scan_log_keys(limit=1):
+            return actual_key
+        raise IndexError("first() of an empty collection")
+
+    def last(self) -> str | int:
+        """Newest key. One reverse seek. IndexError when empty, as ``seq[-1]``."""
+        for _log_key, actual_key in self._scan_log_keys(reverse=True, limit=1):
+            return actual_key
+        raise IndexError("last() of an empty collection")
 
     def keys_with_log_keys(
         self, *, after: str | None = None
     ) -> Generator[tuple[str, str | int], None, None]:
-        """Yield (log_key, actual_key) pairs for cursor tracking.
+        """Yield (log_key, actual_key) pairs, past the log key ``after``.
 
-        This is the primary method for Stream consumers that need to
-        advance a cursor.
+        The log-key cursor: unlike an item id, a log key still marks a
+        position after its item is deleted, so a stream resumes past it.
         """
         yield from self._scan_log_keys(after=after)
 
@@ -463,13 +524,6 @@ class LogIndexedDictViewBase(
         for entry in self._scan_log_keys(after=cursor):
             return entry  # first result only
         return None
-
-    def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        """Value at ``address``, or ``default`` (EMPTY) when the key is absent."""
-        try:
-            return self[address]
-        except KeyError:
-            return default
 
     # -- Mutations ---------------------------------------------------------
 
@@ -492,27 +546,15 @@ class LogIndexedDictViewBase(
         # No ensure_created here: deletes must not materialize the view as
         # a side effect. If the underlying __data__/ container doesn't
         # exist yet, exists_child returns False against raw storage and we
-        # raise KeyError -- matching Python dict semantics and letting ref
-        # callers no-op via their KeyError/IndexError catch.
+        # raise KeyNotFoundError -- a KeyError, matching Python dict
+        # semantics.
         dc = self._data_container()
         if not is_view_key(address) or not dc.exists_child(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc.delete_child(address)
-        # Drop the log entry: one reverse-index get, one get to confirm the
-        # log row still names this key, then two point deletes. A missing
-        # reverse row (data logged before ``__log__/`` existed) or a stale
-        # one (a writer that does not maintain the index deleted and re-set
-        # the key) falls back to a log scan, as before the index.
-        log_key = self._log_key_or_empty(address)
-        if not is_empty(log_key):
-            held = self._keys_container().get_child_primitive_unsafe(cast("str", log_key))
-            if is_empty(held) or held != address:
-                log_key = EMPTY
-        if is_empty(log_key):
-            for candidate, actual_key in self._scan_log_keys():
-                if actual_key == address:
-                    log_key = candidate
-                    break
+        # Drop the log entry: found in two gets (a scan only for data
+        # logged before the reverse index), then two point deletes.
+        log_key = self._find_log_key(address)
         if not is_empty(log_key):
             self._keys_container().delete_child_primitive_unsafe(cast("str", log_key))
             self._log_container().delete_child_primitive_unsafe(address)
@@ -559,14 +601,12 @@ class LogIndexedDictViewBase(
         self[key] = value
         return key
 
-    def update(self, other: PyMapping[str | int, object] | None = None, **kwargs: object) -> None:
-        self._reject_empty_in(other or {})
-        self._reject_empty_in(kwargs)
-        if other:
-            for key, value in other.items():
-                self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value  # type: ignore[assignment]
+    def update(self, other: object = (), /, **kwargs: object) -> None:
+        """Update as ``dict.update``. The whole batch is checked for EMPTY before the first write."""
+        items = self._update_items(other, kwargs)
+        self._reject_empty_in(items)
+        for key, value in items.items():
+            self[key] = value
 
     def store(self, value: PyMapping[str | int, object], *, replace: bool = True) -> None:
         value = self._reject_empty_in(value)  # type: ignore[assignment]
@@ -592,14 +632,14 @@ class LogIndexedDictViewBase(
 
     def _read_child_from_data(self, address: str | int) -> tuple[object, bool]:
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc = self._data_container()
         child_site = (*dc.site, address)
         from virtuals.container import node_ops
 
         node_info = node_ops.get_node_info(child_site, dc.ctx)
         if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         return node_info, node_info.node_type == NodeType.CONTAINER
 
     def _extract_data_child(self, address: str | int, node_info: object) -> object:
@@ -623,7 +663,7 @@ class LogIndexedDictViewBase(
         if node_info.structure is None:  # type: ignore[union-attr]
             raise ValueError(f"Child container '{address}' has no structure ID")
         view_class = self.registry.get_view_for_structure(node_info.structure)  # type: ignore[union-attr]
-        return view_class(container=child_container, registry=self.registry, parent=self)
+        return view_class(container=child_container, registry=self.registry, parent=self).lazy
 
 
 # =============================================================================
@@ -640,7 +680,7 @@ class EagerLogIndexedDictView(LogIndexedDictViewBase):
         node_info, is_container = self._read_child_from_data(address)
         if not is_container:
             if is_empty(node_info.primitive_value):  # type: ignore[union-attr]
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value  # type: ignore[union-attr]
         return self._extract_data_child(address, node_info)
 
@@ -696,16 +736,6 @@ class EagerLogIndexedDictView(LogIndexedDictViewBase):
             else:
                 yield actual_key, self._extract_data_child(actual_key, node_info)
 
-    def pop(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        try:
-            value = self[address]
-            del self[address]
-            return value
-        except KeyError:
-            if is_empty(default):
-                raise
-            return default
-
     def extract(self) -> dict[str | int, object]:
         return {k: self[k] for k in self}
 
@@ -732,7 +762,7 @@ class LazyLogIndexedDictView(LogIndexedDictViewBase):
         node_info, is_container = self._read_child_from_data(address)
         if not is_container:
             if is_empty(node_info.primitive_value):  # type: ignore[union-attr]
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value  # type: ignore[union-attr]
         return self._view_data_child(address, node_info)
 
@@ -893,6 +923,3 @@ class _LazyLogIndexedReversedItemsView(ItemsView):
 
     def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
         yield from self._mapping._iter_items_reverse()
-
-
-MutableMapping.register(LogIndexedDictViewBase)

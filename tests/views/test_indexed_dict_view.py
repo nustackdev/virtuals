@@ -2,6 +2,8 @@
 
 from itertools import islice
 
+import pytest
+
 from virtuals._views import EagerIndexedDictView, LazyIndexedDictView
 from virtuals.view import ViewBase
 
@@ -113,6 +115,45 @@ def test_indexed_dict_keys(indexed_dict_factory):
     dct = indexed_dict_factory("dct", {"a": 1, "b": 2, "c": 3})
     keys = list(dct.keys())
     assert set(keys) == {"a", "b", "c"}
+
+
+def test_indexed_dict_keys_after_pages_in_insertion_order(indexed_dict_factory):
+    dct = indexed_dict_factory("dct", {"c": 3, "a": 1, "b": {"x": 1}, 5: 0})
+
+    assert list(dct.keys(limit=2)) == ["c", "a"]
+    assert list(dct.keys(after="a", limit=2)) == ["b", 5]
+    assert list(dct.keys(after=5)) == []
+    assert list(dct.keys(after="c")) == ["a", "b", 5]
+    assert list(dct.keys(limit=0)) == []
+
+
+def test_indexed_dict_reversed_keys_pages_last_first(indexed_dict_factory):
+    dct = indexed_dict_factory("dct", {"c": 3, "a": 1, "b": {"x": 1}, 5: 0})
+
+    assert list(dct.reversed_keys()) == [5, "b", "a", "c"]
+    assert list(dct.reversed_keys(limit=2)) == [5, "b"]
+    assert list(dct.reversed_keys(before="a", limit=5)) == ["c"]
+    assert list(dct.reversed_keys(before="c")) == []
+
+
+def test_indexed_dict_paging_cursor_must_be_held(indexed_dict_factory):
+    """A cursor is a key the view holds, as on the log and fractional views; checked at the call."""
+    dct = indexed_dict_factory("dct", {"a": 1, "b": 2})
+
+    with pytest.raises(KeyError):
+        dct.keys(after="zz")
+    with pytest.raises(KeyError):
+        dct.reversed_keys(before="zz")
+    with pytest.raises(TypeError):
+        dct.keys(after=1.5)
+
+
+def test_indexed_dict_paging_on_both_facets(indexed_dict_factory):
+    dct = indexed_dict_factory("dct", {"a": 1, "b": 2, "c": 3})
+
+    assert list(dct.lazy.keys(after="a", limit=1)) == ["b"]
+    assert list(dct.lazy.reversed_keys(before="c")) == ["b", "a"]
+    assert list(dct.keys()) == ["a", "b", "c"]  # no arguments: the keys view
 
 
 def test_indexed_dict_values(indexed_dict_factory):
@@ -418,3 +459,47 @@ def test_lazy_indexed_reversed_items_matches_slice(indexed_dict_factory):
     dct = indexed_dict_factory("dct", {"a": 1, "b": 2, "c": 3}).lazy
     fwd = list(dct.items())
     assert list(reversed(dct.items())) == fwd[::-1]
+
+
+# ============================================================================
+# WATCHES: rebased under __data__/, like the other indexed views
+# ============================================================================
+
+
+def test_indexed_dict_watches_fire_on_data_writes():
+    from tests.support.observed import Hooks, observed_storage
+
+    with observed_storage() as observed:
+        h = Hooks(*observed, view_cls=EagerIndexedDictView)
+        h.write(lambda v: v.store({"a": 1, "b": 2, "c": {"n": 0}}))
+        h.watch_view(
+            change=lambda v: v.on_change(),
+            child_b=lambda v: v.on_child_change("b"),
+            children=lambda v: v.on_children_change(),
+            desc=lambda v: v.on_descendants_change("*", "n"),
+        )
+
+        # Re-set of b: its child watch and the children watch fire.
+        hits = h.run(lambda v: v.__setitem__("b", 20))
+        assert len(hits["child_b"]) == 1
+        assert len(hits["children"]) == 1
+        assert len(hits["change"]) == 1
+        assert hits["desc"] == []
+
+        # A new key: the children watch fires on the data row only, never
+        # on the key list.
+        hits = h.run(lambda v: v.__setitem__("d", 4))
+        assert hits["child_b"] == []
+        assert len(hits["children"]) == 1
+        assert all("__keys__" not in k for k in hits["change"])
+
+        # A nested write under c matches the descendants pattern.
+        hits = h.run(lambda v: v.__setitem__("c", {"n": 1}))
+        assert any(k[-2:] == ("c", "n") for k in hits["desc"])
+        assert hits["child_b"] == []
+
+        # Delete of b: fires b's watch, and rewriting the key list stays quiet.
+        hits = h.run(lambda v: v.__delitem__("b"))
+        assert len(hits["child_b"]) == 1
+        assert len(hits["children"]) == 1
+        assert all("__data__" in k for k in hits["change"])
