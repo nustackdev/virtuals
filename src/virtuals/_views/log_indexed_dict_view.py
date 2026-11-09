@@ -545,7 +545,7 @@ class LogIndexedDictViewBase(
         # a side effect. If the underlying __data__/ container doesn't
         # exist yet, exists_child returns False against raw storage and we
         # raise KeyNotFoundError -- a KeyError, matching Python dict
-        # semantics, and the one error ref callers no-op on.
+        # semantics.
         dc = self._data_container()
         if not is_view_key(address) or not dc.exists_child(address):
             raise KeyNotFoundError(address)
