@@ -81,7 +81,11 @@ class MappingBase(CollectionBase[K], Generic[K, V]):
         return ItemsView(self)  # type: ignore[arg-type]
 
     def get(self, key: K, default: object = None) -> V | object:
-        """Value at ``key``, or ``default`` (None) when the key is absent."""
+        """Value at ``key``, or ``default`` (None) when the key is absent, as ``dict.get``.
+
+        A never-written view reads as an empty one: ``default`` too. Its
+        ``ContainerNotFoundError`` is a ``KeyError``, the same miss.
+        """
         try:
             return self[key]
         except KeyError:
@@ -126,7 +130,12 @@ class MutableMappingBase(MappingBase[K, V]):
         return self[key]
 
     def pop(self, key: K, default: object = _MISSING) -> V | object:
-        """Remove ``key`` and return its value; ``default`` if absent, else KeyError."""
+        """Remove ``key`` and return its value; ``default`` if absent, else KeyError, as ``dict.pop``.
+
+        A never-written view acts as an empty one: ``default`` when given
+        (None included), else ``ContainerNotFoundError``, a ``KeyError``.
+        Nothing is written either way.
+        """
         try:
             value = self._plain_value(key)
         except KeyError:

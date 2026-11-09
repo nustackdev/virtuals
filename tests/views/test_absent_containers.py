@@ -5,6 +5,8 @@ For a never-written container, on every view kind:
 - ``len``, iteration, ``in`` and ``extract`` raise ``ContainerNotFoundError``
   (a ``KeyError``) naming the view's own site.
 - a point read raises ``KeyError`` / ``IndexError``, as on a missing key.
+- a read given an explicit default (``get``, ``pop``, ``first``, ``last``)
+  returns it, as on an empty container.
 - adding mutations create the container, removing mutations act as on an
   empty one and write nothing.
 
@@ -240,6 +242,46 @@ def test_ordered_view_edges_raise_on_absent_and_on_empty(root):
     assert not view
 
 
+ORDERED = (
+    EagerFractionalIndexedDictView,
+    LazyFractionalIndexedDictView,
+    EagerLogIndexedDictView,
+    LazyLogIndexedDictView,
+)
+
+
+@pytest.mark.parametrize("view_cls", ORDERED)
+def test_ordered_view_edges_give_an_explicit_default(root, view_cls):
+    view = root.open_child("absent", view_cls)
+    for end in (view.first, view.last):
+        assert end("dflt") == "dflt"
+        assert end(default="dflt") == "dflt"
+        assert end(None) is None
+        with pytest.raises(ContainerNotFoundError):
+            end()
+    assert not view.container.exists()
+    view.ensure_created()
+    for end in (view.first, view.last):
+        assert end("dflt") == "dflt"
+        assert end(None) is None
+        with pytest.raises(IndexError):
+            end()
+    view["a"] = 1
+    view["b"] = 2
+    assert view.first("dflt") == "a"
+    assert view.last(None) == "b"
+
+
+@pytest.mark.parametrize("view_cls", MAPPINGS)
+def test_mapping_get_on_absent_gives_the_default(root, view_cls):
+    view = root.open_child("absent", view_cls)
+    key = _key(view_cls)
+    assert view.get(key) is None
+    assert view.get(key, "dflt") == "dflt"
+    assert view.get(key, None) is None
+    assert not view.container.exists()
+
+
 # ============================================================================
 # MUTATIONS ON A NEVER-WRITTEN CONTAINER
 # ============================================================================
@@ -286,6 +328,7 @@ def test_mapping_removals_on_absent_act_as_on_empty(root, view_cls):
         with pytest.raises(KeyError):
             view.pop(key)
         assert view.pop(key, "dflt") == "dflt"
+        assert view.pop(key, None) is None
     with pytest.raises(KeyError):
         del view[key]
     view.clear()

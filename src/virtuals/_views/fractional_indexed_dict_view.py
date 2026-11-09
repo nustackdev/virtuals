@@ -162,6 +162,9 @@ _ORDER = "__order__"
 _POS = "__pos__"
 _END = "__end__"
 
+_MISSING = object()
+"""``first`` / ``last`` called with no default."""
+
 Address = str | int
 
 
@@ -595,19 +598,28 @@ class FractionalIndexedDictViewBase(
             rows = self._scan_order(start=cursor, reverse=reverse, limit=limit, skip=(cursor,))
         return (address for _okey, address in rows)
 
-    def first(self) -> Address:
-        """First id. One seek. IndexError when empty, as ``seq[0]``."""
-        row = self._edge(last=False)
-        if row is None:
-            raise IndexError("first() of an empty collection")
-        return row[1]
+    def first(self, default: object = _MISSING) -> Address | object:
+        """First id. One seek.
 
-    def last(self) -> Address:
-        """Last id. One seek. IndexError when empty, as ``seq[-1]``."""
-        row = self._edge(last=True)
-        if row is None:
-            raise IndexError("last() of an empty collection")
-        return row[1]
+        With no ``default``: IndexError when empty, as ``seq[0]``, and
+        ``ContainerNotFoundError`` when the view was never written. With a
+        ``default`` (None included), both give the default, as
+        ``next(iter(view), default)``.
+        """
+        return self._end(last=False, default=default)
+
+    def last(self, default: object = _MISSING) -> Address | object:
+        """Last id. One seek. Same contract as ``first``, from the other end."""
+        return self._end(last=True, default=default)
+
+    def _end(self, *, last: bool, default: object) -> Address | object:
+        """The id at one end, or ``default``. A default reads a never-written view as empty."""
+        row = self._edge(last=last, strict=default is _MISSING)
+        if row is not None:
+            return row[1]
+        if default is _MISSING:
+            raise IndexError(f"{'last' if last else 'first'}() of an empty collection")
+        return default
 
     def next_after(self, address: Address) -> Address | None:
         """Id directly after ``address``, or None at the end."""

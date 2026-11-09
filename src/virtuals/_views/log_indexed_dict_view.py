@@ -88,6 +88,9 @@ _KEYS = "__keys__"
 _LOG = "__log__"
 _DATA = "__data__"
 
+_MISSING = object()
+"""``first`` / ``last`` called with no default."""
+
 
 _log_key_lock = threading.Lock()
 _log_key_counter = 0
@@ -340,6 +343,7 @@ class LogIndexedDictViewBase(
         reverse: bool = False,
         before: str | None = None,
         limit: int | None = None,
+        strict: bool = True,
     ) -> Generator[tuple[str, str | int], None, None]:
         """Scan __keys__/ log entries.
 
@@ -353,6 +357,8 @@ class LogIndexedDictViewBase(
                 dropped. The storage scan is asked for one more row when a
                 cursor is given, since the cursor row (if it still exists)
                 is read and skipped here.
+            strict: an empty scan on a never-written view raises
+                ``ContainerNotFoundError``. False reads it as empty.
 
         Yields:
             (log_key, actual_key) tuples in chosen chronological direction.
@@ -395,7 +401,9 @@ class LogIndexedDictViewBase(
         from virtuals.container.context import require_read_context
 
         rctx = require_read_context(kc.ctx)
-        rows = scan_or_absent(rctx.scan(opts).items(), self.container.site, kc.ctx)
+        rows = rctx.scan(opts).items()
+        if strict:
+            rows = scan_or_absent(rows, self.container.site, kc.ctx)
         yielded = 0
         for key, value in rows:
             log_key = key[-1]
@@ -492,17 +500,28 @@ class LogIndexedDictViewBase(
         for _log_key, actual_key in rows:
             yield actual_key
 
-    def first(self) -> str | int:
-        """Oldest key. One seek. IndexError when empty, as ``seq[0]``."""
-        for _log_key, actual_key in self._scan_log_keys(limit=1):
-            return actual_key
-        raise IndexError("first() of an empty collection")
+    def first(self, default: object = _MISSING) -> str | int | object:
+        """Oldest key. One seek.
 
-    def last(self) -> str | int:
-        """Newest key. One reverse seek. IndexError when empty, as ``seq[-1]``."""
-        for _log_key, actual_key in self._scan_log_keys(reverse=True, limit=1):
+        With no ``default``: IndexError when empty, as ``seq[0]``, and
+        ``ContainerNotFoundError`` when the view was never written. With a
+        ``default`` (None included), both give the default, as
+        ``next(iter(view), default)``.
+        """
+        return self._end(newest=False, default=default)
+
+    def last(self, default: object = _MISSING) -> str | int | object:
+        """Newest key. One reverse seek. Same contract as ``first``, from the other end."""
+        return self._end(newest=True, default=default)
+
+    def _end(self, *, newest: bool, default: object) -> str | int | object:
+        """The key at one end, or ``default``. A default reads a never-written view as empty."""
+        rows = self._scan_log_keys(reverse=newest, limit=1, strict=default is _MISSING)
+        for _log_key, actual_key in rows:
             return actual_key
-        raise IndexError("last() of an empty collection")
+        if default is _MISSING:
+            raise IndexError(f"{'last' if newest else 'first'}() of an empty collection")
+        return default
 
     def keys_with_log_keys(
         self, *, after: str | None = None
