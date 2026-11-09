@@ -143,7 +143,8 @@ def validate_parents_exist(
         parent_info: Prefetched parent chain info (optional)
 
     Raises:
-        ContainerNotFoundError: If any parent containers are missing
+        ContainerNotFoundError: If any parent containers are missing, naming
+            the topmost missing one as its site
     """
     parent_info = gather_parent_info(site, ctx) if parent_info is None else parent_info
     if not parent_info.all_exist:
@@ -151,7 +152,10 @@ def validate_parents_exist(
             "Validation failed: missing parent containers",
             extra={"site": site, "missing_sites": parent_info.missing_sites},
         )
-        raise ContainerNotFoundError(f"Missing parent containers: {parent_info.missing_sites}")
+        raise ContainerNotFoundError(
+            f"Missing parent containers: {parent_info.missing_sites}",
+            parent_info.missing_sites[0],
+        )
 
 
 def validate_parents_healthy(
@@ -190,7 +194,8 @@ def validate_parents_chain(
         parent_info: Prefetched parent chain info (optional)
 
     Raises:
-        ContainerNotFoundError: If any parent containers are missing
+        ContainerNotFoundError: If any parent containers are missing, naming
+            the topmost missing one as its site
         ContainerTypeError: If any parent containers have malformed data
     """
     parent_info = gather_parent_info(site, ctx) if parent_info is None else parent_info
@@ -200,7 +205,10 @@ def validate_parents_chain(
             "Validation failed: parent chain broken, missing containers",
             extra={"site": site, "missing_sites": parent_info.missing_sites},
         )
-        raise ContainerNotFoundError(f"Missing parent containers: {parent_info.missing_sites}")
+        raise ContainerNotFoundError(
+            f"Missing parent containers: {parent_info.missing_sites}",
+            parent_info.missing_sites[0],
+        )
 
     if not parent_info.all_healthy:
         logger.error(
