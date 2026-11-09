@@ -14,8 +14,6 @@ test pins that error:
 - a write at a position on a ring (``ring[i] = x``, ``del ring[i]``):
   TypeError, as on a ``tuple``; ``insert``, ``pop``, ``remove``,
   ``reverse`` do not exist.
-- slice writes on a list view (``view[a:b] = ...``, ``del view[a:b]``):
-  TypeError; a list view writes one index at a time.
 - a key or index keeps its kind: writing a compound value over a primitive
   one, or the reverse, raises ``ContainerTypeError`` and changes nothing
   (docs/view/overview.md, "Write rules"). Delete first, then set.
@@ -28,7 +26,9 @@ Documented differences, not checked against the built-in:
   agrees with ``dict``.
 - ``popitem`` pops the last pair in the view's order, as ``dict`` does;
   a kh57 view has no order to pop from the end of and pops the first.
-- set operators accept any iterable, as the ``Set`` mixins do.
+
+What a built-in has beyond its ABC (``copy``, ``|``, ``sort``, slice
+writes, ``union``, ...) is checked in ``test_builtin_conformance.py``.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from collections import deque
 from collections.abc import Mapping, MutableMapping, MutableSequence, MutableSet, Sequence, Set
 
 import pytest
+from tests.support.differential import plain, same
 
 from virtuals._views import (
     ByteArrayView,
@@ -62,40 +63,6 @@ from virtuals._views import (
 )
 from virtuals.container import ContainerTypeError
 from virtuals.view import ViewBase
-
-
-# =============================================================================
-# HELPERS
-# =============================================================================
-
-
-def plain(value):
-    """``value`` with every view in it extracted to the Python value it stands for."""
-    if isinstance(value, ViewBase):
-        return value.eager.extract()  # type: ignore[attr-defined]
-    if isinstance(value, tuple):
-        return tuple(plain(v) for v in value)
-    if isinstance(value, list):
-        return [plain(v) for v in value]
-    return value
-
-
-def outcome(fn, target):
-    """``("ok", plain result)`` or ``("raise", the built-in error type it is)``."""
-    try:
-        return ("ok", plain(fn(target)))
-    except (KeyError, IndexError, ValueError, TypeError, AttributeError) as e:
-        for kind in (KeyError, IndexError, ValueError, TypeError, AttributeError):
-            if isinstance(e, kind):
-                return ("raise", kind)
-        raise  # pragma: no cover
-
-
-def same(view, ref, fn, state=lambda x: x):
-    """Run ``fn`` on both; the outcome and the state left behind must match."""
-    got, want = outcome(fn, view), outcome(fn, ref)
-    assert got == want, (got, want)
-    assert plain(view) == state(ref), (plain(view), ref)
 
 
 # =============================================================================
@@ -377,17 +344,6 @@ def test_sequence_kind_change_raises(sequence):
 
 
 @pytest.mark.parametrize(("view_cls", "data", "new"), MUTABLE_SEQUENCES)
-def test_sequence_slice_writes_raise(sequence):
-    view, *_ = sequence
-    before = plain(view)
-    with pytest.raises(TypeError, match="slice assignment"):
-        view[0:1] = []
-    with pytest.raises(TypeError, match="slice deletion"):
-        del view[0:1]
-    assert plain(view) == before
-
-
-@pytest.mark.parametrize(("view_cls", "data", "new"), MUTABLE_SEQUENCES)
 def test_sequence_insert_append_extend(sequence):
     view, ref, new = sequence
     for index in (0, 2, -1, -99, 99):
@@ -423,7 +379,7 @@ def test_sequence_reverse_clear(sequence):
 def test_sequence_in_place_add(sequence):
     view, ref, new = sequence
     held = view
-    held += [new]
+    held += type(ref)([new])
     ref += type(ref)([new])
     assert held is view
     assert plain(view) == ref
