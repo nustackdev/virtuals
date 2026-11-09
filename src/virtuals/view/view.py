@@ -50,6 +50,10 @@ class View(Protocol):
         """Get container type, associated with this view."""
         ...
 
+    def exists(self) -> bool:
+        """Whether this view's container is stored. One marker read."""
+        ...
+
     def open_parent(self) -> View:
         """Navigate to parent container.
 

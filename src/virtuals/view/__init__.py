@@ -17,6 +17,7 @@ from .bases import (
     ChildNestedGetBase,
     ChildNestedSetBase,
     ChildPrimitiveSetBase,
+    Faceted,
     KeyedChildrenCountBase,
     LazyChildReadBase,
     LiveChildrenCountBase,
@@ -29,16 +30,27 @@ from .bases_observable import (
     DescendantsObservableBase,
     ObservableBase,
 )
-from .exceptions import ViewError, ViewOperationError, ViewRegistryError
+from .exceptions import (
+    AddressNotFoundError,
+    IndexNotFoundError,
+    KeyNotFoundError,
+    ViewError,
+    ViewOperationError,
+    ViewRegistryError,
+)
 from .registry import ViewRegistry
 from .view import View
 
 
 __all__ = [  # noqa: RUF022
+    "AddressNotFoundError",
+    "IndexNotFoundError",
+    "KeyNotFoundError",
     "ChildNavigationBase",
     "ChildNestedGetBase",
     "ChildNestedSetBase",
     "ChildPrimitiveSetBase",
+    "Faceted",
     "LazyChildReadBase",
     "PrimitiveOpsBase",
     "UnsafePrimitiveOpsBase",

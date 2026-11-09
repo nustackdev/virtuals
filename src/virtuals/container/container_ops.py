@@ -512,6 +512,8 @@ def iter_child_keys(
     reverse: bool = False,
     strict: bool = False,
     owner: site_.Site | None = None,
+    cursor: site_.SiteSegment | None = None,
+    limit: int | None = None,
 ) -> Generator[site_.SiteSegment, None, None]:
     """Iterate over direct child keys.
 
@@ -519,10 +521,14 @@ def iter_child_keys(
         site: Container site
         ctx: Storage context (transaction, snapshot or write batch)
         validate: If True, validate site is a container (default False)
-        reverse: If True, yield in reverse insertion order (default False)
+        reverse: If True, yield in reverse key order (default False)
         strict: If True, raise ``ContainerNotFoundError`` when this
             container was never written (checked only on an empty result)
         owner: Site to name in that error (default this container's site)
+        cursor: Start strictly past this key: above it forward, below it
+            reverse. The key does not have to exist; the scan seeks to
+            where it would sort.
+        limit: Cap on the number of keys yielded.
 
     Yields:
         Child keys (last segment of each child site)
@@ -535,19 +541,74 @@ def iter_child_keys(
     Example:
         >>> list(iter_child_keys(("users",), tx))
         ["alice", "bob", "charlie"]
+        >>> list(iter_child_keys(("users",), tx, cursor="alice", limit=1))
+        ["bob"]
     """
     if validate:
         validate_is_container(site, ctx)
 
-    if strict:
-        for key, _ in _strict_child_scan(site, ctx, reverse=reverse, owner=owner):
+    if limit is not None and limit <= 0:
+        return
+
+    if cursor is not None:
+        for key, _ in _child_rows_past(
+            site, ctx, cursor, reverse=reverse, limit=limit, strict=strict, owner=owner
+        ):
             yield key[-1]
         return
 
-    for key in (
-        require_read_context(ctx).scan(_child_scan_options(site, ctx, reverse=reverse)).keys()
-    ):
+    if strict:
+        for key, _ in _strict_child_scan(site, ctx, reverse=reverse, limit=limit, owner=owner):
+            yield key[-1]
+        return
+
+    options = replace(_child_scan_options(site, ctx, reverse=reverse), limit=limit)
+    for key in require_read_context(ctx).scan(options).keys():
         yield key[-1]
+
+
+def _child_rows_past(
+    site: site_.Site,
+    ctx: StorageContextType,
+    cursor: site_.SiteSegment,
+    *,
+    reverse: bool,
+    limit: int | None,
+    strict: bool,
+    owner: site_.Site | None,
+    values: bool = False,
+) -> Generator[tuple[site_.Site, object], None, None]:
+    """Direct child rows strictly past ``cursor`` in key order, as ``(key, raw value)``.
+
+    The value is None unless ``values``. One seek to the cursor's own key,
+    then a child scan from there. The seek is inclusive (forward it lands
+    on the cursor's row, reverse on the cursor's row or just below it), so
+    the cursor row is read and dropped: the storage limit allows one row
+    for it. A subtree under the cursor sorts above it, so a reverse scan
+    never sees it and a forward scan jumps it with ``max_depth``. Cost:
+    O(limit) rows, whatever the container's size.
+    """
+    base = _child_scan_options(site, ctx, reverse=reverse)
+    options = replace(
+        base,
+        start=(*site, cursor),
+        start_encoded=None,
+        limit=None if limit is None else limit + 1,
+    )
+    scan = require_read_context(ctx).scan(options)
+    rows: Iterator[tuple[site_.Site, object]] = (
+        scan.items() if values else ((key, None) for key in scan.keys())
+    )
+    if strict:
+        rows = scan_or_absent(rows, site, ctx, owner=owner)
+    yielded = 0
+    for key, value in rows:
+        if key[-1] == cursor:
+            continue
+        yield key, value
+        yielded += 1
+        if limit is not None and yielded >= limit:
+            return
 
 
 def iter_child_values(
@@ -590,6 +651,8 @@ def iter_children(
     reverse: bool = False,
     strict: bool = False,
     owner: site_.Site | None = None,
+    cursor: site_.SiteSegment | None = None,
+    limit: int | None = None,
 ) -> Generator[tuple[site_.SiteSegment, NodeInfo], None, None]:
     """Iterate over direct children with their info.
 
@@ -597,10 +660,12 @@ def iter_children(
         site: Container site
         ctx: Storage context (transaction, snapshot or write batch)
         validate: If True, validate site is a container (default False)
-        reverse: If True, yield in reverse insertion order (default False)
+        reverse: If True, yield in reverse key order (default False)
         strict: If True, raise ``ContainerNotFoundError`` when this
             container was never written (checked only on an empty result)
         owner: Site to name in that error (default this container's site)
+        cursor: Start strictly past this key, as ``iter_child_keys`` does
+        limit: Cap on the number of children yielded
 
     Yields:
         Tuples of (child_key, NodeInfo)
@@ -613,14 +678,33 @@ def iter_children(
     if validate:
         validate_is_container(site, ctx)
 
-    if strict:
-        for key, value in _strict_child_scan(site, ctx, reverse=reverse, values=True, owner=owner):
+    if limit is not None and limit <= 0:
+        return
+
+    if cursor is not None:
+        rows = _child_rows_past(
+            site,
+            ctx,
+            cursor,
+            reverse=reverse,
+            limit=limit,
+            strict=strict,
+            owner=owner,
+            values=True,
+        )
+        for key, value in rows:
             yield (key[-1], get_node_info(key, ctx, raw_value=cast("Value", value)))
         return
 
-    for key, value in (
-        require_read_context(ctx).scan(_child_scan_options(site, ctx, reverse=reverse)).items()
-    ):
+    if strict:
+        for key, value in _strict_child_scan(
+            site, ctx, reverse=reverse, values=True, limit=limit, owner=owner
+        ):
+            yield (key[-1], get_node_info(key, ctx, raw_value=cast("Value", value)))
+        return
+
+    options = replace(_child_scan_options(site, ctx, reverse=reverse), limit=limit)
+    for key, value in require_read_context(ctx).scan(options).items():
         yield (key[-1], get_node_info(key, ctx, raw_value=value))
 
 

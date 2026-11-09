@@ -1,29 +1,41 @@
 """Mapping collection bases.
 
-Provides default implementations following collections.abc.MutableMapping pattern.
-Subclasses implement the abstract core; the base derives everything else.
+Mirror ``collections.abc.Mapping`` and ``MutableMapping``: the same
+abstract core, the same mixin methods with the same semantics. Each base
+is registered with its ABC, so every view built on it is a ``Mapping`` or
+``MutableMapping`` to ``isinstance``.
 
 Abstract (must implement):
-    __getitem__, __setitem__, __delitem__, __iter__, __len__
+    __getitem__, __iter__, __len__             (Mapping)
+    __setitem__, __delitem__                   (MutableMapping)
 
 Provided for free:
-    keys, values, items, get, pop, update, clear, __contains__
+    __contains__, keys, values, items, get, __eq__
+    pop, popitem, setdefault, update, clear
+
+Like a Python mapping, a view equals any mapping with the same items and
+is not hashable.
+
+``DictMethods`` adds what ``dict`` has beyond ``MutableMapping``
+(``copy``, ``|``, ``|=``, ``reversed``, ``popitem`` from the end) for a view
+that stands in for a dict.
 """
 
 from __future__ import annotations
 
 from abc import abstractmethod
-from collections.abc import ItemsView, KeysView, ValuesView
+from collections.abc import ItemsView, KeysView, Mapping, MutableMapping, ValuesView
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar, runtime_checkable
 
 from .bases import CollectionBase
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator
 
 
 __all__ = [
+    "DictMethods",
     "MappingBase",
     "MutableMappingBase",
     "ReactiveMappingBase",
@@ -33,9 +45,11 @@ __all__ = [
 K = TypeVar("K")
 V = TypeVar("V")
 
+_MISSING = object()
+
 
 class MappingBase(CollectionBase[K], Generic[K, V]):
-    """Read-only mapping base. Provides keys/values/items/get/__contains__ from core methods.
+    """Read-only mapping base, as ``collections.abc.Mapping``.
 
     Inherits abstract __iter__, __len__ from CollectionBase.
 
@@ -67,15 +81,30 @@ class MappingBase(CollectionBase[K], Generic[K, V]):
         return ItemsView(self)  # type: ignore[arg-type]
 
     def get(self, key: K, default: object = None) -> V | object:
-        """Get value with default fallback."""
+        """Value at ``key``, or ``default`` (None) when the key is absent."""
         try:
             return self[key]
         except KeyError:
             return default
 
+    def __eq__(self, other: object) -> bool:
+        """Equal to any mapping holding the same items, as ``Mapping.__eq__``."""
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        return dict(self.items()) == dict(other.items())
+
+    __hash__ = None  # type: ignore[assignment]
+
+    __reversed__ = None  # type: ignore[assignment]
+    """Not reversible, as ``collections.abc.Mapping``: ``reversed(view)`` raises TypeError.
+
+    Without it ``reversed`` would fall back to ``len`` and ``[]`` and read
+    keys as positions. A mapping with an order (``DictMethods``) defines it.
+    """
+
 
 class MutableMappingBase(MappingBase[K, V]):
-    """Mutable mapping base. Adds pop/update/clear from setitem/delitem.
+    """Mutable mapping base, as ``collections.abc.MutableMapping``.
 
     Additional abstract:
         __setitem__(key, value) -> None
@@ -88,33 +117,129 @@ class MutableMappingBase(MappingBase[K, V]):
     @abstractmethod
     def __delitem__(self, key: K) -> None: ...
 
-    def pop(self, key: K, *args: object) -> V | object:
-        """Remove and return value. Accepts optional default."""
-        try:
-            value = self[key]
-            del self[key]
-            return value
-        except KeyError:
-            if args:
-                return args[0]
-            raise
+    def _plain_value(self, key: K) -> V:
+        """The value a removal hands back: the read by default.
 
-    def update(self, other: Mapping[K, V] | None = None, **kwargs: V) -> None:  # type: ignore[override]
-        """Update from mapping or kwargs."""
-        if other is not None:
-            if hasattr(other, "items"):
-                for key, value in other.items():
-                    self[key] = value
-            else:
-                for key, value in other:  # type: ignore[union-attr]
-                    self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value  # type: ignore[index]
+        A mapping whose reads hand out live child views overrides it to
+        read the plain value, since the child is gone after the delete.
+        """
+        return self[key]
+
+    def pop(self, key: K, default: object = _MISSING) -> V | object:
+        """Remove ``key`` and return its value; ``default`` if absent, else KeyError."""
+        try:
+            value = self._plain_value(key)
+        except KeyError:
+            if default is _MISSING:
+                raise
+            return default
+        del self[key]
+        return value
+
+    def popitem(self) -> tuple[K, V]:
+        """Remove and return a ``(key, value)`` pair: the first iteration yields, as ``MutableMapping.popitem``.
+
+        Raises:
+            KeyError: If the mapping is empty.
+        """
+        return self._pop_first(iter(self))
+
+    def _pop_first(self, keys: Iterator[K]) -> tuple[K, V]:
+        """Remove the first key ``keys`` yields and return it with its value."""
+        try:
+            key = next(keys)
+        except StopIteration:
+            raise KeyError("popitem(): mapping is empty") from None
+        value = self._plain_value(key)
+        del self[key]
+        return key, value
+
+    def setdefault(self, key: K, default: object = None) -> V | object:
+        """``self[key]`` if present, else store ``default`` there and return it read back."""
+        try:
+            return self[key]
+        except KeyError:
+            self[key] = default  # type: ignore[assignment]
+        return self[key]
+
+    def update(self, other: object = (), /, **kwargs: V) -> None:
+        """Update from a mapping, an object with ``keys()``, or ``(key, value)`` pairs, then kwargs."""
+        for key, value in self._update_items(other, kwargs).items():
+            self[key] = value
+
+    @staticmethod
+    def _update_items(other: object, kwargs: dict[str, V]) -> dict[K, V]:
+        """What ``update(other, **kwargs)`` writes, in order, as one dict: last write wins.
+
+        ``other`` is read the way ``dict.update`` reads it: a mapping, an
+        object with ``keys()`` and ``[]``, or an iterable of pairs.
+        """
+        if isinstance(other, Mapping):
+            items = {key: other[key] for key in other}
+        elif hasattr(other, "keys"):
+            items = {key: other[key] for key in other.keys()}  # type: ignore[index]
+        else:
+            items = {}
+            for pair in other:  # type: ignore[attr-defined]
+                key, value = pair
+                items[key] = value
+        items.update(kwargs)
+        return items  # type: ignore[return-value]
 
     def clear(self) -> None:
         """Remove all items. Override for bulk delete."""
         for key in list(self):
             del self[key]
+
+
+class DictMethods(MutableMappingBase[K, V]):
+    """What ``dict`` has beyond ``MutableMapping``: ``copy``, ``|``, ``|=``, ``reversed``, LIFO ``popitem``.
+
+    A view built on it is a dict in full: every ``dict`` method with the
+    same semantics. New values come back as a plain ``dict`` holding the
+    values the view reads (a shallow copy, as ``dict.copy``). ``|`` takes a
+    dict or another dict view, as ``dict | dict``; ``|=`` takes anything
+    ``update`` does.
+
+    ``fromkeys`` is not here: it builds a new dict from nothing, and a view
+    cannot exist without a place in storage to stand at.
+
+    Additional abstract:
+        __reversed__() -> keys last first
+    """
+
+    @abstractmethod
+    def __reversed__(self) -> Iterator[K]: ...
+
+    def popitem(self) -> tuple[K, V]:
+        """Remove and return the last ``(key, value)`` pair in order, as ``dict.popitem``.
+
+        Raises:
+            KeyError: If the mapping is empty.
+        """
+        return self._pop_first(reversed(self))
+
+    def copy(self) -> dict[K, V]:
+        """A plain dict of the items, as ``dict.copy``."""
+        return dict(self.items())
+
+    def __or__(self, other: object) -> dict[K, V]:
+        if not isinstance(other, dict | DictMethods):
+            return NotImplemented
+        merged = self.copy()
+        merged.update(other)
+        return merged
+
+    def __ror__(self, other: object) -> dict[K, V]:
+        if not isinstance(other, dict | DictMethods):
+            return NotImplemented
+        merged = dict(other)
+        merged.update(self.items())
+        return merged
+
+    def __ior__(self, other: object) -> DictMethods[K, V]:
+        self.update(other)
+        return self
 
 
 class ReactiveMappingBase(MutableMappingBase[K, V]):
@@ -140,6 +265,10 @@ class ReactiveMappingBase(MutableMappingBase[K, V]):
     def on_children_change(self) -> object:
         """Subscribe to changes on any key."""
         ...
+
+
+Mapping.register(MappingBase)
+MutableMapping.register(MutableMappingBase)
 
 
 @runtime_checkable

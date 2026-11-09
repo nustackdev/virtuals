@@ -831,3 +831,47 @@ def test_child_operations_interleaved(tx: TransactionProtocol) -> None:
     # Final verification
     keys = set(iter_child_keys(("users",), tx))
     assert keys == {"a", "c", "d"}
+
+
+# ============================================================================
+# CURSOR AND LIMIT
+# ============================================================================
+
+
+def _paged(tx: TransactionProtocol) -> None:
+    create_container(("p",), ContainerStructure(1), ContainerProtocol.MUTABLE, tx)
+    for key in ("a", "c", "e"):
+        put_child_primitive(("p",), key, key.upper(), tx)
+    create_child_container(
+        ("p",), "b", ContainerStructure(1), ContainerProtocol.MUTABLE, tx, validate=False
+    )
+    put_child_primitive(("p", "b"), "inner", 1, tx)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_iter_child_keys_cursor_and_limit(tx: TransactionProtocol, strict: bool) -> None:
+    _paged(tx)
+
+    def keys(**kw):
+        return list(iter_child_keys(("p",), tx, strict=strict, **kw))
+
+    assert keys(limit=2) == ["a", "b"]
+    assert keys(cursor="a") == ["b", "c", "e"]
+    assert keys(cursor="b", limit=1) == ["c"]
+    assert keys(cursor="d") == ["e"]
+    assert keys(cursor="b", reverse=True) == ["a"]
+    assert keys(cursor="z", reverse=True, limit=2) == ["e", "c"]
+    assert keys(limit=0) == []
+
+
+def test_iter_children_cursor_yields_values(tx: TransactionProtocol) -> None:
+    _paged(tx)
+
+    rows = list(iter_children(("p",), tx, cursor="b", limit=2))
+    assert [(key, info.primitive_value) for key, info in rows] == [("c", "C"), ("e", "E")]
+
+
+def test_cursor_scan_on_absent_container(tx: TransactionProtocol) -> None:
+    assert list(iter_child_keys(("nope",), tx, cursor="a")) == []
+    with pytest.raises(ContainerNotFoundError):
+        list(iter_child_keys(("nope",), tx, cursor="a", strict=True))

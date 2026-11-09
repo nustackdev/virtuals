@@ -6,15 +6,19 @@ This module provides reusable bases that encapsulate common view patterns:
 - Child navigation with address normalization
 - Nested container extraction (get)
 - Nested container population (set)
+- Eager and lazy facets (Faceted)
 """
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from logging import getLogger
 from typing import TYPE_CHECKING, Generic, TypeVar, cast
 
 from virtuals.container import Container, NodeType, node_ops
 from virtuals.types import EMPTY, Empty, is_empty
+
+from .exceptions import KeyNotFoundError
 
 
 if TYPE_CHECKING:
@@ -30,6 +34,7 @@ __all__ = [
     "ChildNestedGetBase",
     "ChildNestedSetBase",
     "ChildPrimitiveSetBase",
+    "Faceted",
     "LazyChildReadBase",
     "LiveChildrenCountBase",
     "MetadataBasedChildrenCountBase",
@@ -287,12 +292,12 @@ class ChildNestedGetBase:
             node_info = node_ops.get_node_info(child_site, self.container.ctx)
 
         if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
 
         if node_info.node_type == NodeType.PRIMITIVE:
             # Primitive value is already in node_info
             if is_empty(node_info.primitive_value):
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value
 
         # Child is container - extract it (pass info to avoid re-read)
@@ -364,12 +369,45 @@ class ChildNestedGetBase:
         return child_view.extract()
 
 
+class Faceted(ABC):
+    """Base for views with two facets over one container: eager and lazy.
+
+    The eager facet reads nested containers out as plain Python values, the
+    lazy facet hands them out as child Views. Only views that have both
+    inherit it, so ``issubclass(view_class, Faceted)`` tells a caller,
+    from the class alone, whether ``eager`` and ``lazy`` are there to call.
+    A view listed without it has neither attribute.
+    """
+
+    @property
+    @abstractmethod
+    def eager(self) -> View:
+        """This view with reads that return extracted Python values."""
+
+    @property
+    @abstractmethod
+    def lazy(self) -> View:
+        """This view with reads that return child Views for containers."""
+
+    def _plain_value(self, address: object) -> object:
+        """The item at ``address`` read through the eager facet: data, never a child view.
+
+        What ``pop``, ``popitem`` and ``reverse`` move or hand back, so a
+        lazy facet returns the value rather than a view of a removed child.
+        Overrides the collection bases' default (a plain read): a view
+        lists ``Faceted`` before its collection base.
+        """
+        return self.eager[address]  # type: ignore[index]
+
+
 class LazyChildReadBase:
     """Base for getting child values as Views (lazy) instead of extracting.
 
     Like ChildNestedGetBase but stops before extraction — returns the child
     View for containers, raw value for primitives. This is the lazy counterpart
-    to ChildNestedGetBase's eager reads.
+    to ChildNestedGetBase's eager reads, and lazy all the way down: a child
+    View is its lazy facet when its class is ``Faceted``, so its own children
+    read as Views too.
 
     Used by lazy view facets (LazyDictView, LazyListView, etc.) and available
     for community views building custom lazy facets.
@@ -391,7 +429,7 @@ class LazyChildReadBase:
             node_info: Pre-fetched node info to avoid redundant storage read
 
         Returns:
-            Child View for containers, primitive value for leaves
+            Child View (its lazy facet) for containers, primitive value for leaves
 
         Raises:
             KeyError: If child doesn't exist
@@ -402,11 +440,11 @@ class LazyChildReadBase:
             node_info = node_ops.get_node_info(child_site, self.container.ctx)
 
         if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
 
         if node_info.node_type == NodeType.PRIMITIVE:
             if is_empty(node_info.primitive_value):
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value
 
         # Container — resolve view but do NOT extract
@@ -417,7 +455,8 @@ class LazyChildReadBase:
             raise ValueError(f"Child container '{address}' has no structure ID")
 
         view_class = self.registry.get_view_for_structure(node_info.structure)
-        return view_class(container=child_container, registry=self.registry, parent=self)  # type: ignore[call-arg]
+        child = view_class(container=child_container, registry=self.registry, parent=self)  # type: ignore[call-arg]
+        return child.lazy if issubclass(view_class, Faceted) else child
 
 
 class ChildNestedSetBase:

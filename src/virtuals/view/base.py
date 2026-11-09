@@ -56,7 +56,7 @@ def is_view_key(address: object) -> bool:
     return isinstance(address, _KEY_TYPES)
 
 
-@attrs.frozen
+@attrs.frozen(eq=False)
 class ViewBase(ABC):
     """Base class for all views.
 
@@ -70,6 +70,10 @@ class ViewBase(ABC):
     - Parent-aware: A child view knows the view it was opened from, so
       creating it goes through that parent and the parent's bookkeeping
     - Protocol-based: Subclasses implement Convertible/Initializable/Nestable as needed
+    - A collection: every view lists one ``virtuals.collections`` base right
+      after ``ViewBase`` (``SequenceBase``, ``MutableMappingBase``, ...), so
+      it is that ``collections.abc`` type, with its mixins and equality.
+      ``ViewBase`` defines no equality of its own.
 
     Attributes:
         container: Container instance for storage operations
@@ -106,6 +110,14 @@ class ViewBase(ABC):
     def get_container_cls(cls) -> type | None:
         """Get container type, associated with this view."""
         return cls.CONTAINER_CLS
+
+    # =========================================================================
+    # PRESENCE
+    # =========================================================================
+
+    def exists(self) -> bool:
+        """Whether this view's container is stored. One marker read, nothing extracted."""
+        return self.container.exists()
 
     # =========================================================================
     # WRITE SUPPORT
@@ -327,8 +339,8 @@ class ViewBase(ABC):
 
         Walks container children depth-first and runs each view's
         ``_rebuild_bookkeeping``, children before parents. A child's view
-        type comes from its stored structure, via the registry or the
-        built-in views. Children with an unknown structure are skipped.
+        type comes from its stored structure, via the registry.
+        Children with an unknown structure are skipped.
         Silent if this view does not exist in storage.
         """
         if not self.container.exists():
@@ -343,8 +355,9 @@ class ViewBase(ABC):
         for address, info in children.iter_children(validate=False):
             if info.node_type != NodeType.CONTAINER or info.structure is None:
                 continue
-            view_class = _view_for_structure(self.registry, info.structure)
-            if view_class is None:
+            try:
+                view_class = self.registry.get_view_for_structure(info.structure)
+            except ViewRegistryError:
                 logger.debug(
                     "Skipping child with unknown structure",
                     extra={"site": children.site, "address": address, "structure": info.structure},
@@ -386,31 +399,3 @@ class ViewBase(ABC):
         # Use registry to create appropriate view
         view_class = self.registry.get_view_for_structure(parent_info.structure)
         return view_class(container=parent_container, registry=self.registry)  # type: ignore
-
-
-def _view_for_structure(registry: ViewRegistry, structure: ContainerStructure) -> type[View] | None:
-    """View class for a stored structure: the registry's, else the built-in one."""
-    try:
-        return registry.get_view_for_structure(structure)
-    except ViewRegistryError:
-        from virtuals import _views
-
-        builtins = (
-            _views.ByteArrayView,
-            _views.EagerDictView,
-            _views.EagerFractionalIndexedDictView,
-            _views.EagerIndexedDictView,
-            _views.EagerKh57View,
-            _views.EagerListView,
-            _views.EagerLogIndexedDictView,
-            _views.FlatDictView,
-            _views.FlatListView,
-            _views.FrozenSetView,
-            _views.LightDictView,
-            _views.SetView,
-            _views.TupleView,
-        )
-        for view_class in builtins:
-            if view_class.STRUCTURE == structure:
-                return view_class  # type: ignore[return-value]
-        return None
