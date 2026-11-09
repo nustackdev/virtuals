@@ -14,19 +14,27 @@ Provided for free:
     pop, popitem, setdefault, update, clear
 
 Like a Python mapping, a view equals any mapping with the same items and
-is not hashable. Dict-only methods (``|``, ``|=``, ``copy``) are not here.
+is not hashable.
+
+``DictMethods`` adds what ``dict`` has beyond ``MutableMapping``
+(``copy``, ``|``, ``|=``, ``reversed``) for a view that stands in for a dict.
 """
 
 from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import ItemsView, KeysView, Mapping, MutableMapping, ValuesView
-from typing import Generic, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar, runtime_checkable
 
 from .bases import CollectionBase
 
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+
 __all__ = [
+    "DictMethods",
     "MappingBase",
     "MutableMappingBase",
     "ReactiveMappingBase",
@@ -175,6 +183,48 @@ class MutableMappingBase(MappingBase[K, V]):
         """Remove all items. Override for bulk delete."""
         for key in list(self):
             del self[key]
+
+
+class DictMethods(MutableMappingBase[K, V]):
+    """What ``dict`` has beyond ``MutableMapping``: ``copy``, ``|``, ``|=`` and ``reversed``.
+
+    A view built on it is a dict in full: every ``dict`` method with the
+    same semantics. New values come back as a plain ``dict`` holding the
+    values the view reads (a shallow copy, as ``dict.copy``). ``|`` takes a
+    dict or another dict view, as ``dict | dict``; ``|=`` takes anything
+    ``update`` does.
+
+    ``fromkeys`` is not here: it builds a new dict from nothing, and a view
+    cannot exist without a place in storage to stand at.
+
+    Additional abstract:
+        __reversed__() -> keys last first
+    """
+
+    @abstractmethod
+    def __reversed__(self) -> Iterator[K]: ...
+
+    def copy(self) -> dict[K, V]:
+        """A plain dict of the items, as ``dict.copy``."""
+        return dict(self.items())
+
+    def __or__(self, other: object) -> dict[K, V]:
+        if not isinstance(other, dict | DictMethods):
+            return NotImplemented
+        merged = self.copy()
+        merged.update(other)
+        return merged
+
+    def __ror__(self, other: object) -> dict[K, V]:
+        if not isinstance(other, dict | DictMethods):
+            return NotImplemented
+        merged = dict(other)
+        merged.update(self.items())
+        return merged
+
+    def __ior__(self, other: object) -> DictMethods[K, V]:
+        self.update(other)
+        return self
 
 
 class ReactiveMappingBase(MutableMappingBase[K, V]):

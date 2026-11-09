@@ -14,8 +14,11 @@ Provided for free:
     remove, pop, clear, |=, &=, -=, ^=
 
 Operators return a plain Python set (``_from_iterable``); like a Python
-set, a view is not hashable. Set-only methods (``union``, ``issubset``,
-``update``, ...) are not here: a view standing in for a set adds them.
+set, a view is not hashable.
+
+``FrozenSetMethods`` and ``SetMethods`` add what ``frozenset`` and ``set``
+have beyond the ABCs (``union``, ``issubset``, ``copy``, ``update``, ...)
+for a view that stands in for one of them.
 """
 
 from __future__ import annotations
@@ -28,10 +31,12 @@ from .bases import CollectionBase
 
 
 __all__ = [
+    "FrozenSetMethods",
     "MutableSetBase",
     "ReactiveSetBase",
     "ReactiveSetProtocol",
     "SetBase",
+    "SetMethods",
 ]
 
 V = TypeVar("V")
@@ -209,6 +214,139 @@ class MutableSetBase(SetBase[V]):
         for value in it:
             self.discard(value)
         return self
+
+
+class FrozenSetMethods(SetBase[V]):
+    """What ``frozenset`` has beyond ``Set``: the named methods, ``copy``, and its operator rules.
+
+    ``union``, ``intersection``, ``difference``, ``symmetric_difference``,
+    ``issubset``, ``issuperset`` take any iterables, as on ``frozenset``.
+    The operators ``& | - ^`` take a set, a frozenset or another set view
+    and give ``TypeError`` for anything else, as on ``frozenset`` (the
+    ``Set`` mixins take any iterable). New values come back as the plain
+    type ``_from_iterable`` names; a reflected operator (``{1} | view``)
+    gives the type of the left operand, as ``set | frozenset`` does.
+
+    Not hashable, unlike ``frozenset``: the stored members can be replaced
+    under the view, so a hash would not hold for the view's lifetime.
+    """
+
+    def _is_set_operand(self, other: object) -> bool:
+        return isinstance(other, set | frozenset | FrozenSetMethods)
+
+    @staticmethod
+    def _reflected(other: set[V] | frozenset[V], items: Iterable[V]) -> set[V] | frozenset[V]:
+        """A reflected operator's result: the left operand's plain type."""
+        return set(items) if isinstance(other, set) else frozenset(items)
+
+    def copy(self) -> set[V] | frozenset[V]:
+        """A plain copy of the members, as ``set.copy``."""
+        return self._from_iterable(self)
+
+    def union(self, *others: Iterable[V]) -> set[V] | frozenset[V]:
+        """Members of the view or any of ``others``."""
+        return self.copy().union(*others)
+
+    def intersection(self, *others: Iterable[V]) -> set[V] | frozenset[V]:
+        """Members of the view found in every one of ``others``."""
+        return self.copy().intersection(*others)
+
+    def difference(self, *others: Iterable[V]) -> set[V] | frozenset[V]:
+        """Members of the view found in none of ``others``."""
+        return self.copy().difference(*others)
+
+    def symmetric_difference(self, other: Iterable[V]) -> set[V] | frozenset[V]:
+        """Members of exactly one of the view and ``other``."""
+        return self.copy().symmetric_difference(other)
+
+    def issubset(self, other: Iterable[object]) -> bool:
+        """True if every member is in ``other``, as ``set.issubset``."""
+        if not isinstance(other, set | frozenset):
+            other = set(other)
+        return len(self) <= len(other) and all(value in other for value in self)
+
+    def issuperset(self, other: Iterable[object]) -> bool:
+        """True if every item of ``other`` is a member, as ``set.issuperset``."""
+        return all(value in self for value in other)
+
+    def __and__(self, other: object) -> set[V] | frozenset[V]:
+        return super().__and__(other) if self._is_set_operand(other) else NotImplemented
+
+    def __or__(self, other: object) -> set[V] | frozenset[V]:
+        return super().__or__(other) if self._is_set_operand(other) else NotImplemented
+
+    def __sub__(self, other: object) -> set[V] | frozenset[V]:
+        return super().__sub__(other) if self._is_set_operand(other) else NotImplemented
+
+    def __xor__(self, other: object) -> set[V] | frozenset[V]:
+        return super().__xor__(other) if self._is_set_operand(other) else NotImplemented
+
+    def __rand__(self, other: object) -> set[V] | frozenset[V]:
+        if not isinstance(other, set | frozenset):
+            return NotImplemented
+        return self._reflected(other, (value for value in other if value in self))
+
+    def __ror__(self, other: object) -> set[V] | frozenset[V]:
+        if not isinstance(other, set | frozenset):
+            return NotImplemented
+        return self._reflected(other, [*other, *self])
+
+    def __rsub__(self, other: object) -> set[V] | frozenset[V]:
+        if not isinstance(other, set | frozenset):
+            return NotImplemented
+        return self._reflected(other, (value for value in other if value not in self))
+
+    def __rxor__(self, other: object) -> set[V] | frozenset[V]:
+        if not isinstance(other, set | frozenset):
+            return NotImplemented
+        return self._reflected(other, self.copy() ^ other)
+
+
+class SetMethods(MutableSetBase[V], FrozenSetMethods[V]):
+    """What ``set`` has beyond ``MutableSet``: the ``frozenset`` methods plus the in-place ones.
+
+    ``update``, ``intersection_update``, ``difference_update``,
+    ``symmetric_difference_update`` take any iterables, as on ``set``. The
+    in-place operators ``|= &= -= ^=`` take a set, a frozenset or another
+    set view, and give ``TypeError`` for anything else, as on ``set``.
+    """
+
+    def update(self, *others: Iterable[V]) -> None:
+        """Add every item of every one of ``others``."""
+        for other in others:
+            for value in list(other) if other is self else other:
+                self.add(value)
+
+    def intersection_update(self, *others: Iterable[V]) -> None:
+        """Keep only the members found in every one of ``others``."""
+        keep = self.intersection(*others)
+        for value in [value for value in self if value not in keep]:
+            self.discard(value)
+
+    def difference_update(self, *others: Iterable[V]) -> None:
+        """Drop every member found in any of ``others``."""
+        for other in others:
+            if other is self:
+                self.clear()
+                return
+            for value in other:
+                self.discard(value)
+
+    def symmetric_difference_update(self, other: Iterable[V]) -> None:
+        """Keep the members of exactly one of the view and ``other``."""
+        MutableSetBase.__ixor__(self, other if other is self else set(other))
+
+    def __ior__(self, other: Iterable[V]) -> SetMethods[V]:
+        return super().__ior__(other) if self._is_set_operand(other) else NotImplemented
+
+    def __iand__(self, other: Iterable[V]) -> SetMethods[V]:
+        return super().__iand__(other) if self._is_set_operand(other) else NotImplemented
+
+    def __isub__(self, other: Iterable[V]) -> SetMethods[V]:
+        return super().__isub__(other) if self._is_set_operand(other) else NotImplemented
+
+    def __ixor__(self, other: Iterable[V]) -> SetMethods[V]:
+        return super().__ixor__(other) if self._is_set_operand(other) else NotImplemented
 
 
 class ReactiveSetBase(MutableSetBase[V]):

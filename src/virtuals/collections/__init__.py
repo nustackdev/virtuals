@@ -17,6 +17,9 @@ Collection bases (mapping, sequence, set):
     SequenceBase → MutableSequenceBase → ReactiveSequenceBase
     SetBase → MutableSetBase → ReactiveSetBase
 
+Built-in methods (mapping, sequence, set), for a view that stands in for a built-in:
+    DictMethods, ListMethods, TupleMethods, ByteArrayMethods, SetMethods, FrozenSetMethods
+
 Reactive protocols (mapping, sequence, set):
     ReactiveMappingProtocol, ReactiveSequenceProtocol, ReactiveSetProtocol
 """
@@ -24,7 +27,9 @@ Reactive protocols (mapping, sequence, set):
 from __future__ import annotations
 
 from .bases import CollectionBase, ContainerBase, IterableBase, SizedBase
+from .bytearray import ByteArrayMethods
 from .mapping import (
+    DictMethods,
     MappingBase,
     MutableMappingBase,
     ReactiveMappingBase,
@@ -59,16 +64,26 @@ from .protocols import (
     is_subscriptable,
 )
 from .sequence import (
+    ListMethods,
     MutableSequenceBase,
     ReactiveSequenceBase,
     ReactiveSequenceProtocol,
     SequenceBase,
+    TupleMethods,
 )
-from .set import MutableSetBase, ReactiveSetBase, ReactiveSetProtocol, SetBase
+from .set import (
+    FrozenSetMethods,
+    MutableSetBase,
+    ReactiveSetBase,
+    ReactiveSetProtocol,
+    SetBase,
+    SetMethods,
+)
 
 
 __all__ = [
     "Assignable",
+    "ByteArrayMethods",
     "ChildObservable",
     "Clearable",
     # Fundamental bases
@@ -79,8 +94,11 @@ __all__ = [
     "Convertible",
     "Deletable",
     "DescendantsObservable",
+    "DictMethods",
+    "FrozenSetMethods",
     "Initializable",
     "IterableBase",
+    "ListMethods",
     # Collection bases
     "MappingBase",
     "MutableMappingBase",
@@ -99,9 +117,11 @@ __all__ = [
     "Sampleable",
     "SequenceBase",
     "SetBase",
+    "SetMethods",
     "Sizeable",
     "SizedBase",
     "Subscriptable",
+    "TupleMethods",
     # Type guards
     "is_assignable",
     "is_child_observable",
