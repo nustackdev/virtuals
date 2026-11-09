@@ -332,7 +332,7 @@ def test_dict_page_cost_tracks_limit_not_size(storage, counts, direction):
         d = root.open_child("d", EagerDictView)
         if direction == "forward":
             return list(d.keys(after="k5", limit=3))
-        return list(d.keys_reverse(before="k5", limit=3))
+        return list(d.reversed_keys(before="k5", limit=3))
 
     costs = {}
     pages = {}

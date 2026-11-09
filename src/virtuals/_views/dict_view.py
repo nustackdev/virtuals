@@ -128,7 +128,7 @@ class DictViewBase(
 
     def __reversed__(self) -> Generator[str | int, None, None]:
         """Keys last first: one reverse scan."""
-        return self.keys_reverse()
+        return self.reversed_keys()
 
     def keys(
         self, *, after: str | int | None = None, limit: int | None = None
@@ -152,7 +152,7 @@ class DictViewBase(
             return ReversibleKeysView(self)
         return self._keys_page(cursor=after, limit=limit, reverse=False)
 
-    def keys_reverse(
+    def reversed_keys(
         self, *, before: str | int | None = None, limit: int | None = None
     ) -> Generator[str | int, None, None]:
         """Keys in reverse key order, strictly before ``before``, at most ``limit``.

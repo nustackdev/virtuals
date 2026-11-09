@@ -20,7 +20,7 @@ stored head, tail or length: ``first``/``last`` are one seek each and
 
 Placement is relative (``before=``/``after=`` an id), never by index.
 
-Cursors. ``keys(after=id, limit=)`` and ``keys_reverse(before=id, limit=)``
+Cursors. ``keys(after=id, limit=)`` and ``reversed_keys(before=id, limit=)``
 page by id. ``next_key_after(okey)`` steps by order key, the cursor a
 stream follows: it still marks a place after its id is gone.
 
@@ -574,7 +574,7 @@ class FractionalIndexedDictViewBase(
             return ReversibleKeysView(self)
         return self._keys_scan(after=after, limit=limit, reverse=False)
 
-    def keys_reverse(
+    def reversed_keys(
         self, *, before: Address | None = None, limit: int | None = None
     ) -> Generator[Address, None, None]:
         """Ids in reverse order. ``before`` starts just below that id."""

@@ -496,13 +496,13 @@ def test_log_reverse_scan_preserves_log_order(log_dict_factory):
     assert list(reversed(dct.values())) == [k.upper() for k in reversed(order)]
 
 
-def test_log_keys_reverse_still_works(log_dict_factory):
-    """keys_reverse must keep functioning after codec-sentinel migration."""
+def test_log_reversed_keys_still_works(log_dict_factory):
+    """reversed_keys must keep functioning after codec-sentinel migration."""
     dct = log_dict_factory("dct")
     for k in ["a", "b", "c", "d"]:
         dct[k] = k
-    assert list(dct.keys_reverse()) == ["d", "c", "b", "a"]
-    assert list(dct.keys_reverse(limit=2)) == ["d", "c"]
+    assert list(dct.reversed_keys()) == ["d", "c", "b", "a"]
+    assert list(dct.reversed_keys(limit=2)) == ["d", "c"]
 
 
 def test_log_mixed_primitive_and_container_values(log_dict_factory):
@@ -548,13 +548,13 @@ def test_keys_after_with_limit_is_exact(log_dict_factory):
     assert list(dct.keys(limit=3)) == ["k0", "k1", "k2"]
 
 
-def test_keys_reverse_before_with_limit_is_exact(log_dict_factory):
+def test_reversed_keys_before_with_limit_is_exact(log_dict_factory):
     dct = log_dict_factory("dct", {f"k{i}": i for i in range(6)})
-    assert list(dct.keys_reverse(before="k4", limit=2)) == ["k3", "k2"]
-    assert list(dct.keys_reverse(before="k4", limit=1)) == ["k3"]
-    assert list(dct.keys_reverse(before="k4", limit=10)) == ["k3", "k2", "k1", "k0"]
-    assert list(dct.keys_reverse(limit=2)) == ["k5", "k4"]
-    assert list(dct.keys_reverse(before="k0")) == []
+    assert list(dct.reversed_keys(before="k4", limit=2)) == ["k3", "k2"]
+    assert list(dct.reversed_keys(before="k4", limit=1)) == ["k3"]
+    assert list(dct.reversed_keys(before="k4", limit=10)) == ["k3", "k2", "k1", "k0"]
+    assert list(dct.reversed_keys(limit=2)) == ["k5", "k4"]
+    assert list(dct.reversed_keys(before="k0")) == []
 
 
 def test_first_and_last_are_the_oldest_and_newest(log_dict_factory):
@@ -576,7 +576,7 @@ def test_page_cursor_follows_log_order_not_key_order(log_dict_factory):
         dct[k] = 1
     dct["zebra"] = 2
     assert list(dct.keys(after="zebra", limit=2)) == ["alpha", "mango"]
-    assert list(dct.keys_reverse(before="mango")) == ["alpha", "zebra"]
+    assert list(dct.reversed_keys(before="mango")) == ["alpha", "zebra"]
 
 
 def test_keys_after_missing_id_raises(log_dict_factory):
@@ -586,7 +586,7 @@ def test_keys_after_missing_id_raises(log_dict_factory):
     with pytest.raises(KeyError):
         list(dct.keys(after="k1"))
     with pytest.raises(KeyError):
-        list(dct.keys_reverse(before="nope", limit=1))
+        list(dct.reversed_keys(before="nope", limit=1))
     with pytest.raises(TypeError):
         dct.keys(after=1.5)
 
@@ -792,7 +792,7 @@ def test_keys_after_limit_scan_is_bounded(costed):
     _fill_log(storage, 1000)
     for page in (
         lambda d: list(d.keys(after="k10", limit=5)),
-        lambda d: list(d.keys_reverse(before="k10", limit=5)),
+        lambda d: list(d.reversed_keys(before="k10", limit=5)),
     ):
         cost = measure(
             storage,

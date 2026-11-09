@@ -502,7 +502,7 @@ def test_keys_after_with_limit_is_exact(fdict):
     with pytest.raises(KeyError):
         view.keys(after="zz")  # raised at the call, before any read
     with pytest.raises(KeyError):
-        view.keys_reverse(before="zz")
+        view.reversed_keys(before="zz")
 
 
 def test_keys_after_a_cursor_of_the_wrong_type_raises_type_error(fdict):
@@ -511,13 +511,13 @@ def test_keys_after_a_cursor_of_the_wrong_type_raises_type_error(fdict):
         view.keys(after=1.5)
 
 
-def test_keys_reverse_before_with_limit_is_exact(fdict):
+def test_reversed_keys_before_with_limit_is_exact(fdict):
     view = fdict("lst", {k: i for i, k in enumerate("abcdefg")})
-    assert list(view.keys_reverse(before="f", limit=3)) == ["e", "d", "c"]
-    assert list(view.keys_reverse(before="f")) == ["e", "d", "c", "b", "a"]
-    assert list(view.keys_reverse(limit=2)) == ["g", "f"]
-    assert list(view.keys_reverse(before="a", limit=3)) == []
-    assert list(view.keys_reverse(before="b", limit=3)) == ["a"]
+    assert list(view.reversed_keys(before="f", limit=3)) == ["e", "d", "c"]
+    assert list(view.reversed_keys(before="f")) == ["e", "d", "c", "b", "a"]
+    assert list(view.reversed_keys(limit=2)) == ["g", "f"]
+    assert list(view.reversed_keys(before="a", limit=3)) == []
+    assert list(view.reversed_keys(before="b", limit=3)) == ["a"]
 
 
 def _follow(view, cursor=None):
@@ -1486,7 +1486,7 @@ def _ops(n):
         "next_after": lambda v: v.next_after(_mid(n)),
         "prev_before": lambda v: v.prev_before(_mid(n)),
         "keys_after_limit3": lambda v: list(v.keys(after=_mid(n), limit=3)),
-        "keys_reverse_limit3": lambda v: list(v.keys_reverse(before=_mid(n), limit=3)),
+        "reversed_keys_limit3": lambda v: list(v.reversed_keys(before=_mid(n), limit=3)),
         "set_existing": lambda v: v.__setitem__(_mid(n), -1),
         "set_new": lambda v: v.__setitem__("set_new", -1),
         "append": lambda v: v.append("app", -1),

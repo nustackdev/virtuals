@@ -29,7 +29,7 @@ scan on delete; ``rebuild_bookkeeping()`` fills the index.
 Ordered enumeration via ``__keys__/`` prefix scan (lexicographic =
 chronological). Direct lookup via ``__data__.[key]`` (skips ``__keys__``).
 
-Cursors. ``keys(after=id, limit=)`` and ``keys_reverse(before=id, limit=)``
+Cursors. ``keys(after=id, limit=)`` and ``reversed_keys(before=id, limit=)``
 page by an item's own id: the reverse index gives its log key in one get,
 then one seek into ``__keys__/``. An id that is gone raises KeyError, like
 ``FractionalIndexedDictView``: its log slot went with it. Streams that must
@@ -137,7 +137,7 @@ class LogIndexedDictViewBase(
     for nested data with controlled granularity. No ``__len__`` metadata.
 
     Multi-writer safe: each writer generates unique log keys independently.
-    Pages by item id: ``keys(after=id, limit=)``, ``keys_reverse(before=id, limit=)``.
+    Pages by item id: ``keys(after=id, limit=)``, ``reversed_keys(before=id, limit=)``.
     """
 
     STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(15)
@@ -455,7 +455,7 @@ class LogIndexedDictViewBase(
             return ReversibleKeysView(self)
         return self._keys_page(cursor=after, limit=limit, reverse=False)
 
-    def keys_reverse(
+    def reversed_keys(
         self,
         *,
         before: str | int | None = None,
