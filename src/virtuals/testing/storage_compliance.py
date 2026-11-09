@@ -101,6 +101,28 @@ class StorageProtocolCompliance:
         assert txn.is_closed
         assert not txn.is_active
 
+    def test_write_slot_hands_over_to_a_transaction(self, storage: StorageProtocol) -> None:
+        """``areserve_write_slot`` gives a held slot ``begin_transaction`` takes over."""
+        import asyncio
+
+        from virtuals.tkv.storage import WriteSlotProtocol
+
+        async def reserve() -> WriteSlotProtocol:
+            return await storage.areserve_write_slot()
+
+        slot = asyncio.run(reserve())
+        assert isinstance(slot, WriteSlotProtocol)
+        assert slot.held
+        txn = storage.begin_transaction(write_slot=slot)
+        assert not slot.held
+        txn.commit()
+        slot.release()  # taken: a no-op
+
+        unused = asyncio.run(reserve())
+        unused.release()
+        assert not unused.held
+        storage.begin_transaction().abort()  # the slot is free again
+
     def test_begin_snapshot(self, storage: StorageProtocol) -> None:
         """Test begin_snapshot creates a read-only snapshot."""
         snapshot = storage.begin_snapshot()

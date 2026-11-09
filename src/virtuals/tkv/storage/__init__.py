@@ -33,6 +33,7 @@ from .context import (
     TransactionProtocol,
     WriteAccessProtocol,
     WriteBatchProtocol,
+    WriteSlotProtocol,
 )
 from .exceptions import (
     StorageClosedError,
@@ -86,6 +87,7 @@ __all__ = [  # noqa: RUF022
     "ReadWriteAccessProtocol",
     "SnapshotProtocol",
     "WriteBatchProtocol",
+    "WriteSlotProtocol",
     "TransactionProtocol",
     "TransactionalStorageProtocol",
     # Types

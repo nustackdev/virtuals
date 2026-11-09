@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from typing_extensions import Self
 
-from .context import TransactionalStorageProtocol
+from .context import TransactionalStorageProtocol, WriteSlotProtocol
 
 
 if TYPE_CHECKING:
@@ -69,6 +69,18 @@ class StorageProtocol(TransactionalStorageProtocol, Protocol):
         exc_tb: TracebackType | None,
     ) -> None:
         """Close storage via context manager."""
+        ...
+
+    async def areserve_write_slot(self) -> WriteSlotProtocol:
+        """Wait for the writer slot without blocking the event loop.
+
+        Returns:
+            The held slot, for ``begin_transaction(write_slot=...)``. Call
+            its ``release`` if no transaction takes it.
+
+        Raises:
+            StorageError: On a read-only storage.
+        """
         ...
 
     # ========================================================================
