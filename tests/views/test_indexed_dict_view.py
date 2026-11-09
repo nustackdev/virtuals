@@ -2,6 +2,8 @@
 
 from itertools import islice
 
+import pytest
+
 from virtuals._views import EagerIndexedDictView, LazyIndexedDictView
 from virtuals.view import ViewBase
 
@@ -113,6 +115,45 @@ def test_indexed_dict_keys(indexed_dict_factory):
     dct = indexed_dict_factory("dct", {"a": 1, "b": 2, "c": 3})
     keys = list(dct.keys())
     assert set(keys) == {"a", "b", "c"}
+
+
+def test_indexed_dict_keys_after_pages_in_insertion_order(indexed_dict_factory):
+    dct = indexed_dict_factory("dct", {"c": 3, "a": 1, "b": {"x": 1}, 5: 0})
+
+    assert list(dct.keys(limit=2)) == ["c", "a"]
+    assert list(dct.keys(after="a", limit=2)) == ["b", 5]
+    assert list(dct.keys(after=5)) == []
+    assert list(dct.keys(after="c")) == ["a", "b", 5]
+    assert list(dct.keys(limit=0)) == []
+
+
+def test_indexed_dict_reversed_keys_pages_last_first(indexed_dict_factory):
+    dct = indexed_dict_factory("dct", {"c": 3, "a": 1, "b": {"x": 1}, 5: 0})
+
+    assert list(dct.reversed_keys()) == [5, "b", "a", "c"]
+    assert list(dct.reversed_keys(limit=2)) == [5, "b"]
+    assert list(dct.reversed_keys(before="a", limit=5)) == ["c"]
+    assert list(dct.reversed_keys(before="c")) == []
+
+
+def test_indexed_dict_paging_cursor_must_be_held(indexed_dict_factory):
+    """A cursor is a key the view holds, as on the log and fractional views; checked at the call."""
+    dct = indexed_dict_factory("dct", {"a": 1, "b": 2})
+
+    with pytest.raises(KeyError):
+        dct.keys(after="zz")
+    with pytest.raises(KeyError):
+        dct.reversed_keys(before="zz")
+    with pytest.raises(TypeError):
+        dct.keys(after=1.5)
+
+
+def test_indexed_dict_paging_on_both_facets(indexed_dict_factory):
+    dct = indexed_dict_factory("dct", {"a": 1, "b": 2, "c": 3})
+
+    assert list(dct.lazy.keys(after="a", limit=1)) == ["b"]
+    assert list(dct.lazy.reversed_keys(before="c")) == ["b", "a"]
+    assert list(dct.keys()) == ["a", "b", "c"]  # no arguments: the keys view
 
 
 def test_indexed_dict_values(indexed_dict_factory):

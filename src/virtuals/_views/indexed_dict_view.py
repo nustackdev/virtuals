@@ -30,6 +30,7 @@ Provides three classes following the eager/lazy facet pattern:
 from __future__ import annotations
 
 from collections.abc import ItemsView, KeysView, ValuesView
+from itertools import islice
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from virtuals.collections import DictMethods, ReactiveMappingBase
@@ -210,9 +211,55 @@ class IndexedDictViewBase(
         """Get key at index — single O(1) read from __keys__ FlatListView."""
         return self._keys_view()[idx]
 
-    def keys(self) -> KeysView[str | int]:
-        """Get all keys as a set-like view."""
-        return ReversibleKeysView(self)
+    def keys(
+        self, *, after: str | int | None = None, limit: int | None = None
+    ) -> KeysView[str | int] | Generator[str | int, None, None]:
+        """Keys in insertion order.
+
+        With no arguments: a set-like KeysView. With ``after`` or ``limit``:
+        a generator, a page of the keys recorded after the key ``after``
+        (from the first when None), at most ``limit`` of them.
+
+        ``after`` is a key the view holds, KeyError otherwise, as on the log
+        and fractional views. Cost: the key list has no reverse index, so
+        finding ``after`` scans ``__keys__/`` up to it, O(n); with no
+        cursor a page reads O(limit) rows.
+        """
+        if after is None and limit is None:
+            return ReversibleKeysView(self)
+        return self._keys_page(cursor=after, limit=limit, reverse=False)
+
+    def reversed_keys(
+        self, *, before: str | int | None = None, limit: int | None = None
+    ) -> Generator[str | int, None, None]:
+        """Keys last first, recorded before the key ``before``, at most ``limit``.
+
+        From the last when ``before`` is None. ``before`` is a key the view
+        holds, KeyError otherwise; found by the same O(n) scan as
+        ``keys(after=)``.
+        """
+        return self._keys_page(cursor=before, limit=limit, reverse=True)
+
+    def _keys_page(
+        self, *, cursor: str | int | None, limit: int | None, reverse: bool
+    ) -> Generator[str | int, None, None]:
+        """One page of keys. A bad or missing cursor raises at the call, not on the first read."""
+        if cursor is not None:
+            if not is_view_key(cursor):
+                raise TypeError(f"view keys must be str or int, got {type(cursor).__name__}")
+            if cursor not in self:
+                raise KeyNotFoundError(cursor)
+        return self._iter_page(cursor, limit=limit, reverse=reverse)
+
+    def _iter_page(
+        self, cursor: str | int | None, *, limit: int | None, reverse: bool
+    ) -> Generator[str | int, None, None]:
+        keys = self._iter_ordered_keys(reverse=reverse)
+        if cursor is not None:
+            for key in keys:
+                if key == cursor:
+                    break
+        yield from islice(keys, limit)
 
     # -- Bookkeeping ---------------------------------------------------------
 
