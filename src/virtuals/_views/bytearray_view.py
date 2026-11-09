@@ -10,6 +10,7 @@ from virtuals.types import is_empty
 from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
+    IndexNotFoundError,
     MetadataBasedChildrenCountBase,
     ObservableBase,
     UnsafePrimitiveOpsBase,
@@ -79,7 +80,7 @@ class ByteArrayView(
             address = length + address
 
         if address < 0 or address >= length:
-            raise IndexError("bytearray address (index) out of range")
+            raise IndexNotFoundError("bytearray address (index) out of range")
 
         return address
 
@@ -98,7 +99,7 @@ class ByteArrayView(
         normalized = self.normalize_address(address)
         value = self.container.get_child_primitive(normalized)
         if is_empty(value):
-            raise IndexError("bytearray index out of range")
+            raise IndexNotFoundError("bytearray index out of range")
         return cast("int", value)
 
     def __setitem__(self, address: int, value: int) -> None:

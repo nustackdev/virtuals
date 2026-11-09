@@ -15,7 +15,13 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import EMPTY, Empty, Value
-from virtuals.view import ChildPrimitiveSetBase, UnsafePrimitiveOpsBase, ViewBase, is_view_key
+from virtuals.view import (
+    ChildPrimitiveSetBase,
+    KeyNotFoundError,
+    UnsafePrimitiveOpsBase,
+    ViewBase,
+    is_view_key,
+)
 
 from ._keys_view import ReversibleKeysView
 
@@ -77,10 +83,10 @@ class LightDictView(
             KeyError: If key not found, or a key the view cannot hold
         """
         if not is_view_key(key):
-            raise KeyError(key)
+            raise KeyNotFoundError(key)
         value = self.container.get_child_primitive(key)
         if isinstance(value, Empty):
-            raise KeyError(key)
+            raise KeyNotFoundError(key)
         return value
 
     def __setitem__(self, key: str | int, value: Value) -> None:
@@ -101,7 +107,7 @@ class LightDictView(
             key: Key to delete
         """
         if not is_view_key(key) or not self.container.exists_child(key):
-            raise KeyError(key)
+            raise KeyNotFoundError(key)
         self.container.delete_child(key)
 
     def __contains__(self, key: str | int) -> bool:

@@ -55,6 +55,7 @@ from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
     KeyedChildrenCountBase,
+    KeyNotFoundError,
     LazyChildReadBase,
     ObservableBase,
     PrimitiveOpsBase,
@@ -224,7 +225,7 @@ class Kh57ViewBase(
         if isinstance(address, float) and address.is_integer():
             address = int(address)
         if not isinstance(address, int) or address < 0 or address >> _LEVEL_BITS:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         return address
 
     # -- Internal encoded-key ops -----------------------------------------
@@ -363,7 +364,7 @@ class Kh57ViewBase(
         """Delete item at original int key `address`."""
         encoded = kh57(self._read_key(address))
         if not self.container.exists_child(encoded):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         self.container.delete_child(encoded)
         self._decrement_length()
 
@@ -537,12 +538,12 @@ class EagerKh57View(Kh57ViewBase):
         child_site = (*self.container.site, encoded)
         info = node_ops.get_node_info(child_site, self.container.ctx)
         if not info.exists or info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         if info.node_type == NodeType.PRIMITIVE:
             from virtuals.types import is_empty
 
             if is_empty(info.primitive_value):
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return info.primitive_value
         return self._extract_container_value(encoded, info)
 
@@ -613,12 +614,12 @@ class LazyKh57View(Kh57ViewBase):
         child_site = (*self.container.site, encoded)
         info = node_ops.get_node_info(child_site, self.container.ctx)
         if not info.exists or info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         if info.node_type == NodeType.PRIMITIVE:
             from virtuals.types import is_empty
 
             if is_empty(info.primitive_value):
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return info.primitive_value
         return self._view_container_value(encoded, info)
 

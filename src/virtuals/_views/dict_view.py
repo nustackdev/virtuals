@@ -29,6 +29,7 @@ from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
     DescendantsObservableBase,
+    KeyNotFoundError,
     LazyChildReadBase,
     LiveChildrenCountBase,
     ObservableBase,
@@ -184,7 +185,7 @@ class DictViewBase(
         bookkeeping fires.
         """
         if not is_view_key(address) or not self.container.exists_child(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         self.container.delete_child(address)
 
     def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
@@ -269,11 +270,11 @@ class EagerDictView(DictViewBase):
     def __getitem__(self, address: str | int) -> object | Empty:
         """Get value for key — returns extracted Python value."""
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         try:
             return self._get_child_value(address)
         except ContainerNotFoundError as e:
-            raise KeyError(address) from e
+            raise KeyNotFoundError(address) from e
 
     def values(self) -> ValuesView[object]:
         """Get all values as a collection view.
@@ -422,11 +423,11 @@ class LazyDictView(DictViewBase):
     def __getitem__(self, address: str | int) -> object:
         """Get child — returns View for containers, value for primitives."""
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         try:
             return self._get_child_view_or_value(address)
         except ContainerNotFoundError as e:
-            raise KeyError(address) from e
+            raise KeyNotFoundError(address) from e
 
     def values(self) -> ValuesView[object]:
         """Get all children as a collection view.

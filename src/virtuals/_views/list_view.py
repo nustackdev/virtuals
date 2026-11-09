@@ -25,6 +25,7 @@ from virtuals.view import (
     ChildNestedSetBase,
     ChildObservableBase,
     ChildPrimitiveSetBase,
+    IndexNotFoundError,
     LazyChildReadBase,
     MetadataBasedChildrenCountBase,
     ObservableBase,
@@ -113,7 +114,7 @@ class ListViewBase(
             address = length + address
 
         if address < 0 or address >= length:
-            raise IndexError("list index out of range")
+            raise IndexNotFoundError("list index out of range")
 
         return address
 
@@ -299,7 +300,7 @@ class EagerListView(ListViewBase):
         try:
             return self._get_child_value(normalized)
         except ContainerNotFoundError as e:
-            raise IndexError("list index out of bounds") from e
+            raise IndexNotFoundError("list index out of bounds") from e
 
     def __iter__(self) -> Generator[Value, None, None]:
         """Iterate over items — yields extracted Python values."""
@@ -425,7 +426,7 @@ class LazyListView(ListViewBase):
         try:
             return self._get_child_view_or_value(normalized)
         except ContainerNotFoundError as e:
-            raise IndexError("list index out of bounds") from e
+            raise IndexNotFoundError("list index out of bounds") from e
 
     def __iter__(self) -> Generator[object, None, None]:
         """Iterate — yields Views for containers, values for primitives."""

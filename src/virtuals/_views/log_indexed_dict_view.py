@@ -57,6 +57,7 @@ from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
     DescendantsObservableBase,
+    KeyNotFoundError,
     LazyChildReadBase,
     ObservableBase,
     PrimitiveOpsBase,
@@ -229,10 +230,10 @@ class LogIndexedDictViewBase(
     def _require_log_key(self, actual_key: str | int) -> str:
         """Log key of ``actual_key`` as a cursor. KeyError if the id holds no data."""
         if actual_key not in self:
-            raise KeyError(actual_key)
+            raise KeyNotFoundError(actual_key)
         log_key = self._find_log_key(actual_key)
         if is_empty(log_key):
-            raise KeyError(actual_key)
+            raise KeyNotFoundError(actual_key)
         return cast("str", log_key)
 
     # -- Bookkeeping -------------------------------------------------------
@@ -547,11 +548,11 @@ class LogIndexedDictViewBase(
         # No ensure_created here: deletes must not materialize the view as
         # a side effect. If the underlying __data__/ container doesn't
         # exist yet, exists_child returns False against raw storage and we
-        # raise KeyError -- matching Python dict semantics and letting ref
-        # callers no-op via their KeyError/IndexError catch.
+        # raise KeyNotFoundError -- a KeyError, matching Python dict
+        # semantics, and the one error ref callers no-op on.
         dc = self._data_container()
         if not is_view_key(address) or not dc.exists_child(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc.delete_child(address)
         # Drop the log entry: found in two gets (a scan only for data
         # logged before the reverse index), then two point deletes.
@@ -635,14 +636,14 @@ class LogIndexedDictViewBase(
 
     def _read_child_from_data(self, address: str | int) -> tuple[object, bool]:
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc = self._data_container()
         child_site = (*dc.site, address)
         from virtuals.container import node_ops
 
         node_info = node_ops.get_node_info(child_site, dc.ctx)
         if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         return node_info, node_info.node_type == NodeType.CONTAINER
 
     def _extract_data_child(self, address: str | int, node_info: object) -> object:
@@ -683,7 +684,7 @@ class EagerLogIndexedDictView(LogIndexedDictViewBase):
         node_info, is_container = self._read_child_from_data(address)
         if not is_container:
             if is_empty(node_info.primitive_value):  # type: ignore[union-attr]
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value  # type: ignore[union-attr]
         return self._extract_data_child(address, node_info)
 
@@ -775,7 +776,7 @@ class LazyLogIndexedDictView(LogIndexedDictViewBase):
         node_info, is_container = self._read_child_from_data(address)
         if not is_container:
             if is_empty(node_info.primitive_value):  # type: ignore[union-attr]
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value  # type: ignore[union-attr]
         return self._view_data_child(address, node_info)
 

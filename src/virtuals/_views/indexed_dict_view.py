@@ -43,6 +43,7 @@ from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
     DescendantsObservableBase,
+    KeyNotFoundError,
     LazyChildReadBase,
     ObservableBase,
     PrimitiveOpsBase,
@@ -273,11 +274,11 @@ class IndexedDictViewBase(
         # No ensure_created here: deletes must not materialize the view as
         # a side effect. If the underlying __data__/ container doesn't
         # exist yet, exists_child returns False against raw storage and we
-        # raise KeyError -- matching Python dict semantics and letting ref
-        # callers no-op via their KeyError/IndexError catch.
+        # raise KeyNotFoundError -- a KeyError, matching Python dict
+        # semantics, and the one error ref callers no-op on.
         dc = self._data_container()
         if not is_view_key(address) or not dc.exists_child(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc.delete_child(address)
         # Rebuild key index
         kv = self._keys_view()
@@ -329,14 +330,14 @@ class IndexedDictViewBase(
             (node_info, is_container) — the raw node info and whether it's a container
         """
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc = self._data_container()
         child_site = (*dc.site, address)
         from virtuals.container import node_ops
 
         node_info = node_ops.get_node_info(child_site, dc.ctx)
         if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         return node_info, node_info.node_type == NodeType.CONTAINER
 
     def _extract_data_child(self, address: str | int, node_info: object) -> object:
@@ -405,7 +406,7 @@ class EagerIndexedDictView(IndexedDictViewBase):
             from virtuals.types import is_empty
 
             if is_empty(node_info.primitive_value):  # type: ignore[union-attr]
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value  # type: ignore[union-attr]
         return self._extract_data_child(address, node_info)
 
@@ -512,7 +513,7 @@ class LazyIndexedDictView(IndexedDictViewBase):
             from virtuals.types import is_empty
 
             if is_empty(node_info.primitive_value):  # type: ignore[union-attr]
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value  # type: ignore[union-attr]
         return self._view_data_child(address, node_info)
 

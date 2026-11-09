@@ -17,6 +17,7 @@ from virtuals.view import (
     ChildNestedGetBase,
     ChildNestedSetBase,
     ChildPrimitiveSetBase,
+    IndexNotFoundError,
     MetadataBasedChildrenCountBase,
     UnsafePrimitiveOpsBase,
     View,
@@ -95,7 +96,7 @@ class TupleView(
             address = length + address
 
         if address < 0 or address >= length:
-            raise IndexError("tuple index out of range")
+            raise IndexNotFoundError("tuple index out of range")
 
         return address
 
@@ -115,7 +116,7 @@ class TupleView(
         try:
             return self._get_child_value(normalized)
         except ContainerNotFoundError as e:
-            raise IndexError("tuple index out of range") from e
+            raise IndexNotFoundError("tuple index out of range") from e
 
     def __iter__(self) -> Generator[object, None, None]:
         """Iterate over items.

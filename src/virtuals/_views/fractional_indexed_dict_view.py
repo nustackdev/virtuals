@@ -125,6 +125,7 @@ from virtuals.view import (
     ChildObservableBase,
     ChildPrimitiveSetBase,
     DescendantsObservableBase,
+    KeyNotFoundError,
     LazyChildReadBase,
     ObservableBase,
     PrimitiveOpsBase,
@@ -244,7 +245,7 @@ class FractionalIndexedDictViewBase(
     def _require_position(self, address: Address) -> str:
         okey = self._position_or_empty(address)
         if is_empty(okey):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         return cast("str", okey)
 
     def _scan_order(
@@ -800,12 +801,12 @@ class FractionalIndexedDictViewBase(
     def __delitem__(self, address: Address) -> None:
         # No ensure_created: a delete must not materialize the view.
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc = self._data_container()
         okey = self._position_or_empty(address)
         if is_empty(okey):
             if not dc.exists_child(address):
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
         else:
             self._order_container().delete_child_primitive_unsafe(cast("str", okey))
             self._pos_container().delete_child_primitive_unsafe(address)
@@ -868,11 +869,11 @@ class FractionalIndexedDictViewBase(
         from virtuals.container import node_ops
 
         if not is_view_key(address):
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         dc = self._data_container()
         node_info = node_ops.get_node_info((*dc.site, address), dc.ctx)
         if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
         return node_info, node_info.node_type == NodeType.CONTAINER
 
     def _child_view(self, address: Address, node_info: object) -> View:
@@ -891,7 +892,7 @@ class FractionalIndexedDictViewBase(
         node_info, is_container = self._read_child(address)
         if not is_container:
             if is_empty(node_info.primitive_value):  # type: ignore[attr-defined]
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value  # type: ignore[attr-defined]
         return self._child_result(address, node_info)
 

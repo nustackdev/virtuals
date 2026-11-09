@@ -17,6 +17,7 @@ from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import Empty, Value
 from virtuals.view import (
     ChildPrimitiveSetBase,
+    IndexNotFoundError,
     MetadataBasedChildrenCountBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
@@ -75,7 +76,7 @@ class FlatListView(
         if address < 0:
             address = length + address
         if address < 0 or address >= length:
-            raise IndexError("list index out of range")
+            raise IndexNotFoundError("list index out of range")
         return address
 
     # -- Read ---------------------------------------------------------------
@@ -85,7 +86,7 @@ class FlatListView(
         normalized = self.normalize_address(address)
         value = self.container.get_child_primitive(normalized)
         if isinstance(value, Empty):
-            raise IndexError("list index out of range")
+            raise IndexNotFoundError("list index out of range")
         return value
 
     def __iter__(self) -> Generator[Value, None, None]:

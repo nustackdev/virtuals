@@ -53,7 +53,7 @@ from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.tkv.filter import WildcardFilter
 from virtuals.tkv.observer import SubscriptionOptions
 from virtuals.types import EMPTY, is_empty
-from virtuals.view import ObservableBase, ViewBase
+from virtuals.view import IndexNotFoundError, ObservableBase, ViewBase
 
 
 if TYPE_CHECKING:
@@ -134,11 +134,11 @@ class RingView(ObservableBase, ViewBase):
             raise TypeError(f"ring indices must be integers, got {type(index).__name__}")
         edge = self._edge_seq(newest=index < 0)
         if edge is None:
-            raise IndexError("ring index out of range")
+            raise IndexNotFoundError("ring index out of range")
         seq = edge + index if index >= 0 else edge + index + 1
         entry = self.container.get_child_primitive_unsafe(seq) if seq >= 0 else EMPTY
         if is_empty(entry):
-            raise IndexError("ring index out of range")
+            raise IndexNotFoundError("ring index out of range")
         return cast("Value", entry)
 
     def __iter__(self) -> Generator[Value, None, None]:

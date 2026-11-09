@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Generic, TypeVar, cast
 from virtuals.container import Container, NodeType, node_ops
 from virtuals.types import EMPTY, Empty, is_empty
 
+from .exceptions import KeyNotFoundError
+
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -287,12 +289,12 @@ class ChildNestedGetBase:
             node_info = node_ops.get_node_info(child_site, self.container.ctx)
 
         if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
 
         if node_info.node_type == NodeType.PRIMITIVE:
             # Primitive value is already in node_info
             if is_empty(node_info.primitive_value):
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value
 
         # Child is container - extract it (pass info to avoid re-read)
@@ -402,11 +404,11 @@ class LazyChildReadBase:
             node_info = node_ops.get_node_info(child_site, self.container.ctx)
 
         if not node_info.exists or node_info.node_type == NodeType.NOT_FOUND:
-            raise KeyError(address)
+            raise KeyNotFoundError(address)
 
         if node_info.node_type == NodeType.PRIMITIVE:
             if is_empty(node_info.primitive_value):
-                raise KeyError(address)
+                raise KeyNotFoundError(address)
             return node_info.primitive_value
 
         # Container — resolve view but do NOT extract
