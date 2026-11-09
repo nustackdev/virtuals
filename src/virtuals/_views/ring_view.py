@@ -1,5 +1,13 @@
 """RingView: a capped log. Appends go to the end, the oldest entries drop.
 
+A read-only ``Sequence`` (``[i]``, slices, ``len``, ``in``, iteration,
+``reversed``, ``index``, ``count``) plus ``append``, ``extend`` and
+``clear``. Positions run 0..len-1 from the oldest entry kept, so a
+position names a different entry once the ring drops one. There is no
+write at a position: ``ring[i] = x`` and ``del ring[i]`` raise TypeError
+and ``insert``, ``pop``, ``remove``, ``reverse`` do not exist, as on a
+``tuple``. A ring is appended to and read in order.
+
 Layout under the view's container::
 
     site/
@@ -26,13 +34,12 @@ out: a constant number of keys. ``extend`` does the same once for the
 whole batch. An append to an empty ring also reads the restart mark (one
 get). No stored length, no key shared with any other container.
 
-Cursor. A sequence number marks a position for good: ``entries(after=seq)``
-resumes after it even once it has dropped out, so a reader can follow a
-ring by its last seen sequence number. ``clear`` and ``store`` keep the
-numbering going: emptying a ring that held entries writes the next
-sequence number to the ring's ``__next__`` metadata, and the next append
-to the empty ring starts there. Numbering restarts at 0 only for a ring
-that is deleted and written again.
+Numbering. Sequence numbers are storage keys, never handed out.
+``clear`` and ``store`` keep the numbering going, so a key is never
+reused: emptying a ring that held entries writes the next sequence number
+to the ring's ``__next__`` metadata, and the next append to the empty ring
+starts there. Numbering restarts at 0 only for a ring that is deleted and
+written again.
 
 Concurrency. Two writers appending at once read the same newest row and
 pick the same sequence number. sqlite and lmdb serialize writers, so the
@@ -45,15 +52,17 @@ fires once per appended row and once per dropped one.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from functools import cache
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from virtuals.collections import SequenceBase
 from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.tkv.filter import WildcardFilter
 from virtuals.tkv.observer import SubscriptionOptions
 from virtuals.types import EMPTY, is_empty
 from virtuals.view import IndexNotFoundError, ObservableBase, ViewBase
+
+from ._index import require_int_index
 
 
 if TYPE_CHECKING:
@@ -69,7 +78,7 @@ _NEXT = "__next__"
 """Metadata key: the sequence number the next append to an emptied ring takes."""
 
 
-class RingView(ObservableBase, ViewBase):
+class RingView(ObservableBase, ViewBase, SequenceBase[object]):
     """A capped log of primitive entries, oldest first.
 
     Example::
@@ -78,10 +87,8 @@ class RingView(ObservableBase, ViewBase):
         >>> out.extend(["a", "b", "c", "d"])
         >>> list(out)
         ['b', 'c', 'd']
-        >>> out[0], out[-1], len(out)
-        ('b', 'd', 3)
-        >>> list(out.entries(after=2))
-        [(3, 'd')]
+        >>> out[0], out[-1], out[1:], len(out)
+        ('b', 'd', ['c', 'd'], 3)
     """
 
     STRUCTURE: ClassVar[ContainerStructure] = ContainerStructure(18)
@@ -128,10 +135,15 @@ class RingView(ObservableBase, ViewBase):
         """True if the ring holds an entry. One seek."""
         return self._edge_seq(newest=False) is not None
 
-    def __getitem__(self, index: int) -> Value:
-        """Entry by position, oldest first; negative counts from the newest."""
-        if isinstance(index, bool) or not isinstance(index, int):
-            raise TypeError(f"ring indices must be integers, got {type(index).__name__}")
+    def __getitem__(self, index: int | slice) -> Value | list[Value]:
+        """Entry by position, oldest first; negative counts from the newest.
+
+        A slice gives a plain list, as ``list`` does: one seek plus one row
+        per position it spans.
+        """
+        if isinstance(index, slice):
+            return self._slice(index)
+        require_int_index(index, "ring")
         edge = self._edge_seq(newest=index < 0)
         if edge is None:
             raise IndexNotFoundError("ring index out of range")
@@ -140,6 +152,20 @@ class RingView(ObservableBase, ViewBase):
         if is_empty(entry):
             raise IndexNotFoundError("ring index out of range")
         return cast("Value", entry)
+
+    def _slice(self, index: slice) -> list[Value]:
+        """Entries at the positions ``index`` spans: one contiguous scan, then the step."""
+        oldest = self._edge_seq(newest=False)
+        if oldest is None:
+            return []
+        length = cast("int", self._edge_seq(newest=True)) - oldest + 1
+        positions = range(*index.indices(length))
+        if not positions:
+            return []
+        lo, hi = min(positions), max(positions)
+        after = oldest + lo - 1 if lo > 0 else None
+        span = [entry for _seq, entry in self._rows(after=after, limit=hi - lo + 1)]
+        return [span[p - lo] for p in positions]
 
     def __iter__(self) -> Generator[Value, None, None]:
         """Entries, oldest first."""
@@ -151,51 +177,15 @@ class RingView(ObservableBase, ViewBase):
         for _seq, entry in self._rows(reverse=True):
             yield entry
 
-    def __contains__(self, value: object) -> bool:
-        """True if an entry equals ``value``. One scan, O(capacity)."""
-        return any(entry == value for entry in self)
-
-    def index(self, value: object, start: int = 0, stop: int | None = None) -> int:
-        """Position of the first entry equal to ``value``, as ``list.index``. One scan, O(capacity)."""
-        kept = list(self)
-        return kept.index(value, start) if stop is None else kept.index(value, start, stop)
-
-    def count(self, value: object) -> int:
-        """Entries equal to ``value``. One scan, O(capacity)."""
-        return sum(1 for entry in self if entry == value)
-
-    def entries(
-        self, *, after: int | None = None, limit: int | None = None
-    ) -> Generator[tuple[int, Value], None, None]:
-        """``(seq, entry)`` oldest first, past sequence number ``after``, at most ``limit``.
-
-        ``after`` need not be kept any more: a reader that fell behind
-        resumes at the oldest entry still there. Cost: one seek plus
-        O(limit) rows.
-
-        Raises:
-            TypeError: ``after`` is not a sequence number (an int), at the call.
-            ValueError: ``limit`` is not a count of zero or more, at the call.
-            ContainerNotFoundError: On a never-written ring, when the page
-                is read (as ``len`` and iteration do).
-        """
-        if after is not None and (isinstance(after, bool) or not isinstance(after, int)):
-            raise TypeError(f"a ring cursor is a sequence number, got {after!r}")
-        if limit is not None and (
-            isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
-        ):
-            raise ValueError(f"limit must be a count of zero or more, got {limit!r}")
-        return self._rows(after=after, limit=limit)
-
     def extract(self) -> list[Value]:
         """All entries kept, oldest first."""
         return list(self)
 
     # -- Write --------------------------------------------------------------
 
-    def append(self, entry: Value) -> int:
-        """Add ``entry`` as the newest; drop the oldest past capacity. Returns its seq."""
-        return cast("int", self._push(self._checked([entry])))
+    def append(self, entry: Value) -> None:
+        """Add ``entry`` as the newest; drop the oldest past capacity."""
+        self._push(self._checked([entry]))
 
     def extend(self, entries: Iterable[Value]) -> None:
         """Append every entry in order. Writes nothing for an empty iterable."""
@@ -204,8 +194,7 @@ class RingView(ObservableBase, ViewBase):
     def store(self, entries: Iterable[Value], *, replace: bool = True) -> None:
         """Replace the contents with ``entries`` (the last ``capacity`` of them).
 
-        Numbering goes on past the entries replaced, so a reader's cursor
-        stays good. Cost: O(entries kept before and after). ``replace=False``
+        Numbering goes on past the entries replaced. Cost: O(entries kept before and after). ``replace=False``
         skips clearing, for a ring known to be new (its parent just created
         it); on a ring holding entries it appends.
         """
@@ -234,17 +223,16 @@ class RingView(ObservableBase, ViewBase):
         self._require_capacity()
         return cast("list[Value]", self._reject_empty_in(list(entries)))
 
-    def _push(self, batch: list[Value], *, created: bool = False) -> int | None:
+    def _push(self, batch: list[Value], *, created: bool = False) -> None:
         """Write a checked ``batch`` after the newest, then drop what falls past capacity.
 
         An oversized batch still numbers every entry, but writes only the
         last ``capacity`` of them. An empty ring numbers on from its
         ``__next__`` mark. ``created``: the caller just ran ``ensure_created``.
-        Returns the newest seq, None if nothing was given.
         """
         capacity = self._require_capacity()
         if not batch:
-            return None
+            return
         if not created:
             self.ensure_created()
         newest = self._edge_seq(newest=True)
@@ -255,7 +243,6 @@ class RingView(ObservableBase, ViewBase):
                 seq, batch[seq - first], validate=False, validate_parent=False
             )
         self._trim(last - capacity)
-        return last
 
     def _next_on_empty(self) -> int:
         """The sequence number an empty ring's next append takes: its mark, or 0. One get."""
@@ -293,6 +280,3 @@ def _ring_of(base: type[RingView], capacity: int) -> type[RingView]:
         "type[RingView]",
         type(name, (base,), {"CAPACITY": capacity, "__module__": base.__module__}),
     )
-
-
-Sequence.register(RingView)

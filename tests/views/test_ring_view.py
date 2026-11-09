@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import MutableSequence, Sequence
 
 import pytest
 
@@ -59,11 +59,16 @@ def test_ring_without_capacity_reads_but_refuses_writes(ring_factory, root_view)
 # ============================================================================
 
 
+def _seqs(ring):
+    """The sequence numbers the ring's rows are stored under: storage keys, never handed out."""
+    return list(ring.container.iter_child_keys())
+
+
 def test_append_drops_oldest_past_capacity(ring_factory):
     ring = ring_factory(capacity=3)
-    seqs = [ring.append(x) for x in "abcde"]
+    assert [ring.append(x) for x in "abcde"] == [None] * 5  # as list.append
 
-    assert seqs == [0, 1, 2, 3, 4]
+    assert _seqs(ring) == [2, 3, 4]
     assert list(ring) == ["c", "d", "e"]
     assert list(reversed(ring)) == ["e", "d", "c"]
     assert len(ring) == 3
@@ -110,7 +115,7 @@ def test_empty_ring(ring_factory):
     assert len(ring) == 0
     assert not ring
     assert list(ring) == []
-    assert list(ring.entries()) == []
+    assert ring[:] == []
     with pytest.raises(IndexError):
         ring[0]
     with pytest.raises(IndexError):
@@ -119,7 +124,7 @@ def test_empty_ring(ring_factory):
 
 def test_never_written_ring_raises_on_read(root_view):
     ring = root_view.open_child("nope", RingView.of(3))
-    for read in (list, len, lambda r: list(r.entries()), lambda r: list(r.entries(after=3))):
+    for read in (list, len, lambda r: r[0], lambda r: r[1:], lambda r: list(reversed(r))):
         with pytest.raises(ContainerNotFoundError):
             read(ring)
     ring.clear()  # clear of nothing writes nothing
@@ -131,7 +136,7 @@ def test_extend_oversized_batch_keeps_the_last(ring_factory):
     ring.extend(["b", "c", "d", "e", "f"])
 
     assert list(ring) == ["d", "e", "f"]
-    assert [seq for seq, _ in ring.entries()] == [3, 4, 5]
+    assert _seqs(ring) == [3, 4, 5]
     assert len(ring) == 3
     ring.extend([])
     assert list(ring) == ["d", "e", "f"]
@@ -141,8 +146,8 @@ def test_store_replaces_and_numbers_on(ring_factory):
     ring = ring_factory(capacity=3, data=["a", "b", "c", "d"])
     ring.store(["x", "y"])
 
-    assert list(ring.entries()) == [(4, "x"), (5, "y")]
-    assert list(ring.entries(after=3)) == [(4, "x"), (5, "y")]
+    assert list(ring) == ["x", "y"]
+    assert _seqs(ring) == [4, 5]
 
 
 def test_clear_then_append_numbers_on(ring_factory):
@@ -150,8 +155,9 @@ def test_clear_then_append_numbers_on(ring_factory):
     ring.clear()
     assert len(ring) == 0
     ring.clear()  # an empty ring keeps its mark
-    assert ring.append("c") == 2
-    assert list(ring.entries(after=1)) == [(2, "c")]
+    ring.append("c")
+    assert list(ring) == ["c"]
+    assert _seqs(ring) == [2]
 
 
 def test_store_of_nothing_then_append_numbers_on(ring_factory):
@@ -159,7 +165,8 @@ def test_store_of_nothing_then_append_numbers_on(ring_factory):
     ring.store([])
     assert list(ring) == []
     ring.store(["c"])
-    assert list(ring.entries()) == [(2, "c")]
+    assert list(ring) == ["c"]
+    assert _seqs(ring) == [2]
 
 
 def test_a_deleted_ring_written_again_starts_at_zero(root_view):
@@ -169,7 +176,7 @@ def test_a_deleted_ring_written_again_starts_at_zero(root_view):
     parent.open_child("out", RingView.of(3)).clear()
     del parent["out"]
     parent.set_child_container_as("out", ["x"], RingView.of(3))
-    assert list(parent.open_child("out", RingView).entries()) == [(0, "x")]
+    assert _seqs(parent.open_child("out", RingView)) == [0]
 
 
 def test_smaller_capacity_drops_extra_on_next_append(ring_factory, root_view):
@@ -191,39 +198,45 @@ def test_empty_entry_is_refused_before_any_write(ring_factory):
 
 
 # ============================================================================
-# CURSOR
+# SEQUENCE: POSITIONS FROM THE OLDEST KEPT, NO WRITES AT A POSITION
 # ============================================================================
 
 
-def test_entries_follow_by_sequence_number(ring_factory):
-    ring = ring_factory(capacity=3, data=["a", "b"])
-    seen = list(ring.entries())
-    assert seen == [(0, "a"), (1, "b")]
+def test_slices_read_like_a_list(ring_factory):
+    ring = ring_factory(capacity=4, data=list("abcdef"))  # a, b dropped
+    kept = ["c", "d", "e", "f"]
 
-    ring.extend(["c", "d"])
-    assert list(ring.entries(after=seen[-1][0])) == [(2, "c"), (3, "d")]
-    assert list(ring.entries(after=1, limit=1)) == [(2, "c")]
-
-
-@pytest.mark.parametrize("after", [True, 1.5, "3"])
-def test_entries_refuse_a_cursor_that_is_not_a_sequence_number(ring_factory, after):
-    ring = ring_factory(data=["a"])
-    with pytest.raises(TypeError, match="sequence number"):
-        ring.entries(after=after)  # at the call, before any read
-
-
-@pytest.mark.parametrize("limit", [-1, True, 1.5, "3"])
-def test_entries_refuse_a_limit_that_is_not_a_count(ring_factory, limit):
-    ring = ring_factory(data=["a"])
-    with pytest.raises(ValueError, match="count of zero or more"):
-        ring.entries(limit=limit)
+    for sl in (
+        slice(None),
+        slice(1, 3),
+        slice(-2, None),
+        slice(None, None, 2),
+        slice(None, None, -1),
+        slice(3, 0, -2),
+        slice(5, 9),
+        slice(2, 1),
+    ):
+        assert ring[sl] == kept[sl], sl
 
 
-def test_reader_that_fell_behind_resumes_at_oldest_kept(ring_factory):
+def test_positions_move_as_the_oldest_drops(ring_factory):
     ring = ring_factory(capacity=2, data=["a", "b"])
-    ring.extend(["c", "d", "e"])  # a..c dropped
+    assert ring[0] == "a"
+    ring.append("c")
+    assert ring[0] == "b"
+    assert ring.index("c") == 1
 
-    assert list(ring.entries(after=0)) == [(3, "d"), (4, "e")]
+
+def test_no_write_at_a_position(ring_factory):
+    ring = ring_factory(data=["a", "b"])
+    with pytest.raises(TypeError, match="support item assignment"):
+        ring[0] = "x"
+    with pytest.raises(TypeError, match="support item deletion"):
+        del ring[0]
+    for name in ("insert", "pop", "remove", "reverse", "entries"):
+        assert not hasattr(ring, name), name
+    assert not isinstance(ring, MutableSequence)
+    assert list(ring) == ["a", "b"]
 
 
 # ============================================================================
