@@ -51,6 +51,7 @@ from virtuals.view import (
     is_view_key,
 )
 
+from ._keys_view import ReversibleKeysView
 from .flat_list_view import FlatListView
 
 
@@ -207,7 +208,7 @@ class IndexedDictViewBase(
 
     def keys(self) -> KeysView[str | int]:
         """Get all keys as a set-like view."""
-        return KeysView(self)  # type: ignore[arg-type]
+        return ReversibleKeysView(self)
 
     # -- Bookkeeping ---------------------------------------------------------
 

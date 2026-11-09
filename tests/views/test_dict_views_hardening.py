@@ -1049,6 +1049,20 @@ ACCESS_VIEWS = (
 """Every dict-like view and facet. A new dict view belongs here."""
 
 
+@pytest.mark.parametrize(
+    "view_cls", [v for v in ACCESS_VIEWS if v not in (EagerKh57View, LazyKh57View)]
+)
+def test_reversed_reads_keys_values_and_items_last_first(root, view_cls):
+    """Every ordered dict view reverses like a dict: itself, its keys, values and items."""
+    view = root.open_child("d", view_cls)
+    view.store({"k2": 2, "k1": 1, "k3": 3})
+    keys = list(view)
+    assert list(reversed(view)) == keys[::-1]
+    assert list(reversed(view.keys())) == keys[::-1]
+    assert list(reversed(view.values())) == list(view.values())[::-1]
+    assert list(reversed(view.items())) == list(view.items())[::-1]
+
+
 @pytest.mark.parametrize("view_cls", ACCESS_VIEWS)
 def test_access_mimics_dict_with_empty_as_the_absent_default(storage, view_cls):
     """The three access rules, on an absent view, in a transaction and in a snapshot.

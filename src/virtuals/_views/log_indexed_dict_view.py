@@ -65,6 +65,8 @@ from virtuals.view import (
     is_view_key,
 )
 
+from ._keys_view import ReversibleKeysView
+
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -446,7 +448,7 @@ class LogIndexedDictViewBase(
         Cost: O(limit) rows from one seek into ``__keys__/``.
         """
         if after is None and limit is None:
-            return KeysView(self)  # type: ignore[arg-type]
+            return ReversibleKeysView(self)
         return self._keys_page(cursor=after, limit=limit, reverse=False)
 
     def keys_reverse(

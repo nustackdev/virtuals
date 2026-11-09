@@ -38,6 +38,8 @@ from virtuals.view import (
     is_view_key,
 )
 
+from ._keys_view import ReversibleKeysView
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -120,6 +122,10 @@ class DictViewBase(
         """Iterate over keys."""
         yield from self.container.iter_child_keys(validate=False, strict=True)
 
+    def __reversed__(self) -> Generator[str | int, None, None]:
+        """Keys last first: one reverse scan."""
+        return self.keys_reverse()
+
     def keys(
         self, *, after: str | int | None = None, limit: int | None = None
     ) -> KeysView[str | int] | Generator[str | int, None, None]:
@@ -139,7 +145,7 @@ class DictViewBase(
                 is read (as iteration does).
         """
         if after is None and limit is None:
-            return KeysView(self)  # type: ignore[arg-type]
+            return ReversibleKeysView(self)
         return self._keys_page(cursor=after, limit=limit, reverse=False)
 
     def keys_reverse(

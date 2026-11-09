@@ -133,6 +133,7 @@ from virtuals.view import (
     is_view_key,
 )
 
+from ._keys_view import ReversibleKeysView
 from .fractional_index import (
     DEFAULT_SUFFIX_LENGTH,
     generate_n_suffixed_keys_between,
@@ -566,7 +567,7 @@ class FractionalIndexedDictViewBase(
     ) -> KeysView[Address] | Generator[Address, None, None]:
         """Ids in order. ``after`` starts just past that id, ``limit`` caps the count."""
         if after is None and limit is None:
-            return KeysView(self)  # type: ignore[arg-type]
+            return ReversibleKeysView(self)
         return self._keys_scan(after=after, limit=limit, reverse=False)
 
     def keys_reverse(

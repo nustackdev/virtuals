@@ -17,6 +17,8 @@ from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import EMPTY, Empty, Value
 from virtuals.view import ChildPrimitiveSetBase, UnsafePrimitiveOpsBase, ViewBase, is_view_key
 
+from ._keys_view import ReversibleKeysView
+
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -118,6 +120,10 @@ class LightDictView(
         """Iterate over keys."""
         yield from self.container.iter_child_keys(validate=False, strict=True)
 
+    def __reversed__(self) -> Generator[str | int, None, None]:
+        """Keys last first: one reverse scan."""
+        yield from self.container.iter_child_keys(validate=False, strict=True, reverse=True)
+
     def get(self, key: str | int, default: Value | Empty = EMPTY) -> Value | Empty:
         """Get value with default fallback."""
         try:
@@ -127,7 +133,7 @@ class LightDictView(
 
     def keys(self) -> KeysView[str | int]:
         """Get all keys as a set-like view."""
-        return KeysView(self)  # type: ignore[arg-type]
+        return ReversibleKeysView(self)
 
     def values(self) -> ValuesView[Value]:
         """Get all values as a collection view."""
@@ -182,6 +188,12 @@ class _LightValuesView(ValuesView):
         for _k, v in self._mapping.container.iter_children(validate=False, strict=True):
             yield cast("Value", v.primitive_value)
 
+    def __reversed__(self) -> Generator[Value, None, None]:
+        for _k, v in self._mapping.container.iter_children(
+            validate=False, strict=True, reverse=True
+        ):
+            yield cast("Value", v.primitive_value)
+
 
 class _LightItemsView(ItemsView):
     """Efficient ItemsView for LightDictView — single-pass iteration."""
@@ -190,6 +202,12 @@ class _LightItemsView(ItemsView):
 
     def __iter__(self) -> Generator[tuple[str | int, Value], None, None]:  # type: ignore[override]
         for k, v in self._mapping.container.iter_children(validate=False, strict=True):
+            yield k, cast("Value", v.primitive_value)
+
+    def __reversed__(self) -> Generator[tuple[str | int, Value], None, None]:
+        for k, v in self._mapping.container.iter_children(
+            validate=False, strict=True, reverse=True
+        ):
             yield k, cast("Value", v.primitive_value)
 
 
