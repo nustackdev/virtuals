@@ -106,6 +106,30 @@ def cancel_while_reserving(storage) -> None:
     _write_fast(storage)
 
 
+def cancel_meeting_a_grant_still_cancels(storage) -> None:
+    """A queued coroutine cancelled on the tick it is granted the slot is cancelled, and holds nothing.
+
+    The release grants the slot and schedules the wake; the cancel lands
+    before the task resumes. The cancel must win: a task that swallowed it
+    would carry on as if never asked, and whoever awaits its end (a flow
+    cancelling an arm) would wait for good.
+    """
+
+    async def main() -> None:
+        held = await storage.areserve_write_slot()
+        task = asyncio.create_task(storage.areserve_write_slot())
+        await asyncio.sleep(0.02)
+        held.release()
+        task.cancel()
+        await asyncio.wait([task])
+        if not task.cancelled():
+            task.result().release()
+        assert task.cancelled()
+
+    asyncio.run(main())
+    _write_fast(storage)
+
+
 def cancel_between_reserve_and_begin(storage) -> None:
     """A reserved slot no transaction took is freed: by ``with``, or once dropped."""
 
@@ -684,9 +708,16 @@ def areserve_timeout_meeting_a_release_is_a_lock_timeout(storage) -> None:
 
     On timeout the future is cancelled and the task resumes one turn
     later; a release in that window skips the waiter as dead and unlocks.
-    The release here runs as a done callback on the future, standing in
-    for a release from another thread in that window.
+    The waiter's future here ends the holder's transaction inside its own
+    cancel, so the release lands after the cancel and before the task
+    resumes, standing in for a release from another thread in that window.
+    A done callback cannot stand in: on Python 3.12+ ``wait_for`` resumes
+    the task before callbacks added later run.
     """
+    from unittest import mock
+
+    from virtuals._backends.storages import _write_slot
+
     held, release = threading.Event(), threading.Event()
     box: dict = {}
 
@@ -694,6 +725,20 @@ def areserve_timeout_meeting_a_release_is_a_lock_timeout(storage) -> None:
         box["txn"] = storage.begin_transaction()
         held.set()
         release.wait(5)
+
+    class ReleaseOnCancel(asyncio.Future):
+        def cancel(self, msg=None) -> bool:
+            cancelled = super().cancel(msg)
+            if cancelled:
+                box["txn"].abort()
+            return cancelled
+
+    class Waiter(_write_slot._Waiter):
+        __slots__ = ()
+
+        def __init__(self, loop) -> None:
+            super().__init__(loop)
+            self.future = ReleaseOnCancel(loop=loop)
 
     th = threading.Thread(target=holder)
     th.start()
@@ -703,12 +748,10 @@ def areserve_timeout_meeting_a_release_is_a_lock_timeout(storage) -> None:
     async def main() -> None:
         busy, storage._busy_timeout = storage._busy_timeout, 0.05
         try:
-            task = asyncio.create_task(storage.areserve_write_slot())
-            await asyncio.sleep(0.01)
+            with mock.patch.object(_write_slot, "_Waiter", Waiter):
+                task = asyncio.create_task(storage.areserve_write_slot())
+                await asyncio.sleep(0.01)
             waiter = writer._waiters[0]
-            # The holder's transaction is ended from the callback itself, so
-            # the release lands inside the window, on this very turn.
-            waiter.future.add_done_callback(lambda _: box["txn"].abort())
             with pytest.raises(StorageLockTimeoutError):
                 await task
         finally:

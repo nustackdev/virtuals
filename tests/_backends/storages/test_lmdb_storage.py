@@ -261,6 +261,10 @@ def test_cancel_while_reserving_holds_nothing(storage: LMDBStorage) -> None:
     cases.cancel_while_reserving(storage)
 
 
+def test_cancel_meeting_a_grant_still_cancels(storage: LMDBStorage) -> None:
+    cases.cancel_meeting_a_grant_still_cancels(storage)
+
+
 @pytest.mark.timeout(10)
 def test_cancel_between_reserve_and_begin_releases_slot(storage: LMDBStorage) -> None:
     cases.cancel_between_reserve_and_begin(storage)

@@ -33,6 +33,7 @@ __all__ = [  # noqa: RUF022
     "TransactionProtocol",
     # Storage
     "TransactionalStorageProtocol",
+    "WriteSlotProtocol",
 ]
 
 
@@ -321,6 +322,25 @@ class TransactionProtocol(
 
 
 @runtime_checkable
+class WriteSlotProtocol(Protocol):
+    """A storage's writer slot, held before any transaction is begun.
+
+    Returned by ``areserve_write_slot``. Handed to
+    ``begin_transaction(write_slot=...)``, the transaction takes it over; a
+    slot no transaction took is given back with ``release``.
+    """
+
+    @property
+    def held(self) -> bool:
+        """True while the slot is held and no transaction has taken it."""
+        ...
+
+    def release(self) -> None:
+        """Give the slot back if no transaction took it. Idempotent."""
+        ...
+
+
+@runtime_checkable
 class TransactionalStorageProtocol(Protocol):
     """Storage protocol with typed transaction creation.
 
@@ -377,10 +397,17 @@ class TransactionalStorageProtocol(Protocol):
 
     def begin_transaction(
         self,
+        *,
+        write_slot: WriteSlotProtocol | None = None,
     ) -> TransactionProtocol:
         """Begin read-write transaction.
 
         Convenience method for creating transactions.
+
+        Args:
+            write_slot: A slot from ``areserve_write_slot``, still held. The
+                transaction takes it over instead of acquiring the writer
+                slot itself, and releases it on commit or abort.
 
         Returns:
             New transaction instance.

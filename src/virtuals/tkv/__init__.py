@@ -56,6 +56,7 @@ from .storage import (
     TransactionProtocol,
     WriteAccessProtocol,
     WriteBatchProtocol,
+    WriteSlotProtocol,
 )
 from .types import CallbackFn
 
@@ -87,6 +88,7 @@ __all__ = [  # noqa: RUF022
     "WriteBatchProtocol",
     "TransactionProtocol",
     "TransactionalStorageProtocol",
+    "WriteSlotProtocol",
     ## Types
     "StorageScanOptions",
     "StorageContextType",
