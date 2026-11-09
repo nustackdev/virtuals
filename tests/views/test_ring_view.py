@@ -119,8 +119,9 @@ def test_empty_ring(ring_factory):
 
 def test_never_written_ring_raises_on_read(root_view):
     ring = root_view.open_child("nope", RingView.of(3))
-    with pytest.raises(ContainerNotFoundError):
-        list(ring)
+    for read in (list, len, lambda r: list(r.entries()), lambda r: list(r.entries(after=3))):
+        with pytest.raises(ContainerNotFoundError):
+            read(ring)
     ring.clear()  # clear of nothing writes nothing
     assert not ring.container.exists()
 
@@ -202,6 +203,20 @@ def test_entries_follow_by_sequence_number(ring_factory):
     ring.extend(["c", "d"])
     assert list(ring.entries(after=seen[-1][0])) == [(2, "c"), (3, "d")]
     assert list(ring.entries(after=1, limit=1)) == [(2, "c")]
+
+
+@pytest.mark.parametrize("after", [True, 1.5, "3"])
+def test_entries_refuse_a_cursor_that_is_not_a_sequence_number(ring_factory, after):
+    ring = ring_factory(data=["a"])
+    with pytest.raises(TypeError, match="sequence number"):
+        ring.entries(after=after)  # at the call, before any read
+
+
+@pytest.mark.parametrize("limit", [-1, True, 1.5, "3"])
+def test_entries_refuse_a_limit_that_is_not_a_count(ring_factory, limit):
+    ring = ring_factory(data=["a"])
+    with pytest.raises(ValueError, match="count of zero or more"):
+        ring.entries(limit=limit)
 
 
 def test_reader_that_fell_behind_resumes_at_oldest_kept(ring_factory):

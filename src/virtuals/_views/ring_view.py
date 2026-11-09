@@ -172,7 +172,19 @@ class RingView(ObservableBase, ViewBase):
         ``after`` need not be kept any more: a reader that fell behind
         resumes at the oldest entry still there. Cost: one seek plus
         O(limit) rows.
+
+        Raises:
+            TypeError: ``after`` is not a sequence number (an int), at the call.
+            ValueError: ``limit`` is not a count of zero or more, at the call.
+            ContainerNotFoundError: On a never-written ring, when the page
+                is read (as ``len`` and iteration do).
         """
+        if after is not None and (isinstance(after, bool) or not isinstance(after, int)):
+            raise TypeError(f"a ring cursor is a sequence number, got {after!r}")
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
+        ):
+            raise ValueError(f"limit must be a count of zero or more, got {limit!r}")
         return self._rows(after=after, limit=limit)
 
     def extract(self) -> list[Value]:
