@@ -939,7 +939,7 @@ def test_changing_a_keys_kind_raises_and_keeps_the_old_value(root, view_cls):
     with pytest.raises(ContainerTypeError):
         view.set_child_container_as("p", {"z": 2}, EagerDictView)
     assert _rows_under(view) == rows
-    eager = getattr(view, "eager", view)
+    eager = view.eager
     assert eager.extract() == {"p": 1, "c": {"z": 1}}
     assert set(view) == {"p", "c"}
     del view["p"]
@@ -1019,7 +1019,7 @@ def test_none_is_a_stored_value(storage, view_cls):
         assert k in view
         assert view[k] is None
         assert view.get(k, "dflt") is None
-        assert getattr(view, "eager", view).extract() == {k: None}
+        assert view.eager.extract() == {k: None}
 
 
 def test_none_is_a_stored_list_item(storage):

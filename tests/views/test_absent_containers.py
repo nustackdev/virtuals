@@ -234,7 +234,7 @@ def test_adding_mutation_creates_the_container(root, view_cls):
 def test_list_removals_on_absent_act_as_on_empty(root, view_cls):
     view = root.open_child("absent", view_cls)
     with pytest.raises(IndexError):
-        view.eager.pop() if hasattr(view, "eager") else view.pop()
+        view.eager.pop()
     with pytest.raises(ValueError):
         view.remove(7)
     with pytest.raises(IndexError):
@@ -255,7 +255,7 @@ def test_set_removals_on_absent_act_as_on_empty(root):
 @pytest.mark.parametrize("view_cls", MAPPINGS)
 def test_mapping_removals_on_absent_act_as_on_empty(root, view_cls):
     view = root.open_child("absent", view_cls)
-    view = view.eager if hasattr(view, "eager") else view
+    view = view.eager
     key = _key(view_cls)
     if hasattr(view, "pop"):
         with pytest.raises(KeyError):
