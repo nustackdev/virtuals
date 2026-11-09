@@ -140,9 +140,35 @@ class LightDictView(
         """Keys last first: one reverse scan."""
         yield from self.container.iter_child_keys(validate=False, strict=True, reverse=True)
 
-    def keys(self) -> KeysView[str | int]:
-        """Get all keys as a set-like view."""
-        return ReversibleKeysView(self)
+    def keys(
+        self, *, after: str | int | None = None, limit: int | None = None
+    ) -> KeysView[str | int] | Generator[str | int, None, None]:
+        """Keys in key order, or one page of them, as ``DictView.keys``.
+
+        With no arguments: a set-like KeysView. With ``after`` or ``limit``:
+        a generator over the keys strictly after ``after`` (a position in
+        key order, it need not exist), at most ``limit`` of them. Cost: one
+        seek plus O(limit) rows.
+        """
+        if after is None and limit is None:
+            return ReversibleKeysView(self)
+        return self._keys_page(cursor=after, limit=limit, reverse=False)
+
+    def reversed_keys(
+        self, *, before: str | int | None = None, limit: int | None = None
+    ) -> Generator[str | int, None, None]:
+        """Keys in reverse key order, strictly before ``before``, at most ``limit``."""
+        return self._keys_page(cursor=before, limit=limit, reverse=True)
+
+    def _keys_page(
+        self, *, cursor: str | int | None, limit: int | None, reverse: bool
+    ) -> Generator[str | int, None, None]:
+        """One page of keys. A bad cursor raises at the call, not on the first read."""
+        if cursor is not None and not is_view_key(cursor):
+            raise TypeError(f"view keys must be str or int, got {type(cursor).__name__}")
+        return self.container.iter_child_keys(
+            validate=False, strict=True, reverse=reverse, cursor=cursor, limit=limit
+        )
 
     def values(self) -> ValuesView[Value]:
         """Get all values as a collection view."""

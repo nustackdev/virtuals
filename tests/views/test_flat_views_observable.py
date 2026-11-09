@@ -3,6 +3,7 @@
 ``FlatDictView`` and ``LightDictView`` back a reactive dict as ``DictView``
 does, and ``FlatListView`` a reactive list as ``ListView`` does, so each
 serves every watch: the whole view, one child, the children, a pattern.
+The flat dicts page their keys as ``DictView`` does.
 """
 
 import pytest
@@ -81,3 +82,17 @@ def test_flat_list_watch_names_an_index_not_written_yet():
 
         hits = h.run(lambda v: v.append("a"))
         assert len(hits["child_0"]) == 1
+
+
+@pytest.mark.parametrize("factory", ["flat_dict_factory", "light_dict_factory"])
+def test_flat_dict_views_page_like_dict_view(factory, request):
+    d = request.getfixturevalue(factory)("d", {"b": 2, "a": 1, "c": 3, 5: 0})
+
+    assert list(d.keys(limit=2)) == [5, "a"]
+    assert list(d.keys(after="a", limit=5)) == ["b", "c"]
+    assert list(d.keys(after="bb")) == ["c"]  # a cursor need not exist
+    assert list(d.reversed_keys()) == ["c", "b", "a", 5]
+    assert list(d.reversed_keys(before="b", limit=1)) == ["a"]
+    assert set(d.keys()) == {5, "a", "b", "c"}
+    with pytest.raises(TypeError):
+        d.keys(after=1.5)
