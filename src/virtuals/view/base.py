@@ -327,8 +327,8 @@ class ViewBase(ABC):
 
         Walks container children depth-first and runs each view's
         ``_rebuild_bookkeeping``, children before parents. A child's view
-        type comes from its stored structure, via the registry or the
-        built-in views. Children with an unknown structure are skipped.
+        type comes from its stored structure, via the registry.
+        Children with an unknown structure are skipped.
         Silent if this view does not exist in storage.
         """
         if not self.container.exists():
@@ -343,8 +343,9 @@ class ViewBase(ABC):
         for address, info in children.iter_children(validate=False):
             if info.node_type != NodeType.CONTAINER or info.structure is None:
                 continue
-            view_class = _view_for_structure(self.registry, info.structure)
-            if view_class is None:
+            try:
+                view_class = self.registry.get_view_for_structure(info.structure)
+            except ViewRegistryError:
                 logger.debug(
                     "Skipping child with unknown structure",
                     extra={"site": children.site, "address": address, "structure": info.structure},
@@ -386,16 +387,3 @@ class ViewBase(ABC):
         # Use registry to create appropriate view
         view_class = self.registry.get_view_for_structure(parent_info.structure)
         return view_class(container=parent_container, registry=self.registry)  # type: ignore
-
-
-def _view_for_structure(registry: ViewRegistry, structure: ContainerStructure) -> type[View] | None:
-    """View class for a stored structure: the registry's, else the built-in one."""
-    try:
-        return registry.get_view_for_structure(structure)
-    except ViewRegistryError:
-        from virtuals._views import BUILTIN_VIEWS
-
-        for view_class in BUILTIN_VIEWS:
-            if view_class.STRUCTURE == structure:
-                return view_class  # type: ignore[return-value]
-        return None
