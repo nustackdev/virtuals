@@ -480,13 +480,6 @@ class Kh57ViewBase(
 
     # -- Mapping surface --------------------------------------------------
 
-    __reversed__ = None
-    """Not reversible, like ``collections.abc.Mapping``: ``reversed(view)`` raises TypeError.
-
-    The rows sit in kh57 level order, not key order: iteration merges one
-    scan per level into int order, and the layout keeps no reverse path.
-    """
-
     def keys(self) -> KeysView:
         """Set-like view of the int keys, in original int order."""
         return KeysView(self)

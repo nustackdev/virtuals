@@ -17,7 +17,8 @@ Like a Python mapping, a view equals any mapping with the same items and
 is not hashable.
 
 ``DictMethods`` adds what ``dict`` has beyond ``MutableMapping``
-(``copy``, ``|``, ``|=``, ``reversed``) for a view that stands in for a dict.
+(``copy``, ``|``, ``|=``, ``reversed``, ``popitem`` from the end) for a view
+that stands in for a dict.
 """
 
 from __future__ import annotations
@@ -94,6 +95,13 @@ class MappingBase(CollectionBase[K], Generic[K, V]):
 
     __hash__ = None  # type: ignore[assignment]
 
+    __reversed__ = None  # type: ignore[assignment]
+    """Not reversible, as ``collections.abc.Mapping``: ``reversed(view)`` raises TypeError.
+
+    Without it ``reversed`` would fall back to ``len`` and ``[]`` and read
+    keys as positions. A mapping with an order (``DictMethods``) defines it.
+    """
+
 
 class MutableMappingBase(MappingBase[K, V]):
     """Mutable mapping base, as ``collections.abc.MutableMapping``.
@@ -129,16 +137,15 @@ class MutableMappingBase(MappingBase[K, V]):
         return value
 
     def popitem(self) -> tuple[K, V]:
-        """Remove and return a ``(key, value)`` pair: the last in order, as ``dict.popitem``.
-
-        A mapping with no order (no ``__reversed__``) gives the first its
-        iteration yields, as ``MutableMapping.popitem``.
+        """Remove and return a ``(key, value)`` pair: the first iteration yields, as ``MutableMapping.popitem``.
 
         Raises:
             KeyError: If the mapping is empty.
         """
-        ordered = getattr(self, "__reversed__", None) is not None
-        keys = reversed(self) if ordered else iter(self)  # type: ignore[call-overload]
+        return self._pop_first(iter(self))
+
+    def _pop_first(self, keys: Iterator[K]) -> tuple[K, V]:
+        """Remove the first key ``keys`` yields and return it with its value."""
         try:
             key = next(keys)
         except StopIteration:
@@ -186,7 +193,7 @@ class MutableMappingBase(MappingBase[K, V]):
 
 
 class DictMethods(MutableMappingBase[K, V]):
-    """What ``dict`` has beyond ``MutableMapping``: ``copy``, ``|``, ``|=`` and ``reversed``.
+    """What ``dict`` has beyond ``MutableMapping``: ``copy``, ``|``, ``|=``, ``reversed``, LIFO ``popitem``.
 
     A view built on it is a dict in full: every ``dict`` method with the
     same semantics. New values come back as a plain ``dict`` holding the
@@ -203,6 +210,14 @@ class DictMethods(MutableMappingBase[K, V]):
 
     @abstractmethod
     def __reversed__(self) -> Iterator[K]: ...
+
+    def popitem(self) -> tuple[K, V]:
+        """Remove and return the last ``(key, value)`` pair in order, as ``dict.popitem``.
+
+        Raises:
+            KeyError: If the mapping is empty.
+        """
+        return self._pop_first(reversed(self))
 
     def copy(self) -> dict[K, V]:
         """A plain dict of the items, as ``dict.copy``."""
