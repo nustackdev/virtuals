@@ -349,8 +349,12 @@ class ViewsMachine(RuleBasedStateMachine):
         assert list(v.keys()) == ids
         assert [k for k, _ in v.items()] == ids
         assert same_seq([x for _, x in v.items()], [vals[i] for i in ids])
-        assert v.first() == (ids[0] if ids else None)
-        assert v.last() == (ids[-1] if ids else None)
+        if ids:
+            assert (v.first(), v.last()) == (ids[0], ids[-1])
+        else:
+            for edge in (v.first, v.last):
+                with pytest.raises(IndexError):
+                    edge()
         for k in IDS:
             assert (k in v) == (k in vals), k
             if k in vals:

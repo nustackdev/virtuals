@@ -564,7 +564,9 @@ def test_first_and_last_are_the_oldest_and_newest(log_dict_factory):
     assert dct.last() == "a"
     del dct["b"]
     del dct["a"]
-    assert (dct.first(), dct.last()) == (None, None)
+    for read in (dct.first, dct.last):
+        with pytest.raises(IndexError):
+            read()
 
 
 def test_page_cursor_follows_log_order_not_key_order(log_dict_factory):

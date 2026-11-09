@@ -589,15 +589,19 @@ class FractionalIndexedDictViewBase(
             rows = self._scan_order(start=cursor, reverse=reverse, limit=limit, skip=(cursor,))
         return (address for _okey, address in rows)
 
-    def first(self) -> Address | None:
-        """First id, or None when empty. One seek."""
+    def first(self) -> Address:
+        """First id. One seek. IndexError when empty, as ``seq[0]``."""
         row = self._edge(last=False)
-        return None if row is None else row[1]
+        if row is None:
+            raise IndexError("first() of an empty collection")
+        return row[1]
 
-    def last(self) -> Address | None:
-        """Last id, or None when empty. One seek."""
+    def last(self) -> Address:
+        """Last id. One seek. IndexError when empty, as ``seq[-1]``."""
         row = self._edge(last=True)
-        return None if row is None else row[1]
+        if row is None:
+            raise IndexError("last() of an empty collection")
+        return row[1]
 
     def next_after(self, address: Address) -> Address | None:
         """Id directly after ``address``, or None at the end."""

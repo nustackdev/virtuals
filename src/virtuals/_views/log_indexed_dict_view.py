@@ -486,17 +486,17 @@ class LogIndexedDictViewBase(
         for _log_key, actual_key in rows:
             yield actual_key
 
-    def first(self) -> str | int | None:
-        """Oldest key, or None when empty. One seek."""
+    def first(self) -> str | int:
+        """Oldest key. One seek. IndexError when empty, as ``seq[0]``."""
         for _log_key, actual_key in self._scan_log_keys(limit=1):
             return actual_key
-        return None
+        raise IndexError("first() of an empty collection")
 
-    def last(self) -> str | int | None:
-        """Newest key, or None when empty. One reverse seek."""
+    def last(self) -> str | int:
+        """Newest key. One reverse seek. IndexError when empty, as ``seq[-1]``."""
         for _log_key, actual_key in self._scan_log_keys(reverse=True, limit=1):
             return actual_key
-        return None
+        raise IndexError("last() of an empty collection")
 
     def keys_with_log_keys(
         self, *, after: str | None = None

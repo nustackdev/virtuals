@@ -130,8 +130,9 @@ def test_empty(fdict):
     view = fdict()
     assert len(view) == 0
     assert list(view) == []
-    assert view.first() is None
-    assert view.last() is None
+    for edge in (view.first, view.last):
+        with pytest.raises(IndexError):
+            edge()
     assert "a" not in view
     assert is_empty(view.get("a"))
     assert view.get("a", "dflt") == "dflt"

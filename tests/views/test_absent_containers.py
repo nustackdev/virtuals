@@ -179,14 +179,15 @@ def test_internal_layout_views_name_their_own_site(root):
             assert info.value.site == ("/", "absent")
 
 
-def test_ordered_view_edges_raise_on_absent_and_are_none_on_empty(root):
+def test_ordered_view_edges_raise_on_absent_and_on_empty(root):
     view = root.open_child("absent", EagerFractionalIndexedDictView)
     for read in (lambda v: v.first(), lambda v: v.last(), bool):
         with pytest.raises(ContainerNotFoundError):
             read(view)
     view.ensure_created()
-    assert view.first() is None
-    assert view.last() is None
+    for read in (lambda v: v.first(), lambda v: v.last()):
+        with pytest.raises(IndexError):
+            read(view)
     assert not view
 
 
