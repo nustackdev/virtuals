@@ -42,6 +42,8 @@ class ContainerNotFoundError(ContainerError, KeyError):
         site: The missing site, when known.
     """
 
+    site: object
+
     def __init__(self, message: str = "", site: object = None) -> None:
         """Keep the message as the only arg, the site as an attribute."""
         super().__init__(message)

@@ -108,6 +108,32 @@ class ViewBase(ABC):
         return cls.CONTAINER_CLS
 
     # =========================================================================
+    # PRESENCE & FACETS
+    # =========================================================================
+
+    def exists(self) -> bool:
+        """Whether this view's container is stored. One marker read, nothing extracted."""
+        return self.container.exists()
+
+    @property
+    def eager(self) -> View:
+        """This view with reads that return extracted Python values.
+
+        The view itself by default. Views with a lazy facet (dicts, lists,
+        indexed and ordered dicts) return their eager twin.
+        """
+        return self  # type: ignore[return-value]
+
+    @property
+    def lazy(self) -> View:
+        """This view with reads that return child Views for containers.
+
+        The view itself by default. Views with an eager facet return their
+        lazy twin.
+        """
+        return self  # type: ignore[return-value]
+
+    # =========================================================================
     # WRITE SUPPORT
     # =========================================================================
 

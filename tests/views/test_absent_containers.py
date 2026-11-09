@@ -42,6 +42,7 @@ from virtuals._views import (
     LazyListView,
     LazyLogIndexedDictView,
     LightDictView,
+    RingView,
     SetView,
     TupleView,
 )
@@ -95,7 +96,7 @@ def _fill(view):
 
 
 def _extract(view):
-    return (view.eager if hasattr(view, "eager") else view).extract()
+    return view.eager.extract()
 
 
 @pytest.fixture(params=BACKENDS)
@@ -113,6 +114,29 @@ def root(storage):
         root = Navigator(storage).root(tx)
         root.ensure_created()
         yield root
+
+
+# ============================================================================
+# PRESENCE AND FACETS, DECLARED ON EVERY VIEW
+# ============================================================================
+
+
+@pytest.mark.parametrize("view_cls", [*ALL_VIEWS, RingView.of(3)])
+def test_exists_is_false_until_written(root, view_cls):
+    view = root.open_child("absent", view_cls)
+    assert view.exists() is False
+    view.ensure_created()
+    assert view.exists() is True
+
+
+@pytest.mark.parametrize("view_cls", [*ALL_VIEWS, RingView.of(3)])
+def test_every_view_has_both_facets(root, view_cls):
+    view = root.open_child("v", view_cls)
+    for facet in (view.eager, view.lazy):
+        assert facet.container == view.container
+    if not view_cls.__name__.startswith(("Eager", "Lazy")):
+        assert view.eager is view
+        assert view.lazy is view
 
 
 # ============================================================================

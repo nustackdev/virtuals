@@ -50,6 +50,20 @@ class View(Protocol):
         """Get container type, associated with this view."""
         ...
 
+    def exists(self) -> bool:
+        """Whether this view's container is stored. One marker read."""
+        ...
+
+    @property
+    def eager(self) -> View:
+        """This view with reads that return extracted values; itself if it has no lazy facet."""
+        ...
+
+    @property
+    def lazy(self) -> View:
+        """This view with reads that return child Views; itself if it has no eager facet."""
+        ...
+
     def open_parent(self) -> View:
         """Navigate to parent container.
 

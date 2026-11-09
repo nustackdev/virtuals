@@ -11,7 +11,12 @@ from __future__ import annotations
 from logging import getLogger
 from typing import TYPE_CHECKING
 
-from .exceptions import ContainerExistsError, ContainerNotFoundError, ContainerTypeError
+from .exceptions import (
+    ContainerExistsError,
+    ContainerNotFoundError,
+    ContainerTypeError,
+    absent_container,
+)
 from .node_ops import gather_parent_info, get_node_info, get_node_type
 from .types import ContainerProtocol, ContainerStructure, NodeInfo, NodeType, ParentChainInfo
 
@@ -50,7 +55,7 @@ def validate_exists(
     node_type = get_node_type(site, ctx) if node_type is None else node_type
     if node_type == NodeType.NOT_FOUND:
         logger.warning("Validation failed: site does not exist", extra={"site": site})
-        raise ContainerNotFoundError(f"Site does not exist: {site}")
+        raise ContainerNotFoundError(f"Site does not exist: {site}", site)
 
 
 def validate_not_exists(
@@ -92,7 +97,7 @@ def validate_is_container(
     node_type = get_node_type(site, ctx) if node_type is None else node_type
     if node_type == NodeType.NOT_FOUND:
         logger.warning("Validation failed: site does not exist", extra={"site": site})
-        raise ContainerNotFoundError(f"Site does not exist: {site}")
+        raise ContainerNotFoundError(f"Site does not exist: {site}", site)
     if node_type != NodeType.CONTAINER:
         logger.warning(
             "Validation failed: site is not a container",
@@ -118,7 +123,7 @@ def validate_is_primitive(
     node_type = get_node_type(site, ctx) if node_type is None else node_type
     if node_type == NodeType.NOT_FOUND:
         logger.warning("Validation failed: site does not exist", extra={"site": site})
-        raise ContainerNotFoundError(f"Site does not exist: {site}")
+        raise ContainerNotFoundError(f"Site does not exist: {site}", site)
     if node_type != NodeType.PRIMITIVE:
         logger.warning(
             "Validation failed: site is not a primitive",
@@ -234,7 +239,7 @@ def validate_compatible(
 
     if not node_info.exists:
         logger.warning("Validation failed: container does not exist", extra={"site": site})
-        raise ContainerNotFoundError(f"Container does not exist: {site}")
+        raise absent_container(site)
 
     if node_info.node_type != NodeType.CONTAINER:
         logger.warning(
