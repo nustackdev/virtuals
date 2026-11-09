@@ -29,13 +29,13 @@ Provides three classes following the eager/lazy facet pattern:
 
 from __future__ import annotations
 
-from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
+from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from virtuals.collections import ReactiveMappingBase
 from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType
 from virtuals.tkv.filter import PrefixFilter, WildcardFilter
 from virtuals.tkv.observer import SubscriptionOptions
-from virtuals.types import EMPTY, Empty
 from virtuals.view import (
     ChildNavigationBase,
     ChildNestedGetBase,
@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from collections.abc import Mapping as PyMapping
 
+    from virtuals.types import Empty
     from virtuals.view import View
 
 
@@ -90,6 +91,7 @@ class IndexedDictViewBase(
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    ReactiveMappingBase[str | int, object],
 ):
     """Dict view base with hierarchical internal layout for O(1) key access.
 
@@ -237,13 +239,6 @@ class IndexedDictViewBase(
         keys.extend(key for key in data_keys if key not in seen)  # type: ignore[misc]
         kv.store(keys)
 
-    def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        """Value at ``address``, or ``default`` (EMPTY) when the key is absent."""
-        try:
-            return self[address]
-        except KeyError:
-            return default
-
     # -- Mutations (same for both facets) -----------------------------------
 
     def __setitem__(self, address: str | int, value: object) -> None:
@@ -292,14 +287,12 @@ class IndexedDictViewBase(
         self._data_container().clear_children(validate=False)
         self._keys_view().clear()
 
-    def update(self, other: PyMapping[str | int, object] | None = None, **kwargs: object) -> None:
-        self._reject_empty_in(other or {})
-        self._reject_empty_in(kwargs)
-        if other:
-            for key, value in other.items():
-                self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value  # type: ignore[assignment]
+    def update(self, other: object = (), /, **kwargs: object) -> None:
+        """Update as ``dict.update``. The whole batch is checked for EMPTY before the first write."""
+        items = self._update_items(other, kwargs)
+        self._reject_empty_in(items)
+        for key, value in items.items():
+            self[key] = value
 
     def store(self, value: PyMapping[str | int, object], *, replace: bool = True) -> None:
         value = self._reject_empty_in(value)  # type: ignore[assignment]
@@ -465,18 +458,6 @@ class EagerIndexedDictView(IndexedDictViewBase):
     def __reversed__(self) -> Generator[str | int, None, None]:
         """Iterate keys in reverse insertion order."""
         yield from self._iter_ordered_keys(reverse=True)
-
-    def pop(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        try:
-            value = self[address]
-            del self[address]
-            return value
-        except KeyError:
-            from virtuals.types import is_empty
-
-            if is_empty(default):
-                raise
-            return default
 
     def extract(self) -> dict[str | int, object]:
         return {k: self[k] for k in self}
@@ -673,6 +654,3 @@ class _LazyIndexedReversedItemsView(ItemsView):
 
     def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
         yield from self._mapping._iter_items_reverse()
-
-
-MutableMapping.register(EagerIndexedDictView)

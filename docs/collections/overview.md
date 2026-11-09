@@ -33,46 +33,60 @@ Each collection type follows a three-tier pattern:
 
 ### Minimal abstracts, maximum defaults
 
-Like Python's `collections.abc.MutableMapping`, each base requires only a few abstract methods and derives everything else:
+Each base is its `collections.abc` class: the same abstract core, the same mixin methods with the same semantics, and it is registered with that ABC, so `isinstance(view, MutableMapping)` holds for every view built on it. Built-in-only methods (`list +`, `dict |`, `set.union`, `copy`, `sort`) are not on the bases: a view standing in for a built-in adds what it needs.
 
-**MappingBase** — implement `__getitem__`, `__iter__`, `__len__`:
+**MappingBase** (`Mapping`): implement `__getitem__`, `__iter__`, `__len__`:
 ```python
 # You get for free:
 __contains__    # try __getitem__, catch KeyError
-keys()          # yield from __iter__
-values()        # yield self[key] for each key
-items()         # yield (key, self[key]) for each key
-get()           # __getitem__ with default fallback
+keys()          # KeysView over the mapping
+values()        # ValuesView
+items()         # ItemsView
+get()           # __getitem__, default None as dict.get
+__eq__          # equal to any mapping with the same items; not hashable
 ```
 
-**MutableMappingBase** — additionally implement `__setitem__`, `__delitem__`:
+**MutableMappingBase** (`MutableMapping`): additionally implement `__setitem__`, `__delitem__`:
 ```python
 # You get for free:
-pop()           # __getitem__ + __delitem__
-update()        # __setitem__ in a loop
+pop()           # with an optional default, else KeyError
+popitem()       # the last pair in order (dict.popitem); the first without __reversed__
+setdefault()    # the value, or store the default and read it back
+update()        # a mapping, an object with keys(), or pairs, then kwargs
 clear()         # __delitem__ in a loop
 ```
 
-**SequenceBase** — implement `__getitem__`, `__len__`:
+**SequenceBase** (`Sequence`): implement `__getitem__`, `__len__`:
 ```python
 # You get for free:
 __iter__        # yield self[i] for i in range(len)
 __reversed__    # same, reversed
 __contains__    # linear scan
-index()         # linear search
+index()         # linear search, with start and stop
 count()         # linear count
 ```
 
-**SetBase** — all three from CollectionBase remain abstract:
+**MutableSequenceBase** (`MutableSequence`): additionally implement `__setitem__`, `__delitem__`, `insert`:
 ```python
 # You get for free:
-isdisjoint()    # any(value in self for value in other)
-issubset()      # all(value in other_set for value in self)
-issuperset()    # all(value in self for value in other)
-__le__, __ge__  # subset/superset operators
-__or__, __and__,
-__sub__, __xor__ # set algebra operators
+append(), extend(), pop(), remove(), reverse(), clear(), __iadd__
 ```
+
+**SetBase** (`Set`): all three from CollectionBase remain abstract:
+```python
+# You get for free:
+__le__, __lt__, __eq__, __ge__, __gt__   # comparisons; not hashable
+__and__, __or__, __sub__, __xor__        # and their reflected forms, a plain set back
+isdisjoint()
+```
+
+**MutableSetBase** (`MutableSet`): additionally implement `add`, `discard`:
+```python
+# You get for free:
+remove(), pop(), clear(), __ior__, __iand__, __isub__, __ixor__
+```
+
+`pop`, `popitem` and `reverse` read items through `_plain_value`, a plain read by default. A view overrides it to read through its eager facet, so a lazy view hands back data, not a view of a removed child.
 
 ## Protocols vs Bases
 
@@ -130,10 +144,17 @@ Collections provide the **abstract shape**. Views provide the **concrete impleme
 ```text
 Collections (abstract)          Views (concrete)
 ─────────────────────           ────────────────
-ReactiveMappingBase   ←───────  DictViewBase → EagerDictView / LazyDictView
-ReactiveSequenceBase  ←───────  ListViewBase → EagerListView / LazyListView
+ReactiveMappingBase   ←───────  DictViewBase, IndexedDictViewBase, FractionalIndexedDictViewBase,
+                                LogIndexedDictViewBase, Kh57ViewBase (each → Eager / Lazy facet)
+MutableMappingBase    ←───────  FlatDictView, LightDictView
+ReactiveSequenceBase  ←───────  ListViewBase (→ Eager / Lazy), ByteArrayView
+MutableSequenceBase   ←───────  FlatListView
+SequenceBase          ←───────  TupleView, RingView (+ append / extend / clear)
 ReactiveSetBase       ←───────  SetView
+SetBase               ←───────  FrozenSetView
 ```
+
+A view lists its collection base right after `ViewBase`, so the view's own methods and the `virtuals.view` mixins win over the base defaults. Where a layout cannot do what the built-in does, it raises: a kh57 view is not reversible (`reversed()` raises TypeError, as on a plain `Mapping`), a ring has no write at a position, a list view takes no slice writes. `tests/views/test_abc_conformance.py` runs every ABC method on every built-in view and facet against the built-in.
 
 Views that support nested containers have two **facets** — eager (reads return Python values) and lazy (reads return child Views). Both share a common base with mutations, keys, and lifecycle. See [Eager vs Lazy Access](eager-lazy.md) for details.
 

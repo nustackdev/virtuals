@@ -103,9 +103,10 @@ second writer sees the first row and never collides.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
+from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from virtuals.collections import ReactiveMappingBase
 from virtuals.container import (
     Container,
     ContainerProtocol,
@@ -180,6 +181,7 @@ class FractionalIndexedDictViewBase(
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    ReactiveMappingBase[Address, object],
 ):
     """Ordered dict view with fractional index order keys.
 
@@ -647,13 +649,6 @@ class FractionalIndexedDictViewBase(
         """``(order key, id)`` rows in order."""
         return self._scan_order(reverse=reverse)
 
-    def get(self, address: Address, default: object | Empty = EMPTY) -> object | Empty:
-        """Value at ``address``, or ``default`` (EMPTY) when the id is absent."""
-        try:
-            return self[address]  # type: ignore[index]
-        except KeyError:
-            return default
-
     # -- Mutations ---------------------------------------------------------
 
     def _ensure_positioned(self, address: Address) -> None:
@@ -813,16 +808,6 @@ class FractionalIndexedDictViewBase(
             self._retire(cast("str", okey))
         dc.delete_child(address)
 
-    def pop(self, address: Address, default: object | Empty = EMPTY) -> object | Empty:
-        try:
-            value = self[address]  # type: ignore[index]
-        except KeyError:
-            if is_empty(default):
-                raise
-            return default
-        del self[address]
-        return value
-
     def clear(self) -> None:
         if not self.container.exists():
             return  # clear of nothing is not a write: the view stays absent
@@ -834,13 +819,11 @@ class FractionalIndexedDictViewBase(
         if last is not None:
             self._raise_end(last[0])
 
-    def update(self, other: PyMapping[Address, object] | None = None, **kwargs: object) -> None:
-        self._reject_empty_in(other or {})
-        self._reject_empty_in(kwargs)
-        if other:
-            for key, value in other.items():
-                self[key] = value
-        for key, value in kwargs.items():
+    def update(self, other: object = (), /, **kwargs: object) -> None:
+        """Update as ``dict.update``. The whole batch is checked for EMPTY before the first write."""
+        items = self._update_items(other, kwargs)
+        self._reject_empty_in(items)
+        for key, value in items.items():
             self[key] = value
 
     def store(
@@ -1006,6 +989,3 @@ class _FractionalItemsView(ItemsView):
 
     def __reversed__(self) -> Generator[tuple[Address, object], None, None]:
         yield from self._mapping._iter_items(reverse=not self._reverse)
-
-
-MutableMapping.register(FractionalIndexedDictViewBase)

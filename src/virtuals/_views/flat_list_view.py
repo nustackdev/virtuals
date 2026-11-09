@@ -10,9 +10,9 @@ Iteration is a prefix scan over flat primitives only.
 
 from __future__ import annotations
 
-from collections.abc import MutableSequence
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from virtuals.collections import MutableSequenceBase
 from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import Empty, Value
 from virtuals.view import (
@@ -22,6 +22,8 @@ from virtuals.view import (
     UnsafePrimitiveOpsBase,
     ViewBase,
 )
+
+from ._index import refuse_slice, require_int_index
 
 
 if TYPE_CHECKING:
@@ -38,6 +40,7 @@ class FlatListView(
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    MutableSequenceBase[Value],
 ):
     """Primitives-only list with O(1) append and length tracking.
 
@@ -71,7 +74,13 @@ class FlatListView(
         return isinstance(address, int) and address >= 0
 
     def normalize_address(self, address: int) -> int:
-        """Normalize index, handling negative indices. No existence check."""
+        """Normalize index, handling negative indices. No existence check.
+
+        Raises:
+            TypeError: If ``address`` is not an int, as ``list`` does.
+            IndexError: If ``address`` is out of range.
+        """
+        require_int_index(address)
         length = self._len()
         if address < 0:
             address = length + address
@@ -81,8 +90,13 @@ class FlatListView(
 
     # -- Read ---------------------------------------------------------------
 
-    def __getitem__(self, address: int) -> Value:
-        """Get primitive value at index."""
+    def __getitem__(self, address: int | slice) -> Value | list[Value]:
+        """Get primitive value at index; a slice gives a plain list, as ``list`` does."""
+        if isinstance(address, slice):
+            start, stop, step = address.indices(len(self))
+            if step == 1:
+                return self.extract_range(start, stop)
+            return [self[i] for i in range(start, stop, step)]
         normalized = self.normalize_address(address)
         value = self.container.get_child_primitive(normalized)
         if isinstance(value, Empty):
@@ -93,12 +107,6 @@ class FlatListView(
         """Iterate over values via prefix scan (flat primitives only)."""
         for _k, v in self.container.iter_children(validate=False, strict=True):
             yield cast("Value", v.primitive_value)
-
-    def __contains__(self, obj: object) -> bool:
-        for item in self:
-            if item == obj:
-                return True
-        return False
 
     # -- Write --------------------------------------------------------------
 
@@ -111,9 +119,40 @@ class FlatListView(
         self._set_length(index + 1)
 
     def __setitem__(self, address: int, value: Value) -> None:
-        """Set primitive value at existing index."""
+        """Set primitive value at existing index. A slice raises TypeError."""
+        refuse_slice(address, "assignment")
         normalized = self.normalize_address(address)
+        self._reject_empty_in(value)
         self.container.put_child_primitive(normalized, value)
+
+    def __delitem__(self, address: int) -> None:
+        """Delete the item at ``address``, shifting later items down. O(n - address) rows.
+
+        A slice raises TypeError.
+        """
+        refuse_slice(address, "deletion")
+        normalized = self.normalize_address(address)  # IndexError before any write
+        length = self._len()
+        for i in range(normalized + 1, length):
+            self.container.put_child_primitive(i - 1, self.container.get_child_primitive(i))
+        self.container.delete_child(length - 1)
+        self._set_length(length - 1)
+
+    def insert(self, index: int, value: Value) -> None:
+        """Insert ``value`` before ``index``, shifting later items up, as ``list.insert``.
+
+        An index past either end clamps to it. O(n - index) rows.
+        """
+        if not isinstance(index, int):
+            raise TypeError(f"'{type(index).__name__}' object cannot be interpreted as an integer")
+        self._reject_empty_in(value)
+        self.ensure_created()
+        length = self._len()
+        index = max(0, length + index) if index < 0 else min(index, length)
+        for i in range(length - 1, index - 1, -1):
+            self.container.put_child_primitive(i + 1, self.container.get_child_primitive(i))
+        self.container.put_child_primitive(index, value)
+        self._set_length(length + 1)
 
     def clear(self) -> None:
         """Remove all items."""
@@ -163,6 +202,21 @@ class FlatListView(
         """Extract all items as a plain list."""
         return list(self)
 
+    def __reversed__(self) -> Generator[Value, None, None]:
+        """Values last first: one reverse scan."""
+        for _k, v in self.container.iter_children(validate=False, strict=True, reverse=True):
+            yield cast("Value", v.primitive_value)
+
+    def __eq__(self, other: object) -> bool:
+        """Equal to a list, or a list view, holding equal items in order, as ``list ==``."""
+        from .list_view import ListViewBase
+
+        if not isinstance(other, list | FlatListView | ListViewBase):
+            return NotImplemented
+        return list(self) == list(other)
+
+    __hash__ = None  # type: ignore[assignment]
+
     def extract_range(self, start: int, stop: int) -> list[Value]:
         """Extract a range of items by index.  O(stop-start) individual reads."""
         length = len(self)
@@ -174,6 +228,3 @@ class FlatListView(
             if not isinstance(value, Empty):
                 result.append(value)
         return result
-
-
-MutableSequence.register(FlatListView)

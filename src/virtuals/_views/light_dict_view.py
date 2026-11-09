@@ -10,11 +10,12 @@ Ultra-lightweight dict view with no:
 
 from __future__ import annotations
 
-from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
+from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from virtuals.collections import MutableMappingBase
 from virtuals.container import ContainerProtocol, ContainerStructure
-from virtuals.types import EMPTY, Empty, Value
+from virtuals.types import Empty, Value
 from virtuals.view import (
     ChildPrimitiveSetBase,
     KeyNotFoundError,
@@ -40,6 +41,7 @@ class LightDictView(
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    MutableMappingBase[str | int, Value],
 ):
     """Ultra-lightweight dict view for maximum performance.
 
@@ -130,13 +132,6 @@ class LightDictView(
         """Keys last first: one reverse scan."""
         yield from self.container.iter_child_keys(validate=False, strict=True, reverse=True)
 
-    def get(self, key: str | int, default: Value | Empty = EMPTY) -> Value | Empty:
-        """Get value with default fallback."""
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
     def keys(self) -> KeysView[str | int]:
         """Get all keys as a set-like view."""
         return ReversibleKeysView(self)
@@ -156,15 +151,12 @@ class LightDictView(
         self.ensure_created()
         self.container.clear_children(validate=False)
 
-    def update(self, other: PyMapping[str | int, Value] | None = None, **kwargs: Value) -> None:
-        """Update from dict or kwargs."""
-        self._reject_empty_in(other or {})
-        self._reject_empty_in(kwargs)
-        if other:
-            for key, value in other.items():
-                self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value  # type: ignore[index]
+    def update(self, other: object = (), /, **kwargs: Value) -> None:
+        """Update as ``dict.update``. The whole batch is checked for EMPTY before the first write."""
+        items = self._update_items(other, kwargs)
+        self._reject_empty_in(items)
+        for key, value in items.items():
+            self[key] = value
 
     def extract(self) -> dict[str | int, Value]:
         """Extract all items as dict."""
@@ -215,6 +207,3 @@ class _LightItemsView(ItemsView):
             validate=False, strict=True, reverse=True
         ):
             yield k, cast("Value", v.primitive_value)
-
-
-MutableMapping.register(LightDictView)

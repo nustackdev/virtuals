@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import MutableSet
 from typing import TYPE_CHECKING, ClassVar
 
 from virtuals._views._member_key import member_key
+from virtuals.collections import ReactiveSetBase
 from virtuals.container import ContainerProtocol, ContainerStructure, ContainerTypeError
 from virtuals.types import is_empty
 from virtuals.view import (
@@ -21,7 +21,6 @@ from virtuals.view import (
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable
-    from collections.abc import Set as PySet
 
     from virtuals.collections import (
         ChildObservable,
@@ -46,12 +45,14 @@ class SetView(
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    ReactiveSetBase[object],
 ):
     """Set-like view over container.
 
-    Provides set interface using values as keys:
-    - add(), remove(), discard()
-    - __contains__, __len__, __iter__
+    A ``MutableSet`` using values as keys: ``add``, ``discard``,
+    ``remove``, ``pop``, ``clear``, ``in``, ``len``, iteration, comparisons,
+    the ``& | - ^`` operators (returning a plain set) and their in-place
+    forms, ``isdisjoint``, plus ``issubset`` and ``issuperset`` as on ``set``.
 
     Implementation:
     - Keys are a hash of the member's canonical pickle (see ``_member_key``)
@@ -141,6 +142,7 @@ class SetView(
         Raises:
             KeyError: If value not in set
         """
+        hash(value)  # TypeError for an unhashable value, as a Python set raises
         key = self._make_key(value)
         if not self.container.exists_child(key):  # False under an absent set
             raise KeyError(value)
@@ -154,6 +156,7 @@ class SetView(
         Args:
             value: Value to remove
         """
+        hash(value)  # TypeError for an unhashable value, as a Python set raises
         key = self._make_key(value)
         if self.container.exists_child(key):  # False under an absent set
             self.ensure_created()
@@ -169,6 +172,7 @@ class SetView(
         Returns:
             True if value in set
         """
+        hash(obj)  # TypeError for an unhashable value, as a Python set raises
         key = self._make_key(obj)
         return self.container.exists_child(key, strict=True)
 
@@ -192,18 +196,7 @@ class SetView(
         # Reset length metadata
         self._set_length(0)
 
-    def isdisjoint(self, other: PySet[object]) -> bool:
-        """Check if no elements in common with other.
-
-        Args:
-            other: Set to compare with
-
-        Returns:
-            True if no common elements
-        """
-        return not any(value in self for value in other)
-
-    def issubset(self, other: PySet[object]) -> bool:
+    def issubset(self, other: Iterable[object]) -> bool:
         """Check if all elements are in other.
 
         Args:
@@ -214,7 +207,7 @@ class SetView(
         """
         return all(value in other for value in self)
 
-    def issuperset(self, other: PySet[object]) -> bool:
+    def issuperset(self, other: Iterable[object]) -> bool:
         """Check if all elements of other are in this set.
 
         Args:
@@ -224,30 +217,6 @@ class SetView(
             True if superset
         """
         return all(value in self for value in other)
-
-    def __or__(self, other: object) -> set[object]:
-        """Set union: self | other."""
-        return set(self) | set(other)
-
-    def __and__(self, other: object) -> set[object]:
-        """Set intersection: self & other."""
-        return set(self) & set(other)
-
-    def __sub__(self, other: object) -> set[object]:
-        """Set difference: self - other."""
-        return set(self) - set(other)
-
-    def __xor__(self, other: object) -> set[object]:
-        """Set symmetric difference: self ^ other."""
-        return set(self) ^ set(other)
-
-    def __le__(self, other: object) -> bool:
-        """Test if subset: self <= other."""
-        return self.issubset(other)
-
-    def __ge__(self, other: object) -> bool:
-        """Test if superset: self >= other."""
-        return self.issuperset(other)
 
     # =========================================================================
     # VIEW INTERFACE
@@ -275,9 +244,6 @@ class SetView(
 
         for key, item in keyed:
             self._put_member(key, item)
-
-
-MutableSet.register(SetView)
 
 
 if TYPE_CHECKING:

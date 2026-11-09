@@ -214,7 +214,7 @@ def test_bytearray_index(bytearray_factory):
 
 def test_bytearray_index_not_found(bytearray_factory):
     data = bytearray_factory("data", b"abc")
-    with pytest.raises(ValueError, match="is not in bytearray"):
+    with pytest.raises(ValueError, match="not found"):
         data.index(ord("z"))
 
 

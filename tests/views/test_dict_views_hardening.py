@@ -846,7 +846,7 @@ def test_fractional_nested_empty_insert_leaves_no_trace(root):
     assert _lacks(view, "x")
     assert len(view) == 2
     assert list(view) == ["a", "b"]
-    assert view.get("x") is EMPTY
+    assert view.get("x") is None
     assert not view._data_container().exists_child("x")
     assert list(view.items()) == [("a", 1), ("b", 2)]
     with pytest.raises(ValueError, match="EMPTY"):
@@ -1036,7 +1036,7 @@ def test_none_is_a_stored_list_item(storage):
 
 
 # ============================================================================
-# ACCESS: every dict-like view mimics dict, with EMPTY as the absent default
+# ACCESS: every dict-like view mimics dict
 # ============================================================================
 
 ACCESS_VIEWS = (
@@ -1064,20 +1064,20 @@ def test_reversed_reads_keys_values_and_items_last_first(root, view_cls):
 
 
 @pytest.mark.parametrize("view_cls", ACCESS_VIEWS)
-def test_access_mimics_dict_with_empty_as_the_absent_default(storage, view_cls):
+def test_access_mimics_dict(storage, view_cls):
     """The three access rules, on an absent view, in a transaction and in a snapshot.
 
     ``view[key]`` on an absent key raises KeyError. ``view.get(key)`` returns
-    EMPTY, never None, and ``view.get(key, default)`` returns the given
-    default. None is a stored value, never a marker for absent. ``pop``
-    follows ``get``. A read never creates the view.
+    None, as ``dict.get`` does, and ``view.get(key, default)`` returns the
+    given default. None is also a value a view stores: ``in`` tells the two
+    apart. ``pop`` follows ``get``. A read never creates the view.
     """
     key, absent = _key(view_cls, 1), _key(view_cls, 2)
 
     def check_absent_key(view):
         with pytest.raises(KeyError):
             view[absent]
-        assert view.get(absent) is EMPTY
+        assert view.get(absent) is None
         assert view.get(absent, "dflt") == "dflt"
         assert view.get(absent, None) is None
         assert _lacks(view, absent)
@@ -1177,7 +1177,7 @@ def test_a_key_the_view_cannot_hold_is_absent_on_reads_and_rejected_on_writes(ro
     for bad in foreign:
         with pytest.raises(KeyError):
             view[bad]
-        assert view.get(bad) is EMPTY
+        assert view.get(bad) is None
         assert view.get(bad, "dflt") == "dflt"
         assert _lacks(view, bad)
         with pytest.raises((TypeError, ValueError)):
@@ -1202,7 +1202,7 @@ def test_kh57_reads_follow_python_int_key_semantics(root, view_cls):
         assert view[alias] == "one"
         assert view.get(alias) == "one"
     assert _lacks(view, 1.5)
-    assert view.get(1.5) is EMPTY
+    assert view.get(1.5) is None
     with pytest.raises(KeyError):
         view[1.5]
     with pytest.raises(TypeError):

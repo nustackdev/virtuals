@@ -202,9 +202,9 @@ has_python = "python" in tags  # True
 tags.remove("python")
 tags.discard("java")  # Silent if missing
 
-# Set algebra
-union = tags.union(other)
-intersection = tags.intersection(other)
+# Set algebra (plain sets back)
+union = tags | other
+intersection = tags & other
 
 # Extract entire set
 all_tags = tags.extract()  # {"python", "rust"}
@@ -238,7 +238,8 @@ The same on every view and every backend. Pinned by `tests/views/test_dict_views
 - Writes create. Setting into an absent view creates it. A delete of a missing key creates nothing: DictView, FlatDictView and LightDictView are silent, the index views and Kh57View raise `KeyError`. Nor does any write that raises or changes nothing: an out-of-range `del` or set on a list or bytearray, `remove` or `discard` of a non-member, `extend([])`, `update({})`, `clear()`.
 - A set member is an opaque hashable value. A tuple or frozenset is stored as one row and reads back as is; a list, dict or set raises `TypeError` before any write, as a Python set would, and so does a member that does not pickle. A frozenset member is keyed by its sorted contents, so equal sets match from any process.
 - `update` applies its keys in order. A kind change on one key raises there and leaves the keys before it written and the rest unwritten; abort the transaction, or delete the key first.
-- `LazyListView`, `LazyDictView` and `LightDictView` have no `pop`: read, then `del`, or use the eager view. `FlatListView` has no `pop`, `remove`, `insert` or `del` at all: it appends, sets, extends and clears.
+- Every view is the `collections.abc` type it stands for, with all its methods, on both facets: `pop`, `popitem`, `setdefault`, `update`, `reverse`, `+=`, `|=` and the rest work as on the built-in. A lazy `pop` or `popitem` hands back the value, not a view of the removed child. What a layout cannot do raises: `reversed()` on a Kh57View (no order to reverse), a write at a position on a RingView, a slice write on a list view. `tests/views/test_abc_conformance.py` pins all of it against the built-ins.
+- `get(key)` of an absent key returns `None`, as `dict.get` does.
 - Existence is one read: `view.container.exists()`. Opening a chain of children touches no storage.
 - `len()` on DictView, FlatDictView, LightDictView, LogIndexedDictView and FractionalIndexedDictView counts live rows (O(children)); Kh57View, IndexedDictView, ListView and SetView read a stored count. `bool()` is one storage op on every view. Paging with `keys(after=, limit=)` and `keys_reverse(before=, limit=)` on the dict, log and fractional views returns exactly `limit` keys when they exist. `RingView.len()` is two seeks: its sequence numbers are dense.
 - `IndexedDictView` delete and `ListView` insert or delete in the middle are O(n). Use `FractionalIndexedDictView` for ordered collections.

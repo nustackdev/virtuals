@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar, TypeVar
 
+from virtuals.collections import SequenceBase
 from virtuals.container import (
     Container,
     ContainerNotFoundError,
@@ -24,9 +24,11 @@ from virtuals.view import (
     ViewBase,
 )
 
+from ._index import require_int_index
+
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Iterable
 
     from virtuals.collections import (
         Containable,
@@ -51,12 +53,12 @@ class TupleView(
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    SequenceBase[object],
 ):
     """Tuple-like view over container (immutable sequence).
 
-    Provides read-only tuple interface using integer keys:
-    - __getitem__, __len__, __iter__
-    - count(), index()
+    A read-only ``Sequence`` using integer keys: ``[i]`` and slices,
+    ``len``, ``in``, iteration, ``reversed``, ``index`` and ``count``.
 
     Type Parameters:
         V: Type of values (default: Value)
@@ -88,8 +90,10 @@ class TupleView(
             Normalized positive index
 
         Raises:
+            TypeError: If ``address`` is not an int, as ``tuple`` does
             IndexError: If index out of bounds (also on an absent tuple)
         """
+        require_int_index(address, "tuple")
         length = self._len()
 
         if address < 0:
@@ -100,11 +104,11 @@ class TupleView(
 
         return address
 
-    def __getitem__(self, address: int) -> object | Empty:
-        """Get item at index.
+    def __getitem__(self, address: int | slice) -> object | Empty | tuple[object, ...]:
+        """Get item at index; a slice gives a plain tuple, as ``tuple`` does.
 
         Args:
-            address: Index (supports negative)
+            address: Index (supports negative) or slice
 
         Returns:
             Value at index
@@ -112,75 +116,28 @@ class TupleView(
         Raises:
             IndexError: If index out of bounds
         """
+        if isinstance(address, slice):
+            return tuple(self[i] for i in range(*address.indices(len(self))))
         normalized = self.normalize_address(address)
         try:
             return self._get_child_value(normalized)
         except ContainerNotFoundError as e:
             raise IndexNotFoundError("tuple index out of range") from e
 
-    def __iter__(self) -> Generator[object, None, None]:
-        """Iterate over items.
-
-        Yields:
-            Items in order
-        """
-        for i in range(len(self)):
-            yield self[i]
-
-    def __contains__(self, obj: object) -> bool:
-        """Check if value exists in tuple.
-
-        Args:
-            obj: Value to check for
-
-        Returns:
-            True if value exists in tuple
-        """
-        for item in self:
-            if item == obj:
-                return True
-        return False
-
-    def __reversed__(self) -> Generator[object, None, None]:
-        """Iterate in reverse order.
-
-        Yields:
-            Items in reverse order
-        """
-        for i in range(len(self) - 1, -1, -1):
-            yield self[i]
-
-    def index(self, value: object) -> int:
-        """Find index of first occurrence of value.
-
-        Args:
-            value: Value to find
-
-        Returns:
-            Index of first occurrence
-
-        Raises:
-            ValueError: If value not found
-        """
-        for i, item in enumerate(self):
-            if item == value:
-                return i
-        raise ValueError(f"{value!r} is not in tuple")
-
-    def count(self, value: object) -> int:
-        """Count occurrences of value.
-
-        Args:
-            value: Value to count
-
-        Returns:
-            Number of occurrences
-        """
-        return sum(1 for item in self if item == value)
-
     # =========================================================================
     # VIEW INTERFACE
     # =========================================================================
+
+    def __eq__(self, other: object) -> bool:
+        """Equal to a tuple, or a tuple view, holding equal items in order, as ``tuple ==``.
+
+        Not hashable: the stored tuple can be replaced under the view.
+        """
+        if not isinstance(other, tuple | TupleView):
+            return NotImplemented
+        return tuple(self) == tuple(other)
+
+    __hash__ = None  # type: ignore[assignment]
 
     def extract(self) -> tuple[object, ...]:
         """Extract all items as tuple.
@@ -227,9 +184,6 @@ class TupleView(
         child_site = key_.join_segment(self.container.site, normalized)
         child_container = Container(ctx=self.container.ctx, site=child_site)
         return view(child_container, self.registry, parent=self)
-
-
-Sequence.register(TupleView)
 
 
 if TYPE_CHECKING:

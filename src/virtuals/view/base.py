@@ -56,7 +56,7 @@ def is_view_key(address: object) -> bool:
     return isinstance(address, _KEY_TYPES)
 
 
-@attrs.frozen
+@attrs.frozen(eq=False)
 class ViewBase(ABC):
     """Base class for all views.
 
@@ -70,6 +70,10 @@ class ViewBase(ABC):
     - Parent-aware: A child view knows the view it was opened from, so
       creating it goes through that parent and the parent's bookkeeping
     - Protocol-based: Subclasses implement Convertible/Initializable/Nestable as needed
+    - A collection: every view lists one ``virtuals.collections`` base right
+      after ``ViewBase`` (``SequenceBase``, ``MutableMappingBase``, ...), so
+      it is that ``collections.abc`` type, with its mixins and equality.
+      ``ViewBase`` defines no equality of its own.
 
     Attributes:
         container: Container instance for storage operations
@@ -132,6 +136,16 @@ class ViewBase(ABC):
         lazy twin.
         """
         return self  # type: ignore[return-value]
+
+    def _plain_value(self, address: object) -> object:
+        """The item at ``address`` read through the eager facet: data, never a child view.
+
+        What ``pop``, ``popitem`` and ``reverse`` move or hand back, so a
+        lazy facet returns the value rather than a view of a removed child.
+        Overrides the collection bases' default (a plain read): a view
+        lists ``ViewBase`` before its collection base.
+        """
+        return self.eager[address]  # type: ignore[index]
 
     # =========================================================================
     # WRITE SUPPORT

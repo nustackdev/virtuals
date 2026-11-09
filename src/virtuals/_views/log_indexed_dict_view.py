@@ -42,9 +42,10 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
+from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from virtuals.collections import ReactiveMappingBase
 from virtuals.container import Container, ContainerProtocol, ContainerStructure, NodeType
 from virtuals.tkv.filter import LengthFilter, PrefixFilter, WildcardFilter
 from virtuals.tkv.observer import SubscriptionOptions
@@ -127,6 +128,7 @@ class LogIndexedDictViewBase(
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    ReactiveMappingBase[str | int, object],
 ):
     """Dict view with append-only log key index for multi-writer safety.
 
@@ -520,13 +522,6 @@ class LogIndexedDictViewBase(
             return entry  # first result only
         return None
 
-    def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        """Value at ``address``, or ``default`` (EMPTY) when the key is absent."""
-        try:
-            return self[address]
-        except KeyError:
-            return default
-
     # -- Mutations ---------------------------------------------------------
 
     def __setitem__(self, address: str | int, value: object) -> None:
@@ -603,14 +598,12 @@ class LogIndexedDictViewBase(
         self[key] = value
         return key
 
-    def update(self, other: PyMapping[str | int, object] | None = None, **kwargs: object) -> None:
-        self._reject_empty_in(other or {})
-        self._reject_empty_in(kwargs)
-        if other:
-            for key, value in other.items():
-                self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value  # type: ignore[assignment]
+    def update(self, other: object = (), /, **kwargs: object) -> None:
+        """Update as ``dict.update``. The whole batch is checked for EMPTY before the first write."""
+        items = self._update_items(other, kwargs)
+        self._reject_empty_in(items)
+        for key, value in items.items():
+            self[key] = value
 
     def store(self, value: PyMapping[str | int, object], *, replace: bool = True) -> None:
         value = self._reject_empty_in(value)  # type: ignore[assignment]
@@ -739,16 +732,6 @@ class EagerLogIndexedDictView(LogIndexedDictViewBase):
                 yield actual_key, node_info.primitive_value  # type: ignore[union-attr]
             else:
                 yield actual_key, self._extract_data_child(actual_key, node_info)
-
-    def pop(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        try:
-            value = self[address]
-            del self[address]
-            return value
-        except KeyError:
-            if is_empty(default):
-                raise
-            return default
 
     def extract(self) -> dict[str | int, object]:
         return {k: self[k] for k in self}
@@ -937,6 +920,3 @@ class _LazyLogIndexedReversedItemsView(ItemsView):
 
     def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
         yield from self._mapping._iter_items_reverse()
-
-
-MutableMapping.register(LogIndexedDictViewBase)

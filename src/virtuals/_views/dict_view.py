@@ -12,16 +12,16 @@ Provides three classes following the eager/lazy facet pattern:
 
 from __future__ import annotations
 
-from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
+from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar
 
+from virtuals.collections import ReactiveMappingBase
 from virtuals.container import (
     ContainerNotFoundError,
     ContainerProtocol,
     ContainerStructure,
     NodeType,
 )
-from virtuals.types import EMPTY, Empty, is_empty
 from virtuals.view import (
     ChildNavigationBase,
     ChildNestedGetBase,
@@ -60,6 +60,7 @@ if TYPE_CHECKING:
         Sizeable,
         Subscriptable,
     )
+    from virtuals.types import Empty
 
 __all__ = [
     "DictViewBase",
@@ -86,6 +87,7 @@ class DictViewBase(
     PrimitiveOpsBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    ReactiveMappingBase[str | int, object],
 ):
     """Dict-like view base — shared by eager and lazy facets.
 
@@ -188,13 +190,6 @@ class DictViewBase(
             raise KeyNotFoundError(address)
         self.container.delete_child(address)
 
-    def get(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        """Value at ``address``, or ``default`` (EMPTY) when the key is absent."""
-        try:
-            return self[address]
-        except KeyError:
-            return default
-
     def clear(self) -> None:
         """Remove all items."""
         if not self.container.exists():
@@ -202,15 +197,12 @@ class DictViewBase(
         self.ensure_created()
         self.container.clear_children(validate=True)
 
-    def update(self, other: PyMapping[str | int, object] | None = None, **kwargs: object) -> None:
-        """Update from dict or kwargs."""
-        self._reject_empty_in(other or {})
-        self._reject_empty_in(kwargs)
-        if other:
-            for key, value in other.items():
-                self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value  # type: ignore[assignment]
+    def update(self, other: object = (), /, **kwargs: object) -> None:
+        """Update as ``dict.update``. The whole batch is checked for EMPTY before the first write."""
+        items = self._update_items(other, kwargs)
+        self._reject_empty_in(items)
+        for key, value in items.items():
+            self[key] = value
 
     def store(self, value: PyMapping[str | int, object], *, replace: bool = True) -> None:
         """Store dict contents."""
@@ -324,17 +316,6 @@ class EagerDictView(DictViewBase):
                 yield k, v.primitive_value
             elif v.node_type == NodeType.CONTAINER:
                 yield k, self._get_child_value(k, node_info=v)
-
-    def pop(self, address: str | int, default: object | Empty = EMPTY) -> object | Empty:
-        """Remove and return value."""
-        try:
-            value = self[address]
-            del self[address]
-            return value
-        except KeyError:
-            if is_empty(default):
-                raise
-            return default
 
     def extract(self) -> dict[str | int, object]:
         """Extract all items as dict."""
@@ -577,9 +558,6 @@ class _LazyReversedItemsView(ItemsView):
 
     def __iter__(self) -> Generator[tuple[str | int, object], None, None]:  # type: ignore[override]
         yield from self._mapping._iter_items_reverse()
-
-
-MutableMapping.register(EagerDictView)
 
 
 if TYPE_CHECKING:
