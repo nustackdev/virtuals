@@ -2,10 +2,11 @@
 
 Ultra-lightweight dict view with no:
 - Length tracking
-- Observable support
 - Nested views support (primitives only)
 - Functional operations
 - Child navigation
+
+Observable like ``DictView``: the whole view, one key, the keys, a pattern.
 """
 
 from __future__ import annotations
@@ -13,12 +14,15 @@ from __future__ import annotations
 from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from virtuals.collections import DictMethods
+from virtuals.collections import DictMethods, ReactiveMappingBase
 from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import Empty, Value
 from virtuals.view import (
+    ChildObservableBase,
     ChildPrimitiveSetBase,
+    DescendantsObservableBase,
     KeyNotFoundError,
+    ObservableBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
     is_view_key,
@@ -38,15 +42,19 @@ __all__ = [
 
 
 class LightDictView(
+    ObservableBase,
+    ChildObservableBase[str | int],
+    DescendantsObservableBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    ReactiveMappingBase[str | int, Value],
     DictMethods[str | int, Value],
 ):
     """Ultra-lightweight dict view for maximum performance.
 
     Stores only primitive values (int, float, str, bool, bytes, None).
-    No nested containers, no observables, no length tracking.
+    No nested containers, no length tracking.
 
     Use when:
     - You need maximum set/get performance

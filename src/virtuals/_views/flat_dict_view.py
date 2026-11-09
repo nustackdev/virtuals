@@ -3,7 +3,7 @@
 Lightweight dict view with:
 - Live length (no stored counter, so no key shared between writers)
 - Primitives only (no nested containers)
-- No observables
+- Observable like ``DictView``: the whole view, one key, the keys, a pattern
 - No functional operations
 """
 
@@ -12,13 +12,16 @@ from __future__ import annotations
 from collections.abc import ItemsView, KeysView, ValuesView
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from virtuals.collections import DictMethods
+from virtuals.collections import DictMethods, ReactiveMappingBase
 from virtuals.container import ContainerProtocol, ContainerStructure
 from virtuals.types import Empty, Value
 from virtuals.view import (
+    ChildObservableBase,
     ChildPrimitiveSetBase,
+    DescendantsObservableBase,
     KeyNotFoundError,
     LiveChildrenCountBase,
+    ObservableBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
     is_view_key,
@@ -38,10 +41,14 @@ __all__ = [
 
 
 class FlatDictView(
+    ObservableBase,
+    ChildObservableBase[str | int],
+    DescendantsObservableBase,
     LiveChildrenCountBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    ReactiveMappingBase[str | int, Value],
     DictMethods[str | int, Value],
 ):
     """Flat dict view with no nested containers.
@@ -52,7 +59,7 @@ class FlatDictView(
 
     Use when:
     - You only store primitives
-    - You don't need nested containers or observables
+    - You don't need nested containers
 
     Example:
         >>> scores = nav.root(tx)

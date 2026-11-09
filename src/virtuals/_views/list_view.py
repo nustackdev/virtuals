@@ -25,6 +25,7 @@ from virtuals.view import (
     ChildNestedSetBase,
     ChildObservableBase,
     ChildPrimitiveSetBase,
+    DescendantsObservableBase,
     IndexNotFoundError,
     LazyChildReadBase,
     MetadataBasedChildrenCountBase,
@@ -72,6 +73,7 @@ __all__ = [
 class ListViewBase(
     ObservableBase,
     ChildObservableBase[int],
+    DescendantsObservableBase,
     MetadataBasedChildrenCountBase,
     ChildNavigationBase[int],
     ChildNestedGetBase,

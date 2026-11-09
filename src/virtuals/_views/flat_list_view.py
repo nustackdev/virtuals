@@ -1,7 +1,8 @@
 """FlatListView — primitives-only list with length tracking, no nesting overhead.
 
 Lightweight list view optimized for primitive values (int, float, str, bool,
-bytes, None).  No observables, no nested containers, no child navigation.
+bytes, None).  No nested containers, no child navigation. Observable like
+``ListView``: the whole list, one index, the indexes, a pattern.
 Each element is a single ``put_child_primitive`` / ``get_child_primitive`` call.
 
 Append is O(1) (one primitive write + one metadata write for length).
@@ -12,13 +13,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from virtuals.collections import ListMethods
+from virtuals.collections import ListMethods, ReactiveSequenceBase
 from virtuals.container import ContainerProtocol, ContainerStructure
+from virtuals.tkv.filter import PrefixFilter
+from virtuals.tkv.observer import SubscriptionOptions
 from virtuals.types import Empty, Value
 from virtuals.view import (
+    ChildObservableBase,
     ChildPrimitiveSetBase,
+    DescendantsObservableBase,
     IndexNotFoundError,
     MetadataBasedChildrenCountBase,
+    ObservableBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
 )
@@ -36,16 +42,20 @@ __all__ = [
 
 
 class FlatListView(
+    ObservableBase,
+    ChildObservableBase[int],
+    DescendantsObservableBase,
     MetadataBasedChildrenCountBase,
     ChildPrimitiveSetBase,
     UnsafePrimitiveOpsBase,
     ViewBase,
+    ReactiveSequenceBase[Value],
     ListMethods[Value],
 ):
     """Primitives-only list with O(1) append and length tracking.
 
     Stores only primitive values using integer keys (0, 1, 2, ...).
-    Includes ``__len__`` via metadata.  No nested containers, no observables.
+    Includes ``__len__`` via metadata.  No nested containers.
 
     Use when:
     - Elements are always primitives (str, int, etc.)
@@ -87,6 +97,18 @@ class FlatListView(
         if address < 0 or address >= length:
             raise IndexNotFoundError("list index out of range")
         return address
+
+    def on_child_change(self, address: int) -> SubscriptionOptions:
+        """Build subscription options for the item at ``address``, as ``ListView`` does.
+
+        A non-negative index names a slot whether or not the list, or that
+        slot, exists yet, so the watch works on an absent list. A negative
+        index is resolved against the current length and raises
+        ``IndexError`` when out of range.
+        """
+        if address < 0:
+            address = self.normalize_address(address)
+        return SubscriptionOptions(filter=PrefixFilter(prefix=(*self.container.site, address)))
 
     # -- Read ---------------------------------------------------------------
 
