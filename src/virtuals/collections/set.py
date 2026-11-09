@@ -1,26 +1,30 @@
 """Set collection bases.
 
-Provides default implementations following collections.abc.MutableSet pattern.
-Subclasses implement the abstract core; the base derives everything else.
+Mirror ``collections.abc.Set`` and ``MutableSet``: the same abstract core,
+the same mixin methods and operators with the same semantics. Each base is
+registered with its ABC, so every view built on it is a ``Set`` or
+``MutableSet`` to ``isinstance``.
 
 Abstract (must implement):
-    __contains__, __iter__, __len__, add, discard
+    __contains__, __iter__, __len__            (Set)
+    add, discard                               (MutableSet)
 
 Provided for free:
-    remove, clear, isdisjoint, issubset, issuperset,
-    __or__, __and__, __sub__, __xor__, __le__, __ge__
+    <=, <, ==, >=, >, &, |, -, ^ (and reflected), isdisjoint
+    remove, pop, clear, |=, &=, -=, ^=
+
+Operators return a plain Python set (``_from_iterable``); like a Python
+set, a view is not hashable. Set-only methods (``union``, ``issubset``,
+``update``, ...) are not here: a view standing in for a set adds them.
 """
 
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable
+from collections.abc import Iterable, MutableSet, Set
+from typing import Protocol, TypeVar, runtime_checkable
 
 from .bases import CollectionBase
-
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable
 
 
 __all__ = [
@@ -34,52 +38,102 @@ V = TypeVar("V")
 
 
 class SetBase(CollectionBase[V]):
-    """Read-only set base. Provides set algebra from contains/iter/len.
+    """Read-only set base, as ``collections.abc.Set``.
 
     All three abstract methods (__contains__, __iter__, __len__) inherited
-    from CollectionBase — subclasses must implement all of them.
+    from CollectionBase: subclasses implement all of them.
     """
 
-    def isdisjoint(self, other: Iterable[object]) -> bool:
-        """Check if no elements in common with other."""
-        return not any(value in self for value in other)
-
-    def issubset(self, other: Iterable[object]) -> bool:
-        """Check if all elements are in other."""
-        other_set = other if isinstance(other, set) else set(other)
-        return all(value in other_set for value in self)
-
-    def issuperset(self, other: Iterable[object]) -> bool:
-        """Check if all elements of other are in this set."""
-        return all(value in self for value in other)
+    @classmethod
+    def _from_iterable(cls, it: Iterable[V]) -> set[V]:
+        """What an operator returns: a plain set. Override for another type."""
+        return set(it)
 
     def __le__(self, other: object) -> bool:
-        """Test if subset: self <= other."""
-        return self.issubset(other)  # type: ignore[arg-type]
+        """Subset: every item of ``self`` is in ``other``."""
+        if not isinstance(other, Set):
+            return NotImplemented
+        if len(self) > len(other):
+            return False
+        return all(elem in other for elem in self)
+
+    def __lt__(self, other: object) -> bool:
+        """Proper subset."""
+        if not isinstance(other, Set):
+            return NotImplemented
+        return len(self) < len(other) and self.__le__(other)
+
+    def __gt__(self, other: object) -> bool:
+        """Proper superset."""
+        if not isinstance(other, Set):
+            return NotImplemented
+        return len(self) > len(other) and self.__ge__(other)
 
     def __ge__(self, other: object) -> bool:
-        """Test if superset: self >= other."""
-        return self.issuperset(other)  # type: ignore[arg-type]
+        """Superset: every item of ``other`` is in ``self``."""
+        if not isinstance(other, Set):
+            return NotImplemented
+        if len(self) < len(other):
+            return False
+        return all(elem in self for elem in other)
 
-    def __or__(self, other: object) -> set[V]:
-        """Set union: self | other."""
-        return set(self) | set(other)  # type: ignore[arg-type]
+    def __eq__(self, other: object) -> bool:
+        """Equal to any set holding the same items, as ``Set.__eq__``."""
+        if not isinstance(other, Set):
+            return NotImplemented
+        return len(self) == len(other) and self.__le__(other)
+
+    __hash__ = None  # type: ignore[assignment]
 
     def __and__(self, other: object) -> set[V]:
-        """Set intersection: self & other."""
-        return set(self) & set(other)  # type: ignore[arg-type]
+        """Intersection: ``self & other``."""
+        if not isinstance(other, Iterable):
+            return NotImplemented
+        return self._from_iterable(value for value in other if value in self)
+
+    __rand__ = __and__
+
+    def isdisjoint(self, other: Iterable[object]) -> bool:
+        """True if no item of ``other`` is in ``self``."""
+        return not any(value in self for value in other)
+
+    def __or__(self, other: object) -> set[V]:
+        """Union: ``self | other``."""
+        if not isinstance(other, Iterable):
+            return NotImplemented
+        return self._from_iterable([*self, *other])
+
+    __ror__ = __or__
 
     def __sub__(self, other: object) -> set[V]:
-        """Set difference: self - other."""
-        return set(self) - set(other)  # type: ignore[arg-type]
+        """Difference: ``self - other``."""
+        if not isinstance(other, Set):
+            if not isinstance(other, Iterable):
+                return NotImplemented
+            other = self._from_iterable(other)
+        return self._from_iterable(value for value in self if value not in other)
+
+    def __rsub__(self, other: object) -> set[V]:
+        """Reflected difference: ``other - self``."""
+        if not isinstance(other, Set):
+            if not isinstance(other, Iterable):
+                return NotImplemented
+            other = self._from_iterable(other)
+        return self._from_iterable(value for value in other if value not in self)
 
     def __xor__(self, other: object) -> set[V]:
-        """Set symmetric difference: self ^ other."""
-        return set(self) ^ set(other)  # type: ignore[arg-type]
+        """Symmetric difference: ``self ^ other``."""
+        if not isinstance(other, Set):
+            if not isinstance(other, Iterable):
+                return NotImplemented
+            other = self._from_iterable(other)
+        return (self - other) | (other - self)  # type: ignore[operator]
+
+    __rxor__ = __xor__
 
 
 class MutableSetBase(SetBase[V]):
-    """Mutable set base. Adds remove/clear from add/discard.
+    """Mutable set base, as ``collections.abc.MutableSet``.
 
     Additional abstract:
         add(value) -> None
@@ -102,10 +156,59 @@ class MutableSetBase(SetBase[V]):
             raise KeyError(value)
         self.discard(value)
 
+    def pop(self) -> V:
+        """Remove and return an arbitrary item (the first iteration yields).
+
+        Raises:
+            KeyError: If the set is empty.
+        """
+        it = iter(self)
+        try:
+            value = next(it)
+        except StopIteration:
+            raise KeyError("pop from an empty set") from None
+        self.discard(value)
+        return value
+
     def clear(self) -> None:
         """Remove all items. Override for bulk delete."""
         for value in list(self):
             self.discard(value)
+
+    def __ior__(self, it: Iterable[V]) -> MutableSetBase[V]:
+        """``self |= it``: add every item."""
+        for value in it:
+            self.add(value)
+        return self
+
+    def __iand__(self, it: Iterable[V]) -> MutableSetBase[V]:
+        """``self &= it``: keep only the items also in ``it``."""
+        for value in self - it:  # type: ignore[operator]
+            self.discard(value)
+        return self
+
+    def __ixor__(self, it: Iterable[V]) -> MutableSetBase[V]:
+        """``self ^= it``: keep the items in exactly one of the two."""
+        if it is self:
+            self.clear()
+            return self
+        if not isinstance(it, Set):
+            it = self._from_iterable(it)
+        for value in it:
+            if value in self:
+                self.discard(value)
+            else:
+                self.add(value)
+        return self
+
+    def __isub__(self, it: Iterable[V]) -> MutableSetBase[V]:
+        """``self -= it``: drop every item of ``it``."""
+        if it is self:
+            self.clear()
+            return self
+        for value in it:
+            self.discard(value)
+        return self
 
 
 class ReactiveSetBase(MutableSetBase[V]):
@@ -119,6 +222,10 @@ class ReactiveSetBase(MutableSetBase[V]):
     def on_change(self) -> object:
         """Subscribe to all changes in this set."""
         ...
+
+
+Set.register(SetBase)
+MutableSet.register(MutableSetBase)
 
 
 @runtime_checkable
