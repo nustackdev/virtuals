@@ -601,6 +601,10 @@ class LazyKh57View(Kh57ViewBase):
 
     # -- Facet navigation ------------------------------------------------
 
+    def extract(self) -> dict[int, object]:
+        """The whole subtree as plain Python values, read through the eager facet."""
+        return self.eager.extract()
+
     @property
     def eager(self) -> EagerKh57View:
         """Switch to eager facet — reads return extracted values."""

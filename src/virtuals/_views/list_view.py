@@ -443,6 +443,10 @@ class LazyListView(ListViewBase):
     # FACET NAVIGATION
     # =========================================================================
 
+    def extract(self) -> list[object]:
+        """The whole subtree as plain Python values, read through the eager facet."""
+        return self.eager.extract()
+
     @property
     def eager(self) -> EagerListView:
         """Switch to eager facet — reads return extracted values."""

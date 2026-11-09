@@ -460,6 +460,10 @@ class LazyDictView(DictViewBase):
     # FACET NAVIGATION
     # =========================================================================
 
+    def extract(self) -> dict[str | int, object]:
+        """The whole subtree as plain Python values, read through the eager facet."""
+        return self.eager.extract()
+
     @property
     def eager(self) -> EagerDictView:
         """Switch to eager facet — reads return extracted values."""
