@@ -337,13 +337,13 @@ class Kh57ViewBase(
         return child_view.extract()
 
     def _view_container_value(self, encoded: int, info: NodeInfo) -> object:
-        """Lazy reader: return a child View for a container child."""
+        """Lazy reader: return the lazy child View for a container child."""
         child_site = (*self.container.site, encoded)
         child_container = Container(ctx=self.container.ctx, site=child_site)
         if info.structure is None:
             raise ValueError(f"Child container at {encoded} has no structure ID")
         view_class = self.registry.get_view_for_structure(info.structure)
-        return view_class(container=child_container, registry=self.registry, parent=self)
+        return view_class(container=child_container, registry=self.registry, parent=self).lazy
 
     # -- Membership -------------------------------------------------------
 

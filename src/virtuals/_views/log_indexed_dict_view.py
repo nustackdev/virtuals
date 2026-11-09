@@ -661,7 +661,7 @@ class LogIndexedDictViewBase(
         if node_info.structure is None:  # type: ignore[union-attr]
             raise ValueError(f"Child container '{address}' has no structure ID")
         view_class = self.registry.get_view_for_structure(node_info.structure)  # type: ignore[union-attr]
-        return view_class(container=child_container, registry=self.registry, parent=self)
+        return view_class(container=child_container, registry=self.registry, parent=self).lazy
 
 
 # =============================================================================

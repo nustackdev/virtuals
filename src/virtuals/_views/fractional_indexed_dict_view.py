@@ -946,7 +946,7 @@ class LazyFractionalIndexedDictView(FractionalIndexedDictViewBase):
     """Lazy facet: container children read as child Views."""
 
     def _child_result(self, address: Address, node_info: object) -> object:
-        return self._child_view(address, node_info)
+        return self._child_view(address, node_info).lazy
 
     @property
     def eager(self) -> EagerFractionalIndexedDictView:

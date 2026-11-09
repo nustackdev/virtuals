@@ -371,7 +371,8 @@ class LazyChildReadBase:
 
     Like ChildNestedGetBase but stops before extraction — returns the child
     View for containers, raw value for primitives. This is the lazy counterpart
-    to ChildNestedGetBase's eager reads.
+    to ChildNestedGetBase's eager reads, and lazy all the way down: a child
+    View is its lazy facet, so its own children read as Views too.
 
     Used by lazy view facets (LazyDictView, LazyListView, etc.) and available
     for community views building custom lazy facets.
@@ -393,7 +394,7 @@ class LazyChildReadBase:
             node_info: Pre-fetched node info to avoid redundant storage read
 
         Returns:
-            Child View for containers, primitive value for leaves
+            Child View (its lazy facet) for containers, primitive value for leaves
 
         Raises:
             KeyError: If child doesn't exist
@@ -419,7 +420,8 @@ class LazyChildReadBase:
             raise ValueError(f"Child container '{address}' has no structure ID")
 
         view_class = self.registry.get_view_for_structure(node_info.structure)
-        return view_class(container=child_container, registry=self.registry, parent=self)  # type: ignore[call-arg]
+        child = view_class(container=child_container, registry=self.registry, parent=self)  # type: ignore[call-arg]
+        return child.lazy
 
 
 class ChildNestedSetBase:

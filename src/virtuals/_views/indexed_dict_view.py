@@ -397,14 +397,14 @@ class IndexedDictViewBase(
         return child_view.extract()
 
     def _view_data_child(self, address: str | int, node_info: object) -> object:
-        """Return a View for a container child from __data__ (no extraction)."""
+        """Return the lazy View of a container child from __data__ (no extraction)."""
         dc = self._data_container()
         child_site = (*dc.site, address)
         child_container = Container(ctx=dc.ctx, site=child_site)
         if node_info.structure is None:  # type: ignore[union-attr]
             raise ValueError(f"Child container '{address}' has no structure ID")
         view_class = self.registry.get_view_for_structure(node_info.structure)  # type: ignore[union-attr]
-        return view_class(container=child_container, registry=self.registry, parent=self)
+        return view_class(container=child_container, registry=self.registry, parent=self).lazy
 
     # -- Ordered key iteration --------------------------------------------
     #

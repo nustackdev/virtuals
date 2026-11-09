@@ -19,6 +19,7 @@ import pytest
 from virtuals._views import (
     EagerDictView,
     EagerFractionalIndexedDictView,
+    LazyDictView,
     LazyFractionalIndexedDictView,
 )
 from virtuals._views.fractional_index import validate_order_key
@@ -652,11 +653,11 @@ def test_lazy_facet_returns_views(fdict):
     lazy = view.lazy
     assert isinstance(lazy, LazyFractionalIndexedDictView)
     child = lazy["a"]
-    assert isinstance(child, EagerDictView)
+    assert isinstance(child, LazyDictView)  # lazy all the way down
     assert child["n"] == 1
     assert lazy["b"] == 2
     assert list(lazy) == ["a", "b"]
-    assert [type(v).__name__ for v in lazy.values()] == ["EagerDictView", "int"]
+    assert [type(v).__name__ for v in lazy.values()] == ["LazyDictView", "int"]
     assert lazy.extract() == {"a": {"n": 1}, "b": 2}
     assert isinstance(lazy.eager, EagerFractionalIndexedDictView)
     assert lazy.eager.extract() == {"a": {"n": 1}, "b": 2}
