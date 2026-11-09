@@ -43,7 +43,7 @@ from ._keys_view import ReversibleKeysView
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Generator
     from collections.abc import Mapping as PyMapping
 
     from virtuals.collections import (
@@ -335,56 +335,6 @@ class EagerDictView(DictViewBase):
     def eager(self) -> EagerDictView:
         """Identity — already eager."""
         return self
-
-    # =========================================================================
-    # FUNCTIONAL OPERATIONS
-    # =========================================================================
-
-    def map_values(self, fn: Callable[[object], object]) -> dict[str | int, object]:
-        """Apply function to each value, keeping keys unchanged."""
-        return {k: fn(v) for k, v in self.items()}
-
-    def map_items(
-        self, fn: Callable[[str | int, object], tuple[str | int, object]]
-    ) -> dict[str | int, object]:
-        """Apply function to each (key, value) pair."""
-        return dict(fn(k, v) for k, v in self.items())
-
-    def filter(self, fn: Callable[[str | int, object], bool]) -> dict[str | int, object]:
-        """Filter items by predicate."""
-        return {k: v for k, v in self.items() if fn(k, v)}
-
-    def reduce(self, fn: Callable[[object, str | int, object], object], initial: object) -> object:
-        """Reduce dict to single value."""
-        result = initial
-        for k, v in self.items():
-            result = fn(result, k, v)
-        return result
-
-    # =========================================================================
-    # SEARCH OPERATIONS
-    # =========================================================================
-
-    def find(self, fn: Callable[[object], bool]) -> object:
-        """Find first value matching predicate."""
-        for v in self.values():
-            if fn(v):
-                return v
-        raise ValueError("No matching value found")
-
-    def find_key(self, fn: Callable[[object], bool]) -> str | int:
-        """Find first key whose value matches predicate."""
-        for k, v in self.items():
-            if fn(v):
-                return k
-        raise ValueError("No matching value found")
-
-    def find_item(self, fn: Callable[[str | int, object], bool]) -> tuple[str | int, object]:
-        """Find first item (key, value) matching predicate."""
-        for k, v in self.items():
-            if fn(k, v):
-                return k, v
-        raise ValueError("No matching item found")
 
 
 # =============================================================================

@@ -126,7 +126,7 @@ Only views that support **nested containers** need the eager/lazy split:
 
 ```text
 DictViewBase                    shared mutations, keys, contains, len, lifecycle
-├── EagerDictView               eager reads, extract(), functional ops
+├── EagerDictView               eager reads, extract()
 └── LazyDictView                lazy reads, facet cross-navigation
 ```
 

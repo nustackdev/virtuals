@@ -126,6 +126,16 @@ def test_view_has_the_whole_builtin_api(kind, view_cls):
         assert not hasattr(view_cls, name), name
 
 
+@pytest.mark.parametrize(("kind", "view_cls"), CLAIMS, ids=lambda x: x.__name__)
+def test_view_adds_no_helpers_the_builtin_lacks(kind, view_cls):
+    """The facets carry the built-in's surface, not a functional toolkit of their own."""
+    for name in ("map", "map_values", "map_items", "filter", "reduce", "find_key", "find_item"):
+        assert not hasattr(view_cls, name), name
+    if kind is not bytearray:  # bytearray.find is the built-in's own
+        assert not hasattr(view_cls, "find")
+    assert not hasattr(view_cls, "find_index")
+
+
 # =============================================================================
 # DICT
 # =============================================================================

@@ -38,7 +38,7 @@ from ._index import require_int_index
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable
+    from collections.abc import Generator, Iterable
     from collections.abc import Sequence as PySequence
 
     from virtuals.collections import (
@@ -367,43 +367,6 @@ class EagerListView(ListViewBase):
     def eager(self) -> EagerListView:
         """Identity — already eager."""
         return self
-
-    # =========================================================================
-    # FUNCTIONAL OPERATIONS
-    # =========================================================================
-
-    def map(self, fn: Callable[[object], object]) -> list[object]:
-        """Apply function to each element."""
-        return [fn(item) for item in self]
-
-    def filter(self, fn: Callable[[object], bool]) -> list[object]:
-        """Filter elements by predicate."""
-        return [item for item in self if fn(item)]
-
-    def reduce(self, fn: Callable[[object, object], object], initial: object) -> object:
-        """Reduce list to single value."""
-        result = initial
-        for item in self:
-            result = fn(result, item)
-        return result
-
-    # =========================================================================
-    # SEARCH OPERATIONS
-    # =========================================================================
-
-    def find(self, fn: Callable[[object], bool]) -> object:
-        """Find first element matching predicate."""
-        for item in self:
-            if fn(item):
-                return item
-        raise ValueError("No matching element found")
-
-    def find_index(self, fn: Callable[[object], bool]) -> int:
-        """Find index of first element matching predicate."""
-        for i, item in enumerate(self):
-            if fn(item):
-                return i
-        raise ValueError("No matching element found")
 
 
 # =============================================================================
