@@ -106,6 +106,30 @@ def cancel_while_reserving(storage) -> None:
     _write_fast(storage)
 
 
+def cancel_meeting_a_grant_still_cancels(storage) -> None:
+    """A queued coroutine cancelled on the tick it is granted the slot is cancelled, and holds nothing.
+
+    The release grants the slot and schedules the wake; the cancel lands
+    before the task resumes. The cancel must win: a task that swallowed it
+    would carry on as if never asked, and whoever awaits its end (a flow
+    cancelling an arm) would wait for good.
+    """
+
+    async def main() -> None:
+        held = await storage.areserve_write_slot()
+        task = asyncio.create_task(storage.areserve_write_slot())
+        await asyncio.sleep(0.02)
+        held.release()
+        task.cancel()
+        await asyncio.wait([task])
+        if not task.cancelled():
+            task.result().release()
+        assert task.cancelled()
+
+    asyncio.run(main())
+    _write_fast(storage)
+
+
 def cancel_between_reserve_and_begin(storage) -> None:
     """A reserved slot no transaction took is freed: by ``with``, or once dropped."""
 

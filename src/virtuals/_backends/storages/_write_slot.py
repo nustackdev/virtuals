@@ -572,10 +572,17 @@ class WriterLock:
                 self._pass_on_or_leave(waiter)
             raise
         try:
-            await asyncio.wait_for(waiter.future, max(timeout, 0))
+            # Not ``wait_for``: before Python 3.12 it hands the result back,
+            # and drops the cancel, when the grant lands on the tick the
+            # task is cancelled. ``asyncio.wait`` raises the cancel as is.
+            done, _ = await asyncio.wait({waiter.future}, timeout=max(timeout, 0))
+            if not done:
+                raise asyncio.TimeoutError
         except BaseException as e:
             # Timeout, cancellation, or the coroutine being closed with its
             # loop: leave the queue, or hand on a grant that just landed.
+            # The future ends first, so a release from now on skips it.
+            waiter.future.cancel()
             with self._guard:
                 state = waiter.state
                 if state == "waiting":
